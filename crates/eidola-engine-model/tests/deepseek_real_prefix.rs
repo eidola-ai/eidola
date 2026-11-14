@@ -7,8 +7,9 @@
 //!     EIDOLA_DEEPSEEK_PREFIX_DIR=<dir> cargo test --release -p eidola-engine-model \
 //!         --test deepseek_real_prefix -- --ignored --nocapture
 //!
-//! Every `golden/reference-*.safetensors` in the directory is compared. The
-//! pinned one must be equalled exactly; the others are reported.
+//! Every `golden/reference-*.safetensors` in the directory is compared, with
+//! our forward and with each other. `reference-pinned` must be equalled
+//! exactly; the others are reported. Without it nothing is asserted.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -122,7 +123,22 @@ fn whole_early_layers_match_the_reference_and_measure_its_sensitivity() {
         .verify_sha256(&manifest)
         .expect("fetched files match their manifest");
 
-    let pinned = open(&dir.join("golden/reference-pinned.safetensors"));
+    let mut goldens: Vec<PathBuf> = std::fs::read_dir(dir.join("golden"))
+        .expect("the checkpoint directory has a golden/ directory")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.starts_with("reference-") && f.ends_with(".safetensors"))
+        })
+        .collect();
+    goldens.sort_by_key(|p| (!p.ends_with("reference-pinned.safetensors"), p.clone()));
+    assert!(
+        !goldens.is_empty(),
+        "no golden/reference-*.safetensors to compare against"
+    );
+    // Every golden holds the tokens and the Engram map it was made with.
+    let pinned = open(&goldens[0]);
     let ints = |set: &WeightSet, name: &str| set.get(name).unwrap().to_i64(name).unwrap();
     let tokens: Vec<u32> = ints(&pinned, "tokens").iter().map(|t| *t as u32).collect();
     let token_map = ints(&pinned, "engram.token_map")
@@ -177,16 +193,6 @@ fn whole_early_layers_match_the_reference_and_measure_its_sensitivity() {
     let prefill = run(&model, &tokens, Some(n));
     let canonical = run(&model, &tokens, None);
 
-    let mut goldens: Vec<PathBuf> = std::fs::read_dir(dir.join("golden"))
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|f| f.to_str())
-                .is_some_and(|f| f.starts_with("reference-") && f.ends_with(".safetensors"))
-        })
-        .collect();
-    goldens.sort();
     let mut inexact = 0;
     for path in &goldens {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
@@ -224,6 +230,32 @@ fn whole_early_layers_match_the_reference_and_measure_its_sensitivity() {
             inexact = differing;
         }
     }
+    // The reference against itself: every pair of goldens other than the
+    // pinned one (which this forward equals, so its rows are the ones above).
+    let names: Vec<String> = goldens
+        .iter()
+        .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+        .collect();
+    for i in 0..goldens.len() {
+        for j in i + 1..goldens.len() {
+            if names[i] == "reference-pinned" {
+                continue;
+            }
+            let (a, b) = (open(&goldens[i]), open(&goldens[j]));
+            println!("{} against {}, one prefill chunk:", names[j], names[i]);
+            for l in 0..layers {
+                let routes = |g: &WeightSet| -> Vec<Vec<usize>> {
+                    ints(g, &format!("prefill.route.{l}"))
+                        .chunks(c.moe.n_active)
+                        .map(|r| r.iter().map(|e| *e as usize).collect())
+                        .collect()
+                };
+                let same = same_routes(&routes(&b), &routes(&a));
+                let key = format!("prefill.layer.{l}");
+                report(l, &f32s(&b, &key), &f32s(&a, &key), width, Some(same));
+            }
+        }
+    }
     println!(
         "the reference's prefill layout against its decode layout (both ours, exact stand-ins):"
     );
@@ -236,6 +268,9 @@ fn whole_early_layers_match_the_reference_and_measure_its_sensitivity() {
             width,
             Some(same),
         );
+    }
+    if names[0] != "reference-pinned" {
+        println!("no reference-pinned golden present: nothing was asserted beyond a completed run");
     }
     assert_eq!(inexact, 0, "the pinned reference must be equalled exactly");
 }
