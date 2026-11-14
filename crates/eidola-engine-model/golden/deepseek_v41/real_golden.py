@@ -240,7 +240,7 @@ def main() -> None:
         golden["prefill.logits"] = st.entry(out["logits"])
         golden["prefill.main_hidden"] = st.entry(out["main_hidden"])
     log(f"prefill done at {time.time() - began:.0f} s")
-    if opts.step_tokens and spread:
+    if opts.step_tokens and spread and n > args["window_size"]:
         # A prefill chunk of one window, then one token per call: every
         # position then has the layout of the decode pattern.
         window = args["window_size"]
@@ -254,7 +254,7 @@ def main() -> None:
         golden["step.draft_confidence"] = st.entry(step["draft_confidence"])
         golden["step.draft_logits"] = st.entry(step["draft_logits"][:16])
         log(f"steps done at {time.time() - began:.0f} s")
-    elif opts.step_tokens:
+    elif opts.step_tokens and not spread:
         # One token per call from the first: the reference's decode layout at
         # every position (no global entry exists at position 0 here).
         k = min(opts.step_tokens, n)
