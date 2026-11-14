@@ -458,14 +458,33 @@ pub fn inject(
     hc: usize,
     norm_eps: f32,
 ) -> Result<()> {
-    let dim = x.len() / hc;
-    let head = w.table.dim();
+    let gathered = gather(w.table.as_ref(), rows)?;
+    inject_gathered(w, &gathered, x, hc, norm_eps);
+    Ok(())
+}
+
+/// The table rows `rows`, concatenated: all an Engram lookup reads of its
+/// table, so the table may live apart from the layer that consumes it.
+pub fn gather(table: &dyn EngramTable, rows: &[u64]) -> Result<Vec<f32>> {
+    let head = table.dim();
     let mut gathered = vec![0.0f32; rows.len() * head];
     for (r, out) in rows.iter().zip(gathered.chunks_exact_mut(head)) {
-        w.table.read_row(*r, out)?;
+        table.read_row(*r, out)?;
     }
+    Ok(gathered)
+}
+
+/// [`inject`] given the rows already gathered ([`gather`]).
+pub fn inject_gathered(
+    w: &EngramWeights,
+    gathered: &[f32],
+    x: &mut [f32],
+    hc: usize,
+    norm_eps: f32,
+) {
+    let dim = x.len() / hc;
     let mut kv = vec![0.0f32; dim * (hc + 1)];
-    lin8(&gathered, &w.wkv, &mut kv);
+    lin8(gathered, &w.wkv, &mut kv);
     let (keys, value) = kv.split_at(hc * dim);
     let scale = (1.0 / (dim as f64).sqrt()) as f32;
     let mut terms = vec![0.0f32; dim];
@@ -483,7 +502,6 @@ pub fn inject(
             xj[d] = bf16_round(xj[d] + gate * value[d]);
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

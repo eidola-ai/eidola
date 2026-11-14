@@ -20,7 +20,9 @@ use super::moe::{DsRouting, route, routed_expert, shared_expert};
 use super::numeric::{bf16_round, exp32};
 use super::quant::{fake_quant_fp4_e4m3, fake_quant_fp4_pow2, fake_quant_fp8};
 use super::rope::{RopeTable, Yarn, rotate, unrotate};
-use super::weights::{CompressorWeights, DsAttentionWeights, DsMoeWeights, DsWeights, rms};
+use super::weights::{
+    CompressorWeights, DsAttentionWeights, DsMoeWeights, DsWeights, IndexerWeights, rms,
+};
 use crate::error::{Error, Result};
 use crate::tensor::{Matrix, dot};
 
@@ -301,10 +303,23 @@ impl DsModel {
         }
     }
 
-    pub(super) fn rope(&self, kind: RopeKind) -> &RopeTable {
+    /// The rotation table of a RoPE variant.
+    pub fn rope(&self, kind: RopeKind) -> &RopeTable {
         match kind {
             RopeKind::Plain => &self.plain,
             RopeKind::Compressed => &self.compressed,
+        }
+    }
+
+    /// The table rows Engram layer `slot` (index in the config's Engram
+    /// layers) reads for the position whose token is the last of `history`:
+    /// the sequence from its start, or at least its last `max_ngram` tokens.
+    pub fn engram_rows(&self, slot: usize, history: &[u32], position: usize) -> Result<Vec<u64>> {
+        match (&self.config().engram, &self.hasher) {
+            (Some(spec), Some(hasher)) => Ok(hasher.rows(&spec.layers[slot], history, position)),
+            _ => Err(Error::Input(
+                "this model has no Engram hasher (no compressed-vocabulary map was given)".into(),
+            )),
         }
     }
 
@@ -412,19 +427,7 @@ impl DsModel {
                     return;
                 }
                 let group = std::mem::take(&mut st.pending);
-                let pooled: Vec<f32> = (0..hd)
-                    .map(|ch| {
-                        let max = group.iter().fold(f32::NEG_INFINITY, |m, g| m.max(g.1[ch]));
-                        let e: Vec<f32> = group.iter().map(|g| exp32(g.1[ch] - max)).collect();
-                        let sum = e.iter().fold(0.0f32, |a, v| a + v);
-                        let mut pooled = 0.0f32;
-                        for (g, e) in group.iter().zip(&e) {
-                            pooled += g.0[ch] * (e / sum);
-                        }
-                        bf16_round(pooled)
-                    })
-                    .collect();
-                rms(&pooled, &cw.norm, c.norm_eps)
+                pooled_latent(c, cw, &group)
             }
         };
         // An entry stands at the first position of its group.
@@ -610,15 +613,7 @@ impl DsModel {
                     if let Some(ix) = &w.attention.indexer {
                         if visible > 0 {
                             let ihd = c.indexer.head_dim;
-                            let mut iq = vec![0.0; ix.wq_b.rows];
-                            lin8(&qr, &ix.wq_b, &mut iq);
-                            for head in iq.chunks_exact_mut(ihd) {
-                                rotate(head, &cis);
-                            }
-                            fake_quant_fp4_pow2(&mut iq);
-                            let weights: Vec<f32> = (0..c.indexer.n_heads)
-                                .map(|h| bf16_round(bf16_round(dot(&p.u, ix.weights_proj.row(h))) * c.indexer.weight_scale))
-                                .collect();
+                            let (iq, weights) = index_query(c, ix, &qr, &p.u, &cis);
                             let scores: Vec<f32> = (0..visible)
                                 .map(|t| index_score(&iq, &bank.index_keys[t * ihd..(t + 1) * ihd], &weights))
                                 .collect();
@@ -900,6 +895,53 @@ impl DsModel {
             opts,
         )
     }
+}
+
+/// A pooled global entry's latent from its group's tokens, each as its f32
+/// `(kv, gate score)`: per channel the softmax of the scores weights the KVs,
+/// in f32 and in token order, the sum is rounded to BF16, and the result is
+/// normed.
+pub fn pooled_latent(
+    c: &DsConfig,
+    cw: &CompressorWeights,
+    group: &[(Vec<f32>, Vec<f32>)],
+) -> Vec<f32> {
+    let hd = c.attention.head_dim;
+    let pooled: Vec<f32> = (0..hd)
+        .map(|ch| {
+            let max = group.iter().fold(f32::NEG_INFINITY, |m, g| m.max(g.1[ch]));
+            let e: Vec<f32> = group.iter().map(|g| exp32(g.1[ch] - max)).collect();
+            let sum = e.iter().fold(0.0f32, |a, v| a + v);
+            let mut pooled = 0.0f32;
+            for (g, e) in group.iter().zip(&e) {
+                pooled += g.0[ch] * (e / sum);
+            }
+            bf16_round(pooled)
+        })
+        .collect();
+    rms(&pooled, &cw.norm, c.norm_eps)
+}
+
+/// An index source's query for one position: the per-head index queries
+/// (projected from the query latent `qr`, rotated, fake-FP4) and the per-head
+/// weights (from the attention input `u`) that [`index_score`] combines.
+pub fn index_query(
+    c: &DsConfig,
+    ix: &IndexerWeights,
+    qr: &[f32],
+    u: &[f32],
+    cis: &[(f32, f32)],
+) -> (Vec<f32>, Vec<f32>) {
+    let mut iq = vec![0.0; ix.wq_b.rows];
+    lin8(qr, &ix.wq_b, &mut iq);
+    for head in iq.chunks_exact_mut(c.indexer.head_dim) {
+        rotate(head, cis);
+    }
+    fake_quant_fp4_pow2(&mut iq);
+    let weights = (0..c.indexer.n_heads)
+        .map(|h| bf16_round(bf16_round(dot(u, ix.weights_proj.row(h))) * c.indexer.weight_scale))
+        .collect();
+    (iq, weights)
 }
 
 /// The mean of the residual copies, as a BF16 vector.

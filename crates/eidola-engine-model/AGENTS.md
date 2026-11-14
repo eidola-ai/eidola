@@ -123,16 +123,16 @@ See `golden/README.md`. Python is dev-only and never a build input. `cargo test`
 |---|---|
 | `config` | Either config shape (the checkpoint's `config.json` with its nested `text_config`, or the flat `inference/config.json`) → `DsConfig`. Every key of both is read and an unknown key is refused, at every nesting level. Floats are validated after conversion to f32. The per-layer table (`DsLayerSpec`) comes from the config's own lists: compress ratio, RoPE variant, the layer whose global KV a layer reads, the layer whose top-k it uses, candidate source and users, Engram slot. `truncated()` keeps a subset of layers and refuses one that is not a model (a consumer without its KV source, a re-indexing layer without the candidate source); dropping a drafter target layer drops the drafter. `with_routed_experts()` uses only the first N routed experts. |
 | `numeric` | Every rounding point (`bf16_round`, `round_e4m3`, `round_e2m1`, `round_scale`) and every transcendental (`det_exp`, `det_ln`, `det_sin_cos` and the f32 wrappers `exp32`, `sigmoid32`, `silu32`, `softplus32`, `pow32`, `rsqrt32`), plus `pinned_sum`. |
-| `quant` | Run-time activation quantisation: `act_quant` (FP8 codes and block scales for a GEMM), `fake_quant_fp8`, `fake_quant_fp4_pow2`, `fake_quant_fp4_e4m3`. |
+| `quant` | Run-time activation quantisation: `act_quant` (FP8 codes and block scales for a GEMM), `fake_quant_fp8`, `fake_quant_fp4_pow2`, `fake_quant_fp4_e4m3`, and the FP4 quantisers as codes and scales (`quant_fp4_pow2`, `quant_fp4_e4m3`: the forms a packed KV is stored in). |
 | `linear` | `lin8` and `lin4` (the quantised GEMMs over `Fp8Linear` / `Fp4Linear`), `linear_bf16` and `linear_f32` (the products the reference leaves to PyTorch). |
 | `rope` | The frequency table, with YaRN on compressed layers, and `rotate` / `unrotate` of a vector's last `rope_dim` elements. |
 | `mhc` | Hyper-connection coefficients (`mixes`, with the Sinkhorn steps), `collapse` and `expand`. |
 | `attention` | `sparse_attend` (the online-softmax attention over a slot list), `top_k`, `index_score`, `candidate_mask`. |
 | `moe` | `route`, `swiglu_hidden`, `shared_expert`, `routed_expert`. |
-| `engram` | The hash layout (primes, offsets, multipliers), `EngramHasher`, the `EngramTable` seam with `MappedEngramTable` (rows read lazily from the mapped checkpoint) and `SparseEngramTable` (a test's handful of rows), and `inject`. |
+| `engram` | The hash layout (primes, offsets, multipliers), `EngramHasher`, the `EngramTable` seam with `MappedEngramTable` (rows read lazily from the mapped checkpoint) and `SparseEngramTable` (a test's handful of rows), `inject`, and its two halves `gather` and `inject_gathered` (for a table held apart from the layer that reads it). |
 | `weights` | `DsWeights::load`. Dense tensors are decoded once; routed experts stay mapped and are decoded per call; Engram rows are read by index. Vision tensors and `gate.bias_vl` are never read. |
-| `forward` | `DsModel`: `embed`, `layer_forward` (one layer over a contiguous range of positions), `head`, and on top of them `forward`, `encode` / `decode` and `bank_stub`. Block-level kernels: `sub_layer_input`, `query`, `window_kv`, `attention_output`, `moe_forward`, `stream_mean`. |
-| `drafter` | `drafter_observe`, `drafter_forward`, `draft_logits`, `draft_confidence`, `draft_greedy`, `ring_order`. |
+| `forward` | `DsModel`: `embed`, `layer_forward` (one layer over a contiguous range of positions), `head`, and on top of them `forward`, `encode` / `decode` and `bank_stub`. Block-level kernels: `sub_layer_input`, `query`, `window_kv`, `attention_output`, `moe_forward`, `stream_mean`, `pooled_latent`, `index_query`; and `DsModel::rope` and `DsModel::engram_rows`, the rotation tables and the Engram row hash an executor that pages its own KV needs. |
+| `drafter` | `drafter_observe`, `drafter_forward`, `drafter_slots` (the draft pass given each block's window KV), `draft_logits`, `draft_confidence`, `draft_greedy`, `ring_order`. |
 
 ### The forward is one per-layer step
 
