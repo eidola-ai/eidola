@@ -1,5 +1,8 @@
-//! MiMo-V2.6 model definition: configuration, weight loading, and the dense
-//! f32 reference forward pass.
+//! Model definitions for the engine: configuration, weight loading, and the
+//! dense reference forward pass.
+//!
+//! The crate root is MiMo-V2.6; [`deepseek`] is DeepSeek-V4.1 and shares the
+//! weight set, the matrix kernels and the comparison metrics.
 //!
 //! - [`config`] parses `config.json` into a per-layer table and rejects
 //!   anything the reference does not implement.
@@ -18,6 +21,7 @@
 pub mod attention;
 pub mod compare;
 pub mod config;
+pub mod deepseek;
 pub mod dequant;
 mod error;
 pub mod forward;

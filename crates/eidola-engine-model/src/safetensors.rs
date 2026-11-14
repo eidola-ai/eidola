@@ -23,7 +23,10 @@ pub enum Dtype {
     F16,
     F32,
     F8E4M3,
+    /// OCP E8M0 block scales (`2^(byte - 127)`).
+    F8E8M0,
     U8,
+    I8,
     I32,
     I64,
 }
@@ -35,7 +38,9 @@ impl Dtype {
             "F16" => Dtype::F16,
             "F32" => Dtype::F32,
             "F8_E4M3" => Dtype::F8E4M3,
+            "F8_E8M0" => Dtype::F8E8M0,
             "U8" => Dtype::U8,
+            "I8" => Dtype::I8,
             "I32" => Dtype::I32,
             "I64" => Dtype::I64,
             _ => return None,
@@ -47,7 +52,7 @@ impl Dtype {
             Dtype::Bf16 | Dtype::F16 => 2,
             Dtype::F32 | Dtype::I32 => 4,
             Dtype::I64 => 8,
-            Dtype::F8E4M3 | Dtype::U8 => 1,
+            Dtype::F8E4M3 | Dtype::F8E8M0 | Dtype::U8 | Dtype::I8 => 1,
         }
     }
 }
@@ -332,6 +337,12 @@ impl WeightSet {
                 reason: "no config.json was read with these weights".into(),
             })?;
         crate::ModelConfig::from_json_bytes(bytes, "config.json")
+    }
+
+    /// The bytes of one of the [`SEMANTIC_FILES`] this set read (and hashed)
+    /// in [`WeightSet::open_dir`].
+    pub fn semantic_file(&self, name: &str) -> Option<&[u8]> {
+        self.semantic.get(name).map(Vec::as_slice)
     }
 
     /// sha256 of every loaded file (shards and semantic files), keyed by file
