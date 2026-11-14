@@ -12,9 +12,9 @@
 // and a host build passes `-ffp-contract=off` and no fast-math option.
 //
 // Values outside what the forward produces keep the reference's behaviour
-// where it is defined (NaN and infinite inputs of the casts and of
-// `bf16_round`, signed zeros); `det_ln` and `det_sin_cos` have the
-// reference's preconditions.
+// where it is defined (infinite inputs, signed zeros, a NaN cast to a code);
+// `det_ln` and `det_sin_cos` have the reference's preconditions. A NaN result
+// is a NaN of unspecified sign and payload, here as in the reference.
 #pragma once
 
 #include <cmath>
@@ -193,20 +193,20 @@ DS_FN uint32_t rne_code(uint32_t abs_bits, uint32_t mbits, int32_t emin, uint32_
 }
 
 // f32 → E4M3 code: `numeric::round_e4m3` as the stored byte (saturating at
-// ±448; a NaN becomes a zero of its sign, as the reference's table search
-// leaves it).
+// ±448). A NaN gives +0 whatever its sign and payload: which NaN an invalid
+// operation returns differs between processors.
 DS_FN uint8_t e4m3_encode(float v) {
   const uint32_t b = f32_bits(v);
   const uint32_t sign = (b >> 24) & 0x80u;
-  if (is_nan(v)) return static_cast<uint8_t>(sign);
+  if (is_nan(v)) return 0;
   return static_cast<uint8_t>(sign | rne_code(b & ~kSign32, 3, -6, 0x7eu, 0x43e00000u));
 }
 // f32 → E2M1 code: `numeric::round_e2m1` as the stored nibble (saturating at
-// ±6).
+// ±6; a NaN gives +0).
 DS_FN uint8_t e2m1_encode(float v) {
   const uint32_t b = f32_bits(v);
   const uint32_t sign = (b >> 28) & 0x08u;
-  if (is_nan(v)) return static_cast<uint8_t>(sign);
+  if (is_nan(v)) return 0;
   return static_cast<uint8_t>(sign | rne_code(b & ~kSign32, 1, 0, 0x07u, 0x40c00000u));
 }
 DS_FN float round_e4m3(float v) { return e4m3_decode(e4m3_encode(v)); }

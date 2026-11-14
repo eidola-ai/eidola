@@ -16,7 +16,8 @@
 //! - `v <fn> <inputs…> = <outputs…>`: one case.
 //! - `s <fn> <seed> <log2 items> = <digest>`: `2^n` cases drawn from the
 //!   generator the function's sweep uses (below), all outputs folded in order
-//!   into one digest.
+//!   into one digest. A quantiser's `<fn>+` sweep mixes infinities, NaNs and
+//!   zeros into its blocks.
 //! - `x <fn> = <digest>` (the exhaustive file): the wrapping sum over every
 //!   u32 `b` of `fin((b << 32) | out(b))`.
 //!
@@ -184,6 +185,7 @@ fn fp4_block_dot(a: &[u8], packed: &[u8]) -> f32 {
 /// A function's case as `(inputs, outputs)` words. `eval` computes the
 /// outputs of explicit inputs; `sweep_item` draws inputs.
 fn eval(name: &str, i: &[u64]) -> Vec<u64> {
+    let name = name.trim_end_matches('+');
     if let Some((_, func)) = UNARY.iter().find(|(n, _)| *n == name) {
         return vec![w32(func(f(i[0])))];
     }
@@ -303,8 +305,33 @@ fn eval(name: &str, i: &[u64]) -> Vec<u64> {
     }
 }
 
-/// The inputs of one case of `name`'s sweep.
+/// Infinities, NaNs of both signs and several payloads, and zeros: what a
+/// `+` sweep puts in place of one element in eight.
+const BLOCK_SPECIALS: [u64; 8] = [
+    0x7f80_0000,
+    0xff80_0000,
+    0x7fc0_0000,
+    0xffc0_0000,
+    0x7f80_0001,
+    0xffa1_2345,
+    0x0000_0000,
+    0x8000_0000,
+];
+
+/// The inputs of one case of `name`'s sweep. A quantiser's `+` sweep is its
+/// plain one with, per element, one more draw `r`: when `r % 8 == 0` the
+/// element becomes `BLOCK_SPECIALS[(r >> 8) % 8]`.
 fn sweep_item(name: &str, g: &mut Rng) -> Vec<u64> {
+    if let Some(plain) = name.strip_suffix('+') {
+        let mut v = sweep_item(plain, g);
+        for x in &mut v {
+            let r = g.next();
+            if r.is_multiple_of(8) {
+                *x = BLOCK_SPECIALS[((r >> 8) % 8) as usize];
+            }
+        }
+        return v;
+    }
     match name {
         // Any bit pattern on even items, a moderate value on odd ones.
         "bf16_round" | "round_e4m3" | "round_e2m1" | "exp32" | "sigmoid32" | "silu32"
@@ -502,6 +529,19 @@ fn generate() -> String {
         }
     }
 
+    // Both casts map a NaN to +0, whatever its sign and payload.
+    for bits in [
+        0x7fc0_0001u64,
+        0xff80_0001,
+        0x7fff_ffff,
+        0xffff_ffff,
+        0x7fa1_2345,
+        0xffc0_0001,
+    ] {
+        case(&mut out, "round_e4m3", &[bits]);
+        case(&mut out, "round_e2m1", &[bits]);
+    }
+
     // BF16: ties to even, carries, and the overflow to infinity.
     for bits in [
         0x3f80_8000u32,
@@ -599,6 +639,42 @@ fn generate() -> String {
     blocks.push(with(&[3.0, 0.3, -0.2]));
     blocks.push(with(&[1e-6, -3e-7]));
     blocks.push(with(&[f32::NAN, 2.0, -5.0]));
+    // NaNs of both signs and several payloads, alone, beside finite values
+    // and beside infinities of both signs (where the scale is infinite and a
+    // quotient is itself an invalid operation), in both 16-wide halves.
+    let nans = [
+        0x7fc0_0000u32,
+        0xffc0_0000,
+        0x7f80_0001,
+        0xff80_0001,
+        0x7fff_ffff,
+        0xffff_ffff,
+        0x7fa1_2345,
+        0xffa1_2345,
+    ];
+    for bits in nans {
+        let nan = f32::from_bits(bits);
+        for rest in [
+            [0.0f32, 0.0],
+            [2.0, -5.0],
+            [f32::INFINITY, -3.0],
+            [f32::NEG_INFINITY, 448.0],
+        ] {
+            let mut x = vec![0.0f32; 32];
+            for half in [0, 16] {
+                x[half] = nan;
+                x[half + 1] = rest[0];
+                x[half + 2] = rest[1];
+                x[half + 3] = -nan;
+            }
+            blocks.push(x);
+        }
+    }
+    blocks.push(vec![f32::NAN; 32]);
+    blocks.push(vec![-f32::NAN; 32]);
+    blocks.push(with(&[f32::NEG_INFINITY, 2.0, -5.0, f32::INFINITY]));
+    blocks.push(vec![f32::INFINITY; 32]);
+    blocks.push(vec![f32::NEG_INFINITY; 32]);
     blocks.push(with(&[f32::INFINITY, 2.0, -5.0]));
     blocks.push(with(&[f32::MAX, -f32::MAX, 1.0]));
     blocks.push(with(&[1e-45, -1e-45, f32::MIN_POSITIVE]));
@@ -820,6 +896,10 @@ fn generate() -> String {
         ("fq8", 18),
         ("fq4m", 18),
         ("fq4n", 18),
+        ("act_quant+", 18),
+        ("fq8+", 18),
+        ("fq4m+", 18),
+        ("fq4n+", 18),
         ("fp8_dot", 18),
         ("fp4_dot", 18),
         ("lin8", 13),

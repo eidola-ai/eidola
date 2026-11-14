@@ -119,7 +119,8 @@ Words lin(const Words& i, bool fp4) {
   return out;
 }
 
-Words eval(const std::string& name, const Words& i) {
+Words eval(const std::string& full_name, const Words& i) {
+  const std::string name = full_name.back() == '+' ? full_name.substr(0, full_name.size() - 1) : full_name;
   const auto unary = kUnary.find(name);
   if (unary != kUnary.end()) return {w32(unary->second(f(i[0])))};
   if (name == "e4m3_decode") return {w32(ds::e4m3_decode(static_cast<uint8_t>(i[0])))};
@@ -233,8 +234,19 @@ Words eval(const std::string& name, const Words& i) {
   std::exit(2);
 }
 
+const uint64_t kBlockSpecials[8] = {0x7f800000, 0xff800000, 0x7fc00000, 0xffc00000,
+                                    0x7f800001, 0xffa12345, 0x00000000, 0x80000000};
+
 Words sweep_item(const std::string& name, Rng& g) {
   Words v;
+  if (name.back() == '+') {
+    v = sweep_item(name.substr(0, name.size() - 1), g);
+    for (uint64_t& x : v) {
+      const uint64_t r = g.next();
+      if (r % 8 == 0) x = kBlockSpecials[(r >> 8) % 8];
+    }
+    return v;
+  }
   if (kUnary.count(name)) {
     const uint64_t raw = g.next();
     const uint32_t moderate = g.moderate();

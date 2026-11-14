@@ -123,7 +123,7 @@
     },
     {
       "path": "csrc/ds_numeric.cuh",
-      "sha256": "08fb84a15a780226b1188ab0e3dda9d2368666c2fba296bc628459cd0d218792"
+      "sha256": "448cd6cb8ea6bdd8e8c72c277d6979bf62b545e5a0e730bf2f3dcbbb18d37e30"
     },
     {
       "path": "csrc/ds_probe.cu",
@@ -434,8 +434,8 @@
       "source": "csrc/ds_probe.cu",
       "profile": "exact",
       "file": "cubin/ds_probe.sm_100a.cubin",
-      "sha256": "d1f7adbf76e9f8d76dfbaf328e4d7f549fa88b18784a45166c4a5f99f8555f9f",
-      "size": 226192,
+      "sha256": "8fd50cd1e07929bdf78ff789d4492220f6f4a7841b18297e93e6ad4727882b95",
+      "size": 228768,
       "entries": [
         {
           "symbol": "eidola_ds_probe",
@@ -460,8 +460,8 @@
       "source": "csrc/ds_probe.cu",
       "profile": "exact",
       "file": "cubin/ds_probe.sm_100f.cubin",
-      "sha256": "8579c823df191a25679fe4a7de2f34a058ed2ed32cdf8135ca2c71eea3255f8c",
-      "size": 226192,
+      "sha256": "d6e78c4034de84c66bc9b1a276472b1102620b4260f239c4aee663b003203516",
+      "size": 228768,
       "entries": [
         {
           "symbol": "eidola_ds_probe",
@@ -486,8 +486,8 @@
       "source": "csrc/ds_probe.cu",
       "profile": "exact",
       "file": "cubin/ds_probe.sm_103a.cubin",
-      "sha256": "3835c6b2e29a06e1e86a6753902a547242e29948eb516eae444f195eb2e411ad",
-      "size": 262464,
+      "sha256": "19ed8bae38cf64d83a699629ca60c4d21377c4f554ddea6c64395a23546aad4c",
+      "size": 265048,
       "entries": [
         {
           "symbol": "eidola_ds_probe",
@@ -512,8 +512,8 @@
       "source": "csrc/ds_probe_nodiv.cu",
       "profile": "exact",
       "file": "cubin/ds_probe_nodiv.sm_100a.cubin",
-      "sha256": "4a4d8a10a0ce731377a908ba8e63a66fa7cf6b574e5b19da85397c56f3e15a20",
-      "size": 173840,
+      "sha256": "238a72aa09ec8900983351992ec4288a283fb0fe7b06e98049c69c3388cc0aea",
+      "size": 175904,
       "entries": [
         {
           "symbol": "eidola_ds_probe_nodiv",
@@ -538,8 +538,8 @@
       "source": "csrc/ds_probe_nodiv.cu",
       "profile": "exact",
       "file": "cubin/ds_probe_nodiv.sm_100f.cubin",
-      "sha256": "856aad52887146e3cf00268b46a4ec90a369d1385419e24970ea65516c8e260b",
-      "size": 173840,
+      "sha256": "20df014ff6bd4b0f2f31838f8672a4d7dd5020778db9f50ce898cecb697e2c9f",
+      "size": 175904,
       "entries": [
         {
           "symbol": "eidola_ds_probe_nodiv",
@@ -564,8 +564,8 @@
       "source": "csrc/ds_probe_nodiv.cu",
       "profile": "exact",
       "file": "cubin/ds_probe_nodiv.sm_103a.cubin",
-      "sha256": "4d7849be526b270f87560a0307892fbbedb7d1c3bbfad874e720eb0298ca150b",
-      "size": 184864,
+      "sha256": "e709f61783f0e56f30efd7619927ce625a3faa50f95d68441374d18c039120fa",
+      "size": 186928,
       "entries": [
         {
           "symbol": "eidola_ds_probe_nodiv",
@@ -1507,8 +1507,8 @@
     {
       "name": "ds_probe",
       "file": "fatbin/ds_probe.fatbin",
-      "sha256": "4ed3c04f67a97f1048c7f676793a47c1dfe576287dc040b9f5d579c863fb5b4a",
-      "size": 488888,
+      "sha256": "fe34e0f2ed156331be78d1b11a29234b07b63f0bf7189cfe477a8231ce28396c",
+      "size": 494048,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -1517,8 +1517,8 @@
     {
       "name": "ds_probe_nodiv",
       "file": "fatbin/ds_probe_nodiv.fatbin",
-      "sha256": "7b6fa3940e871a37dadf962c825d850ce1c7a99dcf091cd178610f18b38b24f5",
-      "size": 358936,
+      "sha256": "ef91f889039fa43c03d5ce9f117d34dc63ad433da9c10d52cf01ad490c15394f",
+      "size": 363064,
       "archs": [
         "sm_100a",
         "sm_103a"
