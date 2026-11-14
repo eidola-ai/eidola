@@ -989,7 +989,10 @@ impl KeyWindow {
 
 /// See [`MockConfig::key_deadline`].
 #[derive(Clone, Default)]
-pub struct KeyDeadline(Arc<std::sync::Mutex<Option<(IssuerCalendar, Option<KeyWindow>)>>>);
+pub struct KeyDeadline(Arc<std::sync::Mutex<Option<Deadline>>>);
+
+/// A calendar, and the key window the mock pins to it, if any.
+type Deadline = (IssuerCalendar, Option<KeyWindow>);
 
 impl KeyDeadline {
     /// Put the mock and `core` on a calendar of `epoch_secs`-long epochs
@@ -1012,7 +1015,7 @@ impl KeyDeadline {
         (issue_until, calendar)
     }
 
-    fn get(&self) -> Option<(IssuerCalendar, Option<KeyWindow>)> {
+    fn get(&self) -> Option<Deadline> {
         self.0.lock().unwrap().clone()
     }
 }
