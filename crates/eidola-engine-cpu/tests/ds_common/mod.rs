@@ -101,6 +101,41 @@ pub fn fixture() -> Arc<DsModel> {
     MODEL.get_or_init(|| Arc::new(load_fixture())).clone()
 }
 
+/// The fixture's weights under a wider configuration: a window of 80, which no longer
+/// fits one 64-slot attention block (a query's list is 80 window slots and up to 24
+/// selected global entries; a draft pass's is 80 context entries and its slots), and a
+/// drafter of 5 slots, as released. The window and the slot count shape no tensor, so
+/// the committed weights serve; the top-k (24) and the candidate pool (8 blocks of 4)
+/// prune as before, and the chain is the same four layers, its top layer now starting
+/// 80 positions before a target and its bottom one 317.
+///
+/// The dense oracle for this model is the model crate's forward under the same
+/// configuration, which is verified against the reference only at the committed
+/// fixture's shape: this model checks the executor against the oracle, not the oracle
+/// against the reference.
+pub fn wide() -> Arc<DsModel> {
+    static MODEL: OnceLock<Arc<DsModel>> = OnceLock::new();
+    MODEL
+        .get_or_init(|| {
+            let widen = |mut c: eidola_engine_model::deepseek::DsConfig| {
+                c.attention.window = WIDE_WINDOW as usize;
+                c.drafter.as_mut().expect("the fixture has a drafter").slots = 5;
+                Ok(c)
+            };
+            let model = load_reference(
+                &fixture_dir(),
+                widen,
+                &DsLoadOptions::default(),
+                Some(token_map()),
+            );
+            Arc::new(model.unwrap())
+        })
+        .clone()
+}
+
+pub const WIDE_WINDOW: u32 = 80;
+pub const WIDE_REACH: u32 = 80 + 3 * 79;
+
 /// Token ids a request may hold or produce: the head has 96 rows, and id 95 is the image
 /// token, which the text model refuses, so it is padding here.
 pub const VOCAB: u32 = 95;
