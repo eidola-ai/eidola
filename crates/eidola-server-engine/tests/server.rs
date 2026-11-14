@@ -246,6 +246,12 @@ async fn gateway_token_is_required() {
         "ok; weights-storage=dev-writable"
     );
     assert_eq!(node.stats().submitted, 0);
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -328,7 +334,11 @@ async fn weights_hash_mismatch_is_refused_before_admission() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 200);
-    assert_eq!(node.stats().submitted, 1);
+    // Read to its end, the request has been submitted, and every command before it
+    // handled: the engine publishes its counters before it steps.
+    r.bytes().await.unwrap();
+    let s = node.stats();
+    assert_eq!((s.submitted, s.rejected), (1, 0));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -344,6 +354,12 @@ async fn wrong_model_is_refused() {
     assert_eq!(status, 404);
     assert_eq!(v["error"]["type"], "model_not_found");
     assert_eq!(node.stats(), Stats::default());
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -432,6 +448,12 @@ async fn strict_schema_refuses_what_it_does_not_name() {
     }
     // A refused request never reaches the engine.
     assert_eq!(node.stats(), Stats::default());
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 
     // The fields the gateway forwards today, explicit nulls included, are accepted.
     let ok = json!({
@@ -749,7 +771,11 @@ async fn stop_sequences_truncate_the_output_and_end_the_request() {
     let stop: String = chars[chars.len() / 2..chars.len() / 2 + 3].iter().collect();
     let cut = full_text.find(&stop).unwrap();
 
-    let mut body = request(LONG_TEXT, max);
+    // Room past the stop for the engine to keep generating until the cancel reaches
+    // it, however late the stream's reader sees the stop: greedy, the output up to
+    // the stop is the same, and a request that ran out its tokens first would end
+    // `finished`, not cancelled.
+    let mut body = request(LONG_TEXT, 16 * max);
     body["stop"] = json!([stop, "\u{1}never\u{1}"]);
     for stream in [false, true] {
         let (text, finish, usage) = if stream {
@@ -1184,14 +1210,31 @@ async fn reading_bodies_is_bounded_before_admission() {
     use std::io::Write;
     let node = TestNode::start(&[(env::MAX_REQUESTS, "1")]).await;
     let addr = node.base.strip_prefix("http://").unwrap();
-    let mut stalled = std::net::TcpStream::connect(addr).unwrap();
-    let head = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\nauthorization: Bearer {TOKEN}\r\n\
-         x-eidola-weights-sha256: {}\r\ncontent-type: application/json\r\n\
-         content-length: 1000000\r\n\r\n{{\"model\":",
-        weights_hash()
-    );
-    stalled.write_all(head.as_bytes()).unwrap();
+    // An upload that sends its head and a few body bytes, then nothing.
+    let stall = || {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\nauthorization: Bearer {TOKEN}\r\n\
+             x-eidola-weights-sha256: {}\r\ncontent-type: application/json\r\n\
+             content-length: 1000000\r\n\r\n{{\"model\":",
+            weights_hash()
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        s.set_nonblocking(true).unwrap();
+        s
+    };
+    // Whether the server answered the stalled upload, which it does only when it
+    // refused it: an upload that reached the handler while a probe below held the read
+    // slot is refused at once, and then holds nothing.
+    let answered = |s: &mut std::net::TcpStream| {
+        let mut byte = [0u8; 1];
+        match std::io::Read::read(s, &mut byte) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("reading the stalled upload: {e}"),
+        }
+    };
+    let mut stalled = stall();
 
     // Once the stalled upload holds the only read slot, a complete request is refused.
     let mut refused = None;
@@ -1200,6 +1243,9 @@ async fn reading_bodies_is_bounded_before_admission() {
         if status == 503 {
             refused = Some(v);
             break;
+        }
+        if answered(&mut stalled) {
+            stalled = stall();
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1391,6 +1437,12 @@ async fn tools_and_tool_history_render_and_parse() {
     let (status, v) = node.chat_json(&bad).await;
     assert_eq!(status, 400, "{v}");
     assert_eq!(node.stats().submitted, 1);
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (2, 0),
+        "the refused one never reached the engine"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1400,6 +1452,12 @@ async fn prompts_beyond_the_model_length_are_refused() {
     assert_eq!(status, 400);
     assert_eq!(v["error"]["type"], "context_length_exceeded");
     assert_eq!(node.stats().submitted, 0);
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1751,6 +1809,12 @@ async fn multimodal_keys_in_text_parts_are_refused() {
         assert_eq!(status, 400, "{key} on an image part");
     }
     assert_eq!(node.stats(), Stats::default());
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 }
 
 /// The cached dev model is rebuilt when its recorded input fingerprint does not match.

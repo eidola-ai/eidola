@@ -110,6 +110,21 @@ fn setup(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) {
     chat_harness::core_for(config)
 }
 
+/// Wait until the mock has received more than `past` completion requests: a
+/// turn whose request has reached the upstream has taken its claim and its
+/// hold, which come before the request. The mock's `chat_delay_ms` then holds
+/// the turn there.
+async fn until_upstream_reached(mock: &MockServer, past: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while mock.chat_hits() <= past {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the turn never reached the upstream"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// The shared constructor is the only outer request shape app-core may send.
 /// Read every input from the harness-captured body, so a field added at either
 /// dispatch call site makes this exact-body comparison fail.
@@ -1079,17 +1094,15 @@ fn a_later_pair_pays_when_the_first_credential_has_no_fill() {
 #[test]
 fn an_older_keys_residual_is_drained_into_a_newer_keys_fill() {
     run(|| {
-        let now = now_unix_secs();
-        let boundary = now + 6;
-        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
         let config = MockConfig {
-            issuer_calendar: Some(calendar),
             settled_charge: Some(1_500),
             ..MockConfig::default()
         };
         let key_swap = config.key_swap.clone();
+        let deadline = config.key_deadline.clone();
         let (mock, core, _dir) = setup(config);
         with_account(&core);
+        let (boundary, _) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
         let old = core
             .runtime()
             .block_on(core.account_allocate(1_000))
@@ -1181,20 +1194,35 @@ fn a_settled_input_is_announced_while_the_other_still_waits() {
                 .expect("an allocation");
         }
         let mut rx = core.subscribe_changes();
-        let outcome = core.runtime().block_on(async {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                core.chat("hello".into(), MODEL.into(), None),
-            )
-            .await
+        // The turn is dropped once the second recovery is waiting and the
+        // first input's settlement has been announced: the state under test.
+        let mut changes = Vec::new();
+        core.runtime().block_on(async {
+            let turn = core.chat("hello".into(), MODEL.into(), None);
+            let one_settled_one_waiting = async {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    changes.extend(drain(&mut rx));
+                    let wallet = changes.iter().filter(|c| **c == Change::Wallet).count();
+                    if mock.refund_hits() == 2 && wallet >= 2 {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "one input never settled while the other waited"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            };
+            tokio::select! {
+                outcome = turn => panic!("the second recovery never answers: {outcome:?}"),
+                () = one_settled_one_waiting => {}
+            }
         });
-        assert!(outcome.is_err(), "the second recovery never answers");
         assert_eq!(mock.refund_hits(), 2);
         assert_eq!(spending_credentials(&core).len(), 1, "one input settled");
-        let wallet = drain(&mut rx)
-            .into_iter()
-            .filter(|c| *c == Change::Wallet)
-            .count();
+        changes.extend(drain(&mut rx));
+        let wallet = changes.iter().filter(|c| **c == Change::Wallet).count();
         assert_eq!(
             wallet, 2,
             "one at the spend's start, one at the settled input's write"
@@ -1210,7 +1238,7 @@ fn a_settled_input_is_announced_while_the_other_still_waits() {
 fn concurrent_turns_never_share_an_input() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig {
-            chat_delay_ms: 300,
+            chat_delay_ms: 2_000,
             ..MockConfig::default()
         });
         with_account(&core);
@@ -1219,11 +1247,13 @@ fn concurrent_turns_never_share_an_input() {
                 .block_on(core.account_allocate(amount))
                 .expect("an allocation");
         }
+        // The second turn chooses its inputs while the first is held at the
+        // upstream with both of its own still spending.
         let (first, second) = core.runtime().block_on(async {
-            tokio::join!(
-                core.chat("one".into(), MODEL.into(), None),
-                core.chat("two".into(), MODEL.into(), None),
-            )
+            tokio::join!(core.chat("one".into(), MODEL.into(), None), async {
+                until_upstream_reached(&mock, 0).await;
+                core.chat("two".into(), MODEL.into(), None).await
+            })
         });
         first.expect("the first turn");
         second.expect("the second turn");
@@ -1870,15 +1900,11 @@ fn allocations(core: &AppCore) -> usize {
 #[test]
 fn a_credential_issued_just_before_its_key_stops_issuing_stays_spendable() {
     run(|| {
-        let now = now_unix_secs();
-        let issue_until = now + 2;
-        let (window, calendar) = KeyWindow::epoch_ending_at(issue_until, WEEK_SECS as u64);
-        let (mock, core, _dir) = setup(MockConfig {
-            key_window: Some(window),
-            issuer_calendar: Some(calendar),
-            ..MockConfig::default()
-        });
+        let config = MockConfig::default();
+        let deadline = config.key_deadline.clone();
+        let (mock, core, _dir) = setup(config);
         with_account(&core);
+        let (issue_until, _) = deadline.issuing_ends_in(&core, 2, WEEK_SECS as u64, true);
 
         core.runtime()
             .block_on(core.chat("first".into(), MODEL.into(), None))
@@ -1914,18 +1940,14 @@ fn a_credential_issued_just_before_its_key_stops_issuing_stays_spendable() {
 #[test]
 fn a_credential_lapses_its_spend_margin_before_the_keys_acceptance_deadline() {
     run(|| {
-        let now = now_unix_secs();
-        let spend_until = now + 3;
-        // Issuing ends at now + 2 and acceptance one epoch later, at the spend
-        // deadline plus the margin: an epoch of margin + 1 seconds.
-        let (window, calendar) =
-            KeyWindow::epoch_ending_at(now + 2, (spend_until + margin_secs() - (now + 2)) as u64);
-        let (mock, core, _dir) = setup(MockConfig {
-            key_window: Some(window),
-            issuer_calendar: Some(calendar),
-            ..MockConfig::default()
-        });
+        let config = MockConfig::default();
+        let deadline = config.key_deadline.clone();
+        let (mock, core, _dir) = setup(config);
         with_account(&core);
+        // Issuing ends two seconds from now and acceptance one epoch later, at
+        // the spend deadline plus the margin: an epoch of margin + 1 seconds.
+        let (issue_until, _) = deadline.issuing_ends_in(&core, 2, (margin_secs() + 1) as u64, true);
+        let spend_until = issue_until + 1;
 
         core.runtime()
             .block_on(core.chat("first".into(), MODEL.into(), None))
@@ -2067,18 +2089,14 @@ fn the_production_calendars_current_epoch_is_accepted() {
 #[test]
 fn a_second_key_for_a_seen_epoch_is_refused_until_the_next_epoch() {
     run(|| {
-        let now = now_unix_secs();
-        // An epoch boundary a few seconds from now, on week-long epochs (a
-        // key's acceptance has to outlast the spend margin).
-        let boundary = now + 6;
-        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
-        let config = MockConfig {
-            issuer_calendar: Some(calendar),
-            ..MockConfig::default()
-        };
+        let config = MockConfig::default();
         let key_swap = config.key_swap.clone();
+        let deadline = config.key_deadline.clone();
         let (mock, core, _dir) = setup(config);
         with_account(&core);
+        // An epoch boundary a few seconds from now, on week-long epochs (a
+        // key's acceptance has to outlast the spend margin).
+        let (boundary, calendar) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
 
         let first = core
             .runtime()
@@ -2093,7 +2111,7 @@ fn a_second_key_for_a_seen_epoch_is_refused_until_the_next_epoch() {
             .block_on(core.account_allocate(1_000))
             .expect_err("a second key for the epoch is refused");
         let epoch = calendar
-            .epoch_at(u64::try_from(now).unwrap())
+            .epoch_at(u64::try_from(boundary - 1).unwrap())
             .expect("on the calendar");
         assert!(
             matches!(
@@ -2140,14 +2158,11 @@ fn a_second_key_for_a_seen_epoch_is_refused_until_the_next_epoch() {
 #[test]
 fn a_key_kept_across_an_epoch_boundary_is_refused() {
     run(|| {
-        let now = now_unix_secs();
-        let boundary = now + 6;
-        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
-        let (_mock, core, _dir) = setup(MockConfig {
-            issuer_calendar: Some(calendar),
-            ..MockConfig::default()
-        });
+        let config = MockConfig::default();
+        let deadline = config.key_deadline.clone();
+        let (_mock, core, _dir) = setup(config);
         with_account(&core);
+        let (boundary, _) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
         core.runtime()
             .block_on(core.account_allocate(1_000))
             .expect("the epoch's key issues");
@@ -2176,16 +2191,12 @@ fn a_key_kept_across_an_epoch_boundary_is_refused() {
 #[test]
 fn a_key_seen_for_one_epoch_is_refused_for_the_next() {
     run(|| {
-        let now = now_unix_secs();
-        let boundary = now + 6;
-        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
-        let config = MockConfig {
-            issuer_calendar: Some(calendar),
-            ..MockConfig::default()
-        };
+        let config = MockConfig::default();
         let omit = config.omit_previous_key.clone();
+        let deadline = config.key_deadline.clone();
         let (_mock, core, _dir) = setup(config);
         with_account(&core);
+        let (boundary, _) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
         core.runtime()
             .block_on(core.account_allocate(1_000))
             .expect("the epoch's key issues");
@@ -9168,7 +9179,7 @@ fn a_second_regeneration_of_one_post_is_refused_before_it_spends() {
             let b = async {
                 // Let the first claim its item before the second asks. The
                 // held response keeps it claimed until well after this.
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                until_upstream_reached(&mock, before).await;
                 core.regenerate_stream(answer.clone(), MODEL.into(), tx2)
                     .await
             };
@@ -9349,7 +9360,7 @@ fn a_regeneration_that_waited_for_the_claim_revises_the_generation_it_finds() {
 #[test]
 fn a_reply_written_during_a_regeneration_rethreads_onto_the_answer_it_never_saw() {
     run(|| {
-        let (_mock, core, _dir) = setup(MockConfig {
+        let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::OkEitherTransport,
             chat_delay_ms: 1_500,
             ..MockConfig::default()
@@ -9365,6 +9376,7 @@ fn a_reply_written_during_a_regeneration_rethreads_onto_the_answer_it_never_saw(
             .block_on(core.get_space_tree(first.space_id.clone()))
             .expect("tree");
         let answer = tree[1].action_id.clone();
+        let before = mock.chat_hits();
 
         // Both in flight at once: the answer is being revised while a reply is
         // written against the generation that is on its way out.
@@ -9377,7 +9389,7 @@ fn a_reply_written_during_a_regeneration_rethreads_onto_the_answer_it_never_saw(
             };
             let replying = async {
                 // Let the regeneration claim and get its request out first.
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                until_upstream_reached(&mock, before).await;
                 let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
                 let r =
                     core.respond_stream(first.space_id.clone(), MODEL.into(), answer.clone(), tx2);
@@ -9426,7 +9438,7 @@ fn a_failed_regeneration_still_settles_its_claim() {
         // The regeneration's stream ends without ever saying it finished — a
         // failure that writes no successor, which is exactly the ending
         // supersession cannot provide.
-        let (_mock, core, _dir) = setup(MockConfig {
+        let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::OkThenStreamEndsWithoutDone,
             chat_delay_ms: 2_000,
             ..MockConfig::default()
@@ -9454,6 +9466,7 @@ fn a_failed_regeneration_still_settles_its_claim() {
             .await
         });
         assert!(idle.is_ok(), "an unclaimed item settles immediately");
+        let before = mock.chat_hits();
 
         let (regen, (second, early)) = core.runtime().block_on(async {
             let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
@@ -9465,7 +9478,7 @@ fn a_failed_regeneration_still_settles_its_claim() {
             let probe = async {
                 // Let the claim be taken; the held response keeps it claimed
                 // well past everything below.
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                until_upstream_reached(&mock, before).await;
                 let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
                 let second = {
                     let s = core.regenerate_stream(answer.clone(), MODEL.into(), tx2);
@@ -9680,7 +9693,7 @@ fn a_hold_a_live_turn_is_flying_with_is_not_recovered() {
             let taking = core.chat("How do tides work?".into(), MODEL.into(), None);
             let recovering = async {
                 // Let the turn take its hold and get its request out.
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                until_upstream_reached(&mock, 0).await;
                 let in_flight = core
                     .wallet_spending_credentials()
                     .await
@@ -12046,15 +12059,11 @@ fn the_provisioner_tops_up_a_wallet_running_low() {
 #[test]
 fn the_provisioner_issues_two_credentials_under_a_key_it_has_not_issued_under() {
     run(|| {
-        let now = now_unix_secs();
-        let boundary = now + 6;
-        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
-        let config = MockConfig {
-            issuer_calendar: Some(calendar),
-            ..MockConfig::default()
-        };
+        let config = MockConfig::default();
         let key_swap = config.key_swap.clone();
+        let deadline = config.key_deadline.clone();
         let (mock, core, _dir) = setup(config);
+        let (boundary, _) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
         spend_from_a_small_credential(&core, 100_000);
         assert_eq!(mock.issuance_debits(), 1);
 
@@ -12083,15 +12092,11 @@ fn the_provisioner_issues_two_credentials_under_a_key_it_has_not_issued_under() 
 #[test]
 fn a_pair_interrupted_by_a_lost_response_is_finished_later() {
     run(|| {
-        let now = now_unix_secs();
-        let boundary = now + 6;
-        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
-        let config = MockConfig {
-            issuer_calendar: Some(calendar),
-            ..MockConfig::default()
-        };
+        let config = MockConfig::default();
         let key_swap = config.key_swap.clone();
+        let deadline = config.key_deadline.clone();
         let (mock, core, _dir) = setup(config);
+        let (boundary, _) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
         spend_from_a_small_credential(&core, 100_000);
 
         key_swap.swap();
@@ -13095,16 +13100,13 @@ fn the_provisioner_never_issues_under_a_refused_key() {
 #[test]
 fn a_pending_issuance_is_retried_under_its_own_key_after_the_epoch_moves() {
     run(|| {
-        // Twenty-minute epochs, the current one ending in three seconds.
-        let boundary = now_unix_secs() + 3;
-        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, 20 * 60);
-        let config = MockConfig {
-            issuer_calendar: Some(calendar),
-            ..MockConfig::default()
-        };
+        let config = MockConfig::default();
         let swap = config.key_swap.clone();
+        let deadline = config.key_deadline.clone();
         let (mock, core, _dir) = setup(config);
         with_account(&core);
+        // Twenty-minute epochs, the current one ending in three seconds.
+        let (boundary, _) = deadline.issuing_ends_in(&core, 3, 20 * 60, false);
         mock.issuance_knobs().lose_next(1);
         core.runtime()
             .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))

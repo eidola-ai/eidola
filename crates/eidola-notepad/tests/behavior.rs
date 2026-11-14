@@ -62,6 +62,22 @@ fn note(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
+/// Another program rewrites the file. The window notices by modification
+/// time, so the new contents are stamped an hour past the old ones: a
+/// rewrite within the filesystem's timestamp granularity would otherwise
+/// leave the stamp unchanged, and what the test sees would depend on the
+/// host's clock and filesystem rather than on the window.
+fn rewrite_elsewhere(path: &Path, bytes: &[u8]) {
+    let before = file::modified(path).expect("the file has a modification time");
+    std::fs::write(path, bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(before + std::time::Duration::from_secs(3600))
+        .unwrap();
+}
+
 #[gpui::test]
 fn typing_marks_the_document_edited_and_undo_takes_it_back(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -360,9 +376,7 @@ fn a_clean_document_follows_a_change_made_elsewhere(cx: &mut TestAppContext) {
     let (view, cx) = open_file(&path, cx);
 
     cx.deactivate_window();
-    // Another program writes the file; a later mtime is what it leaves.
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    std::fs::write(&path, b"after\n").unwrap();
+    rewrite_elsewhere(&path, b"after\n");
     cx.update(|window, _| window.activate_window());
     cx.run_until_parked();
 
@@ -378,8 +392,7 @@ fn an_edited_document_asks_before_taking_a_change_made_elsewhere(cx: &mut TestAp
     cx.simulate_input("mine ");
 
     cx.deactivate_window();
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    std::fs::write(&path, b"theirs\n").unwrap();
+    rewrite_elsewhere(&path, b"theirs\n");
     cx.update(|window, _| window.activate_window());
     cx.run_until_parked();
 

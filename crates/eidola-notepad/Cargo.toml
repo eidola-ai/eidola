@@ -37,6 +37,12 @@ dirs = "7"
 # before (and after) the app's run callback, outside any `App`.
 futures = "0.3"
 
+# Asking whether a note, or the temporary file that will replace it, carries
+# an access control list (`file::acl`): POSIX ACL xattrs on Linux, macOS's
+# extended ACLs.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.7", features = ["test-support"] }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["test-support", "font-kit", "wayland"] }

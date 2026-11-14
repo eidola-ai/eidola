@@ -269,10 +269,18 @@ jobs:
         # and the promotion PR's base). PRs never save (github.ref is a PR ref),
         # so there's no per-PR thrash. This job only runs tests; no artifact
         # from here is published.
+        #
+        # A failed job saves too. The key's environment half is the Rust
+        # version, and a restore never crosses it, so the first trunk push
+        # after a toolchain move is the only run that can warm the new key:
+        # if a failing test there saved nothing, every run would build cold
+        # (about an hour) until a trunk push passed. What a failed job has
+        # compiled is as valid as what a passing one has.
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true' || steps.scope.outputs.markdown == 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       - name: Check formatting
         if: steps.scope.outputs.rust == 'true'

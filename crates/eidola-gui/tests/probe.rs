@@ -10,6 +10,10 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+#[path = "support/backing.rs"]
+mod backing;
+use backing::Backing;
+
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AttestationInfo, BalancesResult, ConfigState, ModelCapabilities, ModelInfo, PostBlock,
@@ -7407,6 +7411,7 @@ fn each_failed_section_gets_a_retry_of_its_own(cx: &mut TestAppContext) {
         .expect("create space")
         .id;
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    let backing = Backing::with_app(core, dir, cx);
 
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| {
@@ -7469,6 +7474,9 @@ fn each_failed_section_gets_a_retry_of_its_own(cx: &mut TestAppContext) {
             .participants
             .read_with(cx, |s, _| s.participants(&space).has_value())
     });
+    // A wrongly retried Space read would land on its own schedule; once
+    // everything has settled, it has.
+    backing.settle();
     assert!(
         stores
             .space_settings
@@ -7478,9 +7486,6 @@ fn each_failed_section_gets_a_retry_of_its_own(cx: &mut TestAppContext) {
     );
 
     probe::set_probes_enabled(false);
-    while core.runtime().metrics().num_alive_tasks() > 0 {
-        std::thread::yield_now();
-    }
 }
 
 /// Poll `run_until_parked` until `pred` holds — a real-core read round-trips
