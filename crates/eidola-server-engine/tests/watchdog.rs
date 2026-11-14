@@ -263,18 +263,15 @@ fn slow_steps_under_the_limit_do_not_trip_it() {
 /// runs, not the time since one. Its sweeps (each a call) come at three times the limit.
 #[test]
 fn an_idle_engine_does_not_trip_it() {
-    let limit = Duration::from_millis(100);
+    // The mock's calls take no time, so only the engine thread being kept off a core
+    // for the whole limit, mid-call, could trip it: a limit a loaded machine cannot
+    // reach that way, and a quiet window six times as long.
+    let limit = Duration::from_millis(500);
     let (watchdog, exited) = watchdog(limit);
-    let (handle, _) = engine(
-        32,
-        None,
-        Duration::ZERO,
-        Duration::from_millis(300),
-        watchdog,
-    );
+    let (handle, _) = engine(32, None, Duration::ZERO, 3 * limit, watchdog);
     assert!(run_one(&handle, 2));
     assert!(
-        exited.recv_timeout(Duration::from_secs(1)).is_err(),
+        exited.recv_timeout(6 * limit).is_err(),
         "the watchdog stayed quiet while idle"
     );
     assert!(handle.is_healthy());

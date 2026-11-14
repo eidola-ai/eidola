@@ -27,6 +27,12 @@ pub struct LocalModelsStore {
     /// Keyed per-model operation slots (download/cancel/delete/load/unload
     /// initiations) — independent per model id, replace-cancels per key.
     op_tasks: HashMap<String, Task<()>>,
+    /// Accepted downloads whose slot stays occupied until a snapshot read at
+    /// or after the acceptance lands: slot key → the generation of the read
+    /// issued for it.
+    awaiting_read: HashMap<String, u64>,
+    /// The generation of the most recently issued snapshot read.
+    read_generation: u64,
     /// The most recent failed operation, as `(model_or_url, message)`.
     /// Cleared when any new operation begins.
     op_error: Option<String>,
@@ -39,6 +45,8 @@ impl LocalModelsStore {
             state: Loadable::NotLoaded,
             task: None,
             op_tasks: HashMap::new(),
+            awaiting_read: HashMap::new(),
+            read_generation: 0,
             op_error: None,
         }
     }
@@ -53,6 +61,8 @@ impl LocalModelsStore {
             },
             task: None,
             op_tasks: HashMap::new(),
+            awaiting_read: HashMap::new(),
+            read_generation: 0,
             op_error: None,
         }
     }
@@ -153,16 +163,37 @@ impl LocalModelsStore {
     }
 
     /// Refresh the snapshot. Fire-and-notify; the store owns the slot.
+    ///
+    /// The only writer of the cell outside the test seams, and ordered by its
+    /// supersede slot: issuing a read drops the one in flight, so the read that
+    /// lands is always the newest issued. Each read carries a generation, and
+    /// a successful landing releases the download slots waiting on a read no
+    /// older than it (see [`Self::download`]).
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(core) = self.app_core.clone() else {
             return;
         };
+        self.read_generation += 1;
+        let generation = self.read_generation;
         self.state = std::mem::take(&mut self.state).to_loading();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = bridge(core, |c| async move { c.local_models_state().await }).await;
             let _ = this.update(cx, |this, cx| {
+                let read = result.is_ok();
                 this.state = std::mem::take(&mut this.state).resolve(result);
                 this.task = None;
+                if read {
+                    let released: Vec<String> = this
+                        .awaiting_read
+                        .iter()
+                        .filter(|(_, waits_on)| **waits_on <= generation)
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    for key in released {
+                        this.awaiting_read.remove(&key);
+                        this.op_tasks.remove(&key);
+                    }
+                }
                 cx.notify();
             });
         }));
@@ -173,9 +204,11 @@ impl LocalModelsStore {
     /// op slot, which is what "in flight" means here (STATE.md: no shared busy
     /// flags; in-flight is the presence of the task).
     ///
-    /// It covers the initiating call only. Once app-core has accepted the
-    /// transfer the snapshot's own row carries it (`Downloading`, with Cancel),
-    /// which is the state every surface reads from there on.
+    /// It covers the initiating call and, once app-core has accepted the
+    /// transfer, the read that shows it: the snapshot's own row carries it from
+    /// there on (`Downloading`, with Cancel), and the slot clears in the update
+    /// that installs that snapshot, so no frame sees neither (see
+    /// [`Self::download`]).
     pub fn download_pending(&self, url: &str) -> bool {
         self.op_tasks.contains_key(&Self::download_key(url))
     }
@@ -229,18 +262,66 @@ impl LocalModelsStore {
     /// successor carries a newer value that must win, and here there is no
     /// newer value to carry.
     ///
-    /// It covers the initiating call only, which is all the slot knows about:
-    /// once it clears, the snapshot's own `Downloading` row (with Cancel) is
-    /// what stands in the way, and a press landing after that reaches
-    /// app-core's own honest refusal rather than superseding anything.
+    /// **The slot hands over to the snapshot without a gap.** Once it clears,
+    /// the snapshot's own `Downloading` row (with Cancel) is what stands in the
+    /// way of a second press — so the slot clears only in the update that
+    /// installs a snapshot read after app-core accepted the transfer. The
+    /// initiating call's answer is not that moment: the read a
+    /// `Change::LocalModels` drives is a second round trip behind it, and the
+    /// frames between would paint the failed row's Retry (or the catalog's
+    /// Download) as a live control over a transfer app-core is already running
+    /// — a press there publishing "already downloading" over it. So an accepted
+    /// download keeps its slot, issues [`Self::refresh`] and records that
+    /// read's generation in `awaiting_read`; the refresh that lands clears
+    /// every slot waiting on a read issued no later than itself.
+    ///
+    /// **Every snapshot the cell installs comes through `refresh`**, never from
+    /// an operation, because `refresh` is the one ordering there is: a newer
+    /// read replaces the older one's task, so an older read never lands at all,
+    /// let alone over a newer one. An operation carrying its own snapshot would
+    /// be a second, unordered writer — two downloads started together could
+    /// each land a whole list, the earlier-sampled one last, taking away the
+    /// other's accepted row after its slot had cleared.
+    ///
+    /// A refused download leaves the cell alone and clears its slot: app-core
+    /// wrote nothing, so there is nothing for a read to show. A read that fails
+    /// clears nothing — the slot waits for the next read that succeeds (every
+    /// change to the transfer emits a `Change::LocalModels`, which issues one),
+    /// so it never clears over a snapshot that predates the acceptance.
     pub fn download(&mut self, url: String, cx: &mut Context<Self>) {
         if self.download_pending(&url) {
             return;
         }
+        self.op_error = None;
+        let Some(core) = self.app_core.clone() else {
+            cx.notify();
+            return;
+        };
         let key = Self::download_key(&url);
-        self.run_op(key, cx, move |c| async move {
-            c.download_local_model(url).await.map(|_| ())
+        let slot_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = bridge(
+                core,
+                move |c| async move { c.download_local_model(url).await },
+            )
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Err(e) => {
+                        this.op_error = Some(e.to_string());
+                        this.op_tasks.remove(&slot_key);
+                    }
+                    Ok(_) => {
+                        this.refresh(cx);
+                        this.awaiting_read.insert(slot_key, this.read_generation);
+                    }
+                }
+                cx.notify();
+            });
         });
+        // Occupied before the notify, for `run_op`'s reason.
+        self.op_tasks.insert(key, task);
+        cx.notify();
     }
 
     /// Cancel an in-flight download.

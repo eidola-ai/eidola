@@ -59,6 +59,7 @@ fn step(
         token_ids: tokens,
         positions,
         return_logits: true,
+        aux: Default::default(),
     }
 }
 

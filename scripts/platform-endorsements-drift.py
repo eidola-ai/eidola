@@ -26,10 +26,11 @@ def version(tag):
 
 def main(root, upstream_file):
     root = pathlib.Path(root)
-    upstream = sorted(
-        {line.strip() for line in open(upstream_file) if version(line.strip())},
-        key=version,
-    )
+    with open(upstream_file) as lines:
+        upstream = sorted(
+            {line.strip() for line in lines if version(line.strip())},
+            key=version,
+        )
     vendored_dir = root / VENDORED
     vendored = sorted(
         (p.name for p in vendored_dir.iterdir() if p.is_dir() and version(p.name))
