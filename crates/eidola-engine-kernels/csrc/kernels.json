@@ -51,6 +51,8 @@
     { "name": "ds_ops_div", "source": "ds_ops_div.cu", "profile": "exact" },
     { "name": "ds_reference", "source": "ds_reference.cu", "profile": "exact" },
     { "name": "ds_head", "source": "ds_head.cu", "profile": "exact" },
+    { "name": "ds_attention", "source": "ds_attention.cu", "profile": "exact" },
+    { "name": "ds_index", "source": "ds_index.cu", "profile": "exact" },
     { "name": "cutlass_fp8_blockwise_gemm", "source": "cutlass_fp8_blockwise_gemm.cu", "profile": "cutlass" },
     { "name": "cutlass_bf16_gemm", "source": "cutlass_bf16_gemm.cu", "profile": "cutlass" },
     {
