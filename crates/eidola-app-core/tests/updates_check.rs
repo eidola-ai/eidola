@@ -813,7 +813,7 @@ fn a_standing_alert_survives_a_check_that_started_before_it() {
         // Let it read the feed and get its request out, then leave it waiting.
         tokio::select! {
             _ = &mut slow_check => panic!("the slow feed answered too early to prove anything"),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+            _ = request_arrived(&slow) => {}
         }
 
         feed(&alerting.uri());
@@ -888,7 +888,7 @@ fn a_newer_alert_is_not_replaced_by_an_older_check_that_finished_after_it() {
         tokio::pin!(slow_check);
         tokio::select! {
             _ = &mut slow_check => panic!("the slow feed answered too early to prove anything"),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+            _ = request_arrived(&slow) => {}
         }
 
         feed(&alerting.uri());
@@ -980,7 +980,7 @@ fn a_quick_failure_does_not_silence_a_slower_check_that_saw_something() {
         tokio::pin!(slow_check);
         tokio::select! {
             _ = &mut slow_check => panic!("the slow feed answered too early to prove anything"),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+            _ = request_arrived(&slow) => {}
         }
 
         feed(&offline.uri());
@@ -1034,4 +1034,22 @@ async fn non_semver_tag_is_check_failed() {
         matches!(result, UpdateCheckResult::CheckFailed { .. }),
         "expected CheckFailed, got: {result:#?}"
     );
+}
+
+/// Resolves once `server` has received a request: the check that sent it has
+/// read the feed from the config and is now waiting on the answer.
+async fn request_arrived(server: &MockServer) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the check never sent its request"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }

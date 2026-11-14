@@ -2286,7 +2286,16 @@ async fn a_fallback_that_opened_while_the_request_waited_is_skipped() {
                 .map(|_| ())
         })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Trip the fallback as soon as the request is waiting on the first
+    // engine, well inside the headers limit that moves it on.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while stalled.chats().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the request never reached the first engine"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     assert_eq!(stalled.chats().len(), 1, "waiting on the first engine");
     upstream(&router, MODEL_A, &fallback.base_url)
         .breaker()

@@ -2333,7 +2333,12 @@ fn a_sweep_does_not_claim_a_room_this_process_opened() {
         // this room. It is still this process's room, and the owner's turn is
         // still the thing being waited for.
         core.start_subspace_driver();
-        settle(&core);
+        // The sweep's walk ends in one of two places: registered against the
+        // parent, waiting, or reported. Wait for either; it must be the first.
+        wait_until(&core, || {
+            report(&core, &parent).is_some()
+                || core.test_rooms_awaiting(parent.clone()) == vec![out.space.id.clone()]
+        });
         assert!(
             report(&core, &parent).is_none(),
             "the sweep armed it as an ordinary signal, so it holds out for the \
@@ -4674,10 +4679,13 @@ fn settle(core: &AppCore) {
     }
 }
 
-/// Poll for a condition the background driver brings about. Generous, because
-/// what is being asserted is that it happens at all, not how fast.
+/// Poll for a condition the background driver brings about. Generous, and
+/// bounded by the clock rather than a count of polls, because what is being
+/// asserted is that it happens at all, not how fast: a walk of several turns
+/// on a loaded machine takes what it takes.
 fn wait_until(core: &AppCore, mut done: impl FnMut() -> bool) {
-    for _ in 0..300 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
         if done() {
             return;
         }
