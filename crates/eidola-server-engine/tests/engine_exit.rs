@@ -72,11 +72,18 @@ async fn an_engine_thread_panic_stops_the_node() {
     // The slot is released once the response side lets go of the request too.
     assert_eq!(admission.in_flight(), 1);
     drop((guard, events));
-    assert_eq!(
-        admission.in_flight(),
-        0,
-        "the request's permit was released"
-    );
+    // The engine's share goes with its record of the request, which the last holder of
+    // the engine's shared state drops: the watchdog thread, once the engine thread has
+    // gone. The record's channel closes a moment before its share of the permit is let
+    // go, so the end of the stream above does not order that release before this.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while admission.in_flight() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the request's permit was released"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 const CHILD_ENV: &str = "EIDOLA_ENGINE_EXIT_TEST_CHILD";
