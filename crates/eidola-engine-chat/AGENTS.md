@@ -1,6 +1,21 @@
 # eidola-engine-chat
 
-The chat layer of Eidola's inference engine for the MiMo-V2.6 model family (Flash and Pro share every file this crate reads): prompt rendering, tokenization, and turning generated tokens back into OpenAI-shaped `reasoning_content` / `content` / `tool_calls` deltas. AGPL-3.0-only. Workspace context: root `AGENTS.md`.
+The chat layer of Eidola's inference engine: prompt rendering, tokenization, and turning generated tokens back into OpenAI-shaped `reasoning_content` / `content` / `tool_calls` deltas, for two formats: the MiMo-V2.6 model family (Flash and Pro share every file this crate reads) and DeepSeek-V4.1 (text only). AGPL-3.0-only. Workspace context: root `AGENTS.md`.
+
+## Formats
+
+`ChatFormat` names the format of a model architecture, and the caller picks it from the model it serves. The steps are the same for both; what differs is reached through the format:
+
+| Step | MiMo-V2.6 | DeepSeek-V4.1 |
+|---|---|---|
+| Tokenizer | `MimoTokenizer::from_bytes` / `from_model_dir` (`tokenizer.json` + `generation_config.json`) | `Tokenizer::for_format(ChatFormat::DeepSeekV4_1, …)` / `for_format_from_model_dir` (`tokenizer.json` + `config.json`, `ChatFormat::eos_config_file`) |
+| History tool-call arguments | `ChatInput::normalize_tool_call_arguments` first | as the request sent them |
+| Prompt | `ChatTemplate::render_prompt` (the model's Jinja file) | `deepseek_v4_1::encode` (compiled in) |
+| Options | `RenderOptions` | `deepseek_v4_1::EncodeOptions` (`from_request` resolves a request's thinking switch and `reasoning_effort`) |
+| Declared tools | `ToolSchemas::from_tools` | `deepseek_v4_1::tool_schemas` |
+| Output | `OutputConfig::new` | `OutputConfig::deepseek_v4_1` |
+
+`Tokenizer` (of which `MimoTokenizer` is an alias), `Prompt`, `Tokenizer::encode_prompt`, `Detokenizer`, `OutputParser`, `ChatDelta` and the finish-reason mapping are shared. Each format's tokenizer pin refuses the other's file. Everything from Pipeline to Output parsing below describes MiMo; DeepSeek-V4.1 has its own section after them.
 
 ## Pipeline
 
@@ -84,8 +99,33 @@ SGLang's MiMo detector types by schema too, but its conversion was rejected beca
 
 **Format limits**: a string value containing `</parameter>`, `</function>` or `</tool_call>`, or a name containing `>`, cannot be represented in MiMo's format by any parser.
 
+## DeepSeek-V4.1
+
+The format is defined by the reference encoder the model repository ships, `encoding/encoding.py` in `deepseek-ai/DeepSeek-V4.1-Flash-1017` (MIT), not by a template file, so it is code here (`src/deepseek_v4_1/`); the tokenizer is still read from the model directory and pinned (`DEEPSEEK_V4_1_TOKENIZER_SHA256`). The fixtures record the Hugging Face revision they were generated at.
+
+**Encoding** (`deepseek_v4_1::encode`) is `encode_messages`, byte for byte, with the data spans `encode_prompt` needs written as the prompt is built. What the reference does, and a server must know:
+
+- The prompt starts with `<｜begin▁of▁sentence｜>` in its text; the tokenizer adds no BOS of its own.
+- A `tool` message is a `<tool_result>` block of a user turn (joined to the user turn before it, or its own), consecutive user messages merge, and a turn's results are reordered to the order of the calls before it.
+- **Request-level `tools` go on a system message**: the reference reads tools off messages, so the request's are attached as the model's `chat_template.jinja` attaches them, to a leading system message with none of its own, else to a new empty one put first.
+- **Thinking and effort**: `EncodeOptions::thinking` selects `<｜Assistant｜><think>` or `<｜Assistant｜></think>` as the generation header. The effort is one line at the start of a thinking-mode prompt, a budget from 1 to 100 (`low` 50, `high` 75, `max` 100, default `high`), absent in chat mode. `EncodeOptions::from_request` applies the chat template's request defaults: thinking on unless switched off or the effort is `none`, and OpenAI's `minimal` / `medium` / `xhigh` as 50 / 75 / 75.
+- Reasoning of turns before the last user turn is dropped unless any message declares tools; a mid-conversation system message counts as a user turn and gets `<｜System｜>`.
+- The generation header is written whenever the last message is a user or mid-conversation system message; there is no switch for it. A final assistant message ends with the end-of-sequence token unless it sets `wo_eos`.
+- String tool-call `arguments` are decoded by the encoder (twice if doubly encoded); anything that does not come to an object is one parameter named `arguments`. `normalize_tool_call_arguments` is not called for this format.
+
+**Accepted input** is the domain where the reference's output is a function of the JSON alone (`encoding.rs` module docs); the rest is refused where Python would print `None` or raise. The reference's own extensions are accepted where it reads them (message-level `tools` and `response_format`, `task`, `wo_eos`, `latest_reminder`, tool namespaces as `namespace::name`), except `content_blocks`. **An image is a typed refusal** (`ChatError::UnsupportedContent`): an `image` or `image_url` part anywhere, or text spelling `<｜deepseek_image｜>` where the reference refuses it.
+
+**Tokenizer.** The format's markers (`<｜User｜>`, `<think>`, `｜DSML｜`, …) are added tokens flagged `normalized`, accepted because the tokenizer's normalizer is empty, which makes that match a plain literal one (a tokenizer with a real normalizer and such tokens is still refused). `｜DSML｜` can overlap a second copy of itself, the one overlap the build accepts: `encode_prompt` refuses a prompt in which a copy left unmatched for touching request data would hide a copy in the format's own text, which the encoder cannot produce because it writes `<` or `/` before each of its own. `vocab_size()` is 129,280 and the end-of-sequence id comes from `config.json`. The markers are not special, so they reach the parsers as text; the end-of-sequence token is special and skipped.
+
+**Output** (`deepseek_v4_1::output`, through `OutputParser`): in thinking mode reasoning runs to the first `</think>` (dropped) or the first `<｜DSML｜ calls>` (content, with the blank line before it); in chat mode all is content. A `<｜DSML｜ calls>…</｜DSML｜ calls>` block is its calls when every element is a well-formed `invoke` of a declared tool, and the blank line the format writes before it goes with it; any other block, an unclosed one, and text between or after blocks are content, except whitespace next to a block of calls. `arguments` follow the markup, not the schema: a `string="true"` value is a string, a `string="false"` value is spliced in as written when it is strict JSON and is a string otherwise. With a tool declared, the result on every output the reference's `parse_message_from_completion_text` accepts is the reference's (but for a `string="false"` value that is not strict JSON, which the reference splices in regardless); the reference raises on the rest. The safety rules above hold (no panic, linear scanning, strict-JSON arguments, streaming equals whole-output parsing). **A DeepSeek-V4.1 response is never continuable**: `resumes_exactly` and `resumes_exactly_as_tokens` are false, and `continuing_in` only sets where the split starts.
+
+**Format limits**: a string value containing `</｜DSML｜ parameter>`, or a parameter name containing `" string="true">` or `" string="false">`, cannot be represented.
+
 ## Tests
 
+- `tests/deepseek_encoding.rs` — every case in `tests/fixtures/deepseek_v4_1/encoding_cases.json` against the reference's prompt byte for byte (the reference's shipped pairs, 670+ generated, and cases that must be refused, the shipped vision pair among them); every prompt and 400 strings against Python `tokenizers` ids; no added token on request data, with a token appended to every string of every fixture; request options.
+- `tests/deepseek_output.rs` — `output_cases.json` against the reference's parser, re-parsed in 1-, 3- and 7-byte chunks; property tests over format fragments, arbitrary text, arbitrary token ids and arbitrary splits (streaming equals whole-output parsing, strict-JSON arguments, an answer without a closed block is its text, parsing inverts the encoder).
+- `tests/deepseek_linear_parsing.rs` — many blocks, calls or parameters in one chunk allocate in proportion to its length.
 - `tests/template_fixtures.rs` — byte-exact template corpus, continuations included.
 - `tests/prompt_data.rs` — request data spells no added token: every added token at every place a request's text reaches the prompt, every string of every fixture wrapped in one, a token completed by the template's text, a continued message; and every fixture prompt whose data spells none keeps Python's ids.
 - `tests/continuation.rs` — the continuation prefix property, the continued output split, and the render leaving its input alone.
@@ -93,7 +133,7 @@ SGLang's MiMo detector types by schema too, but its conversion was rejected beca
 - `tests/linear_parsing.rs` — one chunk holding many tool-call blocks allocates in proportion to its length, counted by the test binary's own allocator.
 - `tests/round_trip.rs` — property test that the rule inverts the real template; pinned counterexamples showing SGLang's rule does not.
 - Unit and property tests in each module (`cargo test -p eidola-engine-chat`).
-- `tokenizer::reference_tests` — encoding and decoding against the Python tokenizer, on the committed pinned tokenizer.
+- `tokenizer::reference_tests` — encoding and decoding against the Python tokenizer, on the committed pinned tokenizers; for DeepSeek-V4.1 the decode table for every id and the self-overlapping token.
 
 ## Regenerating fixtures
 
@@ -106,5 +146,7 @@ python -I dev/gen_sglang_fixtures.py --sglang-src <sglang checkout> \
 python -I dev/gen_tables.py
 python -I dev/gen_float_repr_cases.py
 ```
+
+The DeepSeek-V4.1 fixtures (`tests/fixtures/deepseek_v4_1/`, with DeepSeek's MIT-licensed `tokenizer.json.gz` and `config.json`; `EIDOLA_DEEPSEEK_MODEL_DIR` overrides the copy) come from `dev/gen_deepseek_fixtures.py`, run with `uv` against a checkout of the model repository; its dependencies are pinned in the script and its lock file. See `dev/README.md`.
 
 `gen_template_fixtures.py` also refreshes the model-file copies in `tests/fixtures/`. Regenerate after changing a pinned artifact, the reference versions, or a case list; review the fixture diff like code. The SGLang harness applies `normalize_json_schema_types` to tools (as SGLang's request validation does) and the per-parameter containment described above, flagging each case where containment fired (`contained`).

@@ -1,0 +1,1963 @@
+{
+ "meta": {
+  "repository": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "revision": "08c8657f02291e11b6f6b63e0e16014f8e748518",
+  "encoding_py_sha256": "13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2",
+  "tokenizer_sha256": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+  "python": "3.12.12",
+  "tokenizers": "0.23.2",
+  "generator": "dev/gen_deepseek_fixtures.py"
+ },
+ "cases": [
+  {
+   "name": "rendered_0_thinking",
+   "text": "</think>Hello there.",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "Hello there.",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_0_chat",
+   "text": "Hello there.",
+   "thinking": false,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "Hello there.",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_1_thinking",
+   "text": "some reasoning\n\nwith paragraphs</think>answer",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "some reasoning\n\nwith paragraphs",
+    "content": "answer",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_1_chat",
+   "text": "answer",
+   "thinking": false,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "answer",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_2_thinking",
+   "text": "only reasoning</think>",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "only reasoning",
+    "content": "",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_2_chat",
+   "text": "",
+   "thinking": false,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_3_thinking",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "lookup"
+   ],
+   "reference": {
+    "reasoning_content": "  reason  ",
+    "content": "summary",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"value\", \"limit\": 2}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_3_chat",
+   "text": "summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "lookup"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "summary",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"value\", \"limit\": 2}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_4_thinking",
+   "text": "r</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"unit\" string=\"true\">celsius</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "get_weather"
+   ],
+   "reference": {
+    "reasoning_content": "r",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"location\": \"Paris\", \"unit\": \"celsius\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_4_chat",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"unit\" string=\"true\">celsius</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "get_weather"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"location\": \"Paris\", \"unit\": \"celsius\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_5_thinking",
+   "text": "r</think>Two calls.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"a\">\n<｜DSML｜ parameter name=\"x\" string=\"false\">1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"b\">\n<｜DSML｜ parameter name=\"y\" string=\"false\">[1, {\"z\": null}]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"s\" string=\"true\">str</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"a\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "a",
+    "b"
+   ],
+   "reference": {
+    "reasoning_content": "r",
+    "content": "Two calls.",
+    "tool_calls": [
+     {
+      "name": "a",
+      "arguments": "{\"x\": 1}"
+     },
+     {
+      "name": "b",
+      "arguments": "{\"y\": [1, {\"z\": null}], \"s\": \"str\"}"
+     },
+     {
+      "name": "a",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_5_chat",
+   "text": "Two calls.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"a\">\n<｜DSML｜ parameter name=\"x\" string=\"false\">1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"b\">\n<｜DSML｜ parameter name=\"y\" string=\"false\">[1, {\"z\": null}]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"s\" string=\"true\">str</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"a\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "a",
+    "b"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "Two calls.",
+    "tool_calls": [
+     {
+      "name": "a",
+      "arguments": "{\"x\": 1}"
+     },
+     {
+      "name": "b",
+      "arguments": "{\"y\": [1, {\"z\": null}], \"s\": \"str\"}"
+     },
+     {
+      "name": "a",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_6_thinking",
+   "text": "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search::lookup\">\n<｜DSML｜ parameter name=\"q\" string=\"true\">ns</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "search::lookup"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "search::lookup",
+      "arguments": "{\"q\": \"ns\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_6_chat",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search::lookup\">\n<｜DSML｜ parameter name=\"q\" string=\"true\">ns</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "search::lookup"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "search::lookup",
+      "arguments": "{\"q\": \"ns\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_7_thinking",
+   "text": "r</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"files::lookup\">\n<｜DSML｜ parameter name=\"q\" string=\"true\">x</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "files::lookup"
+   ],
+   "reference": {
+    "reasoning_content": "r",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "files::lookup",
+      "arguments": "{\"q\": \"x\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_7_chat",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"files::lookup\">\n<｜DSML｜ parameter name=\"q\" string=\"true\">x</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "files::lookup"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "files::lookup",
+      "arguments": "{\"q\": \"x\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_8_thinking",
+   "text": "r\n\n</think>text\n\n\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"s\" string=\"true\">line1\nline2</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"e\" string=\"true\"></｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"ws\" string=\"true\">  </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"j\" string=\"true\">{\"a\": 1}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"n\" string=\"false\">-1.5e-07</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"b\" string=\"false\">true</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"u\" string=\"true\">你好 😀 é مرحبا</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "r\n\n",
+    "content": "text\n\n",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"s\": \"line1\\nline2\", \"e\": \"\", \"ws\": \"  \", \"j\": \"{\\\"a\\\": 1}\", \"n\": -1.5e-07, \"b\": true, \"u\": \"你好 😀 é مرحبا\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_8_chat",
+   "text": "text\n\n\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"s\" string=\"true\">line1\nline2</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"e\" string=\"true\"></｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"ws\" string=\"true\">  </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"j\" string=\"true\">{\"a\": 1}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"n\" string=\"false\">-1.5e-07</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"b\" string=\"false\">true</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"u\" string=\"true\">你好 😀 é مرحبا</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "text\n\n",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"s\": \"line1\\nline2\", \"e\": \"\", \"ws\": \"  \", \"j\": \"{\\\"a\\\": 1}\", \"n\": -1.5e-07, \"b\": true, \"u\": \"你好 😀 é مرحبا\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_9_thinking",
+   "text": "r</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"k\"q\" string=\"true\">v</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"false\">[\"值\"]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"nested\" string=\"false\">{\"a\": {\"b\": [1, 2, {\"c\": \"d\\\"e\\\\f\"}]}}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "r",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"k\\\"q\": \"v\", \"名\": [\"值\"], \"nested\": {\"a\": {\"b\": [1, 2, {\"c\": \"d\\\"e\\\\f\"}]}}}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_9_chat",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"k\"q\" string=\"true\">v</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"false\">[\"值\"]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"nested\" string=\"false\">{\"a\": {\"b\": [1, 2, {\"c\": \"d\\\"e\\\\f\"}]}}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"k\\\"q\": \"v\", \"名\": [\"值\"], \"nested\": {\"a\": {\"b\": [1, 2, {\"c\": \"d\\\"e\\\\f\"}]}}}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_10_thinking",
+   "text": "r</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">NaN</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"big\" string=\"false\">123456789012345678901234567890</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"f\" string=\"false\">Infinity</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "r",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"a\": NaN, \"big\": 123456789012345678901234567890, \"f\": Infinity}"
+     }
+    ],
+    "strict_json": false
+   }
+  },
+  {
+   "name": "rendered_10_chat",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">NaN</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"big\" string=\"false\">123456789012345678901234567890</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"f\" string=\"false\">Infinity</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"a\": NaN, \"big\": 123456789012345678901234567890, \"f\": Infinity}"
+     }
+    ],
+    "strict_json": false
+   }
+  },
+  {
+   "name": "rendered_11_thinking",
+   "text": "r < 1 > 0</think>content with <b>tags</b> and a lone < or > here",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "r < 1 > 0",
+    "content": "content with <b>tags</b> and a lone < or > here",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "rendered_11_chat",
+   "text": "content with <b>tags</b> and a lone < or > here",
+   "thinking": false,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "content with <b>tags</b> and a lone < or > here",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_00",
+   "text": "step 1\n\nstep 2</think>",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_01",
+   "text": "step 1\n\nstep 2</think>a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"true\">text</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"a\": [1, \"two\"], \"query\": \"text\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_02",
+   "text": "a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"query\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"query\": [1, \"two\"]}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_03",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"k k\" string=\"false\">2.5</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">😀</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"true\">你好</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"k k\": 2.5, \"a\": \"😀\", \"query\": \"你好\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_04",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x_1\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">true</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"x_1\": \"\"}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"a\": true}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_05",
+   "text": "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"名\" string=\"true\">multi\nline</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"false\">null</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"名\": \"multi\\nline\", \"query\": null}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_06",
+   "text": "Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"名\" string=\"true\">你好</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"true\">multi\nline</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x_1\" string=\"false\">1</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"名\": \"你好\", \"x_1\": \"multi\\nline\"}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"x_1\": 1, \"k k\": [1, \"two\"]}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_07",
+   "text": "thinking…</think>Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"query\" string=\"true\"> lead and trail </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"false\">{\"n\": {\"m\": []}}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"false\">2.5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"k k\" string=\"true\">你好</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"true\">😀</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"名\" string=\"false\">1</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"true\">multi\nline</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "thinking…",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"query\": \" lead and trail \", \"k k\": {\"n\": {\"m\": []}}, \"名\": 2.5}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"k k\": \"你好\", \"query\": \"😀\", \"a\": \"{\\\"json\\\": \\\"inside\\\"}\"}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"名\": 1, \"k k\": \"multi\\nline\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_08",
+   "text": "",
+   "thinking": false,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_09",
+   "text": "a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"k k\" string=\"true\"></｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"k k\": \"\", \"a\": \"{\\\"json\\\": \\\"inside\\\"}\", \"query\": [1, \"two\"]}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_10",
+   "text": "thinking…</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"名\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">😀</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"true\">multi\nline</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "thinking…",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"名\": [1, \"two\"], \"a\": \"😀\"}"
+     },
+     {
+      "name": "g",
+      "arguments": "{}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"a\": [1, \"two\"], \"名\": \"multi\\nline\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_11",
+   "text": "step 1\n\nstep 2</think>多行\n\n内容",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "多行\n\n内容",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_12",
+   "text": "a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x_1\" string=\"true\">你好</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"false\">null</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"名\" string=\"false\">true</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"x_1\": \"你好\", \"a\": null}"
+     },
+     {
+      "name": "g",
+      "arguments": "{\"名\": true, \"a\": \"{\\\"json\\\": \\\"inside\\\"}\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_13",
+   "text": "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"名\" string=\"true\">multi\nline</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"true\">multi\nline</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x_1\" string=\"false\">2.5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"名\": \"multi\\nline\", \"query\": \"multi\\nline\"}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"x_1\": 2.5}"
+     },
+     {
+      "name": "g",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_14",
+   "text": "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">2.5</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"false\">null</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"a\": 2.5, \"名\": null}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_15",
+   "text": "a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"k k\" string=\"false\">2.5</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"false\">2.5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"k k\": 2.5, \"名\": 2.5}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_16",
+   "text": "step 1\n\nstep 2</think>多行\n\n内容\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"k k\" string=\"false\">{\"n\": {\"m\": []}}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"true\"> lead and trail </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "多行\n\n内容",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"k k\": {\"n\": {\"m\": []}}, \"x_1\": \" lead and trail \"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_17",
+   "text": "</think>多行\n\n内容\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"k k\" string=\"true\"></｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"false\">1</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"k k\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">你好</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "多行\n\n内容",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"k k\": \"\", \"query\": 1, \"x_1\": \"{\\\"json\\\": \\\"inside\\\"}\"}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"k k\": \"{\\\"json\\\": \\\"inside\\\"}\", \"a\": \"你好\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_18",
+   "text": "thinking…</think>a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"query\" string=\"false\">true</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "thinking…",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"query\": true, \"a\": \"{\\\"json\\\": \\\"inside\\\"}\"}"
+     },
+     {
+      "name": "g",
+      "arguments": "{}"
+     },
+     {
+      "name": "f",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_19",
+   "text": "step 1\n\nstep 2</think>多行\n\n内容\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"query\" string=\"true\"> lead and trail </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "多行\n\n内容",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"query\": \" lead and trail \", \"k k\": \"\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_20",
+   "text": "Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"名\" string=\"true\">😀</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"名\" string=\"true\">你好</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"true\">multi\nline</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"名\": \"😀\", \"a\": [1, \"two\"]}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"名\": \"你好\", \"k k\": \"multi\\nline\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_21",
+   "text": "</think>",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_22",
+   "text": "a < b",
+   "thinking": false,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "a < b",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_23",
+   "text": "",
+   "thinking": false,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_24",
+   "text": "step 1\n\nstep 2</think>a < b",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "a < b",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_25",
+   "text": "thinking…</think>多行\n\n内容\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">text</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"false\">2.5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"a\" string=\"true\"> lead and trail </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "thinking…",
+    "content": "多行\n\n内容",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"a\": \"text\", \"query\": 2.5}"
+     },
+     {
+      "name": "g",
+      "arguments": "{\"a\": \" lead and trail \", \"k k\": \"\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_26",
+   "text": "thinking…</think>a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"query\" string=\"false\">{\"n\": {\"m\": []}}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"true\">你好</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "thinking…",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"query\": {\"n\": {\"m\": []}}, \"名\": \"你好\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_27",
+   "text": "Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"名\" string=\"false\">1</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"true\">😀</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"名\": 1, \"x_1\": \"😀\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_28",
+   "text": "</think>多行\n\n内容\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"a\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">true</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "g",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "多行\n\n内容",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"a\": \"\"}"
+     },
+     {
+      "name": "g",
+      "arguments": "{\"a\": true}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_29",
+   "text": "step 1\n\nstep 2</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"名\" string=\"false\">2.5</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"k k\" string=\"true\">text</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"true\">text</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"名\": 2.5, \"a\": 1}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"k k\": \"text\", \"query\": \"text\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_30",
+   "text": "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"k k\" string=\"false\">{\"n\": {\"m\": []}}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"k k\": {\"n\": {\"m\": []}}, \"x_1\": [1, \"two\"]}"
+     },
+     {
+      "name": "g",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_31",
+   "text": "a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">text</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"query\": \"text\", \"a\": \"{\\\"json\\\": \\\"inside\\\"}\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_32",
+   "text": "step 1\n\nstep 2</think>a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">😀</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"false\">{\"n\": {\"m\": []}}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "g",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"query\": \"😀\"}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"a\": \"{\\\"json\\\": \\\"inside\\\"}\", \"名\": {\"n\": {\"m\": []}}}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_33",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"query\" string=\"true\"> lead and trail </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"true\"> lead and trail </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"query\": \" lead and trail \", \"k k\": \" lead and trail \"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_34",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"k k\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"k k\": \"\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_35",
+   "text": "step 1\n\nstep 2</think>a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_36",
+   "text": "Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"k k\" string=\"false\">2.5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"k k\": 2.5}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_37",
+   "text": "</think>多行\n\n内容",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "多行\n\n内容",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_38",
+   "text": "thinking…</think>多行\n\n内容\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"query\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">multi\nline</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "thinking…",
+    "content": "多行\n\n内容",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"query\": \"\"}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"a\": \"multi\\nline\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_39",
+   "text": "a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"名\" string=\"false\">{\"n\": {\"m\": []}}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"false\">true</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"k k\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"query\" string=\"false\">2.5</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"名\": {\"n\": {\"m\": []}}, \"x_1\": true}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"k k\": \"\"}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"query\": 2.5, \"a\": \"{\\\"json\\\": \\\"inside\\\"}\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_40",
+   "text": "thinking…</think>",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "thinking…",
+    "content": "",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_41",
+   "text": "step 1\n\nstep 2</think>Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">multi\nline</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">multi\nline</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"true\"> lead and trail </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"false\">2.5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"query\": \"multi\\nline\", \"名\": [1, \"two\"]}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"query\": \"multi\\nline\", \"x_1\": \" lead and trail \", \"名\": 2.5}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_42",
+   "text": "</think>a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"名\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"true\">text</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"query\" string=\"false\">2.5</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"false\">null</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"false\">{\"n\": {\"m\": []}}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "g",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"名\": [1, \"two\"], \"x_1\": \"text\"}"
+     },
+     {
+      "name": "g",
+      "arguments": "{\"query\": 2.5, \"x_1\": null, \"k k\": {\"n\": {\"m\": []}}}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_43",
+   "text": "step 1\n\nstep 2</think>Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"a\" string=\"true\"></｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"true\">multi\nline</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"k k\" string=\"false\">null</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\"></｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"true\">😀</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"k k\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "g",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"a\": \"\", \"k k\": \"{\\\"json\\\": \\\"inside\\\"}\", \"名\": \"multi\\nline\"}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"k k\": null, \"a\": \"\", \"x_1\": \"😀\"}"
+     },
+     {
+      "name": "g",
+      "arguments": "{\"k k\": \"\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_44",
+   "text": "thinking…</think>a < b\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "thinking…",
+    "content": "a < b",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_45",
+   "text": "</think>多行\n\n内容\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "多行\n\n内容",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{}"
+     },
+     {
+      "name": "g",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_46",
+   "text": "</think>Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"k k\" string=\"true\"></｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"false\">null</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"名\" string=\"true\">你好</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"x_1\" string=\"true\">😀</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">😀</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"k k\": \"\", \"query\": null}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"名\": \"你好\"}"
+     },
+     {
+      "name": "g",
+      "arguments": "{\"x_1\": \"😀\", \"a\": \"😀\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_47",
+   "text": "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"名\" string=\"false\">[1, \"two\"]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\">你好</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"名\" string=\"false\">2.5</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"false\">true</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"名\": [1, \"two\"], \"a\": \"你好\"}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"名\": 2.5, \"k k\": true}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_48",
+   "text": "多行\n\n内容\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "多行\n\n内容",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_49",
+   "text": "step 1\n\nstep 2</think>多行\n\n内容\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x_1\" string=\"false\">2.5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"k k\" string=\"false\">true</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"k k\" string=\"true\"></｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "多行\n\n内容",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{\"x_1\": 2.5}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"k k\": true}"
+     },
+     {
+      "name": "ns::h",
+      "arguments": "{\"k k\": \"\", \"a\": 1}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_50",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"x_1\" string=\"true\"></｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"x_1\": \"\", \"query\": \"\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_51",
+   "text": "Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">null</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"false\">null</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"a\": null, \"x_1\": null}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_52",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">😀</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"a\" string=\"true\"> lead and trail </｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x_1\" string=\"true\">😀</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"query\": \"😀\", \"a\": \" lead and trail \", \"x_1\": \"😀\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_53",
+   "text": "step 1\n\nstep 2</think>Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"x_1\" string=\"false\">{\"n\": {\"m\": []}}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "g",
+      "arguments": "{\"x_1\": {\"n\": {\"m\": []}}, \"k k\": \"{\\\"json\\\": \\\"inside\\\"}\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_54",
+   "text": "thinking…</think>多行\n\n内容\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x_1\" string=\"true\">text</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x_1\" string=\"true\">{\"json\": \"inside\"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"名\" string=\"false\">{\"n\": {\"m\": []}}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "thinking…",
+    "content": "多行\n\n内容",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"x_1\": \"text\", \"名\": \"\"}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"x_1\": \"{\\\"json\\\": \\\"inside\\\"}\", \"名\": {\"n\": {\"m\": []}}}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_55",
+   "text": "thinking…</think>Answer.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">text</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "thinking…",
+    "content": "Answer.",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"query\": \"text\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_56",
+   "text": "",
+   "thinking": false,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_57",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">你好</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "f",
+    "g"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{}"
+     },
+     {
+      "name": "g",
+      "arguments": "{\"query\": \"你好\"}"
+     },
+     {
+      "name": "g",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_58",
+   "text": "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"true\">multi\nline</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x_1\" string=\"false\">true</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"a\": 1, \"k k\": \"multi\\nline\"}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"x_1\": true}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "random_59",
+   "text": "step 1\n\nstep 2</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::h\">\n<｜DSML｜ parameter name=\"名\" string=\"false\">1</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"k k\" string=\"true\">😀</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"k k\" string=\"false\">1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"query\" string=\"false\">1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f",
+    "g",
+    "ns::h"
+   ],
+   "reference": {
+    "reasoning_content": "step 1\n\nstep 2",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "ns::h",
+      "arguments": "{\"名\": 1, \"k k\": \"😀\"}"
+     },
+     {
+      "name": "f",
+      "arguments": "{\"k k\": 1}"
+     },
+     {
+      "name": "g",
+      "arguments": "{\"query\": 1}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "malformed_no_think_end",
+   "text": "reasoning that never ends",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_think_end_only",
+   "text": "</think>",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "malformed_empty",
+   "text": "",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_calls_before_think_end",
+   "text": "plan\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls></think>late",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_text_after_calls",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>trailing words",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_two_blocks",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_unclosed_block",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "ValueError"
+  },
+  {
+   "name": "malformed_unclosed_invoke",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "ValueError"
+  },
+  {
+   "name": "malformed_unclosed_parameter",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "lookup"
+   ],
+   "reference": {
+    "reasoning_content": "  reason  ",
+    "content": "summary",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"value\\n<｜DSML｜ parameter name=\\\"limit\\\" string=\\\"false\\\">2\"}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "malformed_no_blank_line_before_block",
+   "text": "  reason  </think>summary<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_one_newline_before_block",
+   "text": "  reason  </think>summary\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_three_newlines_before_block",
+   "text": "  reason  </think>summary\n\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "lookup"
+   ],
+   "reference": {
+    "reasoning_content": "  reason  ",
+    "content": "summary\n",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"value\", \"limit\": 2}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "malformed_v4_tags",
+   "text": "  reason  </think>summary\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"lookup\">\n<｜DSML｜parameter name=\"query\" string=\"true\">value</｜DSML｜parameter>\n<｜DSML｜parameter name=\"limit\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_empty_block",
+   "text": "r</think>c\n\n<｜DSML｜ calls>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [],
+   "reference": {
+    "reasoning_content": "r",
+    "content": "c",
+    "tool_calls": [],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "malformed_empty_invoke",
+   "text": "r</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "f"
+   ],
+   "reference": {
+    "reasoning_content": "r",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "f",
+      "arguments": "{}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "malformed_duplicate_parameter",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"query\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "ValueError"
+  },
+  {
+   "name": "malformed_bad_string_flag",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"maybe\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "ValueError"
+  },
+  {
+   "name": "malformed_invalid_json_value",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">{not json</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "lookup"
+   ],
+   "reference": {
+    "reasoning_content": "  reason  ",
+    "content": "summary",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"value\", \"limit\": {not json}"
+     }
+    ],
+    "strict_json": false
+   }
+  },
+  {
+   "name": "malformed_spaces_between_elements",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n  <｜DSML｜ invoke name=\"lookup\">\n  <｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n  <｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n  </｜DSML｜ invoke>\n  </｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "ValueError"
+  },
+  {
+   "name": "malformed_no_newlines_between_elements",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls><｜DSML｜ invoke name=\"lookup\"><｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter><｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "ValueError"
+  },
+  {
+   "name": "malformed_name_with_quote",
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"look\"up\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": true,
+   "declared": [
+    "look\"up"
+   ],
+   "reference": {
+    "reasoning_content": "  reason  ",
+    "content": "summary",
+    "tool_calls": [
+     {
+      "name": "look\"up",
+      "arguments": "{\"query\": \"value\", \"limit\": 2}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "malformed_think_in_content",
+   "text": "r</think>content with <think> and </think> in it",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_special_in_reasoning",
+   "text": "r <think> again</think>c",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_dsml_word_in_content",
+   "text": "r</think>the ｜DSML｜ marker",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_block_text_in_content_without_newlines",
+   "text": "r</think>see <｜DSML｜ calls> for syntax",
+   "thinking": true,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_chat_with_think_end",
+   "text": "stray</think>content",
+   "thinking": false,
+   "declared": [],
+   "reference_error": "AssertionError"
+  },
+  {
+   "name": "malformed_chat_calls_only",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [
+    "lookup"
+   ],
+   "reference": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"value\", \"limit\": 2}"
+     }
+    ],
+    "strict_json": true
+   }
+  },
+  {
+   "name": "malformed_chat_calls_no_blank_line",
+   "text": "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "thinking": false,
+   "declared": [],
+   "reference_error": "AssertionError"
+  }
+ ]
+}
