@@ -3111,6 +3111,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
  "image",
+ "libc",
  "tempfile",
 ]
 
