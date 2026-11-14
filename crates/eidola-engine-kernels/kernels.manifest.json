@@ -55,6 +55,14 @@
         ],
         "includes": []
       },
+      "exact": {
+        "flags": [
+          "-std=c++17",
+          "-O3",
+          "--fmad=false"
+        ],
+        "includes": []
+      },
       "cutlass": {
         "flags": [
           "-std=c++17",
@@ -110,6 +118,22 @@
       "sha256": "10d4c6cdc6bd1ac6d8e2f62342196e7ea06c0b5e0ce95544b6e3591af069d1e7"
     },
     {
+      "path": "csrc/ds_abi.cuh",
+      "sha256": "65e8621fe4e7cf2dffdca744515aec2fb47c0f332114a6fa5e57100159a683b0"
+    },
+    {
+      "path": "csrc/ds_numeric.cuh",
+      "sha256": "08fb84a15a780226b1188ab0e3dda9d2368666c2fba296bc628459cd0d218792"
+    },
+    {
+      "path": "csrc/ds_probe.cu",
+      "sha256": "5e5eb9c1fae5bf551c081d8015d0d1dc1887d998db080cafc513f5163ee85ac1"
+    },
+    {
+      "path": "csrc/ds_probe_nodiv.cu",
+      "sha256": "d61e6534a35d730a02099b369aced3802e5600e120191be6c23c19be2537b7c5"
+    },
+    {
       "path": "csrc/eidola_kernel.cuh",
       "sha256": "1981aeed1a06e214fdb23c4723dfeac389c76d0df311fc31a4295a2627a399fb"
     },
@@ -131,7 +155,7 @@
     },
     {
       "path": "csrc/kernels.json",
-      "sha256": "e5382c905754fe833c6891e38dca05d79e0b552cfc8022cbe834d3e63a0bd5f4"
+      "sha256": "51ccf14ed1566b064ae2a7de4098b1d06dcecfb1fdf8ff00e18e067a5d92caf8"
     },
     {
       "path": "csrc/kv_cipher.cu",
@@ -151,7 +175,7 @@
     },
     {
       "path": "nix/build-kernels.sh",
-      "sha256": "f7fc05c41f3441c4ed45e567ac1ef6bf77c2d97b26e8c6e42c5bc68fb49518e3"
+      "sha256": "c7c493f5f6e2ad4b5ace3e427e3e76d113aef06675bea3574eb6279a69720577"
     },
     {
       "path": "nix/default.nix",
@@ -402,6 +426,162 @@
         "UTCBAR": 10,
         "UTCCP": 10,
         "UTCQMMA": 32
+      }
+    },
+    {
+      "name": "ds_probe",
+      "arch": "sm_100a",
+      "source": "csrc/ds_probe.cu",
+      "profile": "exact",
+      "file": "cubin/ds_probe.sm_100a.cubin",
+      "sha256": "d1f7adbf76e9f8d76dfbaf328e4d7f549fa88b18784a45166c4a5f99f8555f9f",
+      "size": 226192,
+      "entries": [
+        {
+          "symbol": "eidola_ds_probe",
+          "demangled": "eidola_ds_probe",
+          "meta": "eidola_ds_probe_meta"
+        }
+      ],
+      "meta": [
+        "eidola_ds_probe_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 1322,
+        "sass_fma": 179
+      }
+    },
+    {
+      "name": "ds_probe",
+      "arch": "sm_100f",
+      "source": "csrc/ds_probe.cu",
+      "profile": "exact",
+      "file": "cubin/ds_probe.sm_100f.cubin",
+      "sha256": "8579c823df191a25679fe4a7de2f34a058ed2ed32cdf8135ca2c71eea3255f8c",
+      "size": 226192,
+      "entries": [
+        {
+          "symbol": "eidola_ds_probe",
+          "demangled": "eidola_ds_probe",
+          "meta": "eidola_ds_probe_meta"
+        }
+      ],
+      "meta": [
+        "eidola_ds_probe_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 1322,
+        "sass_fma": 179
+      }
+    },
+    {
+      "name": "ds_probe",
+      "arch": "sm_103a",
+      "source": "csrc/ds_probe.cu",
+      "profile": "exact",
+      "file": "cubin/ds_probe.sm_103a.cubin",
+      "sha256": "3835c6b2e29a06e1e86a6753902a547242e29948eb516eae444f195eb2e411ad",
+      "size": 262464,
+      "entries": [
+        {
+          "symbol": "eidola_ds_probe",
+          "demangled": "eidola_ds_probe",
+          "meta": "eidola_ds_probe_meta"
+        }
+      ],
+      "meta": [
+        "eidola_ds_probe_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 1322,
+        "sass_fma": 179
+      }
+    },
+    {
+      "name": "ds_probe_nodiv",
+      "arch": "sm_100a",
+      "source": "csrc/ds_probe_nodiv.cu",
+      "profile": "exact",
+      "file": "cubin/ds_probe_nodiv.sm_100a.cubin",
+      "sha256": "4a4d8a10a0ce731377a908ba8e63a66fa7cf6b574e5b19da85397c56f3e15a20",
+      "size": 173840,
+      "entries": [
+        {
+          "symbol": "eidola_ds_probe_nodiv",
+          "demangled": "eidola_ds_probe_nodiv",
+          "meta": "eidola_ds_probe_nodiv_meta"
+        }
+      ],
+      "meta": [
+        "eidola_ds_probe_nodiv_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 989,
+        "sass_fma": 0
+      }
+    },
+    {
+      "name": "ds_probe_nodiv",
+      "arch": "sm_100f",
+      "source": "csrc/ds_probe_nodiv.cu",
+      "profile": "exact",
+      "file": "cubin/ds_probe_nodiv.sm_100f.cubin",
+      "sha256": "856aad52887146e3cf00268b46a4ec90a369d1385419e24970ea65516c8e260b",
+      "size": 173840,
+      "entries": [
+        {
+          "symbol": "eidola_ds_probe_nodiv",
+          "demangled": "eidola_ds_probe_nodiv",
+          "meta": "eidola_ds_probe_nodiv_meta"
+        }
+      ],
+      "meta": [
+        "eidola_ds_probe_nodiv_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 989,
+        "sass_fma": 0
+      }
+    },
+    {
+      "name": "ds_probe_nodiv",
+      "arch": "sm_103a",
+      "source": "csrc/ds_probe_nodiv.cu",
+      "profile": "exact",
+      "file": "cubin/ds_probe_nodiv.sm_103a.cubin",
+      "sha256": "4d7849be526b270f87560a0307892fbbedb7d1c3bbfad874e720eb0298ca150b",
+      "size": 184864,
+      "entries": [
+        {
+          "symbol": "eidola_ds_probe_nodiv",
+          "demangled": "eidola_ds_probe_nodiv",
+          "meta": "eidola_ds_probe_nodiv_meta"
+        }
+      ],
+      "meta": [
+        "eidola_ds_probe_nodiv_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 989,
+        "sass_fma": 0
       }
     },
     {
@@ -1319,6 +1499,26 @@
       "file": "fatbin/deepgemm_fp8_fp4_grouped.fatbin",
       "sha256": "f3bd19f7385c3ad2c873876f336cc89862cb4a181a81b883a552ff0d3a611903",
       "size": 304312,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "ds_probe",
+      "file": "fatbin/ds_probe.fatbin",
+      "sha256": "4ed3c04f67a97f1048c7f676793a47c1dfe576287dc040b9f5d579c863fb5b4a",
+      "size": 488888,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "ds_probe_nodiv",
+      "file": "fatbin/ds_probe_nodiv.fatbin",
+      "sha256": "7b6fa3940e871a37dadf962c825d850ce1c7a99dcf091cd178610f18b38b24f5",
+      "size": 358936,
       "archs": [
         "sm_100a",
         "sm_103a"

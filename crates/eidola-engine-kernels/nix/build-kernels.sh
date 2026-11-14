@@ -77,6 +77,27 @@ compile_one() {
     echo "build-kernels: $name for $arch failed" >&2
     return 1
   }
+  # A source built without multiply-add contraction is also compiled to PTX,
+  # where a contraction is an `fma` instruction and a division is still one
+  # instruction: the SASS cannot tell the two apart.
+  if printf '%s\n' "${flags[@]}" | grep -qx -- '--fmad=false'; then
+    local ptx_flags=()
+    local flag
+    for flag in "${flags[@]}"; do
+      [[ $flag == -cubin ]] || ptx_flags+=("$flag")
+    done
+    (
+      cd "$SCRATCH_DIR"
+      nvcc "--compiler-bindir=$HOST_CC_BIN" "-arch=$arch" -ptx "${ptx_flags[@]}" \
+        -Xcicc --orig_src_path_name -Xcicc "$repo_csrc/$source" \
+        -I"$SCRATCH_DIR/csrc" "${includes[@]}" "${toolkit_includes[@]}" \
+        "csrc/$source" -o "$OUT/inspect/$name.$arch.ptx"
+    ) >"$SCRATCH_DIR/obj/$name.$arch.ptx.log" 2>&1 || {
+      cat "$SCRATCH_DIR/obj/$name.$arch.ptx.log" >&2
+      echo "build-kernels: PTX of $name for $arch failed" >&2
+      return 1
+    }
+  fi
 }
 export -f compile_one
 export spec repo_csrc SCRATCH_DIR OUT HOST_CC_BIN
@@ -152,6 +173,20 @@ mma_json() {
     awk '{ printf "{\"%s\": %d}\n", $2, $1 }' | jq -s 'add // {}'
 }
 
+# For a source built without contraction: the floating-point instructions of
+# its PTX that are fused (`fma`) or that ptxas may fuse (a multiply, add or
+# subtract with no rounding mode), and the fused multiply-adds of its SASS,
+# which are then all of division, reciprocal and square-root expansions.
+float_ops_json() {
+  local ptx=$1 sass=$2
+  jq -n \
+    --argjson ptx_fma "$(grep -cE '^[[:space:]]*fma\.' "$ptx" || true)" \
+    --argjson ptx_unrounded "$(grep -cE '^[[:space:]]*(mul|add|sub)\.(ftz\.)?(sat\.)?f(32|64)[[:space:]]' "$ptx" || true)" \
+    --argjson ptx_rounded "$(grep -cE '^[[:space:]]*(mul|add|sub)\.rn\.(ftz\.)?(sat\.)?f(32|64)[[:space:]]' "$ptx" || true)" \
+    --argjson sass_fma "$(grep -cE '^[[:space:]]+/\*[0-9a-f]+\*/[[:space:]]+(@!?U?P[0-9T]+[[:space:]]+)?[FD]FMA' "$sass" || true)" \
+    '{ptx_fma: $ptx_fma, ptx_unrounded: $ptx_unrounded, ptx_rounded: $ptx_rounded, sass_fma: $sass_fma}'
+}
+
 kernels_json="$SCRATCH_DIR/kernels.json"
 : >"$kernels_json"
 while IFS=$'\t' read -r name source profile arch; do
@@ -159,6 +194,10 @@ while IFS=$'\t' read -r name source profile arch; do
   cuobjdump -sass "$cubin" >"$OUT/inspect/$name.$arch.sass"
   cuobjdump -res-usage "$cubin" >"$OUT/inspect/$name.$arch.res-usage" 2>&1
   entries=$(entries_json "$cubin" "$name" "$arch")
+  float_ops=null
+  if [[ -f $OUT/inspect/$name.$arch.ptx ]]; then
+    float_ops=$(float_ops_json "$OUT/inspect/$name.$arch.ptx" "$OUT/inspect/$name.$arch.sass")
+  fi
   jq -n \
     --arg name "$name" --arg arch "$arch" --arg source "csrc/$source" --arg profile "$profile" \
     --arg file "cubin/$name.$arch.cubin" \
@@ -167,8 +206,10 @@ while IFS=$'\t' read -r name source profile arch; do
     --argjson entries "$entries" \
     --argjson meta "$(meta_json "$cubin")" \
     --argjson mma "$(mma_json "$cubin")" \
+    --argjson float_ops "$float_ops" \
     '{name: $name, arch: $arch, source: $source, profile: $profile, file: $file,
-      sha256: $sha256, size: $size, entries: $entries, meta: $meta, mma_sass: $mma}' \
+      sha256: $sha256, size: $size, entries: $entries, meta: $meta, mma_sass: $mma}
+     + (if $float_ops == null then {} else {float_ops: $float_ops} end)' \
     >>"$kernels_json"
 done <"$SCRATCH_DIR/jobs.tsv"
 
