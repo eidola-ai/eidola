@@ -2332,13 +2332,33 @@ fn a_sweep_does_not_claim_a_room_this_process_opened() {
         // The driver starts *after* the spawn, so the sweep's enumeration finds
         // this room. It is still this process's room, and the owner's turn is
         // still the thing being waited for.
+        //
+        // The registration alone says nothing: a walk registers before it asks
+        // whether the owner has answered, a sweep that will report against the
+        // anchor included. What says the sweep decided to wait is a second walk
+        // reaching the anchor window: walks of one room run one at a time, so
+        // the room asked again (lag recovery arms it as an ordinary signal)
+        // gets there only once the sweep's walk has ended, and only if that
+        // walk left the delegation outstanding — a reported room has nothing
+        // left to ask.
+        let mut window = core.test_open_anchor_window();
         core.start_subspace_driver();
-        // The sweep's walk ends in one of two places: registered against the
-        // parent, waiting, or reported. Wait for either; it must be the first.
-        wait_until(&core, || {
-            report(&core, &parent).is_some()
-                || core.test_rooms_awaiting(parent.clone()) == vec![out.space.id.clone()]
-        });
+        let next_walk = |window: &mut tokio::sync::mpsc::UnboundedReceiver<_>, what: &str| {
+            core.runtime()
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(60), window.recv()).await
+                })
+                .unwrap_or_else(|_| panic!("{what}"))
+                .expect("the window stays open")
+        };
+        let resume: tokio::sync::oneshot::Sender<()> =
+            next_walk(&mut window, "the sweep's walk reaches the anchor window");
+        resume.send(()).expect("the sweep's walk resumes");
+        core.runtime().block_on(core.test_recover_from_lag());
+        let resume: tokio::sync::oneshot::Sender<()> = next_walk(
+            &mut window,
+            "the sweep's walk ended with the delegation still outstanding",
+        );
         assert!(
             report(&core, &parent).is_none(),
             "the sweep armed it as an ordinary signal, so it holds out for the \
@@ -2349,6 +2369,9 @@ fn a_sweep_does_not_claim_a_room_this_process_opened() {
             vec![out.space.id.clone()],
             "and it is registered against its parent, waiting"
         );
+        // Every later walk goes straight through.
+        drop(window);
+        resume.send(()).expect("the second walk resumes");
 
         // The owner's turn lands, and the report goes where it always belonged.
         let answer = ask(&core, &parent, &owner, &asked);
