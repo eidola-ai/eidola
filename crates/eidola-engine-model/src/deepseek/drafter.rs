@@ -118,10 +118,9 @@ impl DsModel {
         token: u32,
     ) -> Result<DraftCore> {
         let c = self.config();
-        let spec = c
-            .drafter
-            .as_ref()
-            .ok_or_else(|| Error::Input("this model has no drafter".into()))?;
+        if c.drafter.is_none() {
+            return Err(Error::Input("this model has no drafter".into()));
+        }
         if state.positions == 0 {
             return Err(Error::Input(
                 "the drafter cannot draft from position 0".into(),
@@ -133,9 +132,54 @@ impl DsModel {
             )));
         }
         self.drafter_observe(state, main_hidden)?;
-        let w = self.weights.drafter.as_ref().unwrap();
         let p = state.positions - 1;
-        let (a, hd, slots) = (&c.attention, c.attention.head_dim, spec.slots);
+        let (window, hd) = (c.attention.window, c.attention.head_dim);
+        let context: Vec<Vec<&[f32]>> = state
+            .window
+            .iter()
+            .map(|ring| {
+                ring_order(p, window)
+                    .into_iter()
+                    .map(|pos| &ring[pos * hd..(pos + 1) * hd])
+                    .collect()
+            })
+            .collect();
+        self.drafter_slots(p, &context, token)
+    }
+
+    /// The draft pass itself, given each draft block's window KV: `context[b]`
+    /// lists block `b`'s KV of the main positions a pass at main position `p`
+    /// attends to, in [`ring_order`]. This is [`DsModel::drafter_forward`]
+    /// for a caller that keeps the window KV itself.
+    pub fn drafter_slots(
+        &self,
+        p: usize,
+        context: &[Vec<&[f32]>],
+        token: u32,
+    ) -> Result<DraftCore> {
+        let c = self.config();
+        let spec = c
+            .drafter
+            .as_ref()
+            .ok_or_else(|| Error::Input("this model has no drafter".into()))?;
+        let w = self
+            .weights
+            .drafter
+            .as_ref()
+            .ok_or_else(|| Error::Input("the drafter is not loaded".into()))?;
+        if token as usize >= c.vocab_size {
+            return Err(Error::Input(format!(
+                "token {token} is outside the vocabulary"
+            )));
+        }
+        if context.len() != w.blocks.len() {
+            return Err(Error::Input(format!(
+                "{} draft blocks' window KV given, the drafter has {}",
+                context.len(),
+                w.blocks.len()
+            )));
+        }
+        let slots = spec.slots;
         let rope = self.rope(RopeKind::Plain);
 
         let mut xs: Vec<Vec<f32>> = (0..slots)
@@ -145,7 +189,7 @@ impl DsModel {
             })
             .collect();
         let mut pres: Vec<Vec<f32>> = vec![mhc::identity_pre(c.hc_mult); slots];
-        for (block, ring) in w.blocks.iter().zip(&state.window) {
+        for (block, ring) in w.blocks.iter().zip(context) {
             let prepared: Vec<_> = (0..slots)
                 .into_par_iter()
                 .map(|i| {
@@ -159,10 +203,7 @@ impl DsModel {
                 .collect();
             // The window in ring-slot order, then every draft slot: each draft
             // position attends to all of them, later ones included.
-            let mut entries: Vec<Option<&[f32]>> = ring_order(p, a.window)
-                .into_iter()
-                .map(|pos| Some(&ring[pos * hd..(pos + 1) * hd]))
-                .collect();
+            let mut entries: Vec<Option<&[f32]>> = ring.iter().map(|kv| Some(*kv)).collect();
             entries.extend(prepared.iter().map(|t| Some(t.2.as_slice())));
             let attended: Vec<_> = (0..slots)
                 .into_par_iter()

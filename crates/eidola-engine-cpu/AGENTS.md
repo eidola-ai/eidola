@@ -1,6 +1,6 @@
 # eidola-engine-cpu
 
-The CPU reference executor for the MiMo-V2.6 engine: `CpuExecutor` implements the serving core's `Executor` (`eidola-engine`) with the model crate's f32 reference numerics (`eidola-engine-model`), over paged KV, with MTP drafting and sampling inside the step. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
+The CPU reference executors of the engine. `CpuExecutor` implements the serving core's `Executor` (`eidola-engine`) for MiMo-V2.6 with the model crate's f32 reference numerics (`eidola-engine-model`), over paged KV, with MTP drafting and sampling inside the step. `DsCpuExecutor` (`src/deepseek/`) does the same for DeepSeek-V4.1, with KV in the model's packed formats and the model split across two logical devices; it has its own section, [DeepSeek-V4.1](#deepseek-v41), and everything before that section is about MiMo's. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
 
 It is not a serving backend. It exists for two reasons:
 
@@ -168,3 +168,81 @@ Measured on a 16-core Apple-silicon machine (128 GB), release build:
 2. Run this crate's workloads with the faster executor in place of `CpuExecutor`. Compare each step's outputs and returned logits with `CpuExecutor` on the same inputs, or with `DenseOracle` directly.
 3. Where bit equality with this executor is impossible (lower precision, another quantization recipe), document the tolerance and why; greedy outputs must still match except at documented near-ties. Bit equality with *itself* is not optional: the seam's determinism contract (`eidola-engine/AGENTS.md`) holds a faster executor to batch invariance, exactly.
 4. Keep the zero-on-free observable: after maintenance, a freed block must hold no data from its previous owner, and a reset slot no per-sequence model state.
+
+## DeepSeek-V4.1
+
+`DsCpuExecutor` runs the window-chain model of `eidola-engine/AGENTS.md` (→ Window chain) on the model crate's DeepSeek-V4.1 kernels (`eidola-engine-model/AGENTS.md` → DeepSeek-V4.1). It reproduces the dense forward, every layer at every position, bit for bit, while computing the decoder only where each row's `chain_start` says.
+
+| Module | Contents |
+|---|---|
+| `deepseek/mod.rs` | `DsCpuExecutor`, `DsCpuExecutorConfig`, `DsRowRecord`: maintenance, the step's order, drafting, sampling. |
+| `deepseek/device.rs` | The two logical devices (`Encoder`, `Decoder`), what crosses between them (`ToEncoder`, `ToDecoder`, `StepTransfer`), the model's `Shape`. |
+| `deepseek/layer.rs` | One model layer over a set of positions with paged KV (`run_layer`), the packed cells, the pooled sources' open entries. |
+| `deepseek/packed.rs` | The packed forms: FP8 window KV, FP4 global KV, FP4 index keys. |
+| `deepseek/pool.rs`, `deepseek/memory.rs` | A group's blocks of packed cells with tags; one device's pools and block tables. |
+| `deepseek/oracle.rs` | `DsDenseOracle`, `ds_dense_generate`, `ds_check_generation`. |
+
+### Shape
+
+The executor splits the model before its first per-position KV source (layer 20 of the released model; `DsModel::check_split` must allow it) and panics at construction on a shape it does not run: the split layer gated or with an Engram module, encoder KV sources of different ratios, a decoder layer with an Engram module or reading an encoder bank, drafter target layers out of order. The KV groups it reports, in order:
+
+| Group | Attention | Ratio | Device | Coverage | Layers | A cell |
+|---|---|---|---|---|---|---|
+| `encoder-bank` | full | the pooling ratio (2) | 0 | all | one per pooled KV source (3) | a global entry |
+| `encoder-window` | sliding, the window | 1 | 0 | all | the layers before the split (20) | window KV |
+| `decoder-bank` | full | 1 | 1 | all | 1 | a global entry |
+| `decoder-window` | sliding, the window | 1 | 1 | chain | the layers from the split (20) | window KV |
+| `drafter` (with drafts) | sliding, the window + 1 | 1 | 1 | chain | the draft blocks (3) | window KV |
+
+The window chain is the decoder's layers; the token history is the Engram n-gram size less one (3).
+
+### Memory images
+
+A block holds `layers · block_size / ratio` **cells**, layer-major (`cell = layer · entries + entry`), each padded with zero bytes to a whole number of 32-bit words (no padding at the released sizes):
+
+- **Window KV** (`Fp8`): `head_dim` FP8 E4M3 codes, then one E8M0 scale per 32 elements: 528 bytes.
+- **A global entry**: the KV (`Fp4E4m3`: E2M1 codes, two per byte with element `2i` in the low nibble, then one FP8 E4M3 scale per 16 elements: 288 bytes), then the index key (`Fp4Pow2`: E2M1 codes the same way, then one E8M0 scale per 32: 68 bytes): 356 bytes.
+
+Packing quantises with the model crate's `act_quant`, `quant_fp4_e4m3` and `quant_fp4_pow2` and stores their codes and scales exactly; a read is `bf16(code · scale)`, which is what the model's in-place quantisers leave, signed zeros included (`packed_forms_round_trip_the_models_quantisers`). So a pool holds the bytes a device executor holds, and a value read from it is the dense forward's.
+
+Each cell has a tag: the position that completed the entry (plus one) and that position's token. A read checks it, so an unmapped block, a zeroed or encrypted one, another sequence's, or a chain layer that never computed that position panics.
+
+**A block's image** (what a zero clears, a copy or a host-tier transfer moves, and the idle cipher XORs) is two ranges, each from a fresh keystream block: the cells' bytes as little-endian words in cell order, then the tags (`pos + 1`, then the token, per cell). A device executor's image is the first range.
+
+### The device boundary
+
+Device 0 (`Encoder`) holds the embedding, the layers before the split with their two groups, the first Engram table, and the split layer's **bank stub**: its attention-input norm and hyper-connection collapse, its compressor and its index-key projection. Device 1 (`Decoder`) holds the layers from the split on with their three groups, the head, the drafter with the embedding rows it reads (the given token and the noise token), and every later Engram table (the released model's second table belongs to layer 14, an encoder layer, and sits on device 1 for memory fit). Each struct owns only its own pools and block tables and indexes only its own layers, so neither can read the other's memory. What one needs of the other is a typed value, built once per step:
+
+- **`ToEncoder`** (device 1 → 0): the rows gathered from the Engram tables device 1 holds, for every position of the step. The table never crosses; the token ids that address it reach both devices from the host, and the drafted ids from device 1.
+- **`ToDecoder`** (device 0 → 1): one **bank entry** for every position of the step, in its stored 356-byte form; and a **boundary row** (the residual copies and the collapse weights entering the split layer) for exactly the positions the chain's bottom layer computes, `x >= chain_start - (depth - 1)(window - 1)`. Where the drafter's context is written (`x >= chain_start`) and the model has drafter target layers before the split (the released model has none; the fixture has one), the row also carries the means entering those layers.
+
+`ToDecoder::check` panics unless the value is exactly that set, and `the_cross_device_transfer_is_exactly_the_declared_set` compares every step's `StepTransfer` with the set computed from the rows.
+
+### A step
+
+1. Maintenance in the order given, then table updates.
+2. **Drafting**, on device 1, before the forward: a row whose last host position is `p` reads each draft block's context KV at the positions before `p` (in the reference's ring order) and runs the draft pass with the token at `p` in slot 0 (`DsModel::drafter_slots`). Slot `i`'s logits are the pass's base logits plus the Markov term of the token before it in the chain (the token at `p`, then each draft), so the drafts are sampled left to right on the draft stream, and the distribution kept for acceptance is the conditional sampled from.
+3. **The encoder**, on device 0, over every position of the step (host tokens, then drafts), layer by layer: Engram, the layer's window KV written, a pooled source's entry written when its last position is computed, then attention and the feed-forward. Then the stub's bank entries.
+4. The crossing, checked.
+5. **The decoder**, on device 1: the bank entries stored, then each chain layer at the positions the row rule gives it (KV only where the next layer does not compute), the drafter's context KV written from the taps wherever the top layer computes (drafts included), and the head at each sampling row's last host position and at its drafts.
+6. Sampling and `chain_accept`, with `sampling.rs` semantics over the sampleable vocabulary.
+
+Within a layer every KV write of the step lands before any read. The attention list is the model crate's canonical one everywhere (the window right-aligned in `window` slots, then the selected global entries, ascending), which is why nothing depends on chunking.
+
+**Per-slot model state** is one thing: each pooled source's **open entry**, the f32 `(kv, gate score)` of the positions computed since an entry closed, kept for the last `ratio + draft width + 1` positions in fixed buffers so the entry open after any accepted length is still there; `ResetSlot` scrubs it. The drafter needs none: a draft pass reads only context KV and token ids, so there is no tap state and no boundary tap. Everything else (hidden states, selections, candidate blocks, logits, drafts) is step-local.
+
+### Drafter row layout
+
+A row at `p` is the reference's draft pass at main position `p - 1` given the token chosen for `p`: draft slot `i` stands at `p + i` and predicts `p + 1 + i`. The reference's own entry point refuses main position 0 (it only seeds the window there); the pass is the same function at that position, and a row at `p = 1` runs it (`the_oracle_drafts_as_the_reference_entry_point_does` holds the oracle's pass equal to the reference's entry point wherever that one drafts). The pass always computes every slot of the drafter (each slot attends to all of them); a narrower draft width uses the first `k`.
+
+### What is verified
+
+On the model crate's committed fixture (`eidola-engine-model/tests/fixtures/deepseek_tiny`: eight layers split four and four, window 48, both top-ks pruning, an attention list spanning two 64-slot blocks, two Engram layers with the second table on device 1, a three-block drafter of four slots with one target layer before the split; the head's last row is the image token, so 95 ids are sampleable). With drafts the chain's top layer starts 48 positions before a target and its bottom layer 189.
+
+`tests/ds_engine.rs` and `tests/ds_memory.rs` drive the real `Engine` and check every row of every step bit for bit against `DsDenseOracle` over the row's own tokens (rejected drafts included): the target logits it sampled or verified from, every draft slot's logits, every draft draw, the produced tokens; and every finished output against dense generation. Covered: chunked against unchunked prefill for prompts below, around and past the reach at chunks that cut triangles everywhere (and the chain's work equal across chunkings); a long prompt costing exactly one triangle; hits at regeneration, continuation and branch points, a short turn after a hit, a required prefix admitted and refused; a sequence cancelled mid-triangle retaining nothing; preemption and resume, mid-triangle too; shedding under KV pressure down to `KvExhausted`; greedy speculation equal to plain decoding at widths 0 to 4 across acceptance patterns from none to all (by narrowing the sampleable vocabulary and removing the drafter's Markov term); seeded sampling exact per step; a request's rows equal alone and beside others in another slot; the cross-device transfer; idle ciphertext for every group and a bit-exact hit after it; a recomputed block sealing to the same ciphertext in the three `All` groups and to another in the two chain-covered ones; the host tier round trip; and a randomized workload (host tier on odd seeds) with the engine's invariants, zero-on-free on real bytes and idle-ciphertext checks after every step. Both suites take under a minute together in the dev profile.
+
+**A window past one attention block** (`tests/ds_wide.rs`, `ds_common::wide`). The fixture's window of 48 fits one 64-slot block, where the place of an empty window slot and the order of a draft pass's context change no bit. The same weights under a window of 80 and a five-slot drafter (neither shapes a tensor; the top-k and candidate pool prune as before; the top layer now starts 80 positions before a target and the bottom one 317) make both observable: a query's list is 80 window slots and up to 24 global entries, a draft pass's is 80 context entries and its slots. Through the engine, every row against the oracle: chunked against unchunked prefill, a hit and a short turn after it, preemption mid-triangle, greedy drafting at widths 0 to 5 across acceptance patterns from none to all five, and batch invariance (10 s; a sweep of eleven chunk sizes from one token up is ignored, 20 s). The oracle here is the model crate's forward under the same configuration, which is verified against the reference only at the committed fixture's shape: this model checks the executor against the oracle, not the oracle against the reference.
+
+Each class was checked to fail under a deliberate bug: a chain layer starting one row late; the boundary row missing at the bottom layer's start; every boundary row crossing (caught only by the transfer test: the results are the same); `chain_start` ignored (every layer everywhere: caught by the chain's work, the transfer set and the retention tests, not by any logit); a global KV unpacked with its first scale; the attention list compacted (empty window slots dropped); the window left-aligned in its slots (no bit changes at the fixture's window of 48; five tests fail at 80); the open entry kept for two positions only; a reset leaving the open entry; the Engram lookback dropped; the drafter's context read in position order (one test fails at the fixture's window, where only the order of sums inside a block changes; six with the window of 80); the Markov term taken from the host token at every slot; no drafter context written at verified drafts; a zero leaving the bytes; encryption skipping the tags; a host-tier transfer dropping the tags; logits depending on the number of rows in the step; drafts sampled over the padded vocabulary; the split layer's bank entry rotated at the wrong position; a pooled entry rotated at its last position instead of its first; selection ignoring the candidate blocks.
+
+**The released checkpoint** (`released_encoder_layers_page_exactly`, ignored, `EIDOLA_DEEPSEEK_PREFIX_DIR`): whole layers 0-3 with every expert and the first Engram module. That truncation has no layer to split before, so the whole executor cannot run on it; device 0 can, and does: 555 positions in uneven chunks through pools at the released cell sizes (528 and 356 bytes), the state leaving layer 3 equal to the dense forward bit for bit (147 s in release, about 28 GB resident, mostly the mapped checkpoint).

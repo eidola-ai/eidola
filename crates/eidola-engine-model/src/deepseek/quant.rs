@@ -63,6 +63,47 @@ pub fn fake_quant_fp4_pow2(x: &mut [f32]) {
     }
 }
 
+/// FP4 quantisation with a power-of-two scale per 32 elements, as codes and
+/// scales: `codes[j]` is the E2M1 value of `x[j] / scale` and `scales` holds
+/// one power of two per block. `bf16(codes[j] · scale)` is what
+/// [`fake_quant_fp4_pow2`] leaves in place of `x[j]`; this is the form a
+/// packed index key is stored in.
+pub fn quant_fp4_pow2(x: &[f32], codes: &mut [f32], scales: &mut [f32]) {
+    assert!(x.len().is_multiple_of(32), "width {}", x.len());
+    assert_eq!(codes.len(), x.len());
+    assert_eq!(scales.len(), x.len() / 32);
+    for ((xb, cb), s) in x
+        .chunks_exact(32)
+        .zip(codes.chunks_exact_mut(32))
+        .zip(scales.iter_mut())
+    {
+        let floor = 6.0 * f32::from_bits(1 << 23);
+        *s = round_scale(amax(xb).max(floor), (1.0f64 / 6.0) as f32);
+        for (c, &v) in cb.iter_mut().zip(xb) {
+            *c = round_e2m1(v / *s);
+        }
+    }
+}
+
+/// FP4 quantisation with an E4M3 scale per 16 elements, as codes and scales:
+/// `bf16(codes[j] · scale)` is what [`fake_quant_fp4_e4m3`] leaves in place of
+/// `x[j]`; this is the form a packed global KV entry is stored in.
+pub fn quant_fp4_e4m3(x: &[f32], codes: &mut [f32], scales: &mut [f32]) {
+    assert!(x.len().is_multiple_of(16), "width {}", x.len());
+    assert_eq!(codes.len(), x.len());
+    assert_eq!(scales.len(), x.len() / 16);
+    for ((xb, cb), s) in x
+        .chunks_exact(16)
+        .zip(codes.chunks_exact_mut(16))
+        .zip(scales.iter_mut())
+    {
+        *s = round_e4m3(amax(xb).max(6.0 * 2f32.powi(-9)) / 6.0);
+        for (c, &v) in cb.iter_mut().zip(xb) {
+            *c = round_e2m1(v / *s);
+        }
+    }
+}
+
 /// Fake FP4 quantisation in place with an E4M3 scale per 16 elements
 /// (`e4m3(max(amax, 6·2^-9) / 6)`): the global KV. The scale is not a power
 /// of two, so `x / s` is a rounded division and `amax / s` can exceed 6, where
@@ -113,6 +154,50 @@ mod tests {
         let mut z = vec![0.0f32; 16];
         fake_quant_fp4_e4m3(&mut z);
         assert!(z.iter().all(|v| *v == 0.0));
+    }
+
+    /// The code-and-scale forms dequantise to exactly what the in-place
+    /// quantisers leave, signed zeros included, for every quantiser a KV is
+    /// stored through.
+    #[test]
+    fn codes_and_scales_dequantise_to_the_fake_quantised_values() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..400 {
+            let magnitude = [1e-9f32, 1e-3, 0.4, 3.0, 70.0, 900.0][case % 6];
+            let x: Vec<f32> = (0..64)
+                .map(|i| match (case + i) % 11 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    _ => ((next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * magnitude,
+                })
+                .collect();
+            let same = |codes: &[f32], scales: &[f32], per: usize, fake: &[f32]| {
+                for (j, (c, f)) in codes.iter().zip(fake).enumerate() {
+                    let v = bf16_round(c * scales[j / per]);
+                    assert_eq!(v.to_bits(), f.to_bits(), "case {case} element {j}");
+                }
+            };
+            let (mut codes, mut s8) = (vec![0.0; 64], vec![0.0; 2]);
+            act_quant(&x, &mut codes, &mut s8);
+            let mut fake = x.clone();
+            fake_quant_fp8(&mut fake);
+            same(&codes, &s8, 32, &fake);
+            quant_fp4_pow2(&x, &mut codes, &mut s8);
+            let mut fake = x.clone();
+            fake_quant_fp4_pow2(&mut fake);
+            same(&codes, &s8, 32, &fake);
+            let mut s16 = vec![0.0; 4];
+            quant_fp4_e4m3(&x, &mut codes, &mut s16);
+            let mut fake = x.clone();
+            fake_quant_fp4_e4m3(&mut fake);
+            same(&codes, &s16, 16, &fake);
+        }
     }
 
     #[test]
