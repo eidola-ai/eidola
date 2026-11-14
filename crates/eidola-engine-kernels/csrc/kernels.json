@@ -47,6 +47,10 @@
     { "name": "kv_cipher", "source": "kv_cipher.cu", "profile": "own" },
     { "name": "ds_probe", "source": "ds_probe.cu", "profile": "exact" },
     { "name": "ds_probe_nodiv", "source": "ds_probe_nodiv.cu", "profile": "exact" },
+    { "name": "ds_ops", "source": "ds_ops.cu", "profile": "exact" },
+    { "name": "ds_ops_div", "source": "ds_ops_div.cu", "profile": "exact" },
+    { "name": "ds_reference", "source": "ds_reference.cu", "profile": "exact" },
+    { "name": "ds_head", "source": "ds_head.cu", "profile": "exact" },
     { "name": "cutlass_fp8_blockwise_gemm", "source": "cutlass_fp8_blockwise_gemm.cu", "profile": "cutlass" },
     { "name": "cutlass_bf16_gemm", "source": "cutlass_bf16_gemm.cu", "profile": "cutlass" },
     {

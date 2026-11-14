@@ -771,7 +771,7 @@ struct DsPlaceParams {
   float* row_weight;
   // Out: `[groups]`.
   uint32_t* group_end;
-  // Per-block counts for a multi-block launch, or null.
+  // `[groups]`: each group's pair count, written by the count launch and read by the placement.
   uint32_t* scratch;
   uint32_t rows;
   uint32_t active;

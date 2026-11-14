@@ -358,3 +358,70 @@ fn no_third_party_sampling_kernels() {
         }
     }
 }
+
+/// The DeepSeek scalar kernels: the images that neither divide nor take a
+/// square root hold rounded operations and not one fused multiply-add in
+/// their SASS (`exact_profiles_fuse_no_multiply_add` holds every image's PTX);
+/// the image of the dividing kernels holds only its divisions' expansions.
+/// Each image has exactly its entries.
+#[test]
+fn ds_scalar_kernels_fuse_nothing() {
+    let manifest = Manifest::embedded();
+    let images: [(&str, bool, &[&str]); 4] = [
+        (
+            "ds_ops",
+            false,
+            &[
+                "eidola_ds_collapse",
+                "eidola_ds_combine",
+                "eidola_ds_embed",
+                "eidola_ds_engram_gather",
+                "eidola_ds_expand",
+                "eidola_ds_linear",
+                "eidola_ds_place",
+                "eidola_ds_place_count",
+                "eidola_ds_quant_fp8",
+                "eidola_ds_rot_quant",
+            ],
+        ),
+        (
+            "ds_ops_div",
+            true,
+            &[
+                "eidola_ds_engram_inject",
+                "eidola_ds_mhc_mix",
+                "eidola_ds_pool",
+                "eidola_ds_rms_norm",
+                "eidola_ds_rot_quant_e4m3",
+                "eidola_ds_route",
+                "eidola_ds_stream_mean",
+                "eidola_ds_swiglu",
+            ],
+        ),
+        (
+            "ds_reference",
+            false,
+            &[
+                "eidola_ds_grouped_dot",
+                "eidola_ds_reference_lin4",
+                "eidola_ds_reference_lin8",
+            ],
+        ),
+        ("ds_head", false, &["eidola_ds_head"]),
+    ];
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        for (name, divides, entries) in images {
+            let cubin = manifest
+                .cubin(name, arch)
+                .unwrap_or_else(|| panic!("no cubin {name} {arch}"));
+            assert_eq!(cubin.profile, "exact", "{name}");
+            let ops = cubin.float_ops.as_ref().expect("float_ops");
+            assert!(ops.ptx_rounded > 0, "{name} {arch}");
+            assert_eq!(ops.sass_fma > 0, divides, "{name} {arch}: {}", ops.sass_fma);
+            assert!(cubin.mma_sass.is_empty(), "{name} {arch}");
+            let mut symbols: Vec<&str> = cubin.entries.iter().map(|e| e.symbol.as_str()).collect();
+            symbols.sort_unstable();
+            assert_eq!(symbols, entries, "{name} {arch}");
+        }
+    }
+}
