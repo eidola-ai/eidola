@@ -635,7 +635,7 @@ pub struct PlaceParams {
     pub row_weight: u64,
     /// Out: `[groups]`.
     pub group_end: u64,
-    /// Per-block counts for a multi-block launch, or null.
+    /// `[groups]`: each group's pair count, written by the count launch and read by the placement.
     pub scratch: u64,
     pub rows: u32,
     pub active: u32,

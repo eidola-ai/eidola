@@ -3,3 +3,6 @@
 //! [`abi`] is the kernels' parameter structs.
 
 pub mod abi;
+pub mod gemm_ref;
+pub mod head;
+pub mod ops;
