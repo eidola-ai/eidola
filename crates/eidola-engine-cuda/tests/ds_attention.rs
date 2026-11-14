@@ -502,7 +502,7 @@ fn bench_launches_build_without_a_device() {
 /// Microseconds per query at the released shapes, at 1, 64 and 384 queries,
 /// for the library's group size and for the others.
 #[test]
-fn bench_on_the_device() {
+fn timings_on_the_device() {
     use eidola_engine_cuda::launch::dptr;
     let Some(su) = common::setup() else { return };
     let arch = su.archs[0];

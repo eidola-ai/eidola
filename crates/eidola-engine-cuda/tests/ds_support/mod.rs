@@ -205,6 +205,10 @@ impl Arena {
     }
 }
 
+/// Under `EIDOLA_DS_DIAG`, a job that differs prints every differing output (how many bytes,
+/// where, the first of them) and the run goes on to the other jobs before it fails.
+static DIAG_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Bytes a job must leave at an offset.
 pub struct Output {
     pub what: String,
@@ -246,6 +250,36 @@ impl Job {
     pub fn verify(&self, got: &[u8], run: &str) {
         assert_eq!(got.len(), self.arena.len(), "{} ({run})", self.label);
         let mut written = vec![false; got.len()];
+        if std::env::var_os("EIDOLA_DS_DIAG").is_some() {
+            let mut failed = false;
+            for o in &self.outputs {
+                let bad: Vec<usize> = (0..o.want.len())
+                    .filter(|i| got[o.at + i] != o.want[*i])
+                    .collect();
+                if !bad.is_empty() {
+                    failed = true;
+                    let lo = bad[0] - bad[0] % 16;
+                    let hi = (lo + 24).min(o.want.len());
+                    eprintln!(
+                        "DIAG {} ({run}): {}: {} of {} bytes differ, first {} last {} got {:02x?} want {:02x?}",
+                        self.label,
+                        o.what,
+                        bad.len(),
+                        o.want.len(),
+                        bad[0],
+                        bad[bad.len() - 1],
+                        &got[o.at + lo..o.at + hi],
+                        &o.want[lo..hi]
+                    );
+                }
+            }
+            if failed {
+                DIAG_FAILED.store(true, Ordering::Relaxed);
+            } else {
+                eprintln!("DIAG ok {} ({run})", self.label);
+            }
+            return;
+        }
         for o in &self.outputs {
             let range = o.at..o.at + o.want.len();
             if let Some(i) = (0..o.want.len()).find(|i| got[o.at + i] != o.want[*i]) {
@@ -464,6 +498,10 @@ pub fn run_on_device(gpu: &Gpu, ops: &Ops, jobs: &[Job]) {
         let got = s.clone_dtoh(&buffer).unwrap();
         job.verify(&got, &format!("device, {:?}", ops.arch));
     }
+    assert!(
+        !DIAG_FAILED.load(Ordering::Relaxed),
+        "jobs differed (listed above)"
+    );
 }
 
 // ---- timing ----

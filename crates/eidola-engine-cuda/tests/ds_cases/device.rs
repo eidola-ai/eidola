@@ -7,11 +7,11 @@ use cudarc::driver::CudaSlice;
 use eidola_engine_cuda::ds::abi::*;
 use eidola_engine_cuda::ds::gemm_ref::DsGemmRef;
 use eidola_engine_cuda::ds::head::DsHead;
-use eidola_engine_cuda::ds::ops::DsOps;
+use eidola_engine_cuda::ds::ops::{DsOps, layout_rows_bound};
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::{Gpu, ImageArch, ImageSource, KernelDir, KernelModule, Result};
 
-use super::{Buf, Case, EPS, SENTINEL_U32};
+use super::{Buf, Case, EPS, SENTINEL_F32, SENTINEL_U32};
 
 /// Every DeepSeek scalar kernel of one architecture's images.
 pub struct Kernels {
@@ -122,7 +122,16 @@ impl<'a> Prepared<'a> {
             outputs: case
                 .outputs
                 .iter()
-                .map(|o| (o.name, Dev::upload(gpu, &o.before)))
+                .map(|o| match (&o.before, Self::place_rows(case)) {
+                    // The layout rows the wrapper asks for, the rows past the case's own
+                    // unwritten like the rest.
+                    (Buf::F32(v), Some(rows)) if o.name == "row_weight" => {
+                        let mut padded = v.clone();
+                        padded.resize(rows as usize, SENTINEL_F32);
+                        (o.name, Dev::upload(gpu, &Buf::F32(padded)))
+                    }
+                    _ => (o.name, Dev::upload(gpu, &o.before)),
+                })
                 .collect(),
             // The placement's counts start as garbage.
             scratch: case
@@ -130,6 +139,18 @@ impl<'a> Prepared<'a> {
                 .get("groups")
                 .map(|groups| Dev::upload(gpu, &Buf::U32(vec![SENTINEL_U32; *groups as usize]))),
         }
+    }
+
+    /// The layout rows a `place` case is launched with: its own, or the most
+    /// its pairs could reach under any routing (`layout_rows_bound`, which the
+    /// wrapper requires because the routing is device data) when that is
+    /// more. The case's own count is exact for its routing.
+    fn place_rows(case: &Case) -> Option<u32> {
+        (case.kernel == "place").then(|| {
+            let pairs = u64::from(case.u("rows")) * u64::from(case.u("active"));
+            let bound = layout_rows_bound(pairs, case.u("groups"), case.u("row_align"));
+            case.u("layout_rows").max(u32::try_from(bound).unwrap())
+        })
     }
 
     fn find(&self, name: &str) -> Option<&Dev> {
@@ -148,7 +169,20 @@ impl<'a> Prepared<'a> {
                 if how.in_place && *name == "out" {
                     self.inputs["x"].download(gpu)
                 } else {
-                    dev.download(gpu)
+                    match (dev.download(gpu), Self::place_rows(self.case)) {
+                        (Buf::F32(mut v), Some(_)) if *name == "row_weight" => {
+                            let own = self.case.u("layout_rows") as usize;
+                            assert!(
+                                v[own..]
+                                    .iter()
+                                    .all(|x| x.to_bits() == SENTINEL_F32.to_bits()),
+                                "place wrote past the case's layout"
+                            );
+                            v.truncate(own);
+                            Buf::F32(v)
+                        }
+                        (b, _) => b,
+                    }
                 }
             })
             .collect()
@@ -395,7 +429,7 @@ impl<'a> Prepared<'a> {
                         active: u("active"),
                         groups: u("groups"),
                         row_align: u("row_align"),
-                        layout_rows: u("layout_rows"),
+                        layout_rows: Self::place_rows(c).unwrap(),
                         reserved: 0,
                     },
                 ),

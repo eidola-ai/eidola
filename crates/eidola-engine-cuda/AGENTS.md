@@ -61,7 +61,7 @@ It prints one line per check (`ok` or `FAILED` with the first differing element)
 - `DsIndex::select`: one block per row.
 - Host forms, for an executor's host mirror and the tests: `window_positions` / `window_slots`, `candidate_blocks`, `global_slots`, each the model crate's function (`ring_order`, `candidate_mask`, `top_k`) through a block table.
 
-**GPU validation of the DeepSeek attention, index and selection kernels** (with the kernel build of the committed manifest). One command, unattended, a few minutes; it prints one line per image and test, the bench table, and the paths of `ds_attention_bench.json` and `ds_index_bench.json` (in `EIDOLA_DS_BENCH_DIR`):
+**GPU validation of the DeepSeek attention, index and selection kernels** (with the kernel build of the committed manifest). One command, unattended, a few minutes; it prints one line per image and test, the bench table (`timings_on_the_device`, which runs after the correctness test so a fault in it cannot take the device from that test), and the paths of `ds_attention_bench.json` and `ds_index_bench.json` (in `EIDOLA_DS_BENCH_DIR`). With `EIDOLA_DS_DIAG=1` a job that differs prints every differing output (how many bytes, where, the first of them) and the run goes on through the other jobs before it fails, which is what locates a device-only fault:
 
 ```sh
 EIDOLA_ENGINE_KERNELS_DIR=<build output> EIDOLA_DS_BENCH_DIR=<dir> \
