@@ -218,16 +218,29 @@ pub struct DsForwardOutput {
     pub rows: Rows,
 }
 
+/// A global bank crossing the boundary, with the layer it belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundaryBank {
+    /// The KV-source layer (index in the layer table) whose bank this is:
+    /// always the first decoder layer.
+    pub layer: usize,
+    pub bank: GlobalBank,
+}
+
 /// The values that cross from the encoder half to the decoder half.
+///
+/// A split is supported only where no decoder layer reads a global bank an
+/// encoder layer built ([`DsModel::check_split`]), so the one bank that can
+/// cross is the first decoder layer's own, which the encoder computes from
+/// the rows it hands over.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Boundary {
     /// The streams and collapse weights entering the first decoder layer,
-    /// with the Engram rows and selections the decoder may still need.
+    /// with the Engram rows the decoder may still need.
     pub rows: Rows,
-    /// The first decoder layer's global bank over every position so far, when
-    /// that layer is a KV source: the encoder computes it from the rows it
-    /// hands over.
-    pub bank: Option<GlobalBank>,
+    /// The first decoder layer's global bank over every position so far;
+    /// present exactly when that layer is a KV source.
+    pub bank: Option<BoundaryBank>,
 }
 
 pub struct DsModel {
@@ -795,8 +808,36 @@ impl DsModel {
         self.forward_layers(state, rows, 0..self.config().layers.len(), opts)
     }
 
+    /// Whether the model can be split into layers `0..split` and `split..`.
+    ///
+    /// Both halves need a layer, and no decoder layer may read a global bank
+    /// that an encoder layer built: the boundary carries the first decoder
+    /// layer's own bank and nothing of the encoder's. In the released model
+    /// that allows a split before layers 1, 2, 8, 14 and 20.
+    pub fn check_split(&self, split: usize) -> Result<()> {
+        let layers = &self.config().layers;
+        if split == 0 || split >= layers.len() {
+            return Err(Error::Input(format!(
+                "split {split} leaves a half without layers"
+            )));
+        }
+        match layers[split..]
+            .iter()
+            .find(|l| l.kv_source.is_some_and(|src| src < split))
+        {
+            Some(l) => Err(Error::Input(format!(
+                "split {split} is not supported: layer {} reads the global KV of layer {}, which would be on the encoder side",
+                l.index,
+                l.kv_source.unwrap_or_default()
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// The encoder half: the embedding and layers `0..split`, plus the stub
-    /// that builds layer `split`'s global bank when it is a KV source.
+    /// that builds layer `split`'s global bank when it is a KV source. An
+    /// unsupported split ([`DsModel::check_split`]) is refused before the
+    /// state changes.
     pub fn encode(
         &self,
         state: &mut SequenceState,
@@ -804,23 +845,22 @@ impl DsModel {
         split: usize,
         opts: &DsForwardOptions,
     ) -> Result<Boundary> {
-        let c = self.config();
-        if split == 0 || split >= c.layers.len() {
-            return Err(Error::Input(format!(
-                "split {split} leaves a half without layers"
-            )));
-        }
+        self.check_split(split)?;
         let rows = self.embed(state, tokens)?;
         let rows = self.forward_layers(state, rows, 0..split, opts)?.rows;
-        let bank = match c.layers[split].is_kv_source {
-            true => Some(self.bank_stub(split, state, &rows)?),
+        let bank = match self.config().layers[split].is_kv_source {
+            true => Some(BoundaryBank {
+                layer: split,
+                bank: self.bank_stub(split, state, &rows)?,
+            }),
             false => None,
         };
         Ok(Boundary { rows, bank })
     }
 
     /// The decoder half: layers `split..` and the head, over the boundary's
-    /// rows. `state` is the decoder's own.
+    /// rows. `state` is the decoder's own. A boundary that does not fit the
+    /// split is refused before the state changes.
     pub fn decode(
         &self,
         state: &mut SequenceState,
@@ -828,8 +868,27 @@ impl DsModel {
         split: usize,
         opts: &DsForwardOptions,
     ) -> Result<DsForwardOutput> {
-        if let Some(bank) = &boundary.bank {
-            state.supply_bank(split, bank.clone());
+        self.check_split(split)?;
+        let source = self.config().layers[split].is_kv_source;
+        match &boundary.bank {
+            Some(b) if b.layer != split || !source => {
+                return Err(Error::Input(format!(
+                    "the boundary carries layer {}'s global KV; a split at {split} {}",
+                    b.layer,
+                    if source {
+                        "needs that layer's own"
+                    } else {
+                        "carries none"
+                    }
+                )));
+            }
+            None if source => {
+                return Err(Error::Input(format!(
+                    "the boundary carries no global KV; layer {split} needs its own from the encoder"
+                )));
+            }
+            Some(b) => state.supply_bank(split, b.bank.clone()),
+            None => {}
         }
         self.forward_layers(
             state,

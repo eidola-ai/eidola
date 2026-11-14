@@ -331,7 +331,8 @@ fn split_halves_equal_the_full_forward() {
             let boundary = model
                 .encode(&mut encoder, &tokens[at..at + len], split, &opts)
                 .unwrap();
-            assert_eq!(boundary.bank.as_ref().unwrap().entries, at + len);
+            let bank = boundary.bank.as_ref().unwrap();
+            assert_eq!((bank.layer, bank.bank.entries), (split, at + len));
             let out = model.decode(&mut decoder, &boundary, split, &opts).unwrap();
             logits.extend(out.logits.data);
             last_tap.extend(out.taps.last().unwrap().data.clone());
@@ -345,6 +346,89 @@ fn split_halves_equal_the_full_forward() {
             c.hc_mult * c.dim,
         );
     }
+}
+
+/// Every split point of the fixture either equals the full forward bit for
+/// bit, in one chunk and in uneven ones, or is refused by `encode` before the
+/// encoder state changes. A split is refused where a decoder layer would read
+/// a global bank an encoder layer built: the boundary carries only the first
+/// decoder layer's own bank.
+#[test]
+fn every_split_point_is_exact_or_refused_up_front() {
+    let golden = Golden::open();
+    let model = model(&golden);
+    let c = model.config();
+    let tokens = golden.tokens();
+    let opts = DsForwardOptions::default();
+    let full = model
+        .forward(&mut model.new_state(), &tokens, &opts)
+        .unwrap();
+    let mut supported = Vec::new();
+    for split in 0..=c.layers.len() {
+        let mut encoder = model.new_state();
+        if model.check_split(split).is_err() {
+            assert!(
+                model
+                    .encode(&mut encoder, &tokens[..7], split, &opts)
+                    .is_err(),
+                "split {split}"
+            );
+            // Nothing was consumed: the same state still runs the whole model.
+            assert_eq!(encoder.position(), 0, "split {split}");
+            let after = model.forward(&mut encoder, &tokens, &opts).unwrap();
+            assert_same(
+                &format!("state after refused split {split}"),
+                &after.logits.data,
+                &full.logits.data,
+                c.vocab_size,
+            );
+            continue;
+        }
+        supported.push(split);
+        for chunks in [vec![tokens.len()], vec![1, 2, 30, 1, 62]] {
+            let (mut encoder, mut decoder) = (model.new_state(), model.new_state());
+            let (mut logits, mut at) = (Vec::new(), 0);
+            for len in chunks {
+                let boundary = model
+                    .encode(&mut encoder, &tokens[at..at + len], split, &opts)
+                    .unwrap();
+                assert_eq!(
+                    boundary.bank.is_some(),
+                    c.layers[split].is_kv_source,
+                    "split {split}"
+                );
+                logits.extend(
+                    model
+                        .decode(&mut decoder, &boundary, split, &opts)
+                        .unwrap()
+                        .logits
+                        .data,
+                );
+                at += len;
+            }
+            assert_same(
+                &format!("split {split}"),
+                &logits,
+                &full.logits.data,
+                c.vocab_size,
+            );
+        }
+    }
+    // Before the window-only layer 1 and before each KV source (2 and 4).
+    assert_eq!(supported, [1, 2, 4]);
+
+    // A boundary made for one split is not accepted at another.
+    let at_two = model
+        .encode(&mut model.new_state(), &tokens[..9], 2, &opts)
+        .unwrap();
+    let at_one = model
+        .encode(&mut model.new_state(), &tokens[..9], 1, &opts)
+        .unwrap();
+    let mut decoder = model.new_state();
+    assert!(model.decode(&mut decoder, &at_two, 4, &opts).is_err());
+    assert!(model.decode(&mut decoder, &at_one, 2, &opts).is_err());
+    assert!(model.decode(&mut decoder, &at_two, 1, &opts).is_err());
+    assert!(model.decode(&mut decoder, &at_two, 2, &opts).is_ok());
 }
 
 /// A triangular replay: the last position's logits from the decoder layers
@@ -393,7 +477,7 @@ fn triangular_decoder_replay_equals_the_full_forward() {
         "the triangle must be narrower than the sequence"
     );
     let mut state = model.new_state();
-    state.supply_bank(split, boundary.bank.clone().unwrap());
+    state.supply_bank(split, boundary.bank.clone().unwrap().bank);
     let mut rows = boundary.rows.from_position(t - depth * (w - 1));
     for (j, layer) in (split..layers).enumerate() {
         let emit_from = t - (depth - 1 - j) * (w - 1);
@@ -423,7 +507,7 @@ fn triangular_decoder_replay_equals_the_full_forward() {
 
     // One row too few below a layer is refused, not answered with a shorter window.
     let mut state = model.new_state();
-    state.supply_bank(split, boundary.bank.clone().unwrap());
+    state.supply_bank(split, boundary.bank.clone().unwrap().bank);
     let short = boundary.rows.from_position(t - (w - 2));
     let err = model.layer_forward(
         split,
@@ -437,7 +521,7 @@ fn triangular_decoder_replay_equals_the_full_forward() {
     assert!(err.is_err());
     // With an explicit window start the same rows are a bounded replay.
     let mut state = model.new_state();
-    state.supply_bank(split, boundary.bank.clone().unwrap());
+    state.supply_bank(split, boundary.bank.clone().unwrap().bank);
     let bounded = model.layer_forward(
         split,
         &mut state,

@@ -31,8 +31,8 @@ use std::sync::Arc;
 
 pub use config::DsConfig;
 pub use forward::{
-    Boundary, DsForwardOptions, DsForwardOutput, DsModel, GlobalBank, LayerOptions, Rows,
-    SequenceState,
+    Boundary, BoundaryBank, DsForwardOptions, DsForwardOutput, DsModel, GlobalBank, LayerOptions,
+    Rows, SequenceState,
 };
 pub use weights::{DsLoadOptions, DsWeights};
 
