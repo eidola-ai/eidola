@@ -69,18 +69,63 @@ The two Engram tables (about 98 GB each) are not fetched. `real_golden.py` hashe
 
 `real_golden.py` tokenises a fixed passage of prose and code and writes `<dir>/golden/reference-pinned.safetensors`: the logits and every layer's streams for the passage as one prefill chunk, then a one-window prefill followed by one token per call with the drafter. With `--native-arithmetic` it writes `reference-native.safetensors` from the same model with PyTorch's own arithmetic and `topk`: the reference with its unspecified bits left to the library, which nothing bit-unequal to it reproduces. The Rust test reports that comparison and does not assert it (`AGENTS.md` → What is verified against what).
 
-## The real kernels (GPU, one command)
+## Whole early layers (local, not CI)
 
-The emulation's distance from the reference's real kernels is measured, not assumed. On a CUDA machine with tilelang 0.1.12:
+The 12-layer truncation above is not a stable function of the bits the reference leaves unspecified (`AGENTS.md` → What is verified against what), and it cannot say whether that is the model or the truncation: it skips most layers and routes among 32 of 384 experts. The `prefix` truncation is the model's first four layers whole, every routed expert, so the residual streams after each layer are the full model's, and so is their sensitivity.
 
 ```sh
-uv run --no-project --with torch --with tilelang==0.1.12 --with numpy --with sympy --with tokenizers \
-    python compare_real_kernels.py --reference-dir <dir> --json real-kernels.json
+uv run python fetch_truncated.py --dir <prefix dir> --truncation prefix --reuse <checkpoint dir>   # about 32 GB
+uv run python real_golden.py --dir <prefix dir> --reference-dir <dir> --truncation prefix --rows-from <checkpoint dir>
+uv run python real_golden.py --dir <prefix dir> --reference-dir <dir> --truncation prefix --native-arithmetic
+cd ../../../.. && EIDOLA_DEEPSEEK_PREFIX_DIR=<prefix dir> \
+    cargo test --release -p eidola-engine-model --test deepseek_real_prefix -- --ignored --nocapture
 ```
 
-- **Input:** the committed synthetic fixture (`--fixture` to point elsewhere) and the reference directory, which here must also hold the upstream `kernel.py`.
-- **What runs:** the reference model on the GPU with its real kernels. Every kernel call is also given to the emulation on the same inputs.
-- **Output:** per kernel, the number of calls, elements, elements that differ and the largest difference; end to end, top-1 agreement, KL and the per-layer stream differences against the committed goldens, for the decode and the prefill pattern. `--json` writes the same numbers.
-- **Variants:** by default PyTorch's arithmetic and `topk` are the GPU's own (the released code as it runs). `--pinned` pins them as the goldens do, so that only the kernels differ.
+`--reuse` copies the tensors another fetched truncation already holds instead of fetching them again, and `--rows-from` does the same for Engram rows. Four layers have no meaningful logits, so the goldens are every layer's streams and every token's routed experts for the whole passage (555 tokens) as one prefill chunk, plus the first 96 tokens one per call. The test equals the pinned golden exactly and prints, per layer, the relative error, the largest difference, the share of elements and positions that differ and the share of tokens whose routed experts are the same, for every other `golden/reference-*.safetensors` present and for the reference's prefill layout against its decode layout.
 
-`--kernels shim --device cpu` runs the script against the emulation itself, where every difference is zero: that is how the script is checked without a GPU. It has not been run against the real kernels.
+## The GPU session
+
+`gpu_session.sh` is the whole session on a rented Linux machine with one NVIDIA GPU: it installs what it needs, runs the real kernels, and leaves every result in one directory. It has **not been run**: nothing here has a CUDA device. Its step runner (skip a finished step, stop loudly on a failure) and both Python entry points were exercised on a CPU against the emulation.
+
+On a fresh Ubuntu 24.04 machine with the NVIDIA driver and CUDA installed (root is not needed beyond `apt-get install -y git curl build-essential`):
+
+```sh
+git clone <this repository> eidola && cd eidola/crates/eidola-engine-model/golden/deepseek_v41
+./gpu_session.sh all          # setup, probes, fixture, fetch, real, summary
+./gpu_session.sh rust         # optional: our forward against the goldens, on that machine
+```
+
+or one step at a time, in this order:
+
+| Step | What it does | Wall-clock (estimate) |
+|---|---|---|
+| `setup` | Installs uv, a Python 3.12 venv with torch (CUDA wheels from `TORCH_INDEX`), tilelang 0.1.12, numpy, sympy, tokenizers; fetches the reference's `model.py`, `engram.py`, `kernel.py` at the pinned revision; checks that PyTorch sees the GPU and can hold the FP8 / FP4 dtypes on it | 5–10 min |
+| `probes` | `gpu_probes.py`: the open numerics questions, on the real kernels (below) | 2–5 min (kernel JIT) |
+| `fixture` | `compare_real_kernels.py` on the committed fixture, with the GPU's own arithmetic and with ours pinned: per-kernel real-against-emulation differences, and end to end against the committed goldens | 5–15 min each of two |
+| `fetch` | Both truncations by range reads into `SPREAD_DIR` and `PREFIX_DIR` (skipped per shard when present) | 10–20 min for 46 GB on a datacentre link |
+| `real` | The reference with its real kernels over both truncations, unpinned (exactly what the released code computes on a GPU) and pinned, writing `reference-gpu-native.safetensors` and `reference-gpu-pinned.safetensors` | unpinned: 2–5 min each; pinned: 15–40 min each (the pinned arithmetic is Python loops) |
+| `summary` | `summary.txt` from the logs | seconds |
+| `rust` | Installs the Rust toolchain of `rust-toolchain.toml` and runs both ignored tests there | 5–10 min install and build, then about 5 and 2 min on 24 vCPUs |
+
+**Engram rows are the one slow part, and are avoidable.** A run needs two small range reads per table row, the host rate-limits them (about 25 minutes per 12,000 requests from here), and the two truncations need about 24,000 and 12,000 requests. Upload `<dir>/golden/engram-rows.safetensors` of each truncation from a machine that has them into `$SPREAD_DIR/golden/` and `$PREFIX_DIR/golden/` before `real`, and none are fetched. The whole pre-fetched directories can be uploaded the same way (`SPREAD_DIR=… PREFIX_DIR=…`), which skips `fetch` too. With the rows uploaded the session is about 1½–2½ hours; the estimates above are guesses until it has been run once, and `real`'s pinned half is the least certain. Everything is resumable: a step that finished leaves `$OUT/done/<step>` and is skipped on a rerun, and the fetches resume by shard and by row.
+
+Results, all under `$OUT` (default `~/eidola-gpu/out`):
+
+- `probes.json`, `fixture-native.json`, `fixture-pinned.json`;
+- `goldens/spread/` and `goldens/prefix/`: `reference-gpu-native.safetensors`, `reference-gpu-pinned.safetensors` and the `engram-rows.safetensors` they were made with;
+- `logs/<step>.log` and `summary.txt`.
+
+`TORCH_INDEX` defaults to PyTorch's CUDA 13 wheel index and `TORCH_VERSION` to 2.10.0; set them if the machine's driver needs another build. `setup` fails if PyTorch does not see the GPU.
+
+### What the probes answer
+
+`gpu_probes.py` runs the real kernels on inputs built to decide what their source leaves open, and records what they did beside what the emulation does:
+
+- **float → FP8 cast**: all 252 exact ties between adjacent E4M3 codes (both signs), through the in-place path and the code path. Ours: ties to the even code.
+- **float → FP4 cast**: all 14 exact ties, with the power-of-two scale and with the E4M3 scale; the E4M3 scale's own rounding when `amax / 6` is an exact tie; and saturation when `amax / scale` exceeds 6.
+- **`torch.topk` on CUDA over equal BF16 scores**: whether the lowest indices, the highest, or neither win among the entries tied at the threshold, and whether it is repeatable. Ours: lower index first.
+- **`sparse_attn` and block layout**: the same entries in the reference's decode layout, its prefill layout, packed, and with empty slots moved without changing any 64-slot block. The emulation says the first three differ from each other and the last equals the decode layout.
+
+### Comparing the GPU-made goldens with our forward
+
+Copy `goldens/spread/reference-gpu-*.safetensors` into `<12-layer dir>/golden/` and `goldens/prefix/reference-gpu-*.safetensors` into `<prefix dir>/golden/` on a machine that has those directories (the GPU machine itself, with `./gpu_session.sh rust`, or this one), and run the two ignored tests as above. Each test compares every `golden/reference-*.safetensors` it finds: `reference-pinned` is asserted exact, and the others (`native`, `gpu-native`, `gpu-pinned`) are printed. `reference-gpu-pinned` is the one to read first: the real kernels under our arithmetic, so every difference in it is a kernel difference. Measured on a 16-core Apple-silicon Mac after the build: about 3 minutes (`deepseek_real`, three forwards of 256 tokens over 12 layers) and about 70 seconds (`deepseek_real_prefix`, two forwards of 555 tokens over 4 layers), with under 40 GB of memory. On 24 x86 vCPUs expect the same order, perhaps twice as long. The 12-layer goldens must be made with the same `--tokens` as the pinned one they sit beside (256, the script's default).

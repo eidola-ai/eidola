@@ -33,6 +33,7 @@ import importlib.util
 import json
 import math
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -41,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch  # noqa: E402
 
 from ds_golden import kernel_shim, pinned_ops, st, synthetic  # noqa: E402
-from ds_golden.reference import Reference, args_from_hf_config, load_reference_modules, place_weights  # noqa: E402
+from ds_golden.reference import Reference, args_from_hf_config, load_reference_modules  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "deepseek_tiny"
 KERNELS = ("act_quant", "fp4_act_quant", "fp4_gemm", "fp8_gemm", "hc_split_sinkhorn", "sparse_attn")
@@ -129,19 +130,13 @@ def main() -> None:
     config = json.loads((opts.fixture / "config.json").read_text())
     golden = {k: v.tensor() for k, v in st.read_file(opts.fixture / "golden.safetensors").items()}
     tokens = golden["tokens"].tolist()
-    torch.set_default_device(opts.device)
     tokenizer = synthetic.SyntheticTokenizer(config["text_config"]["vocab_size"])
-    reference = Reference(module, args_from_hf_config(config), tokenizer, max_seq_len=128)
-    place_weights(reference.model, st.read_file(opts.fixture / "model.safetensors"))
-    for p in reference.model.parameters():
-        scale = getattr(p, "scale", None)
-        p.data = p.data.to(opts.device)
-        if scale is not None:
-            p.scale = scale
-    reference.model.to(opts.device)
+    reference = Reference(module, args_from_hf_config(config), tokenizer, max_seq_len=128, device=opts.device)
+    reference.place(st.read_file(opts.fixture / "model.safetensors"))
 
     report = {"kernels": stats, "end_to_end": {}}
     for pattern, prefill in (("step", 1), ("prefill", len(tokens))):
+        print(f"{time.strftime('%H:%M:%S')} running the {pattern} pattern", flush=True)
         out = {k: v.cpu() for k, v in reference.run(tokens, prefill=prefill).items()}
         entry = {"logits": agreement(golden[f"{pattern}.logits"], out["logits"].float())}
         for i in range(config["text_config"]["num_hidden_layers"]):

@@ -158,24 +158,38 @@ class Reference:
     """One reference model, driven the way the released `generate.py` drives it:
     one prefill chunk at position 0, then one token per call."""
 
-    def __init__(self, module, args: dict, tokenizer, max_seq_len: int):
+    def __init__(self, module, args: dict, tokenizer, max_seq_len: int, device: str = "cpu"):
         torch.set_default_dtype(torch.bfloat16)
+        torch.set_default_device(device)
+        self.device = device
         self.module = module
         self.args = self.module.ModelArgs(**{**args, "max_batch_size": 1, "max_seq_len": max_seq_len, "temperature": 0.0})
         self.model = self.module.Transformer(self.args, tokenizer)
         self.records: dict[str, list[torch.Tensor]] = collections.defaultdict(list)
         for i, layer in enumerate(self.model.layers):
-            layer.register_forward_hook(lambda _m, _i, out, i=i: self.records[f"layer.{i}"].append(out[0][0].clone()))
-            layer.attn.register_forward_hook(lambda _m, _i, out, i=i: self.records[f"attn.{i}"].append(out[0].clone()))
-            layer.ffn.register_forward_hook(lambda _m, _i, out, i=i: self.records[f"ffn.{i}"].append(out[0].clone()))
-        self.model.norm.register_forward_hook(lambda _m, _i, out: self.records["normed"].append(out[0].clone()))
+            layer.register_forward_hook(lambda _m, _i, out, i=i: self.records[f"layer.{i}"].append(out[0][0].cpu().clone()))
+            layer.attn.register_forward_hook(lambda _m, _i, out, i=i: self.records[f"attn.{i}"].append(out[0].cpu().clone()))
+            layer.ffn.register_forward_hook(lambda _m, _i, out, i=i: self.records[f"ffn.{i}"].append(out[0].cpu().clone()))
+            # The routed experts of every token, as an ascending set.
+            layer.ffn.gate.register_forward_hook(
+                lambda _m, _i, out, i=i: self.records[f"route.{i}"].append(out[1].cpu().sort(dim=-1).values.to(torch.int32))
+            )
+        self.model.norm.register_forward_hook(lambda _m, _i, out: self.records["normed"].append(out[0].cpu().clone()))
         if self.model.engram_hash is not None:
-            self.model.engram_hash.register_forward_hook(lambda _m, _i, out: self.records["engram_rows"].append(out[0].clone()))
+            self.model.engram_hash.register_forward_hook(lambda _m, _i, out: self.records["engram_rows"].append(out[0].cpu().clone()))
+
+    def place(self, ckpt, **kwargs):
+        """`place_weights`, then every parameter moved to the model's device."""
+        used = place_weights(self.model, ckpt, **kwargs)
+        if self.device != "cpu":
+            for param in self.model.parameters():
+                param.data = param.data.to(self.device)
+        return used
 
     def token_map(self) -> torch.Tensor:
         return self.model.engram_hash.token_map.to(torch.int32)
 
-    def run(self, tokens: list[int], prefill: int, drafter: bool = False) -> dict[str, torch.Tensor]:
+    def run(self, tokens: list[int], prefill: int, drafter: bool = False, logits: bool = True) -> dict[str, torch.Tensor]:
         """Feed `tokens[:prefill]` as one chunk, then the rest one at a time.
 
         Returns per-position tensors: `layer.{i}` (the residual streams after
@@ -184,30 +198,31 @@ class Reference:
         greedy chain at every position from 1 on: at position p the drafter is
         given the token at p + 1 (the first token again at the last position)."""
         self.records.clear()
-        ids = torch.tensor([tokens], dtype=torch.long)
+        ids = torch.tensor([tokens], dtype=torch.long, device=self.device)
         n = len(tokens)
         main_hidden, drafts = [], collections.defaultdict(list)
         steps = [(0, prefill)] + [(p, p + 1) for p in range(prefill, n)]
         for start, end in steps:
             _, _, hidden = self.model.forward(ids[:, start:end], start)
             if hidden is not None:
-                main_hidden.append(hidden[0].clone())
+                main_hidden.append(hidden[0].cpu().clone())
             if drafter:
                 assert end - start == 1 or start == 0
-                given = torch.tensor([tokens[end % n]], dtype=torch.long)
+                given = torch.tensor([tokens[end % n]], dtype=torch.long, device=self.device)
                 result = self.model.forward_spec(given, hidden, start)
                 if result is not None:
-                    out_ids, logits, confidence = result
-                    drafts["draft_tokens"].append(out_ids[0, 1:].to(torch.int32))
-                    drafts["draft_logits"].append(logits[0].float())
-                    drafts["draft_confidence"].append(confidence[0].float())
+                    out_ids, draft_logits, confidence = result
+                    drafts["draft_tokens"].append(out_ids[0, 1:].cpu().to(torch.int32))
+                    drafts["draft_logits"].append(draft_logits[0].cpu().float())
+                    drafts["draft_confidence"].append(confidence[0].cpu().float())
         out = {k: torch.cat(v, dim=0) for k, v in self.records.items()}
         if main_hidden:
             out["main_hidden"] = torch.cat(main_hidden, dim=0)
-        head = self.model.head.weight
-        # One row at a time, so a position's logits are the same function of its
-        # normed state whichever call pattern produced it.
-        out["logits"] = torch.stack([F.linear(row.float(), head) for row in out["normed"]])
+        if logits:
+            head = self.model.head.weight
+            # One row at a time, so a position's logits are the same function of
+            # its normed state whichever call pattern produced it.
+            out["logits"] = torch.stack([F.linear(row.to(head.device).float(), head).cpu() for row in out["normed"]])
         out.update({k: torch.stack(v) for k, v in drafts.items()})
         return out
 
