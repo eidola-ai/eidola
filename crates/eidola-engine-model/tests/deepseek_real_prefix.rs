@@ -11,9 +11,10 @@
 //! our forward and with each other. `reference-pinned` must be equalled
 //! exactly; the others are reported. Without it nothing is asserted.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod deepseek_upstream;
 
 use eidola_engine_model::WeightSet;
 use eidola_engine_model::deepseek::engram::{EngramTable, SparseEngramTable};
@@ -117,11 +118,7 @@ fn whole_early_layers_match_the_reference_and_measure_its_sensitivity() {
             .expect("EIDOLA_DEEPSEEK_PREFIX_DIR names the fetched checkpoint"),
     );
     let store = Arc::new(WeightSet::open_dir(&dir).unwrap());
-    let manifest: BTreeMap<String, String> =
-        serde_json::from_slice(&std::fs::read(dir.join("local-sha256.json")).unwrap()).unwrap();
-    store
-        .verify_sha256(&manifest)
-        .expect("fetched files match their manifest");
+    deepseek_upstream::verify(&store, &dir, Some("prefix"));
 
     let mut goldens: Vec<PathBuf> = std::fs::read_dir(dir.join("golden"))
         .expect("the checkpoint directory has a golden/ directory")

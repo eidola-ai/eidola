@@ -5,9 +5,10 @@
 //!     EIDOLA_DEEPSEEK_TRUNCATED_DIR=<dir> cargo test --release -p eidola-engine-model \
 //!         --test deepseek_real -- --ignored --nocapture
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod deepseek_upstream;
 
 use eidola_engine_model::WeightSet;
 use eidola_engine_model::compare::compare_logits;
@@ -67,11 +68,7 @@ fn truncated_real_checkpoint_matches_the_reference() {
             .expect("EIDOLA_DEEPSEEK_TRUNCATED_DIR names the fetched checkpoint"),
     );
     let store = Arc::new(WeightSet::open_dir(&dir).unwrap());
-    let manifest: BTreeMap<String, String> =
-        serde_json::from_slice(&std::fs::read(dir.join("local-sha256.json")).unwrap()).unwrap();
-    store
-        .verify_sha256(&manifest)
-        .expect("fetched files match their manifest");
+    deepseek_upstream::verify(&store, &dir, Some("spread"));
 
     // Every golden holds the tokens and the Engram map it was made with.
     let goldens = goldens(&dir);
