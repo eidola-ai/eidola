@@ -11,11 +11,10 @@
 //! DeepSeek fixture (`tests/fixtures/deepseek_tiny`): its four vocabulary-shaped tensors
 //! (the embedding, the head, and the drafter's Markov embedding and head) widened from 96
 //! rows to the real tokenizer's 129,280; `config.json` with that vocabulary and the real
-//! image token id (129,264); the Engram compressed-vocabulary map the reference would
-//! derive from the tokenizer written beside the weights as `engram.token_map` (the
-//! fixture's 96 entries, then deterministic ids in the fixture's compressed vocabulary);
-//! and the chat crate's pinned DeepSeek-V4.1 `tokenizer.json`. Every other tensor is the
-//! fixture's, byte for byte.
+//! image token id (129,264), and the Engram compressed vocabulary of 99,092 classes the
+//! node derives from that tokenizer; and the chat crate's pinned DeepSeek-V4.1
+//! `tokenizer.json`. Like the released checkpoint, its shards carry no Engram map. Every
+//! other tensor is the fixture's, byte for byte.
 //!
 //! The output is gibberish (random weights); tests assert structure and token-level
 //! equality, never semantics.
@@ -44,6 +43,9 @@ const GENERATOR_VERSION: &str = "eidola-server-engine dev model v1";
 /// Rows of the DeepSeek-V4.1 dev model's widened head: the released vocabulary.
 pub const DEEPSEEK_VOCAB: usize = 129_280;
 
+/// Classes of the Engram compressed vocabulary the pinned tokenizer derives.
+pub const DEEPSEEK_COMPRESSED_VOCAB: usize = 99_092;
+
 /// The released checkpoint's image token, which the text model never embeds.
 pub const DEEPSEEK_IMAGE_TOKEN: u32 = 129_264;
 
@@ -65,7 +67,6 @@ fn deepseek_input_files() -> Vec<PathBuf> {
     vec![
         tiny.join("config.json"),
         tiny.join("model.safetensors"),
-        tiny.join("golden.safetensors"),
         chat.join("tokenizer.json.gz"),
     ]
 }
@@ -172,7 +173,7 @@ pub fn write_dev_model(out: &Path) -> std::io::Result<()> {
     std::fs::write(out.join("config.json"), serde_json::to_vec_pretty(&config)?)?;
 
     // model.safetensors: every tensor copied, the two vocabulary matrices widened.
-    let file = widened_safetensors(&tiny.join("model.safetensors"), &WIDENED, WIDE_VOCAB, &[])?;
+    let file = widened_safetensors(&tiny.join("model.safetensors"), &WIDENED, WIDE_VOCAB)?;
     std::fs::write(out.join("model.safetensors"), file)?;
 
     // The pinned chat artifacts.
@@ -196,38 +197,13 @@ pub fn write_deepseek_dev_model(out: &Path) -> std::io::Result<()> {
         serde_json::from_slice(&std::fs::read(tiny.join("config.json"))?)?;
     config["text_config"]["vocab_size"] = DEEPSEEK_VOCAB.into();
     config["image_token_id"] = DEEPSEEK_IMAGE_TOKEN.into();
+    config["text_config"]["engram_compressed_vocab_size"] = DEEPSEEK_COMPRESSED_VOCAB.into();
     std::fs::write(out.join("config.json"), serde_json::to_vec_pretty(&config)?)?;
 
-    // The fixture's compressed-vocabulary map, extended over the wide vocabulary inside
-    // the fixture's compressed vocabulary.
-    let golden = std::fs::read(tiny.join("golden.safetensors"))?;
-    let (header, data) = split_safetensors(&golden)?;
-    let entry = &header["engram.token_map"];
-    assert_eq!(entry["dtype"], "I32");
-    let (start, end) = offsets(entry);
-    let mut map: Vec<i32> = data[start..end]
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| i32::from_le_bytes(*b))
-        .collect();
-    let size = map.iter().copied().max().unwrap() + 1;
-    let mut rng = SplitMix(0xE1D0_DEE5);
-    while map.len() < DEEPSEEK_VOCAB {
-        map.push((rng.next() % size as u64) as i32);
-    }
-    let map_bytes: Vec<u8> = map.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let extra = [(
-        "engram.token_map",
-        "I32",
-        vec![DEEPSEEK_VOCAB as u64],
-        map_bytes,
-    )];
     let file = widened_safetensors(
         &tiny.join("model.safetensors"),
         &DEEPSEEK_WIDENED,
         DEEPSEEK_VOCAB,
-        &extra,
     )?;
     std::fs::write(out.join("model.safetensors"), file)?;
 
@@ -238,32 +214,10 @@ pub fn write_deepseek_dev_model(out: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-type Header = serde_json::Map<String, serde_json::Value>;
-
-fn split_safetensors(bytes: &[u8]) -> std::io::Result<(Header, &[u8])> {
-    let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-    let header: Header = serde_json::from_slice(&bytes[8..8 + header_len])?;
-    Ok((header, &bytes[8 + header_len..]))
-}
-
-fn offsets(entry: &serde_json::Value) -> (usize, usize) {
-    let o = entry["data_offsets"].as_array().unwrap();
-    (
-        o[0].as_u64().unwrap() as usize,
-        o[1].as_u64().unwrap() as usize,
-    )
-}
-
 /// The safetensors file at `path` with the BF16 matrices named in `widened` grown to
 /// `rows` rows (the original rows first, then deterministic random rows at the scale of
-/// the original), every other tensor copied, and `extra` tensors (name, dtype, shape,
-/// bytes) added.
-fn widened_safetensors(
-    path: &Path,
-    widened: &[&str],
-    rows_to: usize,
-    extra: &[(&str, &str, Vec<u64>, Vec<u8>)],
-) -> std::io::Result<Vec<u8>> {
+/// the original), every other tensor copied.
+fn widened_safetensors(path: &Path, widened: &[&str], rows_to: usize) -> std::io::Result<Vec<u8>> {
     let bytes = std::fs::read(path)?;
     let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
     let header: serde_json::Map<String, serde_json::Value> =
@@ -313,18 +267,6 @@ fn widened_safetensors(
             name.clone(),
             serde_json::json!({
                 "dtype": entry["dtype"],
-                "shape": shape,
-                "data_offsets": [begin, new_data.len()],
-            }),
-        );
-    }
-    for (name, dtype, shape, tensor) in extra {
-        let begin = new_data.len();
-        new_data.extend_from_slice(tensor);
-        new_header.insert(
-            name.to_string(),
-            serde_json::json!({
-                "dtype": dtype,
                 "shape": shape,
                 "data_offsets": [begin, new_data.len()],
             }),

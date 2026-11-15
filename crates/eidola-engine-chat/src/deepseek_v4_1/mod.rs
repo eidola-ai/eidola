@@ -14,13 +14,18 @@
 //!    makes an [`OutputParser`](crate::OutputParser) split the generated text
 //!    into reasoning, content and DSML tool calls ([`output`]).
 //!
+//! [`engram::compressed_vocab`] derives the Engram compressed-vocabulary map
+//! the model's Engram layers hash over from the tokenizer.
+//!
 //! Images are not served: a request carrying an image part is refused with
 //! [`ChatError::UnsupportedContent`](crate::ChatError::UnsupportedContent).
 
 pub mod encoding;
+pub mod engram;
 pub mod output;
 
 pub use encoding::{EncodeOptions, ReasoningEffort, encode, tool_schemas};
+pub use engram::{CompressedVocab, compressed_vocab};
 
 /// Starts every prompt.
 pub const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";

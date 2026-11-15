@@ -1,0 +1,42 @@
+[
+  {
+    "name": "plain",
+    "check_width0": true,
+    "messages": [
+      {"role": "user", "content": "What is the capital of Australia? Answer in one sentence."}
+    ]
+  },
+  {
+    "name": "reasoning",
+    "check_width0": true,
+    "messages": [
+      {"role": "user", "content": "A train leaves at 9:40 and arrives at 11:15. How many minutes does the trip take?"}
+    ]
+  },
+  {
+    "name": "code",
+    "messages": [
+      {"role": "user", "content": "Write a Rust function that returns the reverse of a string slice."}
+    ]
+  },
+  {
+    "name": "tool",
+    "messages": [
+      {"role": "user", "content": "What is the weather in Paris right now?"}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "The current weather in a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "The city's name."}},
+            "required": ["city"]
+          }
+        }
+      }
+    ]
+  }
+]

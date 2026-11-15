@@ -14,7 +14,8 @@ committed, and `cargo test` never runs Python. See `dev/README.md`.
         --model-dir /path/to/DeepSeek-V4.1-Flash-1017 --revision <commit sha>
 
 `--model-dir` is a checkout of the model repository at `--revision` (its
-`encoding/`, `tokenizer.json` and `config.json`; no weights). The reference is
+`encoding/`, `inference/engram.py`, `tokenizer.json` and `config.json`; no
+weights). The reference is
 loaded from that path, never vendored. Writes, under
 `tests/fixtures/deepseek_v4_1/`:
 
@@ -23,6 +24,12 @@ loaded from that path, never vendored. Writes, under
 - `output_cases.json`: model outputs with what
   `parse_message_from_completion_text` reads from each;
 - `token_ids.json`: the ids of every prompt and of extra strings;
+- `token_map.json` and `token_map.bin.gz`: the Engram compressed-vocabulary
+  map `build_compressed_token_map` (`inference/engram.py`) derives from the
+  tokenizer: its class count and metadata, and one little-endian u32 per id
+  (gzip with a zero timestamp), 0 where the id opens the next class and
+  1 + its class where it joins an earlier one (classes are numbered in
+  first-seen order, so this is the whole map, in half the bytes);
 - `tokenizer.json.gz` (gzip with a zero timestamp) and `config.json`, copies of
   the model files the tests load.
 
@@ -32,6 +39,7 @@ none, else on a new empty system message put first.
 """
 
 import argparse
+import ast
 import copy
 import gzip
 import hashlib
@@ -40,6 +48,7 @@ import json
 import pathlib
 import random
 import shutil
+import struct
 import sys
 
 CRATE = pathlib.Path(__file__).resolve().parent.parent
@@ -703,6 +712,32 @@ def load_reference(path):
     return module
 
 
+def load_token_map_builder(path):
+    """`build_compressed_token_map` from `inference/engram.py`, run as written.
+
+    Only that function is compiled: the module's other code needs torch, and
+    this one imports what it uses (`tokenizers`) itself.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_compressed_token_map"]
+    if len(body) != 1:
+        sys.exit(f"{path}: no single build_compressed_token_map")
+    namespace = {}
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["build_compressed_token_map"]
+
+
+class ReferenceTokenizer:
+    """What `build_compressed_token_map` reads of a `transformers` tokenizer:
+    its raw `tokenizers` backend and its length, the number of ids."""
+
+    def __init__(self, backend):
+        self.backend_tokenizer = backend
+
+    def __len__(self):
+        return self.backend_tokenizer.get_vocab_size(with_added_tokens=True)
+
+
 def with_request_tools(messages, tools):
     """`chat_template.jinja`'s placement of a request's `tools`."""
     messages = copy.deepcopy(messages)
@@ -984,6 +1019,12 @@ def main():
     strings = tokenizer_strings(400)
     string_ids = [[text, tokenizer.encode(text, add_special_tokens=False).ids] for text in strings]
 
+    vocab = tokenizer.get_vocab(with_added_tokens=True)
+    if sorted(vocab.values()) != list(range(tokenizer.get_vocab_size(with_added_tokens=True))):
+        sys.exit("token ids are not dense")
+    engram_py = args.model_dir / "inference" / "engram.py"
+    token_map, classes = load_token_map_builder(engram_py)(ReferenceTokenizer(tokenizer))
+
     meta = {
         "repository": REPOSITORY,
         "revision": args.revision,
@@ -1003,6 +1044,29 @@ def main():
     write("encoding_cases.json", {"meta": meta, "cases": cases})
     write("output_cases.json", {"meta": meta, "cases": output_cases(enc)})
     write("token_ids.json", {"meta": meta, "token_ids": token_ids, "strings": string_ids})
+    write(
+        "token_map.json",
+        {
+            "meta": {**meta, "engram_py_sha256": sha256(engram_py), "function": "build_compressed_token_map"},
+            "vocab_size": len(token_map),
+            "classes": classes,
+            "file": "token_map.bin.gz",
+            "encoding": "u32 little-endian per id: 0 opens the next class, n > 0 is class n - 1",
+        },
+    )
+    encoded, opened = [], 0
+    for c in token_map:
+        if c == opened:
+            encoded.append(0)
+            opened += 1
+        elif c < opened:
+            encoded.append(c + 1)
+        else:
+            sys.exit("classes are not numbered in first-seen order")
+    if opened != classes:
+        sys.exit("class count disagrees with the map")
+    with open(args.out_dir / "token_map.bin.gz", "wb") as f:
+        f.write(gzip.compress(struct.pack(f"<{len(encoded)}I", *encoded), compresslevel=9, mtime=0))
     with open(args.out_dir / "tokenizer.json.gz", "wb") as f:
         f.write(gzip.compress((args.model_dir / "tokenizer.json").read_bytes(), compresslevel=9, mtime=0))
     shutil.copyfile(args.model_dir / "config.json", args.out_dir / "config.json")
@@ -1013,6 +1077,7 @@ def main():
     print(f"{len(cases)} encoding cases: {by_category}")
     print(f"{sum(c['reject'] is None for c in cases)} rendered, {sum(c['reject'] is not None for c in cases)} refused")
     print(f"{len(string_ids)} tokenizer strings")
+    print(f"token map: {len(token_map)} ids, {classes} classes")
 
 
 if __name__ == "__main__":

@@ -192,6 +192,50 @@ fn the_dev_model_is_deepseek() {
     assert_eq!((d.temperature, d.top_p, d.top_k), (1.0, 1.0, 0));
 }
 
+/// The Engram layers hash over the map derived from the tokenizer: the dev model's shards
+/// carry none, as the released checkpoint's do not, and the rows the loaded model reads
+/// are those of a hasher over the derived map.
+#[test]
+fn the_engram_map_is_derived_from_the_tokenizer() {
+    use eidola_engine_model::deepseek::engram::EngramHasher;
+    use eidola_server_engine::model::ENGRAM_TOKEN_MAP_TENSOR;
+
+    let model = deepseek_loaded();
+    assert!(model.store().get(ENGRAM_TOKEN_MAP_TENSOR).is_err());
+    let reference = reference(&model);
+    let spec = reference.config().engram.as_ref().expect("Engram layers");
+    let derived = deepseek_v4_1::compressed_vocab(model.tokenizer()).unwrap();
+    assert_eq!(derived.classes, fixture::DEEPSEEK_COMPRESSED_VOCAB);
+    assert_eq!(spec.compressed_vocab, derived.classes);
+    // " The", "the" and "THE" are one token each, of one class.
+    let words: Vec<u32> = [" The", "the", "THE"]
+        .iter()
+        .map(|t| match model.tokenizer().encode(t).unwrap()[..] {
+            [id] => id,
+            ref ids => panic!("{t:?} is {ids:?}"),
+        })
+        .collect();
+    assert!(
+        words
+            .iter()
+            .all(|&id| derived.map[id as usize] == derived.map[words[0] as usize])
+    );
+    let hasher = EngramHasher::new(spec, reference.config().vocab_size, derived.map).unwrap();
+    let history: Vec<u32> = words
+        .into_iter()
+        .chain([0, 1, 2, 77_666, 128_799, 129_279])
+        .collect();
+    for slot in 0..spec.layers.len() {
+        for position in 0..history.len() {
+            let seen = &history[..=position];
+            assert_eq!(
+                reference.engram_rows(slot, seen, position).unwrap(),
+                hasher.rows(&spec.layers[slot], seen, position)
+            );
+        }
+    }
+}
+
 /// A plain chat: the answer, joined from the stream, is the engine core's greedy
 /// generation over the same prompt tokens (without speculation, while the node drafts
 /// two tokens a step), parsed by the format's output parser, with the prompt and

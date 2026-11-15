@@ -281,11 +281,33 @@ pub fn check_device_budgets(
     }
 }
 
+/// The engine core's scheduler configuration for `sizing` and `cache` over `model`: the
+/// node's, whichever executor runs it.
+pub fn scheduler_config(
+    sizing: &config::Sizing,
+    cache: &config::CacheConfig,
+    model: &LoadedModel,
+) -> SchedulerConfig {
+    SchedulerConfig {
+        max_batched_tokens: sizing.max_batched_tokens,
+        max_seqs: sizing.max_seqs,
+        max_prefill_chunk: sizing.max_prefill_chunk,
+        eos_token_ids: model.tokenizer().eos_token_ids().to_vec(),
+        speculative: sizing.draft_tokens > 0,
+        cache: CachePolicy {
+            enabled: cache.enabled,
+            idle_ttl_ms: cache.idle_ttl_secs * 1000,
+            max_age_ms: cache.max_age_secs * 1000,
+        },
+        sweep_interval_ms: SWEEP_INTERVAL.as_millis() as u64,
+    }
+}
+
 /// The DeepSeek-V4.1 CPU executor's configuration: one captured shape, as for MiMo; every
 /// group `kv_blocks` blocks. Refuses what the executor would panic on: a block size the
 /// pooling ratios do not divide, or more drafts than the drafter's slots (or any, without
 /// a drafter). A host tier is not offered for this executor.
-fn deepseek_cpu_config(
+pub fn deepseek_cpu_config(
     ds: &eidola_engine_model::deepseek::DsConfig,
     sizing: &config::Sizing,
     kv_blocks: u32,
@@ -357,19 +379,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         )));
     }
     let sampleable_vocab_size = model.sampleable_vocab_size();
-    let scheduler = SchedulerConfig {
-        max_batched_tokens: sizing.max_batched_tokens,
-        max_seqs: sizing.max_seqs,
-        max_prefill_chunk: sizing.max_prefill_chunk,
-        eos_token_ids: model.tokenizer().eos_token_ids().to_vec(),
-        speculative: sizing.draft_tokens > 0,
-        cache: CachePolicy {
-            enabled: config.cache.enabled,
-            idle_ttl_ms: config.cache.idle_ttl_secs * 1000,
-            max_age_ms: config.cache.max_age_secs * 1000,
-        },
-        sweep_interval_ms: SWEEP_INTERVAL.as_millis() as u64,
-    };
+    let scheduler = scheduler_config(&sizing, &config.cache, &model);
 
     let (stopped_tx, stopped_rx) = oneshot::channel();
     let (engine, device) = match (&config.executor, model.served()) {
