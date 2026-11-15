@@ -19,7 +19,7 @@ sev = { version = "8", default-features = false, features = ["snp", "crypto_noss
 # `serde_json/preserve_order`, which would change `serde_json::Value` key
 # order for every crate linked into the same binary. Without `report` there
 # is no PCS fetcher and no `ring`.
-dcap-qvl = { version = "=0.6.6", default-features = false, features = ["rustcrypto", "default-x509"] }
+dcap-qvl = { version = "=0.7.1", default-features = false, features = ["rustcrypto", "default-x509"] }
 
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
 x509-cert = "0.2"
