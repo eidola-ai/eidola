@@ -79,28 +79,12 @@ pub const SIGSTORE_TRUSTED_ROOT: &str = "releases/trust/sigstore-trusted-root.js
 
 /// The vendored files of release `tag`: `(endorsements, Sigstore bundle)`,
 /// relative to the workspace root. `tag` must satisfy
-/// [`is_platform_release_tag`].
+/// [`crate::platform_release::is_tag`].
 pub fn platform_endorsement_files(tag: &str) -> (String, String) {
     (
         format!("{PLATFORM_ENDORSEMENTS_ROOT}/{tag}/platform-endorsements.json"),
         format!("{PLATFORM_ENDORSEMENTS_ROOT}/{tag}/attestation.sigstore.json"),
     )
-}
-
-/// `platform-vX.Y.Z`, each number decimal without a leading zero: the tag
-/// grammar of the provider's release workflow, and a safe path component.
-pub fn is_platform_release_tag(tag: &str) -> bool {
-    let Some(version) = tag.strip_prefix("platform-v") else {
-        return false;
-    };
-    let parts: Vec<&str> = version.split('.').collect();
-    parts.len() == 3
-        && parts.iter().all(|p| {
-            !p.is_empty()
-                && p.len() <= 9
-                && p.bytes().all(|b| b.is_ascii_digit())
-                && (p.len() == 1 || !p.starts_with('0'))
-        })
 }
 
 /// Where the platform provider's release manifests are vendored, relative to
@@ -892,7 +876,7 @@ impl Sidecar {
             .tdx
             .map(|t| {
                 let e = t.platform_endorsements;
-                if !is_platform_release_tag(&e.release) {
+                if !crate::platform_release::is_tag(&e.release) {
                     return Err(format!(
                         "{path}: tdx.platform_endorsements.release must be a platform-vX.Y.Z \
                          release tag"

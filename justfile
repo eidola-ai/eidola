@@ -223,6 +223,7 @@ check:
     ./scripts/artifact-manifest.sh check-complete
     ./scripts/test-release-assets.sh
     ./scripts/test-weights-hash.sh
+    ./scripts/test-platform-endorsements-drift.sh
 
 # Apply auto-fixable markdown formatting via rumdl
 format:

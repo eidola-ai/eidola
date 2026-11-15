@@ -10174,6 +10174,7 @@ dependencies = [
  "const-oid 0.9.6",
  "dcap-qvl",
  "der 0.7.10",
+ "eidola-common",
  "getrandom 0.4.3",
  "hex",
  "http",
