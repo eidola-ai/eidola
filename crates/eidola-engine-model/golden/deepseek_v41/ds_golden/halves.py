@@ -68,9 +68,12 @@ class Half:
             engram_tables={l - layers.start: engram_tables[l] for l in kept} if engram_tables else None,
         )
         model = self.ref.model
-        if engram_rows is not None and kept:
-            rows = engram_rows.to(device)
-            model.engram_hash.register_forward_hook(lambda _m, inputs, _out: rows[inputs[1] : inputs[1] + inputs[0].size(1)].unsqueeze(0))
+        # The compact table rows of the sequence being run, one row of ids per
+        # position; a caller running several sequences through one loaded half
+        # replaces it between them.
+        self.engram_rows = engram_rows.to(device) if engram_rows is not None else None
+        if kept and (engram_rows is not None or engram_tables is not None):
+            model.engram_hash.register_forward_hook(lambda _m, inputs, _out: self.engram_rows.to(device)[inputs[1] : inputs[1] + inputs[0].size(1)].unsqueeze(0))
         self.boundary_out: list[tuple[torch.Tensor, torch.Tensor]] = []
         model.layers[-1].register_forward_hook(lambda _m, _i, out: self.boundary_out.append((out[0][0].cpu().clone(), out[1][0].cpu().clone())))
         self.inject = None  # (streams, pre_mix) rows for the current call

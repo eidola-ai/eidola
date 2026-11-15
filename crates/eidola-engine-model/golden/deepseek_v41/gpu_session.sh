@@ -4,13 +4,18 @@
 #   gpu_session.sh <step> [...]
 #
 #   steps over the two truncations:  setup probes kernels fetch real rust summary   (all = these but rust)
-#   steps over the whole checkpoint: full-fetch full-real full-pinned full-rust     (full = these, then summary)
+#   steps over the whole checkpoint: full-fetch full-health full-real full-pinned full-rust   (full = these, then summary)
 #
 # Run from a checkout of this repository on a Linux machine with one NVIDIA
 # GPU and CUDA. Every step is idempotent and resumable: a finished step leaves
 # a marker under $OUT/done/ and is skipped on a rerun (delete the marker to
 # repeat it). Everything a step prints is also in $OUT/logs/<step>.log, and
 # every result is JSON or a golden file under $OUT. Copy $OUT back.
+#
+# Every fetched checkpoint file is checked against the recorded upstream
+# SHA-256 (upstream-sha256.json) before it gets the name anything loads, and a
+# file already present is checked again when its fetch step runs: a download
+# that resumes or runs in parts can leave the right size and the wrong bytes.
 #
 # Environment (all optional):
 #   WORK         scratch for the venv, the reference code and weights   (default ~/eidola-gpu)
@@ -43,9 +48,10 @@ FULL_TOKENS="${FULL_TOKENS:-0}"
 REPO="deepseek-ai/DeepSeek-V4.1-Flash-1017"
 REVISION="08c8657f02291e11b6f6b63e0e16014f8e748518"
 REFERENCE="$WORK/reference"
+ENCODING="$WORK/encoding"
 PY="${PY:-$WORK/venv/bin/python}"
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-export HERE WORK OUT SPREAD_DIR PREFIX_DIR FULL_DIR FULL_TOKENS TORCH_INDEX TORCH_VERSION SPREAD_TOKENS REPO REVISION REFERENCE PY
+export HERE WORK OUT SPREAD_DIR PREFIX_DIR FULL_DIR FULL_TOKENS TORCH_INDEX TORCH_VERSION SPREAD_TOKENS REPO REVISION REFERENCE ENCODING PY
 
 mkdir -p "$WORK" "$OUT/done" "$OUT/logs" "$OUT/goldens"
 
@@ -79,11 +85,14 @@ setup() {
     [ -x "$PY" ] || uv venv "$WORK/venv" --python 3.12
     uv pip install --python "$PY" "torch==$TORCH_VERSION" --index-url "$TORCH_INDEX"
     uv pip install --python "$PY" tilelang==0.1.12 numpy==2.3.4 sympy==1.14.0 tokenizers==0.22.1
-    mkdir -p "$REFERENCE"
+    mkdir -p "$REFERENCE" "$ENCODING"
     for file in model.py engram.py kernel.py; do
         [ -s "$REFERENCE/$file" ] || curl -fsSL -A python-urllib -o "$REFERENCE/$file" \
             "https://huggingface.co/$REPO/resolve/$REVISION/inference/$file"
     done
+    # The published prompt format, for the health check's chat requests.
+    [ -s "$ENCODING/encoding.py" ] || curl -fsSL -A python-urllib -o "$ENCODING/encoding.py" \
+        "https://huggingface.co/$REPO/resolve/$REVISION/encoding/encoding.py"
     "$PY" - <<'PY'
 import torch, tilelang
 assert torch.cuda.is_available(), "PyTorch does not see a CUDA device (wrong TORCH_INDEX for this driver?)"
@@ -166,8 +175,20 @@ rust_tests() {
 full_fetch() {
     mkdir -p "$FULL_DIR"
     local base="https://huggingface.co/$REPO/resolve/$REVISION"
+    # A file gets its real name only once its bytes are the recorded ones. A
+    # refused download is set aside as <name>.refused, which nothing loads and
+    # no later download resumes onto.
+    accept() {
+        if ! "$PY" -I "$HERE/verify_checkpoint.py" --file "$FULL_DIR/$1.partial" --name "$1"; then
+            mv "$FULL_DIR/$1.partial" "$FULL_DIR/$1.refused"
+            die "$1 does not match its recorded hash; set aside as $1.refused"
+        fi
+        mv "$FULL_DIR/$1.partial" "$FULL_DIR/$1"
+    }
     for file in config.json tokenizer.json model.safetensors.index.json; do
-        [ -s "$FULL_DIR/$file" ] || curl -fsSL -A python-urllib -o "$FULL_DIR/$file" "$base/$file"
+        [ -e "$FULL_DIR/$file" ] && continue
+        curl -fsSL -A python-urllib -o "$FULL_DIR/$file.partial" "$base/$file"
+        accept "$file"
     done
     # Shard 00001 is the vision tower, which nothing here reads.
     for i in $(seq 2 48); do
@@ -175,8 +196,19 @@ full_fetch() {
         [ -e "$FULL_DIR/$shard" ] && continue
         say "fetching $shard"
         curl -fL -C - --retry 8 --retry-delay 10 -A python-urllib -o "$FULL_DIR/$shard.partial" "$base/$shard"
-        mv "$FULL_DIR/$shard.partial" "$FULL_DIR/$shard"
+        accept "$shard"
     done
+    # Files that were already there too, however they got there.
+    "$PY" -I "$HERE/verify_checkpoint.py" --dir "$FULL_DIR"
+}
+
+# The model's health on the whole checkpoint: a known reply and next-token
+# accuracy floors (health_check.py), the reference with the real kernels.
+full_health() {
+    "$PY" -I "$HERE/health_check.py" --dir "$FULL_DIR" --reference-dir "$REFERENCE" --encoding-dir "$ENCODING" \
+        --kernels real --native-arithmetic --json "$OUT/health.json"
+    mkdir -p "$OUT/goldens/full"
+    cp "$FULL_DIR/golden/health.safetensors" "$OUT/goldens/full/"
 }
 
 full_halves() {
@@ -201,7 +233,7 @@ summary() {
     {
         echo "GPU session summary, $(date -u +%Y-%m-%dT%H:%MZ)"
         nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
-        for log in probes kernels real-spread-native real-spread-pinned real-prefix-native real-prefix-pinned rust full-real-native full-pinned full-rust; do
+        for log in probes kernels real-spread-native real-spread-pinned real-prefix-native real-prefix-pinned rust full-health full-real-native full-pinned full-rust; do
             [ -e "$OUT/logs/$log.log" ] || { echo; echo "== $log: not run"; continue; }
             echo; echo "== $log"
             grep -vE '^[0-9:]{8} (Engram layer|running)' "$OUT/logs/$log.log" | tail -n 45
@@ -223,13 +255,14 @@ step() {
         summary) summary ;;
         all)     for s in setup probes kernels fetch real summary; do step "$s"; done ;;
         full-fetch)  run_step full-fetch full_fetch ;;
+        full-health) run_step full-health full_health ;;
         full-real)   run_step full-real-native full_real_native ;;
         full-pinned) run_step full-pinned full_pinned ;;
         full-rust)   run_step full-rust full_rust ;;
-        full)        for s in setup full-fetch full-real full-pinned full-rust summary; do step "$s"; done ;;
-        *)       die "unknown step $1 (setup probes kernels fetch real rust summary all; full-fetch full-real full-pinned full-rust full)" ;;
+        full)        for s in setup full-fetch full-health full-real full-pinned full-rust summary; do step "$s"; done ;;
+        *)       die "unknown step $1 (setup probes kernels fetch real rust summary all; full-fetch full-health full-real full-pinned full-rust full)" ;;
     esac
 }
 
-[ $# -gt 0 ] || die "usage: gpu_session.sh <step> [...]   steps: setup probes kernels fetch real rust summary all; full-fetch full-real full-pinned full-rust full"
+[ $# -gt 0 ] || die "usage: gpu_session.sh <step> [...]   steps: setup probes kernels fetch real rust summary all; full-fetch full-health full-real full-pinned full-rust full"
 for s in "$@"; do step "$s"; done
