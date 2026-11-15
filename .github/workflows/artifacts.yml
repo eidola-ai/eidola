@@ -71,7 +71,8 @@ jobs:
   #            releases/trust/server-enclave.json in the workspace.
   #   Phase 4: bake cli (its OCI Containerfile COPYs server-enclave.json
   #            from Phase 3, so the cli is hardcoded against the same
-  #            enclave the actually-built gateway will produce).
+  #            enclave the actually-built gateway will produce), then take
+  #            its static binary out of that image.
   #   Phase 5: emit the stamped config, recomputed enclave, and combined
   #            OCI partial as job outputs for apple + artifact-manifest.
   #
@@ -90,6 +91,7 @@ jobs:
       stamped_tinfoil_config: ${{ steps.stamp.outputs.config }}
       server_enclave: ${{ steps.measure.outputs.content }}
       artifact_manifest: ${{ steps.partial.outputs.actual }}
+      static_cli_manifest: ${{ steps.static_cli.outputs.actual }}
     permissions:
       contents: read
       packages: write # push OCI images to ghcr.io on push events
@@ -278,6 +280,43 @@ jobs:
           ./scripts/artifact-manifest.sh build \
             ${PUSH_FLAG} --targets cli \
             --metadata-file "${CLI_BAKE_METADATA_FILE}"
+
+      - name: Extract the static Linux CLI from its image
+        # The image Phase 4 built, exported again from this builder's cache
+        # and refused unless it is the digest Phase 4 recorded; the binary
+        # comes out of that image's layer. Run on every build so the path is
+        # exercised before the manifest schema that records the binary is
+        # emitted; below that schema its partial is empty, and a file no
+        # manifest row covers is never published.
+        id: static_cli
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          PUSH_FLAG=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+          ./scripts/artifact-manifest.sh extract-cli ${PUSH_FLAG} \
+            --metadata-file "${CLI_BAKE_METADATA_FILE}" \
+            --output /tmp/static-cli-artifact-manifest.json \
+            --artifact-dir /tmp/eidola-release-assets
+          {
+            echo 'actual<<__EIDOLA_EOF__'
+            cat /tmp/static-cli-artifact-manifest.json
+            echo '__EIDOLA_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload the static Linux CLI
+        # Kept for the tagged release workflow, which attaches it only once
+        # the signed manifest records it and its hash matches.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets-linux-cli
+          path: /tmp/eidola-release-assets
+          if-no-files-found: error
+          # A job re-run reaches the original failure instead of dying on the
+          # artifact this attempt already uploaded.
+          overwrite: true
 
       - name: Phase 5 — record combined OCI partial
         id: partial
@@ -936,6 +975,7 @@ jobs:
           STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
           SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
           OCI_MANIFEST: ${{ needs.oci.outputs.artifact_manifest }}
+          STATIC_CLI_MANIFEST: ${{ needs.oci.outputs.static_cli_manifest }}
           ENGINE_MANIFEST: ${{ needs.oci-engine.outputs.artifact_manifest }}
           APPLE_MANIFEST: ${{ needs.apple.outputs.artifact_manifest }}
           LINUX_GUI_MANIFEST: ${{ needs.linux-gui.outputs.artifact_manifest }}
@@ -974,6 +1014,7 @@ jobs:
           printf '%s\n' "$STAMPED_CONFIG" > tinfoil-config.yml
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
           printf '%s' "$OCI_MANIFEST" > /tmp/oci-artifact-manifest.json
+          printf '%s' "$STATIC_CLI_MANIFEST" > /tmp/static-cli-artifact-manifest.json
           printf '%s' "$ENGINE_MANIFEST" > /tmp/engine-artifact-manifest.json
           printf '%s' "$APPLE_MANIFEST" > /tmp/apple-artifact-manifest.json
           printf '%s' "$LINUX_GUI_MANIFEST" > /tmp/linux-gui-artifact-manifest.json
@@ -986,6 +1027,7 @@ jobs:
         run: |
           if ./scripts/artifact-manifest.sh verify-full \
             --partial /tmp/oci-artifact-manifest.json \
+            --partial /tmp/static-cli-artifact-manifest.json \
             --partial /tmp/engine-artifact-manifest.json \
             --partial /tmp/apple-artifact-manifest.json \
             --partial /tmp/linux-gui-artifact-manifest.json \

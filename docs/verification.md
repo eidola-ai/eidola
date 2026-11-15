@@ -21,13 +21,13 @@ Attestations and `artifact-manifest.json` live **beside** the installable on the
 
 ## What the manifest records
 
-`artifact-manifest.json` is committed at the git ref, signed by CI, and what the engineer attests they reproduced. `schema_version` is `2`; clients also accept `3`, which adds the macOS unsigned shipping zip and the Debian packages as `file` rows and narrows the Nix Linux installable's key from `eidola-gui-linux-amd64` to `eidola-gui-linux-nix-amd64` (accept-before-emit — see [`releases/README.md`](../releases/README.md#rotating-document-schema-versions)).
+`artifact-manifest.json` is committed at the git ref, signed by CI, and what the engineer attests they reproduced. `schema_version` is `2`; clients also accept `3`, which adds the macOS unsigned shipping zip and the Debian packages as `file` rows and narrows the Nix Linux installable's key from `eidola-gui-linux-amd64` to `eidola-gui-linux-nix-amd64`; `4`, which adds the inference node's image; and `5`, which drops the standalone macOS CLI archive (`eidola-cli-macos-universal` — the macOS `.app` carries the CLI) and adds the static Linux CLI as a `file` row (`eidola-cli-linux-static-amd64`) (accept-before-emit — see [`releases/README.md`](../releases/README.md#rotating-document-schema-versions)).
 
 | Artifact `type` | Identity of the payload | Identity of the archive | Envelope / installable |
 | --- | --- | --- | --- |
 | `oci` | Layers of the image | `digest` (`sha256:` + hex) — this *is* the archive | Empty. `docker pull` is the installable. |
 | `nix` | `narHash` (Nix SRI of the store-path NAR) — rebuild/debug checkpoint | `archiveSha256` (`sha256:` + hex of the flake-built `.tar.gz`) | macOS: Apple material, hashes in the **human attestation** only. Current Linux Nix GUI: empty envelope. |
-| `file` (schema 3) | — | `sha256` (`sha256:` + hex) of one published file | The `.deb`: empty envelope, so this file *is* the installable. The macOS unsigned shipping zip: the *container* an installable takes, before any envelope. |
+| `file` (schema 3) | — | `sha256` (`sha256:` + hex) of one published file | The `.deb`: empty envelope, so this file *is* the installable. The static Linux CLI (schema 5): the same, an executable with nothing around it. The macOS unsigned shipping zip: the *container* an installable takes, before any envelope. |
 
 Every value in this file is a function of source. Nothing key-dependent may enter it — no signed-artifact hash, no detached-bundle hash, no Team ID, no ticket; those live in the human attestation, which is signed and non-deterministic already. That is enforced rather than remembered: `scripts/check-manifest-determinism.sh` (run by `just check` and by the `Rust checks` workflow) validates the document's envelope and holds each artifact type to an exact field list (so an unrecognized field is rejected whether or not it names a key), rejects any key naming signing material, and asserts over `.github/workflows/artifacts.yml` that no ancestor of the job assembling the manifest is a signing job and that no job computing part of it holds the signing environment.
 
@@ -53,6 +53,7 @@ Start from a **verified** release (manifest signature + human attestations, [rel
 
 ```bash
 sha256sum eidola-gui-linux-deb-amd64.deb        # `file` row: sha256
+sha256sum eidola-cli-linux-static-amd64         # `file` row: sha256 (schema 5)
 sha256sum eidola-gui-linux-nix-amd64.tar.gz     # `nix` row: archiveSha256
 # macOS: shasum -a 256 eidola-gui-macos-universal.tar.gz
 ```
@@ -67,7 +68,9 @@ nix build .#eidola-gui-linux-nix-archive  # compare archiveSha256
 nix build .#eidola-linux-deb              # compare the .deb's sha256
 ```
 
-The macOS universal attrs (`.#eidola-cli-macos-universal`, `.#eidola-gui-macos-universal`, and their `-archive` variants) work the same way, on a Mac.
+The macOS universal attrs (`.#eidola-gui-macos-universal`, and through manifest schema 4 `.#eidola-cli-macos-universal`, with their `-archive` variants) work the same way, on a Mac.
+
+The static Linux CLI is not a Nix artifact: it is the one file of the `eidola-cli` OCI image, whose digest the same manifest records. `scripts/artifact-manifest.sh extract-cli` takes it out of a build of that image, and refuses unless the image it reads is the recorded digest — so rebuilding the image (`docker buildx bake cli`, as `just update-manifest` does) and extracting the binary reproduces both hashes, and pulling the published image by digest and copying `/eidola` out of it yields the same file.
 
 **macOS installable (Developer ID zip), once published.** The browser file is not the archive. `codesign` rewrites Mach-Os; the unmodified archive is not a subset of the zip. The first-line check is `shasum` of that zip against the **attested shipped-installable** hash. From attestation schema 2 that value is `apple_shipped_artifact_sha256`, published beside `apple_signature_bundle_sha256` (the detached material), `apple_team_id`, and `apple_signing_identifier` — the last two being what the reconstruction's embedded claims must report. The engineer does not merely assert the relationship: `release-tool attest` runs the reconstruction itself and refuses to offer the `apple_signature_reconstructs` claim unless it holds. Binding it to the git ref is one of:
 
@@ -96,4 +99,4 @@ It is the right artifact for NixOS, for `nix profile install`, and for anyone re
 
 The Nix Linux installable *references* nixpkgs Mesa so a Nix glibc binary can load Vulkan ICDs on a non-Nix host. Those driver bytes are not in the archive. The Debian package needs no such reference and carries no GPU bytes at all: its binary runs on the host's glibc, so the host's Vulkan loader and its Mesa or proprietary NVIDIA drivers load into the ABI they were built for.
 
-Server/CLI Linux images stay OCI: they run in an untrusted environment, so the image is the whole functional closure we can measure.
+Server/CLI Linux images stay OCI: they run in an untrusted environment, so the image is the whole functional closure we can measure. The CLI's image has exactly one file, a static binary, so from manifest schema 5 that file is also published and hashed on its own — the same bytes, for a host that should not need a container runtime to run a client.

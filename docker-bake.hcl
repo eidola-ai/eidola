@@ -97,6 +97,11 @@ target "server" {
   tags       = ["eidola-server-gateway:dev"]
 }
 
+# The CLI image (`eidola-cli`). Its one file, the static binary, is recorded on
+# its own too from manifest schema 5 (`eidola-cli-linux-static-amd64`):
+# scripts/artifact-manifest.sh extract-cli exports this target again as an OCI
+# layout, refuses unless that is the image the build recorded, and takes the
+# binary out of it — for the `ci-cli` build as well, which is the same image.
 target "cli" {
   inherits   = ["_common", "_cache_cli"]
   context    = "."

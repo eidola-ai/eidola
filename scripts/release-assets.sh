@@ -24,6 +24,9 @@
 #   * `file` rows naming a Debian package carry the `.deb`'s own `sha256` —
 #     the deb *is* the byte stream, with no archive/envelope indirection.
 #     Published as `<key>.deb`.
+#   * `file` rows naming a static binary (`eidola-cli-linux-static-<arch>`)
+#     carry the executable's own `sha256`. Published as `<key>`, with no
+#     extension, because the download is the program.
 #   * `eidola-gui-macos-universal-zip` is deliberately **not** published.
 #     It is the *unsigned* container, recorded so a verifier can reproduce
 #     the recipe; the macOS installable is the Developer ID-signed zip,
@@ -337,6 +340,8 @@ def expected(name, entry):
         return name + ".tar.gz", entry.get("archiveSha256")
     if kind == "file" and "-deb-" in name:
         return name + ".deb", entry.get("sha256")
+    if kind == "file" and name.startswith("eidola-cli-linux-static-"):
+        return name, entry.get("sha256")
     problems.append(
         "artifacts.{}: type {} is not in the publication table — a new "
         "artifact class needs a deliberate decision about whether a "
