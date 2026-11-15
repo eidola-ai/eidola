@@ -49,8 +49,10 @@ jobs:
     # ceiling also protects the post-merge push run that SAVES the cache:
     # rust-cache saves in a post step, which a timeout cancellation skips — a
     # too-tight timeout there would leave every subsequent PR cold, timing out
-    # in a spiral.
-    timeout-minutes: 90
+    # in a spiral. The `deepseek-v41-flash` integration branch carries a second
+    # engine architecture's test suites, and a cold run there outlasted 90
+    # minutes, so its runs get 150.
+    timeout-minutes: ${{ (github.ref == 'refs/heads/deepseek-v41-flash' || github.base_ref == 'deepseek-v41-flash') && 150 || 90 }}
     env:
       # Nothing here is debugged interactively, and full debuginfo for every
       # gpui-linked test binary overflows the runner's disk at link time.
