@@ -235,10 +235,18 @@ impl ChatTemplate {
             });
         }
         let mut env = Environment::new();
-        // `transformers` uses jinja2's defaults here; `keep_trailing_newline`
-        // is false in both engines.
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
+        // `transformers` turns on `trim_blocks` and `lstrip_blocks` and keeps
+        // jinja2's other defaults: `{{ }}` / `{% %}` / `{# #}` delimiters, no
+        // line statements, and `keep_trailing_newline` off.
+        let syntax = env
+            .syntax()
+            .to_builder()
+            .trim_blocks(true)
+            .lstrip_blocks(true)
+            .keep_trailing_newline(false)
+            .build()
+            .map_err(|e| ChatError::Template(e.to_string()))?;
+        env.set_syntax(syntax);
         env.set_undefined_behavior(UndefinedBehavior::Lenient);
         env.set_auto_escape_callback(|_| AutoEscape::None);
         env.add_filter("tojson", tojson_filter);
@@ -387,7 +395,7 @@ impl ChatTemplate {
                 Value::from(String::from_iter([open, close])),
             ));
         }
-        let context: Value = context.into_iter().collect();
+        let context = Value::from_pairs(context);
         template
             .render(context)
             .map_err(|e| ChatError::Template(format!("{e:#}")))
@@ -756,10 +764,11 @@ fn to_value(json: &Json) -> Value {
         Json::Float(f) => Value::from(*f),
         Json::Str(s) => Value::from(s.as_str()),
         Json::Array(items) => items.iter().map(to_value).collect(),
-        Json::Object(members) => members
-            .iter()
-            .map(|(k, v)| (Value::from(k.as_str()), to_value(v)))
-            .collect(),
+        Json::Object(members) => Value::from_pairs(
+            members
+                .iter()
+                .map(|(k, v)| (Value::from(k.as_str()), to_value(v))),
+        ),
     }
 }
 
@@ -890,5 +899,23 @@ mod tests {
     fn rejects_unpinned_templates() {
         let err = ChatTemplate::from_source("{{ messages }}".to_string()).unwrap_err();
         assert!(matches!(err, ChatError::UnpinnedArtifact { .. }));
+    }
+
+    /// The pinned template strips its own whitespace with `-` markers, so the
+    /// fixture corpus renders the same with or without these settings; this
+    /// holds the environment to the one `transformers` builds regardless.
+    #[test]
+    fn whitespace_settings_are_the_ones_transformers_uses() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let template = ChatTemplate::from_model_dir(&dir).unwrap();
+        let syntax = template.env.syntax();
+        assert!(syntax.trim_blocks());
+        assert!(syntax.lstrip_blocks());
+        assert!(!syntax.keep_trailing_newline());
+        let rendered = template
+            .env
+            .render_str("  {% if true %}\nx\n  {% endif %}\ny\n", ())
+            .unwrap();
+        assert_eq!(rendered, "x\ny");
     }
 }
