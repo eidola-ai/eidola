@@ -833,6 +833,7 @@ fn build_engine(
     let Served::DeepSeek {
         config,
         model: Some(reference),
+        ..
     } = model.served()
     else {
         return Err("the weights are not DeepSeek-V4.1 loaded for the cpu executor".into());

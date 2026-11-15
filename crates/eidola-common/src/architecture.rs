@@ -170,6 +170,28 @@ pub struct Shape {
     /// whose weights are bounded by the whole pack
     /// (`engine_deployment::artifact_data_bytes`).
     pub weights_bytes: Option<u64>,
+    /// For an executor that gives every KV group of every device one block
+    /// count (DeepSeek-V4.1's), this device's groups, in the executor's
+    /// block layout; empty for one that sizes each group's pool by its own
+    /// rule (MiMo-V2.6's), whose bounds read the per-position fields above.
+    pub uniform_kv_groups: &'static [UniformKvGroup],
+}
+
+/// One KV group of an executor whose groups all hold the same number of
+/// blocks (`Shape::uniform_kv_groups`). A block of it is `layers` layers of
+/// `KV_BLOCK_SIZE / ratio` entries of `entry_bytes` each, padded to 16 bytes
+/// (`eidola-engine-cuda`'s `ds::kv::GroupGeometry::block_bytes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UniformKvGroup {
+    pub layers: u64,
+    /// Positions per entry (the pooling ratio; 1 for a group of one entry
+    /// per position).
+    pub ratio: u64,
+    /// Bytes of one entry of one layer.
+    pub entry_bytes: u64,
+    /// The drafter's group: present only when drafting (`DRAFT_TOKENS` > 0),
+    /// and the same size at every draft width.
+    pub drafter: bool,
 }
 
 impl Shape {
@@ -215,6 +237,7 @@ pub const MIMO_V26_FLASH: Shape = Shape {
     // 64 f32 for each distinct θ, at most three.
     rope_device_bytes_per_position: 3 * 64 * 4,
     weights_bytes: None,
+    uniform_kv_groups: &[],
 };
 
 /// One window-KV cell of DeepSeek-V4.1: 512 FP8 codes and an E8M0 scale per
@@ -236,7 +259,8 @@ const DS_LAYERS_PER_DEVICE: u64 = 20;
 /// allocations from above by the same rules as MiMo's, at this model's
 /// widths. They are provisional: that executor's allocations are the
 /// reference, and its derivation must be held to these numbers (or these to
-/// it) when it lands.
+/// it) when it lands. The KV groups are that executor's (its block layouts,
+/// which `eidola-server-engine`'s `cuda::tests` hold these equal to).
 pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
     // Device 0: the embedding, layers 0-19 with the first Engram table, and
     // layer 20's bank stub.
@@ -264,6 +288,22 @@ pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
         rope_device_bytes_per_position: DS_ROPE_DEVICE_BYTES_PER_POSITION,
         // 250.86 GB in the released checkpoint's headers, rounded up.
         weights_bytes: Some(250_870_000_000),
+        // The executor's encoder groups: the three pooled sources' bank, and
+        // layers 0-19's window.
+        uniform_kv_groups: &[
+            UniformKvGroup {
+                layers: 3,
+                ratio: 2,
+                entry_bytes: DS_GLOBAL_CELL,
+                drafter: false,
+            },
+            UniformKvGroup {
+                layers: DS_LAYERS_PER_DEVICE,
+                ratio: 1,
+                entry_bytes: DS_WINDOW_CELL,
+                drafter: false,
+            },
+        ],
     },
     // Device 1: layers 20-39, the norm and head, the second Engram table
     // (layer 14's), and the drafter with its own embedding copy.
@@ -289,6 +329,28 @@ pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
         rope_device_bytes_per_position: DS_ROPE_DEVICE_BYTES_PER_POSITION,
         // 259.78 GB in the released checkpoint's headers, rounded up.
         weights_bytes: Some(259_790_000_000),
+        // The executor's decoder groups: layer 20's bank, layers 20-39's
+        // window, and when drafting the drafter's three blocks' window.
+        uniform_kv_groups: &[
+            UniformKvGroup {
+                layers: 1,
+                ratio: 1,
+                entry_bytes: DS_GLOBAL_CELL,
+                drafter: false,
+            },
+            UniformKvGroup {
+                layers: DS_LAYERS_PER_DEVICE,
+                ratio: 1,
+                entry_bytes: DS_WINDOW_CELL,
+                drafter: false,
+            },
+            UniformKvGroup {
+                layers: 3,
+                ratio: 1,
+                entry_bytes: DS_WINDOW_CELL,
+                drafter: true,
+            },
+        ],
     },
 ];
 
