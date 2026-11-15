@@ -135,11 +135,11 @@
     },
     {
       "path": "csrc/ds_gemm_tc.cu",
-      "sha256": "ab920a01d5476a9f3df27d739ca2117d7f3b537df3de893ef2ad77089130e3b2"
+      "sha256": "6f6797d524ded742a90de42f780de5003fe3ee3f566b5b2a847352b8c72a9cbb"
     },
     {
       "path": "csrc/ds_gemm_tc.cuh",
-      "sha256": "6cecea401e400dbb4952b79e6bdb141ec7ba9f6cce514f36050b2d057816238e"
+      "sha256": "dec9f337dc31bbf96dfcd92f9cb3d1c909e36b1298092e83468b9fe940e07267"
     },
     {
       "path": "csrc/ds_head.cu",
@@ -582,13 +582,18 @@
       "source": "csrc/ds_gemm_tc.cu",
       "profile": "exact",
       "file": "cubin/ds_gemm_tc.sm_100a.cubin",
-      "sha256": "c5ce5d0f3aca438f7557a088a65342fd42319b82438f484abbb00a68f4011463",
-      "size": 652608,
+      "sha256": "57b4bf478aa034b97aed38018699749c2dc5857dffebd2dc8ccd7548dc936f37",
+      "size": 745072,
       "entries": [
         {
           "symbol": "eidola_ds_gemm_probe",
           "demangled": "eidola_ds_gemm_probe",
           "meta": "eidola_ds_gemm_probe_meta"
+        },
+        {
+          "symbol": "eidola_ds_lin4_banded_s8",
+          "demangled": "eidola_ds_lin4_banded_s8",
+          "meta": "eidola_ds_lin4_banded_s8_meta"
         },
         {
           "symbol": "eidola_ds_lin4_banded_t32",
@@ -601,6 +606,11 @@
           "meta": "eidola_ds_lin4_banded_t8_meta"
         },
         {
+          "symbol": "eidola_ds_lin4_tolerance_s8",
+          "demangled": "eidola_ds_lin4_tolerance_s8",
+          "meta": "eidola_ds_lin4_tolerance_s8_meta"
+        },
+        {
           "symbol": "eidola_ds_lin4_tolerance_t32",
           "demangled": "eidola_ds_lin4_tolerance_t32",
           "meta": "eidola_ds_lin4_tolerance_t32_meta"
@@ -611,6 +621,11 @@
           "meta": "eidola_ds_lin4_tolerance_t8_meta"
         },
         {
+          "symbol": "eidola_ds_lin8_banded_s8",
+          "demangled": "eidola_ds_lin8_banded_s8",
+          "meta": "eidola_ds_lin8_banded_s8_meta"
+        },
+        {
           "symbol": "eidola_ds_lin8_banded_t32",
           "demangled": "eidola_ds_lin8_banded_t32",
           "meta": "eidola_ds_lin8_banded_t32_meta"
@@ -619,6 +634,11 @@
           "symbol": "eidola_ds_lin8_banded_t8",
           "demangled": "eidola_ds_lin8_banded_t8",
           "meta": "eidola_ds_lin8_banded_t8_meta"
+        },
+        {
+          "symbol": "eidola_ds_lin8_tolerance_s8",
+          "demangled": "eidola_ds_lin8_tolerance_s8",
+          "meta": "eidola_ds_lin8_tolerance_s8_meta"
         },
         {
           "symbol": "eidola_ds_lin8_tolerance_t32",
@@ -633,22 +653,26 @@
       ],
       "meta": [
         "eidola_ds_gemm_probe_meta",
+        "eidola_ds_lin4_banded_s8_meta",
         "eidola_ds_lin4_banded_t32_meta",
         "eidola_ds_lin4_banded_t8_meta",
+        "eidola_ds_lin4_tolerance_s8_meta",
         "eidola_ds_lin4_tolerance_t32_meta",
         "eidola_ds_lin4_tolerance_t8_meta",
+        "eidola_ds_lin8_banded_s8_meta",
         "eidola_ds_lin8_banded_t32_meta",
         "eidola_ds_lin8_banded_t8_meta",
+        "eidola_ds_lin8_tolerance_s8_meta",
         "eidola_ds_lin8_tolerance_t32_meta",
         "eidola_ds_lin8_tolerance_t8_meta"
       ],
       "mma_sass": {
-        "HMMA": 724
+        "HMMA": 804
       },
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 3172,
+        "ptx_rounded": 3524,
         "sass_fma": 0
       }
     },
@@ -658,13 +682,18 @@
       "source": "csrc/ds_gemm_tc.cu",
       "profile": "exact",
       "file": "cubin/ds_gemm_tc.sm_100f.cubin",
-      "sha256": "b820b52f7e9e5a8937767d5990439fa513074baface0fb867f8dd1161d2a0546",
-      "size": 652608,
+      "sha256": "b97d836c3700a50a57c1eee6505760957092679edb97a3ef85894f610433356d",
+      "size": 745072,
       "entries": [
         {
           "symbol": "eidola_ds_gemm_probe",
           "demangled": "eidola_ds_gemm_probe",
           "meta": "eidola_ds_gemm_probe_meta"
+        },
+        {
+          "symbol": "eidola_ds_lin4_banded_s8",
+          "demangled": "eidola_ds_lin4_banded_s8",
+          "meta": "eidola_ds_lin4_banded_s8_meta"
         },
         {
           "symbol": "eidola_ds_lin4_banded_t32",
@@ -677,6 +706,11 @@
           "meta": "eidola_ds_lin4_banded_t8_meta"
         },
         {
+          "symbol": "eidola_ds_lin4_tolerance_s8",
+          "demangled": "eidola_ds_lin4_tolerance_s8",
+          "meta": "eidola_ds_lin4_tolerance_s8_meta"
+        },
+        {
           "symbol": "eidola_ds_lin4_tolerance_t32",
           "demangled": "eidola_ds_lin4_tolerance_t32",
           "meta": "eidola_ds_lin4_tolerance_t32_meta"
@@ -687,6 +721,11 @@
           "meta": "eidola_ds_lin4_tolerance_t8_meta"
         },
         {
+          "symbol": "eidola_ds_lin8_banded_s8",
+          "demangled": "eidola_ds_lin8_banded_s8",
+          "meta": "eidola_ds_lin8_banded_s8_meta"
+        },
+        {
           "symbol": "eidola_ds_lin8_banded_t32",
           "demangled": "eidola_ds_lin8_banded_t32",
           "meta": "eidola_ds_lin8_banded_t32_meta"
@@ -695,6 +734,11 @@
           "symbol": "eidola_ds_lin8_banded_t8",
           "demangled": "eidola_ds_lin8_banded_t8",
           "meta": "eidola_ds_lin8_banded_t8_meta"
+        },
+        {
+          "symbol": "eidola_ds_lin8_tolerance_s8",
+          "demangled": "eidola_ds_lin8_tolerance_s8",
+          "meta": "eidola_ds_lin8_tolerance_s8_meta"
         },
         {
           "symbol": "eidola_ds_lin8_tolerance_t32",
@@ -709,22 +753,26 @@
       ],
       "meta": [
         "eidola_ds_gemm_probe_meta",
+        "eidola_ds_lin4_banded_s8_meta",
         "eidola_ds_lin4_banded_t32_meta",
         "eidola_ds_lin4_banded_t8_meta",
+        "eidola_ds_lin4_tolerance_s8_meta",
         "eidola_ds_lin4_tolerance_t32_meta",
         "eidola_ds_lin4_tolerance_t8_meta",
+        "eidola_ds_lin8_banded_s8_meta",
         "eidola_ds_lin8_banded_t32_meta",
         "eidola_ds_lin8_banded_t8_meta",
+        "eidola_ds_lin8_tolerance_s8_meta",
         "eidola_ds_lin8_tolerance_t32_meta",
         "eidola_ds_lin8_tolerance_t8_meta"
       ],
       "mma_sass": {
-        "HMMA": 724
+        "HMMA": 804
       },
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 3172,
+        "ptx_rounded": 3524,
         "sass_fma": 0
       }
     },
@@ -734,13 +782,18 @@
       "source": "csrc/ds_gemm_tc.cu",
       "profile": "exact",
       "file": "cubin/ds_gemm_tc.sm_103a.cubin",
-      "sha256": "986d520d125e2e507708687c8d4b7339e8b11cb3851b87594235ffb00dba35ba",
-      "size": 720288,
+      "sha256": "c75a256538d79b9b24575ffd9a120616479446d06b4ca15b5dfda31dc0a1c8a3",
+      "size": 819992,
       "entries": [
         {
           "symbol": "eidola_ds_gemm_probe",
           "demangled": "eidola_ds_gemm_probe",
           "meta": "eidola_ds_gemm_probe_meta"
+        },
+        {
+          "symbol": "eidola_ds_lin4_banded_s8",
+          "demangled": "eidola_ds_lin4_banded_s8",
+          "meta": "eidola_ds_lin4_banded_s8_meta"
         },
         {
           "symbol": "eidola_ds_lin4_banded_t32",
@@ -753,6 +806,11 @@
           "meta": "eidola_ds_lin4_banded_t8_meta"
         },
         {
+          "symbol": "eidola_ds_lin4_tolerance_s8",
+          "demangled": "eidola_ds_lin4_tolerance_s8",
+          "meta": "eidola_ds_lin4_tolerance_s8_meta"
+        },
+        {
           "symbol": "eidola_ds_lin4_tolerance_t32",
           "demangled": "eidola_ds_lin4_tolerance_t32",
           "meta": "eidola_ds_lin4_tolerance_t32_meta"
@@ -763,6 +821,11 @@
           "meta": "eidola_ds_lin4_tolerance_t8_meta"
         },
         {
+          "symbol": "eidola_ds_lin8_banded_s8",
+          "demangled": "eidola_ds_lin8_banded_s8",
+          "meta": "eidola_ds_lin8_banded_s8_meta"
+        },
+        {
           "symbol": "eidola_ds_lin8_banded_t32",
           "demangled": "eidola_ds_lin8_banded_t32",
           "meta": "eidola_ds_lin8_banded_t32_meta"
@@ -771,6 +834,11 @@
           "symbol": "eidola_ds_lin8_banded_t8",
           "demangled": "eidola_ds_lin8_banded_t8",
           "meta": "eidola_ds_lin8_banded_t8_meta"
+        },
+        {
+          "symbol": "eidola_ds_lin8_tolerance_s8",
+          "demangled": "eidola_ds_lin8_tolerance_s8",
+          "meta": "eidola_ds_lin8_tolerance_s8_meta"
         },
         {
           "symbol": "eidola_ds_lin8_tolerance_t32",
@@ -785,22 +853,26 @@
       ],
       "meta": [
         "eidola_ds_gemm_probe_meta",
+        "eidola_ds_lin4_banded_s8_meta",
         "eidola_ds_lin4_banded_t32_meta",
         "eidola_ds_lin4_banded_t8_meta",
+        "eidola_ds_lin4_tolerance_s8_meta",
         "eidola_ds_lin4_tolerance_t32_meta",
         "eidola_ds_lin4_tolerance_t8_meta",
+        "eidola_ds_lin8_banded_s8_meta",
         "eidola_ds_lin8_banded_t32_meta",
         "eidola_ds_lin8_banded_t8_meta",
+        "eidola_ds_lin8_tolerance_s8_meta",
         "eidola_ds_lin8_tolerance_t32_meta",
         "eidola_ds_lin8_tolerance_t8_meta"
       ],
       "mma_sass": {
-        "HMMA": 724
+        "HMMA": 804
       },
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 3172,
+        "ptx_rounded": 3524,
         "sass_fma": 0
       }
     },
@@ -2643,8 +2715,8 @@
     {
       "name": "ds_gemm_tc",
       "file": "fatbin/ds_gemm_tc.fatbin",
-      "sha256": "aed8895ac5afcdb7cfe4ccb4812cccc99dff6c7bd88cb536d9e0aedc9d820d93",
-      "size": 1373128,
+      "sha256": "137718f8ae604098ca0217d800d0519e1c3c347dcba240ea9efe5b34c1960776",
+      "size": 1565296,
       "archs": [
         "sm_100a",
         "sm_103a"
