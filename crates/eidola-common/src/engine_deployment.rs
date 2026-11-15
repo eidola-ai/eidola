@@ -46,7 +46,8 @@ pub mod env {
     /// Physical KV blocks per group, including the reserved null block
     /// (`cpu` only).
     pub const KV_BLOCKS: &str = "EIDOLA_ENGINE_KV_BLOCKS";
-    /// Device memory for the KV pools, in bytes; the node derives the
+    /// Device memory for the KV pools, in bytes, one value per device the
+    /// model runs on, comma-separated in device order; the node derives the
     /// per-group block counts from it (`cuda` only).
     pub const KV_DEVICE_BYTES: &str = "EIDOLA_ENGINE_KV_DEVICE_BYTES";
     /// The kernel build output the CUDA executor loads its images from, each
@@ -127,10 +128,11 @@ pub fn check_env_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(
     }
 }
 
-/// Caps on the node's allocation-driving sizes. The engine serves one model
-/// family, MiMo-V2.6-Flash (`eidola-engine-cuda`'s `support::check_supported`
-/// refuses every other), so each cap follows from that model and the CUDA
-/// executor's own limits, generous but finite.
+/// Caps on the node's allocation-driving sizes. Each follows from the
+/// implemented architectures (MiMo-V2.6-Flash, whose CUDA executor
+/// `eidola-engine-cuda`'s `support::check_supported` names, and
+/// DeepSeek-V4.1-Flash, whose context window and vocabulary are within
+/// MiMo's) and the CUDA executor's own limits, generous but finite.
 pub mod caps {
     /// The model's context window (`support::MAX_POSITIONS`, 2^20).
     pub const MAX_MODEL_LEN: u32 = 1 << 20;
@@ -138,8 +140,8 @@ pub mod caps {
     /// prefix cache's unit of reuse; beyond 1,024 positions paging stops
     /// paying, and the page stride (32-bit) stays far from overflow.
     pub const KV_BLOCK_SIZE: u32 = 1024;
-    /// Device memory for the CUDA executor's KV pools: less than the
-    /// supported GPU's memory ([`super::SUPPORTED_GPU_MEMORY_BYTES`]), as the
+    /// Device memory for the CUDA executor's KV pools on each device: less
+    /// than the supported GPU's memory ([`super::SUPPORTED_GPU_MEMORY_BYTES`]), as the
     /// node itself refuses a value not less than its device's. What a pinned
     /// deployment may give the pools, beside its weights and the executor's
     /// own reserve, is held separately ([`super::check_resources`]).
@@ -414,8 +416,8 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
     read_pool + admission_pool + tables + PROCESS_HEADROOM_BYTES
 }
 
-/// The fewest bytes of device memory the CUDA executor's KV pools need: the
-/// node's own derivation (`cuda::derive_kv_blocks` in `eidola-server-engine`)
+/// The fewest bytes of device memory the CUDA executor's KV pools need on a
+/// device of shape `shape`: the node's own derivation (`cuda::derive_kv_blocks` in `eidola-server-engine`)
 /// at its smallest, for a model of shape `shape`. With `B` = `KV_BLOCK_SIZE`,
 /// `R` = ⌈([`Shape::sliding_window`] − 1) / `B`⌉ + 1, and `P` =
 /// [`RETENTION_POINTS`] with the prefix cache (else 0):
@@ -431,9 +433,10 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
 /// each pool one pad block more (where a replayed decode graph's padding rows
 /// write), each block `B` positions of [`Shape::sliding_kv_bytes_per_position`],
 /// [`Shape::global_kv_bytes_per_position`] or `k` ×
-/// [`Shape::drafter_kv_bytes_per_position_per_depth`], a drafter block also `k` ×
-/// [`Shape::drafter_tap_bytes_per_depth`] of boundary tap. Saturates rather than
-/// wraps.
+/// [`Shape::drafter_kv_bytes_per_position_per_depth`] plus
+/// [`Shape::drafter_kv_bytes_per_position`], a drafter block also `k` ×
+/// [`Shape::drafter_tap_bytes_per_depth`] of boundary tap. A device that holds
+/// no drafter has drafter bytes of 0. Saturates rather than wraps.
 pub fn cuda_kv_min_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig) -> u64 {
     let b = u64::from(sizing.kv_block_size.max(1));
     let global_blocks = u64::from(sizing.max_model_len).div_ceil(b) + 1;
@@ -468,8 +471,13 @@ fn sliding_block_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
 /// without drafting, when there is no such pool.
 fn drafter_block_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
     let k = u64::from(sizing.draft_tokens);
+    let fixed = if k > 0 {
+        shape.drafter_kv_bytes_per_position
+    } else {
+        0
+    };
     u64::from(sizing.kv_block_size.max(1))
-        .saturating_mul(k * shape.drafter_kv_bytes_per_position_per_depth)
+        .saturating_mul((k * shape.drafter_kv_bytes_per_position_per_depth).saturating_add(fixed))
         .saturating_add(k * shape.drafter_tap_bytes_per_depth)
 }
 
@@ -593,6 +601,135 @@ pub fn check_resources(
                 env::KV_DEVICE_BYTES
             ));
         }
+    }
+    Ok(())
+}
+
+/// Whether a deployment of an architecture split across devices (`devices`,
+/// one [`Shape`] per device, [`crate::architecture::Architecture::devices`])
+/// fits its VM and GPUs, as far as configuration alone fixes it: the rule of
+/// [`check_resources`] on every device, with each device's own weights.
+///
+/// - The `cuda` executor runs device `d` on GPU `d`, so the VM attaches at
+///   least as many GPUs as there are devices, and `KV_DEVICE_BYTES` names one
+///   budget per device, in device order.
+/// - On device `d`: its budget holds at least [`cuda_kv_min_bytes`] of its
+///   shape, and the budget, [`Shape::weights_bytes`] and
+///   [`cuda_device_reserve_bytes`] of its shape fit
+///   [`SUPPORTED_GPU_MEMORY_BYTES`].
+/// - The pack's data size (`weights_bytes`, [`artifact_data_bytes`]) is at
+///   most the devices' weights together, so the per-device bounds are bounds
+///   on the weights the deployment pins.
+/// - Host memory holds [`host_memory_bytes`] and the host tier, and a
+///   non-zero tier holds at least the sum over devices of
+///   [`cuda_kv_host_min_bytes`] (every pool of every device two host blocks).
+///
+/// The `cpu` executor runs every device in host memory: the VM holds its KV
+/// pools (`KV_BLOCKS` × `KV_BLOCK_SIZE` × each device's
+/// [`Shape::kv_bytes_per_position`] and drafter bytes), and the weights,
+/// which it does not bound here.
+///
+/// There is no setting for running a device's experts or Engram tables out
+/// of host memory: a deployment places every tensor on its device.
+#[allow(clippy::too_many_arguments)]
+pub fn check_device_resources(
+    devices: &[Shape],
+    sizing: &Sizing,
+    cache: &CacheConfig,
+    executor: &ExecutorSettings,
+    kv_host_bytes: u64,
+    weights_bytes: u64,
+    memory_mib: u64,
+    gpus: u64,
+) -> Result<(), String> {
+    let host_kv = match executor {
+        ExecutorSettings::Cpu { kv_blocks } => devices.iter().fold(0u64, |sum, d| {
+            let per_position =
+                d.kv_bytes_per_position()
+                    .saturating_add(if sizing.draft_tokens > 0 {
+                        d.drafter_kv_bytes_per_position
+                    } else {
+                        0
+                    });
+            sum.saturating_add(
+                u64::from(*kv_blocks)
+                    .saturating_mul(u64::from(sizing.kv_block_size))
+                    .saturating_mul(per_position),
+            )
+        }),
+        ExecutorSettings::Cuda { .. } => 0,
+    };
+    let host = host_memory_bytes(sizing)
+        .saturating_add(host_kv)
+        .saturating_add(kv_host_bytes);
+    let host_limit = memory_mib.saturating_mul(1 << 20);
+    if host > host_limit {
+        return Err(format!(
+            "the node's request pools, block tables, host KV, host tier ({}) and headroom \
+             need {host} bytes, more than the VM's {host_limit} (memory)",
+            env::KV_HOST_BYTES
+        ));
+    }
+    let ExecutorSettings::Cuda { .. } = executor else {
+        return Ok(());
+    };
+    let n = devices.len();
+    if gpus < n as u64 {
+        return Err(format!(
+            "the model runs on {n} GPUs, one per device, and the VM attaches {gpus}"
+        ));
+    }
+    let budgets = executor.kv_device_budgets();
+    if budgets.len() != n {
+        return Err(format!(
+            "{} names {} budgets; the model runs on {n} devices, one budget each, in device \
+             order",
+            env::KV_DEVICE_BYTES,
+            budgets.len()
+        ));
+    }
+    let mut device_weights = 0u64;
+    let mut host_needed = 0u64;
+    for (d, (shape, &budget)) in devices.iter().zip(&budgets).enumerate() {
+        let weights = shape
+            .weights_bytes
+            .ok_or_else(|| format!("device {d} states no weights bound"))?;
+        device_weights = device_weights.saturating_add(weights);
+        let needed = cuda_kv_min_bytes(shape, sizing, cache);
+        if budget < needed {
+            return Err(format!(
+                "device {d}: its {} budget ({budget}) is less than the {needed} bytes its KV \
+                 pools need at their smallest (one {} sequence, every seat's sliding window, \
+                 pad blocks)",
+                env::KV_DEVICE_BYTES,
+                env::MAX_MODEL_LEN
+            ));
+        }
+        host_needed =
+            host_needed.saturating_add(cuda_kv_host_min_bytes(shape, sizing, cache, budget));
+        let reserve = cuda_device_reserve_bytes(shape, sizing);
+        let device = budget.saturating_add(weights).saturating_add(reserve);
+        if device > SUPPORTED_GPU_MEMORY_BYTES {
+            return Err(format!(
+                "device {d}: its {} budget ({budget}), its weights ({weights}) and the \
+                 executor's reserve ({reserve}) need {device} bytes of device memory, more \
+                 than the {SUPPORTED_GPU}'s {SUPPORTED_GPU_MEMORY_BYTES}",
+                env::KV_DEVICE_BYTES
+            ));
+        }
+    }
+    if weights_bytes > device_weights {
+        return Err(format!(
+            "the weights pack holds {weights_bytes} bytes, more than the {device_weights} the \
+             devices' weights bounds allow together"
+        ));
+    }
+    if kv_host_bytes > 0 && kv_host_bytes < host_needed {
+        return Err(format!(
+            "{} ({kv_host_bytes}) is less than the {host_needed} bytes that give every KV pool \
+             of every device two host blocks; 0 is no host tier",
+            env::KV_HOST_BYTES
+        ));
     }
     Ok(())
 }
@@ -725,8 +862,11 @@ pub enum ExecutorSettings {
     Cuda {
         /// The kernel build output: an absolute, clean path.
         kernels_dir: String,
-        /// Device memory for the KV pools, in bytes.
+        /// Device memory for the KV pools of device 0, in bytes.
         kv_device_bytes: u64,
+        /// The KV pools' budgets of devices 1 onwards, in device order: empty
+        /// for a model on one device.
+        further_kv_device_bytes: Vec<u64>,
         graphs: CudaGraphs,
         /// Whether the GPUs must be in confidential-computing mode.
         gpu_cc: GpuCc,
@@ -739,6 +879,21 @@ impl ExecutorSettings {
         match self {
             ExecutorSettings::Cpu { .. } => Executor::Cpu,
             ExecutorSettings::Cuda { .. } => Executor::Cuda,
+        }
+    }
+
+    /// The KV budget of every device, in device order (`cuda`); empty for the
+    /// `cpu` executor.
+    pub fn kv_device_budgets(&self) -> Vec<u64> {
+        match self {
+            ExecutorSettings::Cpu { .. } => Vec::new(),
+            ExecutorSettings::Cuda {
+                kv_device_bytes,
+                further_kv_device_bytes,
+                ..
+            } => core::iter::once(*kv_device_bytes)
+                .chain(further_kv_device_bytes.iter().copied())
+                .collect(),
         }
     }
 }
@@ -897,22 +1052,9 @@ pub fn parse_measured(
         }
         Executor::Cuda => {
             refuse_unless(env::KV_BLOCKS, "cpu")?;
-            let kv_device_bytes = match get(env::KV_DEVICE_BYTES)?.parse::<u64>() {
-                Ok(n) if n > 0 => n,
-                _ => {
-                    return Err(ConfigError(format!(
-                        "{} must be a positive number of bytes",
-                        env::KV_DEVICE_BYTES
-                    )));
-                }
-            };
-            if kv_device_bytes > caps::KV_DEVICE_BYTES {
-                return Err(ConfigError(format!(
-                    "{} must be at most {}",
-                    env::KV_DEVICE_BYTES,
-                    caps::KV_DEVICE_BYTES
-                )));
-            }
+            let mut budgets = parse_kv_device_bytes(&get(env::KV_DEVICE_BYTES)?)?.into_iter();
+            let kv_device_bytes = budgets.next().expect("at least one budget");
+            let further_kv_device_bytes: Vec<u64> = budgets.collect();
             let kernels_dir = get(env::KERNELS_DIR)?;
             if !is_clean_absolute_path(&kernels_dir) {
                 return Err(ConfigError(format!(
@@ -943,6 +1085,7 @@ pub fn parse_measured(
             ExecutorSettings::Cuda {
                 kernels_dir,
                 kv_device_bytes,
+                further_kv_device_bytes,
                 graphs,
                 gpu_cc,
             }
@@ -1086,6 +1229,43 @@ pub fn parse_measured(
         cache,
         kv_host_bytes,
     })
+}
+
+/// `EIDOLA_ENGINE_KV_DEVICE_BYTES`: one budget per device, comma-separated
+/// in device order (a model on one GPU names one), each a positive number of
+/// bytes of at most [`caps::KV_DEVICE_BYTES`], at most as many as
+/// [`CUDA_GPU_COUNTS`] allows GPUs. How many devices the model runs on is its
+/// architecture's ([`check_device_resources`]); the node holds the count to
+/// its weights.
+pub fn parse_kv_device_bytes(text: &str) -> Result<Vec<u64>, ConfigError> {
+    let mut budgets = Vec::new();
+    for part in text.split(',') {
+        let n = match part.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                return Err(ConfigError(format!(
+                    "{} must be one positive number of bytes per device, comma-separated",
+                    env::KV_DEVICE_BYTES
+                )));
+            }
+        };
+        if n > caps::KV_DEVICE_BYTES {
+            return Err(ConfigError(format!(
+                "{} must be at most {} per device",
+                env::KV_DEVICE_BYTES,
+                caps::KV_DEVICE_BYTES
+            )));
+        }
+        budgets.push(n);
+    }
+    if budgets.len() as u64 > *CUDA_GPU_COUNTS.end() {
+        return Err(ConfigError(format!(
+            "{} names more devices than the {} GPUs a deployment may attach",
+            env::KV_DEVICE_BYTES,
+            CUDA_GPU_COUNTS.end()
+        )));
+    }
+    Ok(budgets)
 }
 
 /// A deployment path component (a deployment's name, a variant):
@@ -1334,10 +1514,12 @@ pub fn check_shim_paths(paths: &[&str]) -> Result<(), String> {
 /// The GPU counts a `cuda` deployment may attach (the config's top-level
 /// `gpus`): one to eight, the range Tinfoil's validator accepts
 /// (`tinfoil-config/validation.go`: `gpus must be between 0 and 8`) less the
-/// zero that attaches none. The node computes on one GPU (device 0); any
-/// further GPU a host shape attaches is attested like the first and left
-/// idle, so the count is the platform's shape to choose, and what protects the
-/// deployment is that every attached GPU is attested (below).
+/// zero that attaches none. The node computes on one GPU per device of its
+/// architecture (device `d` on GPU `d`; [`check_device_resources`] holds the
+/// count to at least that); any further GPU a host shape attaches is attested
+/// like the others and left idle, so the count is the platform's shape to
+/// choose, and what protects the deployment is that every attached GPU is
+/// attested (below).
 pub const CUDA_GPU_COUNTS: core::ops::RangeInclusive<u64> = 1..=8;
 
 /// Whether a deployment's GPUs are attested on every handshake.
@@ -1658,8 +1840,199 @@ mod tests {
         ExecutorSettings::Cuda {
             kernels_dir: "/opt/eidola/kernels".into(),
             kv_device_bytes,
+            further_kv_device_bytes: Vec::new(),
             graphs: CudaGraphs::On,
             gpu_cc: GpuCc::Required,
+        }
+    }
+
+    fn cuda_on(budgets: &[u64]) -> ExecutorSettings {
+        ExecutorSettings::Cuda {
+            kernels_dir: "/opt/eidola/kernels".into(),
+            kv_device_bytes: budgets[0],
+            further_kv_device_bytes: budgets[1..].to_vec(),
+            graphs: CudaGraphs::On,
+            gpu_cc: GpuCc::Required,
+        }
+    }
+
+    /// DeepSeek-V4.1-Flash's released sizing on two B300s: its whole context
+    /// window, 64 seats, a step of 8,192 tokens, three drafts, the cache on.
+    fn ds_sizing() -> Sizing {
+        Sizing {
+            kv_block_size: 256,
+            max_model_len: 1 << 20,
+            max_seqs: 64,
+            max_batched_tokens: 8192,
+            max_prefill_chunk: 4096,
+            draft_tokens: 3,
+            max_requests: 64,
+        }
+    }
+
+    const DS_CACHE: CacheConfig = CacheConfig {
+        enabled: true,
+        idle_ttl_secs: 900,
+        max_age_secs: 7200,
+    };
+
+    /// The published text-only pack, bounded: the shards and files of the
+    /// released checkpoint, 510.29 GB, under the devices' 510.66 GB.
+    const DS_PACK_BYTES: u64 = 510_300_000_000;
+
+    /// The fit arithmetic at the released sizes: device 0 holds 250.87 GB of
+    /// weights and device 1 259.79 GB, each beside its KV budget and the
+    /// executor's reserve on a 287.4 GB B300.
+    #[test]
+    fn deepseek_fits_two_b300s_at_the_released_sizes() {
+        use crate::architecture::Architecture;
+        let devices = Architecture::DeepSeekV41Flash.devices();
+        let sizing = ds_sizing();
+        let [d0, d1] = devices else { panic!() };
+        let reserve0 = cuda_device_reserve_bytes(d0, &sizing);
+        let reserve1 = cuda_device_reserve_bytes(d1, &sizing);
+        // The two devices differ only in their pools and weights here.
+        assert_eq!(reserve0, reserve1);
+        let room0 = SUPPORTED_GPU_MEMORY_BYTES - d0.weights_bytes.unwrap() - reserve0;
+        let room1 = SUPPORTED_GPU_MEMORY_BYTES - d1.weights_bytes.unwrap() - reserve1;
+        // About 18.7 GB of KV on device 0 and 9.8 GB on device 1, beside a
+        // reserve of about 18 GB on each.
+        assert_eq!(reserve0 / 1_000_000_000, 17, "{reserve0}");
+        assert_eq!(room0 / 100_000_000, 186, "{room0}");
+        assert_eq!(room1 / 100_000_000, 97, "{room1}");
+        let min0 = cuda_kv_min_bytes(d0, &sizing, &DS_CACHE);
+        let min1 = cuda_kv_min_bytes(d1, &sizing, &DS_CACHE);
+        // Device 0: a 2^20-position sequence of 534-byte entries (4,097
+        // blocks and a pad), and 609 window blocks of 20 layers. Device 1:
+        // 356-byte entries, and the window blocks with the drafter's three.
+        assert_eq!(min0, 4098 * 256 * 534 + 610 * 256 * 20 * 528);
+        assert_eq!(min1, 4098 * 256 * 356 + 610 * 256 * (20 * 528 + 3 * 528));
+        assert!(min0 < room0 && min1 < room1);
+
+        let memory_mib = 196_608;
+        let check = |budgets: &[u64], gpus: u64, pack: u64, host: u64| {
+            check_device_resources(
+                devices,
+                &sizing,
+                &DS_CACHE,
+                &cuda_on(budgets),
+                host,
+                pack,
+                memory_mib,
+                gpus,
+            )
+        };
+        assert_eq!(check(&[room0, room1], 2, DS_PACK_BYTES, 0), Ok(()));
+        assert_eq!(check(&[min0, min1], 2, DS_PACK_BYTES, 0), Ok(()));
+        // More GPUs than devices are attested and left idle.
+        assert_eq!(check(&[room0, room1], 8, DS_PACK_BYTES, 0), Ok(()));
+        // One byte over on either device, or under its least.
+        let err = check(&[room0 + 1, room1], 2, DS_PACK_BYTES, 0).unwrap_err();
+        assert!(
+            err.starts_with("device 0:") && err.contains("device memory"),
+            "{err}"
+        );
+        let err = check(&[room0, room1 + 1], 2, DS_PACK_BYTES, 0).unwrap_err();
+        assert!(
+            err.starts_with("device 1:") && err.contains("device memory"),
+            "{err}"
+        );
+        let err = check(&[min0 - 1, room1], 2, DS_PACK_BYTES, 0).unwrap_err();
+        assert!(
+            err.starts_with("device 0:") && err.contains("smallest"),
+            "{err}"
+        );
+        let err = check(&[room0, min1 - 1], 2, DS_PACK_BYTES, 0).unwrap_err();
+        assert!(
+            err.starts_with("device 1:") && err.contains("smallest"),
+            "{err}"
+        );
+        // Device 0's room is not device 1's: the same budget on both does not
+        // fit.
+        assert!(check(&[room0, room0], 2, DS_PACK_BYTES, 0).is_err());
+        // The wrong device count, either way, and too few GPUs.
+        for budgets in [&[room0][..], &[room0, room1, room1][..]] {
+            let err = check(budgets, 3, DS_PACK_BYTES, 0).unwrap_err();
+            assert!(err.contains("runs on 2 devices"), "{err}");
+        }
+        let err = check(&[room0, room1], 1, DS_PACK_BYTES, 0).unwrap_err();
+        assert!(err.contains("runs on 2 GPUs"), "{err}");
+        // A pack heavier than the devices' bounds together is not this model.
+        let total = d0.weights_bytes.unwrap() + d1.weights_bytes.unwrap();
+        assert_eq!(check(&[room0, room1], 2, total, 0), Ok(()));
+        let err = check(&[room0, room1], 2, total + 1, 0).unwrap_err();
+        assert!(err.contains("weights pack"), "{err}");
+        // A host tier gives every pool of both devices two blocks, or is none.
+        let least: u64 = devices
+            .iter()
+            .zip([room0, room1])
+            .map(|(d, b)| cuda_kv_host_min_bytes(d, &sizing, &DS_CACHE, b))
+            .sum();
+        assert_eq!(check(&[room0, room1], 2, DS_PACK_BYTES, least), Ok(()));
+        let err = check(&[room0, room1], 2, DS_PACK_BYTES, least - 1).unwrap_err();
+        assert!(err.contains("every KV pool of every device"), "{err}");
+        // And the VM holds the tier.
+        let err = check(&[room0, room1], 2, DS_PACK_BYTES, (memory_mib << 20) - 1).unwrap_err();
+        assert!(err.contains("(memory)"), "{err}");
+
+        // The cpu executor runs both devices' pools in host memory.
+        let cpu = ExecutorSettings::Cpu { kv_blocks: 64 };
+        let per_block = 256 * (534 + 20 * 528 + 356 + 20 * 528 + 3 * 528);
+        let host = |mib| check_device_resources(devices, &sizing, &DS_CACHE, &cpu, 0, 0, mib, 0);
+        let needed = host_memory_bytes(&sizing) + 64 * per_block;
+        assert_eq!(host(needed.div_ceil(1 << 20)), Ok(()));
+        assert!(host(needed / (1 << 20) - 1).is_err());
+    }
+
+    /// A one-device model's budget is unchanged by the list grammar.
+    #[test]
+    fn kv_device_bytes_name_one_budget_per_device() {
+        assert_eq!(
+            parse_kv_device_bytes("85899345920"),
+            Ok(vec![85_899_345_920])
+        );
+        assert_eq!(parse_kv_device_bytes("1,2"), Ok(vec![1, 2]));
+        assert_eq!(parse_kv_device_bytes(&["1"; 8].join(",")).unwrap().len(), 8);
+        let cap = caps::KV_DEVICE_BYTES;
+        assert_eq!(
+            parse_kv_device_bytes(&format!("{cap},{cap}")),
+            Ok(vec![cap, cap])
+        );
+        for bad in [
+            "".to_string(),
+            "0".into(),
+            "1,0".into(),
+            "1,".into(),
+            ",1".into(),
+            "1,,2".into(),
+            "1 ,2".into(),
+            "1;2".into(),
+            "-1".into(),
+            format!("1,{}", cap + 1),
+            ["1"; 9].join(","),
+        ] {
+            assert!(parse_kv_device_bytes(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The staged-expert path and host-memory Engram tables are development
+    /// settings of the executors with no spelling in the measured
+    /// configuration, so no pinned deployment can name either.
+    #[test]
+    fn dev_only_placements_have_no_spelling() {
+        for name in [
+            "EIDOLA_ENGINE_STAGED_EXPERTS",
+            "EIDOLA_ENGINE_EXPERTS_ON_HOST",
+            "EIDOLA_ENGINE_ENGRAM_ON_HOST",
+            "EIDOLA_ENGINE_ENGRAM_HOST_BYTES",
+        ] {
+            assert!(check_env_names([name]).is_err(), "{name}");
+        }
+        for name in env::MEASURED {
+            assert!(
+                !name.contains("EXPERT") && !name.contains("ENGRAM") && !name.contains("STAGE"),
+                "{name}"
+            );
         }
     }
 
@@ -2445,10 +2818,19 @@ mod tests {
             ExecutorSettings::Cuda {
                 kernels_dir: "/opt/eidola/kernels".into(),
                 kv_device_bytes: 64 << 30,
+                further_kv_device_bytes: Vec::new(),
                 graphs: CudaGraphs::On,
                 gpu_cc: GpuCc::Required,
             }
         );
+        // Two devices' budgets.
+        let mut two = cuda.clone();
+        two.insert(
+            env::KV_DEVICE_BYTES,
+            format!("{},{}", 64u64 << 30, 32u64 << 30),
+        );
+        let two = parse_map(&two).unwrap().executor;
+        assert_eq!(two.kv_device_budgets(), [64 << 30, 32 << 30]);
         // Every cuda setting is required with cuda.
         for name in CUDA_SETTINGS {
             let mut map = cuda.clone();

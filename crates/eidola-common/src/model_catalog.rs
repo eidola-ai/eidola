@@ -253,7 +253,8 @@ pub fn parse(path: &str, bytes: &[u8]) -> Result<Row, String> {
     }
 
     // The per-file manifest, and its aggregate.
-    let manifest = weights_manifest::canonical_manifest(
+    let manifest = weights_manifest::canonical_manifest_for(
+        architecture,
         raw.files
             .iter()
             .map(|f| (f.path.as_str(), f.sha256.as_str())),

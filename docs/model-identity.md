@@ -42,8 +42,9 @@ Its `id` is the model's first tag, or `sha256:<hex>` when it has none.
 The hash covers files at the top level of the engine's weights directory only. A published checkpoint may hold subdirectories (MiMo-V2.6-Flash's carries a drafter and an audio tokenizer in two); the engine reads nothing in them, and they are not hashed. The hash **covers** these files:
 
 - every file whose name ends in `.safetensors` (the shards);
-- `config.json`, `tokenizer.json`, `chat_template.jinja` and `generation_config.json`, all required;
-- `model.safetensors.index.json`, when present.
+- `config.json`, `tokenizer.json`, `chat_template.jinja`, `generation_config.json` and `model.safetensors.index.json`, each when present.
+
+`config.json` and `tokenizer.json` are always required. A model whose engine reads the other two requires them as well: MiMo-V2.6's reads its template and its sampling defaults; DeepSeek-V4.1's encodes its prompt with code compiled into the engine and reads `generation_config.json` only when there is one. A covered file the engine does not read is hashed all the same.
 
 Every covered name must match `[A-Za-z0-9_][A-Za-z0-9._-]*`: ASCII letters, digits, `.`, `_` and `-`, not starting with `.` or `-`. The engine refuses a directory holding a covered file named otherwise. Files that are not covered are not read.
 
