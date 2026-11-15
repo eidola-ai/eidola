@@ -59,13 +59,13 @@ cd ../../../.. && EIDOLA_DEEPSEEK_TRUNCATED_DIR=<checkpoint dir> \
     cargo test --release -p eidola-engine-model --test deepseek_real -- --ignored --nocapture
 ```
 
-`fetch_truncated.py` fetches `config.json`, `tokenizer.json` and the tensors `ds_golden/truncated.py` keeps, re-packed byte for byte into one local file per upstream shard, and records every file's sha256 in `local-sha256.json`, which the Rust test verifies before loading. The truncation is:
+`fetch_truncated.py` fetches `config.json`, `tokenizer.json` and the tensors `ds_golden/truncated.py` keeps, re-packed byte for byte into one local file per upstream shard. Every file is checked against the recorded hashes before it gets the name anything loads, and the Rust test checks them again before loading (Recorded hashes, below). The truncation is:
 
 - checkpoint layers 0, 1, 2, 3, 14, 15, 20, 21, 24, 37, 38 and 39, which cover every layer kind and the drafter's three target layers;
 - the first 32 of each backbone layer's 384 routed experts and the first 16 of each draft block's 128. The router's rows are cut to match, so routing chooses among the kept experts. Every tensor is the checkpoint's own; the model is smaller than the released one, not an approximation of it;
 - the embedding, the head, the final norm, both Engram projections and the three draft blocks.
 
-The two Engram tables (about 98 GB each) are not fetched. `real_golden.py` hashes its tokens with the reference's own code, fetches only the rows they touch (two range reads per row) into `<dir>/golden/engram-rows.safetensors`, and gives the reference and the Rust test a table of just those rows. The reference's table class runs unmodified on the compact table; a forward hook maps its row ids. The host rate-limits that many small requests (about 24,000 for 256 tokens took 50 minutes), so the fetch backs off, appends rows to a partial file as they arrive and resumes from it. The recorded numbers use `--tokens 256` for that reason; without it the passage is 487 tokens.
+The two Engram tables (about 98 GB each) are not fetched. `real_golden.py` hashes its tokens with the reference's own code, fetches only the rows they touch (two range reads per row) into `<dir>/golden/engram-rows.safetensors`, and gives the reference and the Rust test a table of just those rows. A row read by range has no recorded hash to be checked against: only a whole table shard does. The reference's table class runs unmodified on the compact table; a forward hook maps its row ids. The host rate-limits that many small requests (about 24,000 for 256 tokens took 50 minutes), so the fetch backs off, appends rows to a partial file as they arrive and resumes from it. The recorded numbers use `--tokens 256` for that reason; without it the passage is 487 tokens.
 
 `real_golden.py` tokenises a fixed passage of prose and code and writes `<dir>/golden/reference-pinned.safetensors`: the logits and every layer's streams for the passage as one prefill chunk, then a one-window prefill followed by one token per call with the drafter. With `--native-arithmetic` it writes `reference-native.safetensors` from the same model with PyTorch's own arithmetic and `topk`: the reference with its unspecified bits left to the library, which nothing bit-unequal to it reproduces. The Rust test reports that comparison and does not assert it (`AGENTS.md` → What is verified against what).
 
@@ -83,9 +83,41 @@ cd ../../../.. && EIDOLA_DEEPSEEK_PREFIX_DIR=<prefix dir> \
 
 `--reuse` copies the tensors another fetched truncation already holds instead of fetching them again, and `--rows-from` does the same for Engram rows. Four layers have no meaningful logits, so the goldens are every layer's streams and every token's routed experts for the whole passage (555 tokens) as one prefill chunk, plus the first 96 tokens one per call. The test equals the pinned golden exactly and prints, per layer, the relative error, the largest difference, the share of elements and positions that differ and the share of tokens whose routed experts are the same, for every other `golden/reference-*.safetensors` present and for the reference's prefill layout against its decode layout.
 
+## Recorded hashes
+
+`upstream-sha256.json` records, for the pinned revision of the repository, the size and SHA-256 of every published file used here and the SHA-256 of every re-packed file of each truncation. Nothing is loaded that has not been checked against it:
+
+- a weight shard's hash is its Git LFS object id in the repository's tree listing (`https://huggingface.co/api/models/<repository>/tree/<revision>`); `config.json`, `tokenizer.json` and the index are small Git blobs, and their SHA-256 was computed from bytes whose Git blob id equals the listing's;
+- a truncation's re-pack is a function of the upstream shard and the truncation alone. Its hashes were recorded from fetched re-packs after every tensor in them (9,347 tensors for `prefix`, 3,071 for `spread`) had been compared, by SHA-256, with the same tensor of whole shards matching the upstream hashes;
+- `fetch_truncated.py` and `gpu_session.sh full-fetch` write a download under a name nothing loads and rename it only when it matches; `verify_checkpoint.py --dir <dir> [--truncation spread|prefix]` checks a directory at any time; `health_check.py` and the three real-weights tests check before they load.
+
+This exists because a size check is not enough. A whole-checkpoint download made without it left the shard holding `embed.weight` at the right length with the wrong bytes (a multi-connection download interrupted mid-file and then resumed). The reference and every forward that read that file agreed with each other, and the model they agreed about predicted the next token of plain prose 23 % of the time, where the real one does 67 %.
+
+## Health: is this the model
+
+Agreement with the reference shows that a forward computes what `model.py` computes on the files both were given. `health_check.py` is the check that the files, and everything else both share, are the released model, against things outside this tooling (`ds_golden/health.py`):
+
+- **A publicly reported reply.** For the system prompt "You are a helpful assistant." and the user message "hello", without thinking, at temperature 0, discussion #33 of the upstream model repository reports the reply `Hello! How can\n can I help you today?` (repeated word and all), byte for byte the same from the vendor's hosted API and from a self-hosted SGLang deployment of this checkpoint, and reports the three most likely tokens after "How can" as a newline, `#` and `<` at about -2.4 each. This is a third party's public report of two production-lineage systems, not a measurement made here. The request is rendered by the repository's own `encoding/encoding.py`, unmodified. The check: at every position of the reply the most likely token is the reply's, except at that reported near-tie, where it must be one of the three.
+- **Next-token accuracy floors.** Over an original story as the reply to a chat request, at least 0.55; over the passage the whole-model goldens are made on, at least 0.55 (asserted by `tests/deepseek_real_full.rs` for our forward and for every golden).
+
+Measured with the reference on the hash-verified checkpoint (real kernels, CUDA's own arithmetic, one prefill chunk per sequence):
+
+| | Reference | GPT-2 small / large, same text unprompted |
+|---|---|---|
+| `hello`: tokens of the reported reply that are the most likely token | 11 of 11 | |
+| `hello`: most likely after "How can" | newline -2.23, `#` -2.34, `<` -2.69 | |
+| Story as a chat reply (825 positions) | 0.665 | 0.342 / 0.397 |
+| Story as a chat reply after a thinking preamble (843 positions) | 0.663 | |
+| The story and the passage as plain text (1,379 positions) | 0.683 | 0.352 / 0.402 (first 1,024 tokens) |
+| The passage (554 positions) | 0.670 | 0.380 / 0.431 |
+
+On the damaged copy the same four accuracies were 0.171, 0.179, 0.211 and 0.229, and 6 of the 11 `hello` tokens were right. The GPT-2 figures are the public `openai-community/gpt2` and `gpt2-large` checkpoints on the same text with their own tokenizer: a calibration of what the text allows a small model, nothing more.
+
+`health_check.py` writes `<dir>/golden/health.safetensors` (each sequence's tokens and the reference's most likely token at every position); with it present `tests/deepseek_real_full.rs` holds our forward to the same reply and the same floor. `--first-layers 4 --split 2` runs the script over the fetched first four layers, asserting nothing about the model.
+
 ## The GPU session
 
-`gpu_session.sh` is a whole session on a rented Linux machine with one NVIDIA GPU: it installs what it needs, runs the reference's real kernels, and leaves every result in one directory. Its first part has been run once (one B300, Ubuntu 24.04, torch 2.10.0 with CUDA 13 wheels, tilelang 0.1.12); the measured times below are from that run and the results are recorded in `AGENTS.md` → What is verified against what. The steps over the whole checkpoint have not been run.
+`gpu_session.sh` is a whole session on a rented Linux machine with one NVIDIA GPU: it installs what it needs, runs the reference's real kernels, and leaves every result in one directory. Its first part has been run once (one B300, Ubuntu 24.04, torch 2.10.0 with CUDA 13 wheels, tilelang 0.1.12); the measured times below are from that run and the results are recorded in `AGENTS.md` → What is verified against what. The steps over the whole checkpoint are described under The whole model, below.
 
 On a fresh Ubuntu 24.04 machine with the NVIDIA driver and CUDA installed (root only for `apt-get install -y git curl build-essential`):
 
@@ -145,14 +177,15 @@ It records final logits at every position for three call patterns over the same 
 For a machine with the whole checkpoint on a volume, one GPU of at least 160 GB and about 340 GB of host memory:
 
 ```sh
-FULL_DIR=<volume>/checkpoint ./gpu_session.sh full     # setup, full-fetch, full-real, full-pinned, full-rust, summary
+FULL_DIR=<volume>/checkpoint ./gpu_session.sh full     # setup, full-fetch, full-health, full-real, full-pinned, full-rust, summary
 ```
 
 | Step | What it does | Wall-clock (estimate) | Needs |
 |---|---|---|---|
-| `full-fetch` | The checkpoint as published into `FULL_DIR`, shard by shard, resumable; skipped per shard when present | 1–3 h for 510 GB | 510 GB of disk |
+| `full-fetch` | The checkpoint as published into `FULL_DIR`, shard by shard, resumable. Each download is checked against its recorded SHA-256 before it gets its name (a refused one is set aside as `<name>.refused`), and every file present is checked at the end | 1–3 h for 510 GB, plus the time to read it once more | 510 GB of disk |
+| `full-health` | `health_check.py --kernels real --native-arithmetic`: the recorded hashes, the reported reply and the accuracy floor, both halves loaded once; `health.safetensors` | measured: 6 minutes with a cold volume for eight sequences, before the hash check | 150 GB of GPU memory at a time |
 | `full-real` | `full_halves.py --kernels real --native-arithmetic`: both halves on the GPU, three patterns, `reference-gpu-native.safetensors` | 30–45 min: each half is 150 GB to read from the volume (5–10 min), then about a minute for the prefill patterns and up to 8 for the 555 single-token calls, by the measured cost of the truncations | 150 GB of GPU memory at a time; a 3 GB golden |
 | `full-pinned` | The same on the CPU with emulated kernels and pinned arithmetic, one prefill chunk only: the golden our forward must equal exactly at full depth | 45–90 min on 24 vCPUs, scaled from 90 s for four layers here | about 170 GB of host memory at a time |
 | `full-rust` | Our forward over the whole model, twice, against every golden | 30–60 min on 24 vCPUs after a 5–10 min build: here one layer over 555 tokens costs about 9 s, so 40 layers twice are about 12 minutes plus the head, and each run reads every expert of every layer from the volume (about 290 GB) | about 35 GB of memory plus page cache |
 
-None of these four steps has been run. The estimates are scaled from the measured truncation runs and are guesses for the parts that depend on the volume's speed.
+`full-real` has been run on the hash-verified checkpoint: 323 s for the three patterns over 555 tokens with a warm volume. The other estimates are scaled from the measured truncation runs and are guesses for the parts that depend on the volume's speed. `tests/deepseek_real_full.rs` compares every `golden/reference-*.safetensors` it finds and holds each to the passage floor, so a golden made from files that were not the checkpoint's does not belong in that directory.
