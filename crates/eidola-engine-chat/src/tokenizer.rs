@@ -221,6 +221,11 @@ impl Tokenizer {
         })
     }
 
+    /// The `tokenizers` tokenizer itself.
+    pub(crate) fn backend(&self) -> &tokenizers::Tokenizer {
+        &self.inner
+    }
+
     /// Hex SHA-256 of the loaded `tokenizer.json`.
     pub fn sha256(&self) -> &str {
         &self.sha256

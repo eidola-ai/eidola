@@ -120,13 +120,15 @@ precedence = "closest"
 SPDX-FileCopyrightText = "© 2023 DeepSeek"
 SPDX-License-Identifier = "MIT"
 
-# Test fixtures generated from the DeepSeek-V4.1 reference prompt encoder and
-# tokenizer.
+# Test fixtures generated from the DeepSeek-V4.1 reference prompt encoder,
+# tokenizer and Engram map.
 [[annotations]]
 path = [
     "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/encoding_cases.json",
     "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/output_cases.json",
     "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/token_ids.json",
+    "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/token_map.bin.gz",
+    "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/token_map.json",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = ["© Eidola, Inc. and contributors", "© 2023 DeepSeek"]

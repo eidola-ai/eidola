@@ -6,7 +6,7 @@ Dev-only Python that produces the committed fixtures under `tests/fixtures/`. No
 
 `gen_deepseek_fixtures.py` runs the reference prompt encoder and output parser that the model repository ships (`encoding/encoding.py` in [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), MIT) and the reference `tokenizers` build, and writes `tests/fixtures/deepseek_v4_1/`. The reference is read from a checkout you supply; it is not vendored.
 
-1. Fetch the model repository's non-weight files at the revision to pin: `encoding/`, `tokenizer.json` and `config.json`.
+1. Fetch the model repository's non-weight files at the revision to pin: `encoding/`, `inference/engram.py`, `tokenizer.json` and `config.json`.
 2. From the crate directory, run the generator with [`uv`](https://docs.astral.sh/uv/), which installs the Python and packages pinned in the script's header and in `gen_deepseek_fixtures.py.lock`:
 
    ```sh
@@ -15,6 +15,8 @@ Dev-only Python that produces the committed fixtures under `tests/fixtures/`. No
    ```
 
 3. Review the fixture diff like code, and run `cargo test -p eidola-engine-chat`.
+
+It also runs `build_compressed_token_map` from `inference/engram.py` (that function alone, compiled out of the file, since the rest of it needs torch) for the Engram map: `token_map.json` (class count and metadata, with `engram.py`'s SHA-256) and `token_map.bin.gz` (one little-endian u32 per id: 0 opens the next class, n > 0 is class n − 1).
 
 The revision is recorded in each fixture file's `meta`, with the SHA-256 of `encoding.py` and `tokenizer.json`. Regenerating at the recorded revision reproduces the committed files byte for byte. A new revision whose `tokenizer.json` differs also needs its hash pinned in `src/tokenizer.rs`.
 
