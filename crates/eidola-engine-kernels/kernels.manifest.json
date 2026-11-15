@@ -135,11 +135,11 @@
     },
     {
       "path": "csrc/ds_gemm_tc.cu",
-      "sha256": "6f6797d524ded742a90de42f780de5003fe3ee3f566b5b2a847352b8c72a9cbb"
+      "sha256": "942bf0c027439dcb90a9d316e1aaa98f3bcc220d51b2cb5c071ce13197658636"
     },
     {
       "path": "csrc/ds_gemm_tc.cuh",
-      "sha256": "dec9f337dc31bbf96dfcd92f9cb3d1c909e36b1298092e83468b9fe940e07267"
+      "sha256": "ca4a585edfda7e4f6f60040f0c47e12772db545dcaa33975ed9d1f02fff74d8b"
     },
     {
       "path": "csrc/ds_head.cu",
@@ -582,8 +582,8 @@
       "source": "csrc/ds_gemm_tc.cu",
       "profile": "exact",
       "file": "cubin/ds_gemm_tc.sm_100a.cubin",
-      "sha256": "57b4bf478aa034b97aed38018699749c2dc5857dffebd2dc8ccd7548dc936f37",
-      "size": 745072,
+      "sha256": "9285fb54fe79917ed214a09d5740ce9148c579a4ab078cba162efc7ccd1ec1f9",
+      "size": 784104,
       "entries": [
         {
           "symbol": "eidola_ds_gemm_probe",
@@ -682,8 +682,8 @@
       "source": "csrc/ds_gemm_tc.cu",
       "profile": "exact",
       "file": "cubin/ds_gemm_tc.sm_100f.cubin",
-      "sha256": "b97d836c3700a50a57c1eee6505760957092679edb97a3ef85894f610433356d",
-      "size": 745072,
+      "sha256": "00a4eb41f7ae0ad05500b95afeba88a402eda8cd2eb717dacf9a72528bbc4e5e",
+      "size": 784104,
       "entries": [
         {
           "symbol": "eidola_ds_gemm_probe",
@@ -782,8 +782,8 @@
       "source": "csrc/ds_gemm_tc.cu",
       "profile": "exact",
       "file": "cubin/ds_gemm_tc.sm_103a.cubin",
-      "sha256": "c75a256538d79b9b24575ffd9a120616479446d06b4ca15b5dfda31dc0a1c8a3",
-      "size": 819992,
+      "sha256": "2cd4843006e358a166a7edc657defb8ae4fdb83445831b48d26ad7df064681e6",
+      "size": 857904,
       "entries": [
         {
           "symbol": "eidola_ds_gemm_probe",
@@ -2715,8 +2715,8 @@
     {
       "name": "ds_gemm_tc",
       "file": "fatbin/ds_gemm_tc.fatbin",
-      "sha256": "137718f8ae604098ca0217d800d0519e1c3c347dcba240ea9efe5b34c1960776",
-      "size": 1565296,
+      "sha256": "328e5e9b9e87711ed9801bf2546f228fef48e6469edcd588db6905b1ab0c5e2f",
+      "size": 1642240,
       "archs": [
         "sm_100a",
         "sm_103a"
