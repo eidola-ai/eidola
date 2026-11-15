@@ -197,8 +197,10 @@
             matchingCrate = getCrateForPath relPath;
             # Both `eidola-app-core/build.rs` and `eidola-server-gateway/build.rs`
             # consume pinned trust data from `releases/`:
-            #   * eidola-app-core → all of `releases/trust/*.json` +
-            #     `releases/schema/*.json` (client trust root)
+            #   * eidola-app-core → exactly the files `appCoreTrustInputs`
+            #     names (the client trust root), so nothing else under
+            #     `releases/` (the engine pins, vendored platform material,
+            #     Linux desktop files) moves the client's narHash
             #   * eidola-server-gateway → `releases/trust/engine-enclaves.json`
             #     (the engine pins), the platform endorsements and Sigstore
             #     trusted root their machine policy is re-derived from, and the
@@ -210,18 +212,18 @@
             # itself, so including it would create a self-reference that
             # prevents the build from reaching a fixed point.
             isTrustRootPath = relPath == "/releases" || pkgs.lib.hasPrefix "/releases/" relPath;
-            # The vendored platform endorsements, from which the gateway's
-            # build re-derives each engine pin's machine policy. Only the
-            # gateway reads them, so app-core-only packages leave them out
-            # and do not rebuild when a new release is vendored.
-            isPlatformEndorsementsPath =
-              relPath == "/releases/trust/platform-endorsements"
-              || pkgs.lib.hasPrefix "/releases/trust/platform-endorsements/" relPath;
-            # The vendored platform release manifests, likewise the gateway's
-            # alone.
-            isCvmReleasesPath =
-              relPath == "/releases/trust/cvm-releases"
-              || pkgs.lib.hasPrefix "/releases/trust/cvm-releases/" relPath;
+            # What app-core's build reads (its `build.rs`, and
+            # eidola-attestation's `include_str!` of the templates), with the
+            # directories that hold them.
+            appCoreTrustInputs = [
+              "/releases"
+              "/releases/trust"
+              "/releases/trust/server-enclave.json"
+              "/releases/trust/trust-constants.json"
+              "/releases/trust/sigstore-trusted-root.json"
+              "/releases/schema"
+              "/releases/schema/attestation-templates.json"
+            ];
             # `eidola-server-gateway/build.rs` also checks every engine pin in
             # `releases/trust/engine-enclaves.json` against the committed
             # deployment configs it names.
@@ -233,12 +235,7 @@
             # weights under `models/`, bound to those pins by weights hash.
             isModelCatalogPath = relPath == "/models" || pkgs.lib.hasPrefix "/models/" relPath;
           in
-          (
-            crateInSet "eidola-app-core"
-            && isTrustRootPath
-            && !isPlatformEndorsementsPath
-            && !isCvmReleasesPath
-          )
+          (crateInSet "eidola-app-core" && builtins.elem relPath appCoreTrustInputs)
           || (crateInSet "eidola-server-gateway" && isTrustRootPath)
           || (crateInSet "eidola-server-gateway" && isEngineDeployPath)
           || (crateInSet "eidola-server-gateway" && isModelCatalogPath)
@@ -337,6 +334,12 @@
                   } relPath path type
                 then
                   true
+                # Nothing else under `releases/` is a build input: without
+                # this, crane's filter below keeps every directory there, so
+                # vendoring a release would still add an (empty) directory to
+                # a source that does not read it.
+                else if pkgs.lib.hasPrefix "/releases/" relPath then
+                  false
                 # Keep only root-level files that affect Cargo resolution/builds.
                 # This avoids generated files like artifact-manifest.json from
                 # perturbing package hashes for unrelated Nix builds.
