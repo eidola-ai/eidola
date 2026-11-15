@@ -105,6 +105,21 @@ pub struct DsRowRecord {
     /// Tokens the row produced.
     pub produced: Vec<u32>,
     pub sampling: SamplingParams,
+    /// A hash ([`stream_hash`]) of the residual copies leaving each layer at the row's
+    /// last host position, in layer order (0 where a chain layer did not emit it): what
+    /// names the first layer at which a row leaves the dense forward.
+    pub layer_streams: Vec<u64>,
+}
+
+/// FNV-1a over the bits of a stream's values.
+pub fn stream_hash(x: &[f32]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for v in x {
+        for b in v.to_bits().to_le_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
 }
 
 /// A row of a step in flight.
@@ -604,6 +619,8 @@ impl Executor for DsCpuExecutor {
         // 3. Device 1 gathers the Engram rows of the tables it holds; device 0 runs the
         //    encoder and the first decoder layer's bank stub; the typed crossing goes to
         //    device 1, which runs the chain.
+        self.encoder.trace = self.cfg.record.then(Vec::new);
+        self.decoder.trace = self.cfg.record.then(Vec::new);
         let gathered = self.decoder.gather(&items)?;
         transfer.note_to_encoder(&items, &gathered);
         let crossing = self.encoder.forward(&items, &needs, &gathered)?;
@@ -655,6 +672,7 @@ impl Executor for DsCpuExecutor {
             };
         }
 
+        let mut traces: Vec<Vec<u64>> = Vec::new();
         let stride = self.spec.max_draft_tokens + 1;
         let mut out = StepOutput {
             tokens: vec![0; rows.len() * stride as usize],
@@ -675,11 +693,23 @@ impl Executor for DsCpuExecutor {
             }
         }
         if self.cfg.record {
+            let layers: Vec<Vec<u64>> = [self.encoder.trace.take(), self.decoder.trace.take()]
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect();
+            for (ri, row) in rows.iter().enumerate() {
+                let at = items
+                    .iter()
+                    .position(|it| it.row == ri && it.pos == row.p)
+                    .expect("a row's last host position is an item");
+                traces.push(layers.iter().map(|l| l[at]).collect::<Vec<u64>>());
+            }
             self.transfers
                 .get_mut()
                 .expect("transfers lock")
                 .push(transfer);
-            for row in rows {
+            for (row, layer_streams) in rows.into_iter().zip(traces) {
                 let mut tokens = self.decoder.prefix_tokens(row.slot, row.c);
                 tokens.extend(&row.known[row.history..]);
                 let mut target_logits: Vec<(u32, Vec<f32>)> =
@@ -699,6 +729,7 @@ impl Executor for DsCpuExecutor {
                         drafts: row.drafts,
                         produced: row.produced,
                         sampling: row.params,
+                        layer_streams,
                     });
             }
         }

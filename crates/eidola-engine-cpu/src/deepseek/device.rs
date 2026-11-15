@@ -24,7 +24,6 @@ use eidola_engine_model::deepseek::mhc;
 use eidola_engine_model::deepseek::weights::rms;
 use eidola_engine_model::tensor::Matrix;
 
-use super::DsCpuExecutorConfig;
 use super::layer::{
     Flow, LayerItem, LayerPlan, OpenEntries, bank_cell, bank_cell_bytes, plain_latent, run_layer,
     unpack_window, window_cell,
@@ -32,6 +31,7 @@ use super::layer::{
 use super::memory::{GroupMem, Memory};
 use super::packed::Fp8;
 use super::pool::BytePool;
+use super::{DsCpuExecutorConfig, stream_hash};
 
 /// The model's shape as the executor splits it.
 #[derive(Clone, Debug)]
@@ -338,6 +338,9 @@ pub(crate) struct Encoder {
     pub mem: Memory,
     /// The pooled sources' open entries: this device's per-slot model state.
     pub open: OpenEntries,
+    /// Testing aid: when set, each layer run appends a hash of every position's state
+    /// leaving it ([`super::stream_hash`]; 0 where the layer emitted nothing).
+    pub trace: Option<Vec<Vec<u64>>>,
 }
 
 impl Encoder {
@@ -366,6 +369,7 @@ impl Encoder {
             shape: shape.clone(),
             mem,
             model,
+            trace: None,
         }
     }
 
@@ -484,6 +488,12 @@ impl Encoder {
                 gathered,
                 &mut taps,
             )?;
+            if let Some(trace) = &mut self.trace {
+                let hashes = flows
+                    .iter()
+                    .map(|f| f.as_ref().map_or(0, |f| stream_hash(&f.x)));
+                trace.push(hashes.collect());
+            }
         }
         let flows = flows
             .into_iter()
@@ -504,6 +514,8 @@ pub(crate) struct Decoder {
     no_open: OpenEntries,
     /// Layer-positions the chain computed.
     pub chain_work: u64,
+    /// Testing aid: as [`Encoder::trace`], for the chain's layers.
+    pub trace: Option<Vec<Vec<u64>>>,
 }
 
 impl Decoder {
@@ -525,6 +537,7 @@ impl Decoder {
         Self {
             no_open: OpenEntries::new(0, 0, 1, 0),
             chain_work: 0,
+            trace: None,
             mem: Memory {
                 block_size: spec.block_size,
                 groups,
@@ -642,6 +655,12 @@ impl Decoder {
                 None,
                 &mut taps,
             )?;
+            if let Some(trace) = &mut self.trace {
+                let hashes = flows
+                    .iter()
+                    .map(|f| f.as_ref().map_or(0, |f| stream_hash(&f.x)));
+                trace.push(hashes.collect());
+            }
         }
 
         if self.shape.drafting {
