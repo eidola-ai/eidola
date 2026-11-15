@@ -7,6 +7,7 @@
 #   steps: setup build kernels ds_ops ds_gemm_ref ds_gemm ds_gemm_bench
 #          ds_attention ds_index ds_tiny ds_tiny_drafting ds_tiny_memory mimo
 #          summary
+#   named only:  ds_gemm_profile
 #   with the released checkpoint (never run by default; name them):
 #          halves_build halves_encoder halves_decoder halves_reference
 #          halves_invariance
@@ -18,6 +19,22 @@
 # `ds_gemm_bench.jsonl`). The GEMMs alone, as one command:
 #
 #   ds_gpu_session.sh setup build kernels ds_gemm ds_gemm_bench summary
+#
+# `ds_gemm_profile` (never run by default; name it) profiles the tensor-core
+# GEMMs with NVIDIA Nsight Compute, installing it from NVIDIA's apt repository
+# when no `ncu` is found: both forms of `wo_b` (5120 × 8192) and `wq_b`
+# (32768 × 1280) at 1 and 8 rows in the split block and the 8-row tile, and
+# the routed experts' gate and up at 1 token and at 4,096 tokens (about 64
+# rows an expert) in every block shape, each launched once
+# (`ds_gemm_bench --once`). `ncu` runs under sudo (profiling counters are
+# for administrators unless the driver allows them to all users), with the
+# speed-of-light, memory, launch, occupancy, warp-state, scheduler,
+# instruction and source-counter sections. Under $OUT/ncu: per case the
+# report (`.ncu-rep`), its details page as text and as CSV, a per-kernel
+# summary, and the bench's `launch` lines, which name each profiled launch in
+# order. `DRY_RUN=1` prints every command of the step instead of running it.
+#
+#   ds_gpu_session.sh setup build kernels ds_gemm_profile
 #
 # `ds_tiny` is the executor without drafts; `ds_tiny_drafting` is every draft
 # width and acceptance pattern, seeded sampling and the scenarios again with
@@ -182,6 +199,86 @@ ds_gemm_bench() {
 }
 ds_attention() { device_tests ds_attention; }
 ds_index() { device_tests ds_index; }
+# A command, or with DRY_RUN set the command printed.
+x() {
+    if [ -n "${DRY_RUN:-}" ]; then
+        printf 'would run:'
+        printf ' %q' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+find_ncu() {
+    local c
+    for c in "$(command -v ncu 2>/dev/null || true)" /usr/local/cuda/bin/ncu \
+        /opt/nvidia/nsight-compute/*/ncu /usr/local/cuda-*/bin/ncu; do
+        if [ -n "$c" ] && [ -x "$c" ]; then printf '%s\n' "$c"; return 0; fi
+    done
+    return 1
+}
+
+# Nsight Compute from NVIDIA's CUDA apt repository (its keyring first, when
+# the repository is not configured): the newest `nsight-compute-<version>`.
+install_ncu() {
+    . /etc/os-release 2>/dev/null || true
+    local release="ubuntu${VERSION_ID:-24.04}"
+    release="${release//./}"
+    if ! grep -rqs 'developer.download.nvidia.com/compute/cuda/repos' /etc/apt/; then
+        x curl -fsSL -o "$WORK/cuda-keyring.deb" \
+            "https://developer.download.nvidia.com/compute/cuda/repos/$release/x86_64/cuda-keyring_1.1-1_all.deb"
+        x sudo dpkg -i "$WORK/cuda-keyring.deb"
+    fi
+    x sudo apt-get update -y
+    local pkg
+    pkg="$( (apt-cache search --names-only '^nsight-compute-[0-9]' 2>/dev/null || true) |
+        cut -d' ' -f1 | sort -V | tail -1)"
+    [ -n "$pkg" ] || pkg=nsight-compute
+    x sudo apt-get install -y "$pkg"
+}
+
+# profile_case <name> <bench arguments>...: one bench run under ncu, and its
+# report as text.
+profile_case() {
+    local name="$1"
+    shift
+    local ncu="$NCU" bin="$CARGO_TARGET_DIR/release/examples/ds_gemm_bench" dir="$OUT/ncu"
+    local sudo=(sudo -E)
+    [ "$(id -u)" -eq 0 ] && sudo=()
+    x ${sudo[@]+"${sudo[@]}"} "$ncu" --target-processes all --kernel-name regex:'^eidola_ds_lin[48]_' \
+        --section SpeedOfLight --section MemoryWorkloadAnalysis --section MemoryWorkloadAnalysis_Tables \
+        --section LaunchStats --section Occupancy --section WarpStateStats --section SchedulerStats \
+        --section ComputeWorkloadAnalysis --section InstructionStats --section SourceCounters \
+        --export "$dir/$name" --force-overwrite \
+        "$bin" "$KERNELS" --once --forms banded,tolerance "$@" > "$dir/$name.run.txt"
+    grep '^launch ' "$dir/$name.run.txt" > "$dir/$name.launches.txt" || [ -n "${DRY_RUN:-}" ]
+    x ${sudo[@]+"${sudo[@]}"} chown "$(id -u):$(id -g)" "$dir/$name.ncu-rep"
+    x "$ncu" --import "$dir/$name.ncu-rep" --page details > "$dir/$name.details.txt"
+    x "$ncu" --import "$dir/$name.ncu-rep" --page details --csv > "$dir/$name.details.csv"
+    x "$ncu" --import "$dir/$name.ncu-rep" --print-summary per-kernel > "$dir/$name.summary.txt"
+}
+
+# The tensor-core GEMMs under Nsight Compute (the header says what).
+ds_gemm_profile() {
+    [ -n "${DRY_RUN:-}" ] || { [ -n "$KERNELS" ] && [ -d "$KERNELS/cubin" ]; } ||
+        die "no kernel build output: set KERNELS"
+    NCU="$(find_ncu || true)"
+    if [ -z "$NCU" ]; then
+        say "installing Nsight Compute"
+        install_ncu
+        NCU="$(find_ncu || echo /usr/local/cuda/bin/ncu)"
+    fi
+    export NCU
+    x "$NCU" --version
+    (cd "$REPO" && x cargo build --release --locked -p eidola-engine-cuda --example ds_gemm_bench)
+    mkdir -p "$OUT/ncu"
+    profile_case wo_b --only dense --dense 5120,8192 --rows 1,8 --tiles s8,t8
+    profile_case wq_b --only dense --dense 32768,1280 --rows 1,8 --tiles s8,t8
+    profile_case experts --only experts --rows 1,4096 --tiles s8,t8,t32
+    ls -l "$OUT/ncu"
+}
+
 # device_test_named <test binary> <test name>: one test of a binary.
 device_test_named() {
     (cd "$REPO" && cargo test --release --locked -p eidola-engine-cuda --test "$1" -- \
@@ -251,7 +348,7 @@ summary() {
 }
 
 ALL="setup build kernels ds_ops ds_gemm_ref ds_gemm ds_gemm_bench ds_attention ds_index ds_tiny ds_tiny_drafting ds_tiny_memory mimo summary"
-NAMED="halves_build halves_encoder halves_decoder halves_reference halves_invariance"
+NAMED="ds_gemm_profile halves_build halves_encoder halves_decoder halves_reference halves_invariance"
 for step in ${*:-$ALL}; do
     case " $ALL $NAMED " in
         *" $step "*) ;;
