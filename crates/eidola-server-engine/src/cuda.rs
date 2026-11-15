@@ -656,6 +656,7 @@ pub fn prepare_deepseek(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eidola_common::architecture::{Shape, UniformKvGroup};
     use eidola_engine::spec::KvRole;
 
     fn group(attention: AttentionKind, layers: u32, heads: u32) -> KvGroupSpec {
@@ -996,6 +997,16 @@ mod tests {
         .unwrap()
     }
 
+    /// The released DeepSeek-V4.1-Flash configuration (the chat crate's copy of its
+    /// `config.json`).
+    fn deepseek_released() -> DsConfig {
+        DsConfig::from_file(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../eidola-engine-chat/tests/fixtures/deepseek_v4_1/config.json"),
+        )
+        .unwrap()
+    }
+
     fn ds_sizing(draft_tokens: u32) -> Sizing {
         Sizing {
             max_model_len: 64,
@@ -1010,8 +1021,7 @@ mod tests {
     /// The executor's spec under `sizing`, and the bytes of one block of every group on
     /// each device, summed from the executor's own block layouts.
     fn ds_spec(ds: &DsConfig, sizing: &Sizing) -> (ModelSpec, [u64; 2]) {
-        let config =
-            deepseek_config(ds, sizing, [1 << 30, 1 << 30], 0, CudaGraphs::Off, 90).unwrap();
+        let config = deepseek_config(ds, sizing, [u64::MAX; 2], 0, CudaGraphs::Off, 90).unwrap();
         let (_, spec) = DsCudaExecutor::preflight(ds, &config).unwrap();
         let per = |half| {
             eidola_engine_cuda::ds::executor::geometry(ds, &spec, half)
@@ -1022,6 +1032,118 @@ mod tests {
         };
         let per_block = [per(Half::Encoder), per(Half::Decoder)];
         (spec, per_block)
+    }
+
+    /// The dev model's KV groups in the shared contract's terms (the model crate's tiny
+    /// configuration: a 32-wide entry, 35-byte bank entries and 33-byte window entries;
+    /// one pooled source at ratio 2 and four window layers on device 0; one bank layer,
+    /// four window layers and the drafter's three on device 1).
+    const DEV_GROUPS: [&[UniformKvGroup]; 2] = [
+        &[
+            UniformKvGroup {
+                layers: 1,
+                ratio: 2,
+                entry_bytes: 35,
+                drafter: false,
+            },
+            UniformKvGroup {
+                layers: 4,
+                ratio: 1,
+                entry_bytes: 33,
+                drafter: false,
+            },
+        ],
+        &[
+            UniformKvGroup {
+                layers: 1,
+                ratio: 1,
+                entry_bytes: 35,
+                drafter: false,
+            },
+            UniformKvGroup {
+                layers: 4,
+                ratio: 1,
+                entry_bytes: 33,
+                drafter: false,
+            },
+            UniformKvGroup {
+                layers: 3,
+                ratio: 1,
+                entry_bytes: 33,
+                drafter: true,
+            },
+        ],
+    ];
+
+    /// The gateway's build holds a pinned DeepSeek-V4.1 deployment's per-device budgets
+    /// to `cuda_kv_min_bytes` and its host tier to the devices' `cuda_kv_host_min_bytes`
+    /// summed. Over the released configuration (the shared `DEEPSEEK_V41_FLASH` shapes)
+    /// and the dev model's (`DEV_GROUPS`), across block sizes, context lengths and every
+    /// draft width a deployment can set: the shared block bytes are the executor's, the
+    /// node's derivation accepts exactly the shared minimum on each device and refuses
+    /// one byte below on either, and likewise the host tier.
+    #[test]
+    fn the_shared_deepseek_minimums_are_the_derivations() {
+        use eidola_common::architecture::DEEPSEEK_V41_FLASH;
+        use eidola_common::engine_deployment::{
+            cuda_kv_host_min_bytes, cuda_kv_min_bytes, uniform_kv_block_bytes,
+        };
+        let dev = DEV_GROUPS.map(|groups| Shape {
+            uniform_kv_groups: groups,
+            ..DEEPSEEK_V41_FLASH[0]
+        });
+        let cases = [
+            (
+                deepseek_released(),
+                DEEPSEEK_V41_FLASH,
+                vec![4096, 131_072, 1 << 20],
+            ),
+            (deepseek_tiny(), dev, vec![64, 1000, 1024]),
+        ];
+        for (ds, shapes, lengths) in cases {
+            for block in [2u32, 16, 64, 256] {
+                for &len in &lengths {
+                    for draft in 0..=3u32 {
+                        let sizing = Sizing {
+                            kv_block_size: block,
+                            max_model_len: len,
+                            ..ds_sizing(draft)
+                        };
+                        let at = (block, len, draft);
+                        let (spec, per_block) = ds_spec(&ds, &sizing);
+                        let shared = shapes.map(|s| uniform_kv_block_bytes(&s, &sizing));
+                        assert_eq!(shared, per_block, "{at:?}");
+                        let min = shapes.map(|s| cuda_kv_min_bytes(&s, &sizing, &cache(true)));
+                        let needed = len.div_ceil(block) + 1;
+                        assert_eq!(
+                            derive_deepseek_kv_blocks(&ds, &spec, min, &sizing).unwrap(),
+                            needed,
+                            "{at:?}"
+                        );
+                        for short in [[min[0] - 1, min[1]], [min[0], min[1] - 1]] {
+                            assert!(
+                                derive_deepseek_kv_blocks(&ds, &spec, short, &sizing).is_err(),
+                                "{at:?}"
+                            );
+                        }
+                        let host: u64 = shapes
+                            .iter()
+                            .zip(min)
+                            .map(|(s, b)| cuda_kv_host_min_bytes(s, &sizing, &cache(true), b))
+                            .sum();
+                        assert_eq!(
+                            derive_deepseek_host_blocks(&ds, &spec, host).unwrap(),
+                            2,
+                            "{at:?}"
+                        );
+                        assert!(
+                            derive_deepseek_host_blocks(&ds, &spec, host - 1).is_err(),
+                            "{at:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// One count for every group: what the tighter device budget holds, each budget

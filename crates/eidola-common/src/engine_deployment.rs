@@ -437,13 +437,44 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
 /// [`Shape::drafter_kv_bytes_per_position`], a drafter block also `k` ×
 /// [`Shape::drafter_tap_bytes_per_depth`] of boundary tap. A device that holds
 /// no drafter has drafter bytes of 0. Saturates rather than wraps.
+///
+/// A shape with [`Shape::uniform_kv_groups`] (DeepSeek-V4.1's) follows its
+/// executor's rule instead (`cuda::derive_deepseek_kv_blocks` in
+/// `eidola-server-engine`): every group of every device holds the same block
+/// count, which must hold one `MAX_MODEL_LEN` sequence and the null block, so
+/// a device needs ⌈`MAX_MODEL_LEN` / `B`⌉ + 1 blocks of
+/// [`uniform_kv_block_bytes`]. No pool holds a pad block, and neither the
+/// seats nor the cache enter.
 pub fn cuda_kv_min_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig) -> u64 {
     let b = u64::from(sizing.kv_block_size.max(1));
+    if !shape.uniform_kv_groups.is_empty() {
+        return (u64::from(sizing.max_model_len).div_ceil(b) + 1)
+            .saturating_mul(uniform_kv_block_bytes(shape, sizing));
+    }
     let global_blocks = u64::from(sizing.max_model_len).div_ceil(b) + 1;
     global_blocks
         .saturating_add(1)
         .saturating_mul(global_block_bytes(shape, sizing))
         .saturating_add(cuda_windowed_pools_bytes(shape, sizing, cache))
+}
+
+/// Bytes of one block of every group of `shape`'s [`Shape::uniform_kv_groups`]
+/// together, the drafter's only when drafting: per group `layers` ×
+/// (`KV_BLOCK_SIZE` / `ratio`) entries of `entry_bytes`, padded to 16 bytes.
+/// 0 for a shape without uniform groups. Saturates rather than wraps.
+pub fn uniform_kv_block_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
+    let b = u64::from(sizing.kv_block_size);
+    shape
+        .uniform_kv_groups
+        .iter()
+        .filter(|g| sizing.draft_tokens > 0 || !g.drafter)
+        .fold(0u64, |sum, g| {
+            let image = g
+                .layers
+                .saturating_mul(b / g.ratio.max(1))
+                .saturating_mul(g.entry_bytes);
+            sum.saturating_add(image.saturating_add(15) / 16 * 16)
+        })
 }
 
 /// Blocks of the CUDA executor's sliding pool, and of its drafter pool when
@@ -504,12 +535,21 @@ fn cuda_windowed_pools_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig
 /// count, and a global pool of what is left of `kv_device_bytes` after them,
 /// less its pad block, at most `i32::MAX` blocks. So the least `H` is
 /// ⌈2 × `D` / the smallest pool's blocks⌉. Saturates rather than wraps.
+///
+/// A shape with [`Shape::uniform_kv_groups`] follows its executor's rule
+/// (`cuda::derive_deepseek_host_blocks`): the tier holds one count of blocks
+/// for every group of every device, at least two, so this device's share of
+/// the least tier is two blocks of [`uniform_kv_block_bytes`], whatever
+/// `kv_device_bytes`; [`check_device_resources`] sums the devices' shares.
 pub fn cuda_kv_host_min_bytes(
     shape: &Shape,
     sizing: &Sizing,
     cache: &CacheConfig,
     kv_device_bytes: u64,
 ) -> u64 {
+    if !shape.uniform_kv_groups.is_empty() {
+        return uniform_kv_block_bytes(shape, sizing).saturating_mul(2);
+    }
     let windowed = sliding_pool_blocks(shape, sizing, cache);
     let global_bytes = global_block_bytes(shape, sizing).max(1);
     let global = (kv_device_bytes.saturating_sub(cuda_windowed_pools_bytes(shape, sizing, cache))
@@ -695,6 +735,20 @@ pub fn check_device_resources(
             .weights_bytes
             .ok_or_else(|| format!("device {d} states no weights bound"))?;
         device_weights = device_weights.saturating_add(weights);
+        // A block of a pooled group holds whole entries (the executor refuses
+        // any other block size).
+        if let Some(g) = shape
+            .uniform_kv_groups
+            .iter()
+            .find(|g| !u64::from(sizing.kv_block_size).is_multiple_of(g.ratio.max(1)))
+        {
+            return Err(format!(
+                "device {d}: {} ({}) is not a multiple of the pooling ratio {}",
+                env::KV_BLOCK_SIZE,
+                sizing.kv_block_size,
+                g.ratio
+            ));
+        }
         let needed = cuda_kv_min_bytes(shape, sizing, cache);
         if budget < needed {
             return Err(format!(
@@ -1880,14 +1934,124 @@ mod tests {
     /// released checkpoint, 510.29 GB, under the devices' 510.66 GB.
     const DS_PACK_BYTES: u64 = 510_300_000_000;
 
-    /// The fit arithmetic at the released sizes: device 0 holds 250.87 GB of
-    /// weights and device 1 259.79 GB, each beside its KV budget and the
-    /// executor's reserve on a 287.4 GB B300.
+    /// The executor gives every KV group of both devices one block count,
+    /// which must hold one `MAX_MODEL_LEN` sequence: a block of every group
+    /// of a device together is 128 entries of 356 bytes for each of the three
+    /// pooled sources and 256 window entries of 528 bytes for each of 20
+    /// layers on device 0 (2,840,064 bytes); 256 bank entries, the 20 window
+    /// layers and the drafter's three on device 1 (3,200,000 bytes, 2,794,496
+    /// without drafting).
     #[test]
-    fn deepseek_fits_two_b300s_at_the_released_sizes() {
+    fn deepseek_kv_minimum_is_one_sequence_of_every_group() {
+        use crate::architecture::Architecture;
+        let [d0, d1] = Architecture::DeepSeekV41Flash.devices() else {
+            panic!()
+        };
+        let sizing = ds_sizing();
+        assert_eq!(uniform_kv_block_bytes(d0, &sizing), 2_840_064);
+        assert_eq!(uniform_kv_block_bytes(d1, &sizing), 3_200_000);
+        let undrafted = Sizing {
+            draft_tokens: 0,
+            ..sizing
+        };
+        assert_eq!(uniform_kv_block_bytes(d0, &undrafted), 2_840_064);
+        assert_eq!(uniform_kv_block_bytes(d1, &undrafted), 2_794_496);
+        // 2^20 positions are 4,096 blocks and the null block; 2^17, 512.
+        assert_eq!(cuda_kv_min_bytes(d0, &sizing, &DS_CACHE), 4097 * 2_840_064);
+        assert_eq!(cuda_kv_min_bytes(d1, &sizing, &DS_CACHE), 4097 * 3_200_000);
+        let short = Sizing {
+            max_model_len: 1 << 17,
+            ..sizing
+        };
+        assert_eq!(cuda_kv_min_bytes(d0, &short, &DS_CACHE), 513 * 2_840_064);
+        assert_eq!(cuda_kv_min_bytes(d1, &short, &DS_CACHE), 513 * 3_200_000);
+        // Neither the seats nor the cache enter.
+        let crowded = Sizing {
+            max_seqs: 1024,
+            ..short
+        };
+        let no_cache = CacheConfig {
+            enabled: false,
+            ..DS_CACHE
+        };
+        assert_eq!(
+            cuda_kv_min_bytes(d1, &crowded, &no_cache),
+            cuda_kv_min_bytes(d1, &short, &DS_CACHE)
+        );
+        // A block rounds up to 16 bytes per group: at two positions, device
+        // 0's bank is 3 × 356 = 1,068 bytes, held in 1,072.
+        let tiny = Sizing {
+            kv_block_size: 2,
+            ..short
+        };
+        assert_eq!(uniform_kv_block_bytes(d0, &tiny), 1_072 + 20 * 2 * 528);
+        // The host tier's least is two blocks of every group of each device.
+        assert_eq!(
+            cuda_kv_host_min_bytes(d0, &sizing, &DS_CACHE, 1),
+            2 * 2_840_064
+        );
+        assert_eq!(
+            cuda_kv_host_min_bytes(d1, &sizing, &DS_CACHE, u64::MAX),
+            2 * 3_200_000
+        );
+    }
+
+    /// At its whole 2^20-position window DeepSeek-V4.1 does not fit two
+    /// B300s: device 1's least KV (every group holding a whole sequence:
+    /// 13.1 GB drafting three, 11.4 GB without drafts) is past what its
+    /// weights and the executor's reserve leave (9.7 GB, and 10.4 GB with
+    /// the smaller reserve of no drafts).
+    #[test]
+    fn deepseek_does_not_fit_two_b300s_at_its_whole_window() {
         use crate::architecture::Architecture;
         let devices = Architecture::DeepSeekV41Flash.devices();
-        let sizing = ds_sizing();
+        let [d0, d1] = devices else { panic!() };
+        for draft_tokens in [0, 3] {
+            let sizing = Sizing {
+                draft_tokens,
+                ..ds_sizing()
+            };
+            let room0 = SUPPORTED_GPU_MEMORY_BYTES
+                - d0.weights_bytes.unwrap()
+                - cuda_device_reserve_bytes(d0, &sizing);
+            let room1 = SUPPORTED_GPU_MEMORY_BYTES
+                - d1.weights_bytes.unwrap()
+                - cuda_device_reserve_bytes(d1, &sizing);
+            let expected_room = if draft_tokens > 0 { 97 } else { 103 };
+            assert_eq!(room1 / 100_000_000, expected_room, "{room1}");
+            let min0 = cuda_kv_min_bytes(d0, &sizing, &DS_CACHE);
+            let min1 = cuda_kv_min_bytes(d1, &sizing, &DS_CACHE);
+            assert!(min0 < room0, "{min0} {room0}");
+            assert!(min1 > room1, "{min1} {room1}");
+            let err = check_device_resources(
+                devices,
+                &sizing,
+                &DS_CACHE,
+                &cuda_on(&[room0, min1]),
+                0,
+                DS_PACK_BYTES,
+                196_608,
+                2,
+            )
+            .unwrap_err();
+            assert!(
+                err.starts_with("device 1:") && err.contains("device memory"),
+                "{err}"
+            );
+        }
+    }
+
+    /// The fit arithmetic at the released sizes with a 2^17-position context:
+    /// device 0 holds 250.87 GB of weights and device 1 259.79 GB, each
+    /// beside its KV budget and the executor's reserve on a 287.4 GB B300.
+    #[test]
+    fn deepseek_fits_two_b300s_at_a_131072_position_context() {
+        use crate::architecture::Architecture;
+        let devices = Architecture::DeepSeekV41Flash.devices();
+        let sizing = Sizing {
+            max_model_len: 1 << 17,
+            ..ds_sizing()
+        };
         let [d0, d1] = devices else { panic!() };
         let reserve0 = cuda_device_reserve_bytes(d0, &sizing);
         let reserve1 = cuda_device_reserve_bytes(d1, &sizing);
@@ -1895,18 +2059,14 @@ mod tests {
         assert_eq!(reserve0, reserve1);
         let room0 = SUPPORTED_GPU_MEMORY_BYTES - d0.weights_bytes.unwrap() - reserve0;
         let room1 = SUPPORTED_GPU_MEMORY_BYTES - d1.weights_bytes.unwrap() - reserve1;
-        // About 18.7 GB of KV on device 0 and 9.8 GB on device 1, beside a
-        // reserve of about 18 GB on each.
+        // About 19 GB of KV on device 0 and 10 GB on device 1, beside a
+        // reserve of about 17 GB on each.
         assert_eq!(reserve0 / 1_000_000_000, 17, "{reserve0}");
-        assert_eq!(room0 / 100_000_000, 186, "{room0}");
-        assert_eq!(room1 / 100_000_000, 97, "{room1}");
+        assert_eq!(room0 / 1_000_000_000, 19, "{room0}");
+        assert_eq!(room1 / 1_000_000_000, 10, "{room1}");
         let min0 = cuda_kv_min_bytes(d0, &sizing, &DS_CACHE);
         let min1 = cuda_kv_min_bytes(d1, &sizing, &DS_CACHE);
-        // Device 0: a 2^20-position sequence of 534-byte entries (4,097
-        // blocks and a pad), and 609 window blocks of 20 layers. Device 1:
-        // 356-byte entries, and the window blocks with the drafter's three.
-        assert_eq!(min0, 4098 * 256 * 534 + 610 * 256 * 20 * 528);
-        assert_eq!(min1, 4098 * 256 * 356 + 610 * 256 * (20 * 528 + 3 * 528));
+        assert_eq!((min0, min1), (513 * 2_840_064, 513 * 3_200_000));
         assert!(min0 < room0 && min1 < room1);
 
         let memory_mib = 196_608;
@@ -1974,6 +2134,26 @@ mod tests {
         // And the VM holds the tier.
         let err = check(&[room0, room1], 2, DS_PACK_BYTES, (memory_mib << 20) - 1).unwrap_err();
         assert!(err.contains("(memory)"), "{err}");
+        // A block of the pooled sources holds whole entries.
+        let odd = Sizing {
+            kv_block_size: 15,
+            ..sizing
+        };
+        let err = check_device_resources(
+            devices,
+            &odd,
+            &DS_CACHE,
+            &cuda_on(&[room0, room1]),
+            0,
+            DS_PACK_BYTES,
+            memory_mib,
+            2,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("device 0:") && err.contains("pooling ratio 2"),
+            "{err}"
+        );
 
         // The cpu executor runs both devices' pools in host memory.
         let cpu = ExecutorSettings::Cpu { kv_blocks: 64 };

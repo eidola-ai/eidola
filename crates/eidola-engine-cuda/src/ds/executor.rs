@@ -1,17 +1,19 @@
 //! [`DsCudaExecutor`]: the serving core's [`Executor`] for DeepSeek-V4.1 on two logical
 //! devices, eager (every step is launched afresh; no graph is captured).
 //!
-//! It reports the model as the CPU reference executor does without drafts (the same
-//! four groups, ratios, devices and coverage, the window chain, the token history) and
-//! runs a step in that executor's order: maintenance and table updates; the decoder's
-//! device gathers the Engram rows of the tables it holds; the encoder runs every layer
-//! before the split at every position, then the split layer's bank stub; the crossing
-//! is checked; the decoder stores the bank entries, runs each chain layer over the rows
-//! the row rule gives it, the head over the sampling rows, and samples on its device.
+//! It reports the model as the CPU reference executor does (the same groups, ratios,
+//! devices and coverage, the window chain, the token history, and with `draft_width` > 0
+//! the drafter's group) and runs a step in that executor's order: maintenance (the host
+//! tier's `Demote`, `Promote` and `ZeroHost` among it, with `host_blocks` > 0) and table
+//! updates; the draft pass of the rows that draft; the decoder's device gathers the
+//! Engram rows of the tables it holds; the encoder runs every layer before the split at
+//! every position, then the split layer's bank stub; the crossing is checked; the
+//! decoder stores the bank entries, runs each chain layer over the rows the row rule
+//! gives it, the head over the sampling rows and drafted positions, and samples on its
+//! device, or accepts a drafting row's drafts there.
 //!
-//! Not supported, and refused before a step takes any effect: drafts (a row asking for
-//! them is a host bug and panics, as at the seam), and the host tier (`Demote`,
-//! `Promote`, `ZeroHost` fail the step).
+//! Not supported: decode graphs, and the drafter's confidence head. A row asking for more
+//! drafts than `draft_width` is a host bug and panics, as at the seam.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -118,8 +120,8 @@ fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1e3
 }
 
-/// The seam's description of the model under `cfg`: the CPU reference executor's
-/// without drafts.
+/// The seam's description of the model under `cfg`: the CPU reference executor's, the
+/// drafter's group among it when drafting.
 fn model_spec(c: &DsConfig, shape: &DsShape, cfg: &DsCudaExecutorConfig) -> Result<ModelSpec> {
     let window: u32 = narrow(c.attention.window, "window")?;
     let hd: u32 = narrow(c.attention.head_dim, "head dim")?;
