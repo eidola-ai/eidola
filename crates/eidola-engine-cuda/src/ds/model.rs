@@ -19,7 +19,7 @@ use super::half::{Buffer, Device, Kind};
 use super::kv::{KvStore, Plane};
 use super::plan::{Member, PoolPlan};
 use super::support::DsShape;
-use super::weights::{Fp8, Half, HalfWeights, LayerWeights, Mhc};
+use super::weights::{Experts, Fp8, Half, HalfWeights, LayerWeights, Mhc};
 use crate::{CudaError, Result, narrow};
 
 /// This half's bank group and window group, as indices into its [`KvStore`].
@@ -393,6 +393,21 @@ pub struct HalfNet {
     open_tags: Vec<u32>,
     /// The drafter's scratch, when the executor drafts.
     pub ds: Option<DraftScratch>,
+    /// The backbone's routed experts cached from host memory (dev-only, `ds::staged`);
+    /// without it they are the half's weights.
+    #[cfg(feature = "dev-staged-experts")]
+    pub staged: Option<super::staged::ExpertCache>,
+}
+
+/// Where a feed-forward's routed pairs find their experts: the groups the placement and
+/// the products run over, the group table and the placement's scratch (`groups` words
+/// each), and the weights, expert-major by group.
+#[derive(Clone, Copy, Debug)]
+pub struct Routing {
+    pub groups: u32,
+    pub group_end: u64,
+    pub scratch: u64,
+    pub experts: Experts,
 }
 
 /// The scratch drafting adds to a half. The encoder keeps only the taps of its target
@@ -556,6 +571,8 @@ impl HalfNet {
             ds,
             kv,
             dev,
+            #[cfg(feature = "dev-staged-experts")]
+            staged: None,
         })
     }
 
@@ -564,6 +581,10 @@ impl HalfNet {
         let mut all = self.s.buffers();
         if let Some(ds) = &self.ds {
             all.extend(ds.buffers());
+        }
+        #[cfg(feature = "dev-staged-experts")]
+        if let Some(cache) = &self.staged {
+            all.extend(cache.scratch());
         }
         all
     }
@@ -582,6 +603,10 @@ impl HalfNet {
             weights: self.w.bytes.total(),
             ..MemoryBytes::default()
         };
+        #[cfg(feature = "dev-staged-experts")]
+        if let Some(cache) = &self.staged {
+            m.weights += cache.weight_bytes();
+        }
         for g in &self.kv.groups {
             m.kv += g.pool.bytes as u64;
             m.tables += g.tables.bytes as u64;
@@ -1179,16 +1204,14 @@ impl HalfNet {
         self.collapse(&self.s.mix_a, ne)?;
         self.rms(&self.s.u, lw.ffn_norm, ne, d.dim)?;
         self.quant(&self.s.u, &self.s.ucodes, &self.s.uscales, ne, d.dim)?;
-        self.moe(&lw, ne, &d.moe)?;
+        self.moe(&lw, Some(l), ne, &d.moe)?;
         self.expand(&self.s.mix_b, ne)
     }
 
-    /// The feed-forward of `rows` rows from their quantised input, into `y`.
-    fn moe(&self, lw: &LayerWeights, rows: u32, m: &MoeDims) -> Result<()> {
+    /// The feed-forward of `rows` rows from their quantised input, into `y`. `layer` is
+    /// the backbone layer's index (none for a draft block).
+    fn moe(&self, lw: &LayerWeights, layer: Option<usize>, rows: u32, m: &MoeDims) -> Result<()> {
         let (d, s, k) = (&self.d, &self.s, self.dev.kernels());
-        let pairs = rows
-            .checked_mul(m.active)
-            .ok_or_else(|| CudaError::new("routed pairs"))?;
         self.linear(&s.u, lw.router, &s.rlogits, rows, m.experts, d.dim, DT_F32)?;
         // SAFETY: as `lin8`; the layout buffers hold every pair of the largest step.
         unsafe {
@@ -1204,16 +1227,62 @@ impl HalfNet {
                 route_scale: m.route_scale,
                 reserved: 0,
             })?;
+        }
+        #[cfg(feature = "dev-staged-experts")]
+        if let (Some(l), Some(cache)) = (layer, &self.staged) {
+            // The selected experts are read back and brought into the cache, in rounds
+            // of rows whose experts fit it; each round is combined with the shared
+            // expert before the next reuses the layout.
+            let dev = self.dev.as_ref();
+            let active = m.active as usize;
+            let asked = std::time::Instant::now();
+            let ids: Vec<u32> = s.ids.read(dev, 0, rows as usize * active)?;
+            let rounds = cache.rounds(&ids, m.active, asked.elapsed().as_secs_f64())?;
+            self.shared_expert(lw, rows, m)?;
+            for (first, count) in rounds {
+                let (a, b) = (first as usize * active, (first + count) as usize * active);
+                let (slots, routing) = cache.admit(dev, l, &ids[a..b])?;
+                s.ids.write(dev, a * 4, &slots)?;
+                self.routed(first, count, m, &routing)?;
+                self.combine(first, count, m)?;
+            }
+            return Ok(());
+        }
+        let _ = layer;
+        let routing = Routing {
+            groups: m.experts,
+            group_end: s.group_end.addr,
+            scratch: s.place_scratch.addr,
+            experts: lw.experts,
+        };
+        self.routed(0, rows, m, &routing)?;
+        self.shared_expert(lw, rows, m)?;
+        self.combine(0, rows, m)
+    }
+
+    /// The routed experts of rows `first .. first + rows`, routed already: their pairs
+    /// placed expert-major from layout row 0, both products and the SwiGLU between them,
+    /// into `routed`.
+    fn routed(&self, first: u32, rows: u32, m: &MoeDims, r: &Routing) -> Result<()> {
+        let (d, s, k) = (&self.d, &self.s, self.dev.kernels());
+        let pairs = rows
+            .checked_mul(m.active)
+            .ok_or_else(|| CudaError::new("routed pairs"))?;
+        let (f, p) = (first as usize, pairs as usize);
+        let pair_at = |b: &Buffer| b.at(f * m.active as usize * 4, p * 4);
+        let row_of = pair_at(&s.row_of);
+        // SAFETY: as `lin8`; the layout buffers hold every pair of the largest step.
+        unsafe {
             k.place(&PlaceParams {
-                ids: s.ids.addr,
-                weights: s.rweights.addr,
-                row_of: s.row_of.addr,
+                ids: pair_at(&s.ids),
+                weights: pair_at(&s.rweights),
+                row_of,
                 row_weight: s.row_weight.addr,
-                group_end: s.group_end.addr,
-                scratch: s.place_scratch.addr,
+                group_end: r.group_end,
+                scratch: r.scratch,
                 rows,
                 active: m.active,
-                groups: m.experts,
+                groups: r.groups,
                 row_align: ROW_ALIGN,
                 layout_rows: pairs,
                 reserved: 0,
@@ -1222,10 +1291,11 @@ impl HalfNet {
                 (&s.ucodes, &s.lay_codes, d.dim),
                 (&s.uscales, &s.lay_scales, d.dim / 32),
             ] {
+                let width = row_bytes as usize;
                 k.place_rows(&PlaceRowsParams {
-                    src: src.addr,
+                    src: src.at(f * width, rows as usize * width),
                     dst: dst.addr,
-                    row_of: s.row_of.addr,
+                    row_of,
                     status: s.status.addr,
                     rows,
                     active: m.active,
@@ -1239,17 +1309,17 @@ impl HalfNet {
                     act_scales: scales.addr,
                     w_packed: w.0,
                     w_scales: w.1,
-                    group_end: s.group_end.addr,
+                    group_end: r.group_end,
                     out: out.addr,
                     layout_rows: pairs,
                     n,
                     k: kk,
-                    groups: m.experts,
+                    groups: r.groups,
                     row_align: ROW_ALIGN,
                     reserved: 0,
                 })
             };
-            let e = &lw.experts;
+            let e = &r.experts;
             lin4(
                 &s.lay_codes,
                 &s.lay_scales,
@@ -1276,14 +1346,18 @@ impl HalfNet {
                 &s.routed,
                 d.dim,
                 m.inter,
-            )?;
+            )
         }
-        // The shared expert.
+    }
+
+    /// The shared expert of `rows` rows, into `shared`.
+    fn shared_expert(&self, lw: &LayerWeights, rows: u32, m: &MoeDims) -> Result<()> {
+        let s = &self.s;
         self.lin8(&s.ucodes, &s.uscales, &lw.w1, &s.sgate, rows)?;
         self.lin8(&s.ucodes, &s.uscales, &lw.w3, &s.sup, rows)?;
         // SAFETY: as `lin8`.
         unsafe {
-            k.swiglu(&SwigluParams {
+            self.dev.kernels().swiglu(&SwigluParams {
                 gate: s.sgate.addr,
                 up: s.sup.addr,
                 weight: 0,
@@ -1295,14 +1369,22 @@ impl HalfNet {
                 limit: m.limit,
             })?;
         }
-        self.lin8(&s.shcodes, &s.shscales, &lw.w2, &s.shared, rows)?;
+        self.lin8(&s.shcodes, &s.shscales, &lw.w2, &s.shared, rows)
+    }
+
+    /// Rows `first .. first + rows` of `y`: their routed outputs (placed by `routed`)
+    /// summed with the shared expert's.
+    fn combine(&self, first: u32, rows: u32, m: &MoeDims) -> Result<()> {
+        let (d, s) = (&self.d, &self.s);
+        let (f, n, dim) = (first as usize, rows as usize, d.dim as usize);
+        let active = m.active as usize;
         // SAFETY: as `lin8`.
         unsafe {
-            k.combine(&CombineParams {
+            self.dev.kernels().combine(&CombineParams {
                 routed: s.routed.addr,
-                shared: s.shared.addr,
-                row_of: s.row_of.addr,
-                out: s.y.addr,
+                shared: s.shared.at(f * dim * 2, n * dim * 2),
+                row_of: s.row_of.at(f * active * 4, n * active * 4),
+                out: s.y.at(f * dim * 2, n * dim * 2),
                 rows,
                 active: m.active,
                 dim: d.dim,
@@ -1620,7 +1702,7 @@ impl HalfNet {
             self.collapse(&self.s.mix_a, rows)?;
             self.rms(&self.s.u, lw.ffn_norm, rows, d.dim)?;
             self.quant(&self.s.u, &self.s.ucodes, &self.s.uscales, rows, d.dim)?;
-            self.moe(lw, rows, &draft.moe)?;
+            self.moe(lw, None, rows, &draft.moe)?;
             self.expand(&self.s.mix_b, rows)?;
         }
         self.collapse(&self.s.mix_b, rows)?;

@@ -17,7 +17,7 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
 | `sampler.rs` | The device sampler and chain acceptance (host-plan and device-side launches). |
 | `engine_ops.rs` | Wrappers for our own kernels (`engine_ops.cu`), and the decode path's launch geometry (`RouterForm`, `executor_router` and its bound `ROUTER_PER_TOKEN_MAX`, the one-token form's `router_grid` and the split form's `router_scores_grid` and `router_select_grid`, `permute_grid`, `gather_grid`, `swiglu_grid` and the dense `swiglu_f32scale_grid`, `quant_grid`, `combine_grid`, `qkv_grid`, `copy_grid`). |
 | `support.rs` | `check_supported` and `check_drafting`: the one model configuration the kernels can run; `Unsupported` names the field. |
-| `ds/` | DeepSeek-V4.1 (*DeepSeek-V4.1*): the kernels' parameter structs (`abi.rs`); the launch wrappers of the kernel images (`ops.rs`, `gemm_ref.rs`, `head.rs`, `attention.rs`, `index.rs`) with their grids, precondition checks and host forms; the launches the executor makes through them (`kernels.rs`); and the second executor: `executor.rs`, `half.rs`, `model.rs`, `plan.rs`, `kv.rs`, `weights.rs`, `boundary.rs`, `support.rs`, `host.rs`. |
+| `ds/` | DeepSeek-V4.1 (*DeepSeek-V4.1*): the kernels' parameter structs (`abi.rs`); the launch wrappers of the kernel images (`ops.rs`, `gemm_ref.rs`, `head.rs`, `attention.rs`, `index.rs`) with their grids, precondition checks and host forms; the launches the executor makes through them (`kernels.rs`); and the second executor: `executor.rs`, `half.rs`, `model.rs`, `plan.rs`, `kv.rs`, `weights.rs`, `boundary.rs`, `support.rs`, `host.rs`; dev-only, behind the `dev-staged-experts` feature, `staged.rs` (the whole model on one GPU, its routed experts cached from host memory). |
 | `tma.rs` | `cuTensorMapEncodeTiled` specs, CuTe's descriptor fix-up. |
 | `device.rs`, `module.rs`, `launch.rs`, `ops.rs`, `bf16.rs` | Device, verified image loading and launch, argument lists, the RMSNorm smoke kernel and DeepGEMM's grid, BF16 bits. |
 
@@ -80,10 +80,11 @@ EIDOLA_ENGINE_KERNELS_DIR=<build output> EIDOLA_DS_BENCH_DIR=<dir> \
 | `plan.rs` | The step planner, pure: row order, per-layer row counts, the pooling pairs, window slot lists, the draft pass's rows and lists (`DraftPlan`), the expert layout's bound and placement. |
 | `kv.rs` | Block layouts (`GroupGeometry`), pools, device block tables with a host mirror, `Zero` / `Copy` / `Encrypt` / `Decrypt`, the host tier (`Demote` / `Promote` / `ZeroHost`), position tags. |
 | `weights.rs` | A half's weights in kernel layouts, and `weight_bytes`: the same sums as arithmetic over the configuration. |
-| `model.rs` | A half (`HalfNet`): scratch, per-slot state, one model layer as launches, and the drafter (the pass, a slot's logits, the context KV). |
+| `model.rs` | A half (`HalfNet`): scratch, per-slot state, one model layer as launches, and the drafter (the pass, a slot's logits, the context KV). A feed-forward's routed part runs over a `Routing` (groups, group table, placement scratch, expert-major weights): the layer's own experts, or a staged half's cache. |
 | `boundary.rs` | `ToEncoder`, `ToDecoder` and its check, `StepTransfer`. |
 | `executor.rs` | The seam: maintenance, the step's order, drafting, sampling and acceptance, timings. |
 | `host.rs` | `HostDevice`: host memory and every family computed with the model crate's functions. Tests only. |
+| `staged.rs` | Dev-only (*The whole model on one GPU*): `ExpertIndex`, `plan_rounds`, `HostExperts`, `ExpertCache`, `DevOnly`, and the staged constructors. |
 | `dry.rs` | `DryDevice`: no memory at all. Allocations are addresses, read-backs zeros, and a launch runs its wrapper's checks and grid only. With a half laid out without its checkpoint (`HalfWeights::load` with no store) it gives a configuration's device bytes by kind and whether every launch of a step is accepted, at any scale. |
 
 **Two logical devices.** An `Encoder` half and a `Decoder` half each own a `Device`, their weights, pools, tables, scratch and state as separate allocations, and hand kernels only their own addresses. `DsCudaExecutorConfig::devices` names each half's ordinal: the same one twice is two streams of one GPU; two ordinals is two GPUs, with no other change (not exercised).
@@ -179,6 +180,37 @@ Weights are copied tensor by tensor from the mapped checkpoint, in pieces of 256
 | `halves_invariance` | named only, with `CHECKPOINT`: both device phases over the first 192 tokens, for the invariance passes alone, under `ds_halves_invariance` | two loads and under a minute of steps |
 
 The times of `ds_tiny`, the loads, a step and the CPU reference were measured on a B300; the rest are estimates.
+
+### The whole model on one GPU (dev-only)
+
+The released model (about 510 GB) does not fit one B300 (about 288 GB); production runs it on two. For development on one device, `ds/staged.rs` (only with the crate's `dev-staged-experts` feature) loads every half's weights except the backbone's routed experts (`HalfWeights` with `routed: false`: the arrays are not allocated and the layer's expert addresses are 0, so an unstaged launch over them is refused) and gives each half an `ExpertCache`: four device arrays of `capacity` experts in the expert-major layout, a host `ExpertIndex` of which (layer, expert) each slot holds, and its own group table and placement scratch (`capacity` words each, scrubbed with the half's scratch). The drafter's experts stay resident.
+
+A staged feed-forward (`HalfNet::moe` with a backbone layer and a cache) runs the router, reads the selected ids back, and splits the rows into rounds of consecutive rows whose distinct experts fit the cache (`plan_rounds`; a row's own experts must fit, so `capacity >= active`). It runs the shared expert first; then per round the index admits the round's experts (a missing one takes the least recently used slot this admission does not use, a never-used one first), the misses are copied from host memory into their slots on the half's stream, the round's ids are rewritten to slot numbers, and the placement, both grouped products, the SwiGLU between them and the combine run over rows `first .. first + count` with `capacity` groups. The kernels are the production ones and every one computes a pair or a row from its own inputs, so the logits are the unstaged executor's bit for bit: only the weights' addresses, the layout's row order and the launches' row counts differ, all of which batch invariance already covers. An unstaged feed-forward runs `routed`, `shared_expert` and `combine` over all its rows, in that order. Each layer costs a read-back (a synchronisation) and the copies of its misses.
+
+`HostExperts` holds the experts for the copies: read once into host memory in the device's order (`HostMode::Read`, on several threads each taking a contiguous run of experts, its rate recorded), or read from the mapped checkpoint on every miss (`HostMode::Mapped`). Plain, not page-locked, memory: a copy from it is staged by the driver.
+
+| Released model, one B300 (275,040 MiB), both halves, five drafts | Bytes |
+|---|---|
+| Weights without the backbone's routed experts: encoder (both Engram modules, the layer-1 table, embedding, stub) | 106,474,131,872 |
+| Weights without them: decoder (the layer-14 table, head, drafter and its embedding copy) | 115,397,941,176 |
+| Scratch and KV at steps of 96, sequences of 4,096 | about 0.9 GB |
+| Total beside the caches | 222,780,432,372 |
+| Left after a 4 GiB reserve | 61,324,943,372: 3,261 experts of 15,360 (18,800,640 bytes each, 289 GB in all) |
+
+Both Engram tables (101.4 GB each) fit beside a useful cache, so they stay on the device (`ds::staged`'s `the_released_model_leaves_room_for_thousands_of_experts_on_one_device` holds the figures). The executor's halves are two streams of the device's one primary context (`devices: [0, 0]`), so the crossing is the production code.
+
+**Never in a pinned deployment.** The feature is the crate's alone and the node's image build (`--features cuda`) does not enable it, so the module is not in the measured binary; every constructor (`DsCudaExecutor::staged`, `staged_with_devices`, `staged::half_weights`, `attach`, `HostExperts::new`, `ExpertCache::new`) takes a `DevOnly` token that only tests and examples build; and nothing the node's configuration is read through names it. `tests/ds_staged_release.rs` (no feature, any machine) holds all three: the Containerfile's builds, every manifest of the workspace, Cargo's own resolution of the release build (with a positive control asking for the feature), and every source of the workspace and the deployment files.
+
+**Verification.** `ds::staged`'s unit tests hold the index (LRU over seeded admissions, never evicting an expert the admission needs, refusals before any change, one slot) and the rounds. `tests/ds_staged.rs` runs the shared scenarios (`ds_common`, with `STAGED` set on the test's thread) with caches smaller than the fixture's experts (2, 3, 4 and 5 of a half's 32, and all 32), from both host modes, with and without drafts, the memory scenarios included, equal to the CPU reference executor exactly as the unstaged executor is: on `HostDevice`, on the kernels' bodies compiled for the host, and (its two `on_a_device` tests) on a GPU.
+
+```sh
+cargo test -p eidola-engine-cuda --features dev-staged-experts --lib ds::staged
+cargo test -p eidola-engine-cuda --features dev-staged-experts --test ds_staged   # about three minutes
+cargo test -p eidola-engine-cuda --features dev-staged-experts --example ds_whole
+cargo test -p eidola-engine-cuda --test ds_staged_release
+```
+
+`examples/ds_whole.rs` runs the released checkpoint whole: `compare` runs `ds_halves`' text and steps through both halves at once and compares every layer's streams, the boundary, the bank entries and the logits with that example's recordings bit for bit (its own recordings are written in the same form); `generate` generates greedily from `eidola-server-engine`'s `ds_generate` prompts through the engine at draft widths 0 and 5, requires the same tokens at both, and records each step's time by part, the caches' read-backs, copies and hit rate, and each draft slot's acceptance. Its tests run both phases on the fixture over the host device. `scripts/ds_staged_session.sh` is the device session (the host scenarios, the tiny model staged on the device, then `whole_compare` and `whole_generate` with `CHECKPOINT`); the reading of the experts needs about 270 GiB of host memory (`HOST_MODE=mapped` needs none beyond the page cache). None of it has run on a device yet.
 
 ## The dev-only oracle
 
