@@ -109,12 +109,15 @@ generate() {
 }
 
 summary() {
+    # The runner writes the transcripts of exactly the requests summary.json lists;
+    # transcripts/ may also hold files an earlier run of this directory left.
+    [ -s "$OUT/run/transcripts.txt" ] || die "no transcripts: run the generate step"
     [ -s "$OUT/run/summary.json" ] || die "no summary: run the generate step"
     {
         echo "DeepSeek-V4.1 CPU generation, $(date -u +%Y-%m-%dT%H:%MZ), $(nproc) CPUs"
         echo "weights hash $(cat "$OUT/weights.sha256") (checked by the node's loader)"
         echo
-        for t in "$OUT"/run/transcripts/*.txt; do cat "$t"; echo; done
+        cat "$OUT/run/transcripts.txt"
         echo "== summary.json"
         cat "$OUT/run/summary.json"
     } > "$OUT/summary.txt"

@@ -285,10 +285,6 @@ impl Calibration {
         })
     }
 
-    fn calibrated(&self) -> bool {
-        self.prefill_secs_per_position.is_some() && !self.step_secs.is_empty()
-    }
-
     /// A decode step's cost at `width`: measured, else the most expensive width measured
     /// (a drafting step computes more positions than a plain one, so this bounds a
     /// width not yet measured from above only when the measured width is the wider).
@@ -299,13 +295,57 @@ impl Calibration {
             .or_else(|| self.step_secs.values().copied().reduce(f64::max))
     }
 
-    /// The worst-case time of `tasks`: every prompt position at the calibrated prefill
-    /// rate, and every new token its own decode step (no draft accepted).
-    fn estimate(&self, tasks: &[&Task], max_new: u32) -> Option<f64> {
+    /// A bound on the time of `tasks` from what is measured. With the prefill rate and a
+    /// decode step's cost known (or no decode step to cost: the first new token comes from
+    /// the prefill), the worst case, an upper bound: every prompt position at the prefill
+    /// rate and every new token after the first its own decode step (no draft accepted).
+    /// With only the prefill rate known, the prefill alone, a lower bound. Either refuses a
+    /// run when it exceeds the limit.
+    fn bound(&self, tasks: &[&Task], max_new: u32) -> Option<Bound> {
         let spp = self.prefill_secs_per_position?;
-        tasks.iter().try_fold(0.0, |acc, t| {
-            Some(acc + t.prompt_tokens as f64 * spp + max_new as f64 * self.step(t.width)?)
+        let prefill: f64 = tasks.iter().map(|t| t.prompt_tokens as f64 * spp).sum();
+        let steps = max_new.saturating_sub(1) as f64;
+        let decode = tasks.iter().try_fold(0.0, |acc, t| {
+            Some(
+                acc + if steps > 0.0 {
+                    steps * self.step(t.width)?
+                } else {
+                    0.0
+                },
+            )
+        });
+        Some(match decode {
+            Some(d) => Bound {
+                secs: prefill + d,
+                upper: true,
+            },
+            None => Bound {
+                secs: prefill,
+                upper: false,
+            },
         })
+    }
+}
+
+/// A bound on a run's time ([`Calibration::bound`]).
+#[derive(Clone, Copy, Debug)]
+struct Bound {
+    secs: f64,
+    /// An upper bound (the worst case); otherwise a lower one (the prefill alone).
+    upper: bool,
+}
+
+impl std::fmt::Display for Bound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.upper {
+            write!(f, "at most {} (no draft accepted)", hms(self.secs))
+        } else {
+            write!(
+                f,
+                "at least {} (the prefill alone; no decode step measured yet)",
+                hms(self.secs)
+            )
+        }
     }
 }
 
@@ -531,9 +571,10 @@ impl SlotCounts {
     }
 }
 
-/// Calls back after the first decode step, with the measured prefill seconds per
-/// position and the decode step's seconds; an error ends the request.
-type OnCalibrated<'a> = &'a mut dyn FnMut(f64, f64) -> Result<(), String>;
+/// Calls back when the prefill's output arrives, with the measured prefill seconds per
+/// position, and again after the first decode step, with its seconds too; an error ends
+/// the request.
+type OnCalibrated<'a> = &'a mut dyn FnMut(f64, Option<f64>) -> Result<(), String>;
 
 /// Runs one prepared request alone through `engine` and the node's decoder.
 fn run_task(
@@ -643,12 +684,20 @@ fn run_task(
             "drafts": drafted,
             "accepted": accepted,
         }));
-        if !first_output
-            && decode_steps == 1
+        // Calibration: the prefill's rate once its output arrives (a request that ends
+        // there has no decode step to wait for), then the first decode step's cost.
+        let measured = if first_output && produced > 0 {
+            Some(None)
+        } else if !first_output && decode_steps == 1 {
+            Some(Some(secs))
+        } else {
+            None
+        };
+        if let Some(step) = measured
             && prefill_positions > 0
             && let Some(f) = on_calibrated.as_mut()
         {
-            f(prefill_secs / prefill_positions as f64, secs)?;
+            f(prefill_secs / prefill_positions as f64, step)?;
         }
     }
     // As the node's engine thread does when its last request ends.
@@ -853,13 +902,12 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome, String> {
     {
         let pending: Vec<&Task> = tasks.iter().filter(|t| !t.finished(&cfg.out_dir)).collect();
         if !pending.is_empty()
-            && let Some(est) = cal.estimate(&pending, cfg.max_new_tokens)
-            && est > cfg.time_limit_secs
+            && let Some(est) = cal.bound(&pending, cfg.max_new_tokens)
+            && est.secs > cfg.time_limit_secs
         {
             return Ok(Outcome::Refused(format!(
-                "estimated {} for {} requests (calibrated earlier, worst case: no draft \
-                 accepted), over the limit of {}; nothing was loaded",
-                hms(est),
+                "{} requests take {est} (calibrated earlier), over the limit of {}; nothing \
+                 was loaded",
                 pending.len(),
                 hms(cfg.time_limit_secs)
             )));
@@ -953,20 +1001,16 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome, String> {
         }
     }
     if !pending.is_empty() {
-        match cal.estimate(&pending, cfg.max_new_tokens) {
-            Some(est) if est > cfg.time_limit_secs => {
+        match cal.bound(&pending, cfg.max_new_tokens) {
+            Some(est) if est.secs > cfg.time_limit_secs => {
                 return Ok(Outcome::Refused(format!(
-                    "estimated {} for {} requests (calibrated earlier, worst case: no draft \
-                     accepted), over the limit of {}",
-                    hms(est),
+                    "{} requests take {est} (calibrated earlier), over the limit of {}",
                     pending.len(),
                     hms(cfg.time_limit_secs)
                 )));
             }
             Some(est) => log(format_args!(
-                "estimated at most {} for {} requests (calibration from an earlier run; \
-                 limit {})",
-                hms(est),
+                "{} requests take {est} (calibration from an earlier run; limit {})",
                 pending.len(),
                 hms(cfg.time_limit_secs)
             )),
@@ -1013,30 +1057,32 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome, String> {
             prepared.request.max_tokens
         ));
         let remaining: Vec<&Task> = tasks[i..].iter().filter(|t| !done(t)).collect();
-        let needs_calibration = !cal.calibrated() || !cal.step_secs.contains_key(&task.width);
+        let needs_calibration = cal.prefill_secs_per_position.is_none()
+            || (cfg.max_new_tokens > 1 && !cal.step_secs.contains_key(&task.width));
         let mut refusal = None;
-        let mut on_cal = |spp: f64, step: f64| -> Result<(), String> {
+        let mut on_cal = |spp: f64, step: Option<f64>| -> Result<(), String> {
             let mut c = cal.clone();
             c.prefill_secs_per_position.get_or_insert(spp);
-            c.step_secs.entry(task.width).or_insert(step);
+            if let Some(step) = step {
+                c.step_secs.entry(task.width).or_insert(step);
+            }
             write_json(&cal_path, &c.to_json())?;
             let est = c
-                .estimate(&remaining, cfg.max_new_tokens)
-                .expect("calibrated");
+                .bound(&remaining, cfg.max_new_tokens)
+                .expect("the prefill is measured");
             log(format_args!(
-                "calibrated: {spp:.2} s per prefill position, {step:.1} s per decode step at \
-                 width {}; the {} remaining requests take at most {} (no draft accepted; \
-                 limit {})",
-                task.width,
+                "calibrated: {spp:.2} s per prefill position{}; the {} remaining requests \
+                 take {est} (limit {})",
+                step.map_or(String::new(), |s| format!(
+                    ", {s:.1} s per decode step at width {}",
+                    task.width
+                )),
                 remaining.len(),
-                hms(est),
                 hms(cfg.time_limit_secs)
             ));
-            if est > cfg.time_limit_secs {
+            if est.secs > cfg.time_limit_secs {
                 let msg = format!(
-                    "estimated {} for {} requests (worst case: no draft accepted), over the \
-                     limit of {}",
-                    hms(est),
+                    "{} requests take {est}, over the limit of {}",
                     remaining.len(),
                     hms(cfg.time_limit_secs)
                 );
@@ -1082,19 +1128,14 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome, String> {
         ));
         eprintln!("{}", transcript(&result));
         let rest: Vec<&Task> = tasks[i + 1..].iter().filter(|t| !done(t)).collect();
-        if let Some(est) = cal.estimate(&rest, cfg.max_new_tokens)
+        if let Some(est) = cal.bound(&rest, cfg.max_new_tokens)
             && !rest.is_empty()
         {
-            log(format_args!(
-                "{} requests remain, at most {} (no draft accepted)",
-                rest.len(),
-                hms(est)
-            ));
-            if est > cfg.time_limit_secs {
+            log(format_args!("{} requests remain, {est}", rest.len()));
+            if est.secs > cfg.time_limit_secs {
                 return Ok(Outcome::Refused(format!(
-                    "the {} remaining requests are estimated at {}, over the limit of {}",
+                    "the {} remaining requests take {est}, over the limit of {}",
                     rest.len(),
-                    hms(est),
                     hms(cfg.time_limit_secs)
                 )));
             }
@@ -1243,6 +1284,13 @@ fn summarize(
         "memory": memory(),
     });
     write_json(&cfg.out_dir.join("summary.json"), &summary)?;
+    // This run's transcripts, in its order: `transcripts/` may also hold files of
+    // requests an earlier run of this directory had and this one does not.
+    let transcripts: String = results
+        .iter()
+        .map(|(_, v)| format!("{}\n", transcript(v)))
+        .collect();
+    write_atomic(&cfg.out_dir.join("transcripts.txt"), transcripts.as_bytes())?;
     log(format_args!(
         "wrote {}; {}",
         cfg.out_dir.join("summary.json").display(),

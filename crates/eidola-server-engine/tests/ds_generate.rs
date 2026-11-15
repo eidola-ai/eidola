@@ -218,6 +218,24 @@ fn the_runner_generates_checkpoints_and_resumes() {
             .all(|c| c["identical"] == true)
     );
 
+    // The text summary's transcripts are this run's requests', whatever else the
+    // directory holds.
+    std::fs::write(out.path().join("transcripts/gone.w9.txt"), "STALE").unwrap();
+    assert_eq!(run(&edited).unwrap(), Outcome::Complete { mismatches: 0 });
+    let text = std::fs::read_to_string(out.path().join("transcripts.txt")).unwrap();
+    assert!(!text.contains("STALE"));
+    assert_eq!(text.matches("(draft width ").count(), names.len());
+    for n in &names {
+        let (name, width) = n.split_once(".w").unwrap();
+        assert!(
+            text.contains(&format!("== {name} (draft width {width})")),
+            "{n}"
+        );
+    }
+    let cal = read(&out.path().join("calibration.json"));
+    assert!(cal["step_secs_by_width"]["4"].as_f64().unwrap() > 0.0);
+    assert!(cal["step_secs_by_width"]["0"].as_f64().unwrap() > 0.0);
+
     // The wrong hash is refused by the node's loader.
     let mut wrong = config(out.path());
     wrong.weights_sha256 = "0".repeat(64);
@@ -236,7 +254,11 @@ fn the_time_limit_refuses_after_calibration_and_then_up_front() {
     assert!(why.contains("over the limit"), "{why}");
     let cal = read(&out.path().join("calibration.json"));
     assert!(cal["prefill_secs_per_position"].as_f64().unwrap() > 0.0);
-    assert!(cal["step_secs_by_width"]["4"].as_f64().unwrap() > 0.0);
+    assert_eq!(
+        cal["step_secs_by_width"],
+        serde_json::json!({}),
+        "refused at the prefill, before any decode step"
+    );
     let finished = std::fs::read_dir(out.path().join("requests"))
         .unwrap()
         .count();
@@ -255,4 +277,33 @@ fn the_time_limit_refuses_after_calibration_and_then_up_front() {
     changed.max_new_tokens = 7;
     let e = run(&changed).unwrap_err();
     assert!(e.contains("weights directory"), "{e}");
+}
+
+/// With one new token every request ends at its prefill: the prefill's measured cost
+/// alone refuses a run over the limit, though no decode step is ever timed.
+#[test]
+fn one_new_token_is_bounded_by_the_prefill_alone() {
+    let out = tempfile::tempdir().unwrap();
+    let mut cfg = config(out.path());
+    cfg.max_new_tokens = 1;
+    cfg.time_limit_secs = 1e-6;
+    let Outcome::Refused(why) = run(&cfg).unwrap() else {
+        panic!("not refused");
+    };
+    assert!(why.contains("over the limit"), "{why}");
+    let cal = read(&out.path().join("calibration.json"));
+    assert!(cal["prefill_secs_per_position"].as_f64().unwrap() > 0.0);
+    assert_eq!(cal["step_secs_by_width"], serde_json::json!({}));
+    let finished = std::fs::read_dir(out.path().join("requests"))
+        .unwrap()
+        .count();
+    assert_eq!(finished, 0);
+
+    cfg.time_limit_secs = 3600.0;
+    assert_eq!(run(&cfg).unwrap(), Outcome::Complete { mismatches: 0 });
+    let summary = read(&out.path().join("summary.json"));
+    for r in summary["requests"].as_array().unwrap() {
+        assert_eq!(r["generated_tokens"], 1, "{r}");
+        assert_eq!(r["decode"]["steps"], 0, "{r}");
+    }
 }
