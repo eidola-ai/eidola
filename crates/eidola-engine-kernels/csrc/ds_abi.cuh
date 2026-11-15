@@ -66,6 +66,10 @@ constexpr uint32_t DS_KV_FP8 = 0;
 constexpr uint32_t DS_KV_FP4_E4M3 = 1;
 // E2M1 nibbles, a power-of-two scale byte per 32: index keys and queries.
 constexpr uint32_t DS_KV_FP4_E8M0 = 2;
+// Not a packed format: `DsRotQuantParams::format` for a rotation with no quantisation (the
+// attention queries). The row's BF16 values go to `dst_codes` as `[rows, heads · head_dim]` BF16;
+// there are no scales and no pool target.
+constexpr uint32_t DS_KV_BF16 = 3;
 
 constexpr uint32_t ds_kv_code_bytes(uint32_t format, uint32_t width) {
   return format == DS_KV_FP8 ? width : width / 2;
@@ -90,6 +94,12 @@ constexpr uint32_t DS_DT_F32 = 1;
 // `DsWindowSlotsParams::order`.
 constexpr uint32_t DS_ORDER_POSITION = 0;
 constexpr uint32_t DS_ORDER_RING = 1;
+
+// `DsAttnParams::layout`.
+// A slot's index in the row's `a_slots + b_slots` words is its place in the list.
+constexpr uint32_t DS_ATTN_FIXED = 0;
+// The row's `a` part ends after its last listed slot, and the `b` slots follow it there.
+constexpr uint32_t DS_ATTN_PACKED = 1;
 
 // f32 words of one mix row (`DsMhcMixParams::out`).
 constexpr uint32_t ds_mix_words(uint32_t copies) { return (2 + copies) * copies; }
@@ -469,7 +479,10 @@ DS_ABI_FIELD(DsGroupedDotParams, k, 52);
 // codes and scales (`ds::dequant_*`). For a layer of the backbone `a` is its window plane
 // (`a_slots` the window, position order, right-aligned) and `b` the global KV plane of the bank it
 // reads (ascending entries); for a drafter block `a` is its window plane in ring order and `b` the
-// draft slots' KV in scratch.
+// draft slots' KV in scratch, under `DS_ATTN_PACKED`: the reference lists a drafter's window
+// without the slots a short sequence has not reached, so the draft slots follow the row's last
+// listed window slot (`drafter::ring_order`), whatever `a_slots` is. At most 8 heads per block of
+// the launch, `head_dim` a multiple of 16 and at most 512.
 struct DsAttnParams {
   // BF16 `[rows, heads · head_dim]`: rotated queries.
   const uint16_t* q;
@@ -492,8 +505,8 @@ struct DsAttnParams {
   uint32_t slot_stride;
   // `softmax_scale`.
   float scale;
-  // 0.
-  uint32_t reserved;
+  // `DS_ATTN_*`.
+  uint32_t layout;
 };
 DS_ABI_STRUCT(DsAttnParams, 160);
 DS_ABI_FIELD(DsAttnParams, q, 0);
@@ -509,7 +522,7 @@ DS_ABI_FIELD(DsAttnParams, a_slots, 140);
 DS_ABI_FIELD(DsAttnParams, b_slots, 144);
 DS_ABI_FIELD(DsAttnParams, slot_stride, 148);
 DS_ABI_FIELD(DsAttnParams, scale, 152);
-DS_ABI_FIELD(DsAttnParams, reserved, 156);
+DS_ABI_FIELD(DsAttnParams, layout, 156);
 
 // A plain product in the pinned order (`linear::linear_f32` / `linear_bf16`): `out[r][n] =
 // dot(x_row, w[n])`, plus `addend[r][n]` when given, rounded to BF16 when `out_dtype` says so. The
@@ -771,7 +784,7 @@ struct DsPlaceParams {
   float* row_weight;
   // Out: `[groups]`.
   uint32_t* group_end;
-  // Per-block counts for a multi-block launch, or null.
+  // `[groups]`: each group's pair count, written by the count launch and read by the placement.
   uint32_t* scratch;
   uint32_t rows;
   uint32_t active;
@@ -828,6 +841,33 @@ DS_ABI_FIELD(DsSwigluParams, rows, 40);
 DS_ABI_FIELD(DsSwigluParams, width, 44);
 DS_ABI_FIELD(DsSwigluParams, in_stride, 48);
 DS_ABI_FIELD(DsSwigluParams, limit, 52);
+
+// The routed rows of a byte array, copied into the expert-major layout: row `r` of `src` goes to
+// row `row_of[r · active + s]` of `dst` for every slot `s`, `row_bytes` bytes each. The activation
+// codes and their scale bytes reach the layout this way; a scale row need not be whole words. A
+// layout row at or past `layout_rows` copies nothing and raises `DS_STATUS_BAD_INDEX`.
+struct DsPlaceRowsParams {
+  // `[rows, row_bytes]`.
+  const uint8_t* src;
+  // `[layout_rows, row_bytes]`.
+  uint8_t* dst;
+  // `[rows, active]` (`DsPlaceParams::row_of`).
+  const uint32_t* row_of;
+  uint32_t* status;
+  uint32_t rows;
+  uint32_t active;
+  uint32_t row_bytes;
+  uint32_t layout_rows;
+};
+DS_ABI_STRUCT(DsPlaceRowsParams, 48);
+DS_ABI_FIELD(DsPlaceRowsParams, src, 0);
+DS_ABI_FIELD(DsPlaceRowsParams, dst, 8);
+DS_ABI_FIELD(DsPlaceRowsParams, row_of, 16);
+DS_ABI_FIELD(DsPlaceRowsParams, status, 24);
+DS_ABI_FIELD(DsPlaceRowsParams, rows, 32);
+DS_ABI_FIELD(DsPlaceRowsParams, active, 36);
+DS_ABI_FIELD(DsPlaceRowsParams, row_bytes, 40);
+DS_ABI_FIELD(DsPlaceRowsParams, layout_rows, 44);
 
 // The feed-forward sum (`forward::moe_forward`): from +0, a row's routed outputs added in slot
 // order (ascending expert id), then `bf16(sum + shared)`.
