@@ -24,7 +24,7 @@
 
 use eidola_app_core::updates::{
     AcceptedClaims, CheckContext, Claim, UpdateCheckResult, UpdateCheckSnapshot, UpdateState,
-    check_for_update, check_outcome, classify, expected_claims,
+    attested_claims, check_for_update, check_outcome, classify, compare_claims, expected_claims,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1051,5 +1051,152 @@ async fn request_arrived(server: &MockServer) {
             "the check never sent its request"
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The command-line client's artifact rows across the schema-5 rotation
+// ---------------------------------------------------------------------------
+
+/// The manifest this tree emits today, at whatever schema it declares.
+const WORKSPACE_MANIFEST: &[u8] = include_bytes!("../../../artifact-manifest.json");
+
+fn workspace_manifest() -> serde_json::Value {
+    serde_json::from_slice(WORKSPACE_MANIFEST).expect("the committed manifest is JSON")
+}
+
+fn cli_deltas(manifest: &serde_json::Value) -> Vec<(String, Option<String>)> {
+    compare_claims(&expected_claims(), &attested_claims(manifest))
+        .into_iter()
+        .filter(|d| d.key.starts_with("artifacts.eidola-cli"))
+        .map(|d| (d.key, d.attested))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authentic_release_recording_the_macos_cli_reads_cleanly_on_its_cli_rows() {
+    // The real signed release, checked against this build's *own* expected
+    // set rather than the fixture-era one: it records the standalone macOS
+    // CLI archive, which schema 5 retires, so this is the verified path's
+    // proof that accepting schema 5 did not stop this build reading a
+    // release that still records the row. Other rows differ (the fixture
+    // predates the current enclave and schema); the CLI rows must not.
+    let server = MockServer::start().await;
+    mount_release(&server, FIXTURE_TAG, FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
+
+    let mut ctx = ctx(&server, OLD_INSTALLED);
+    ctx.expected_claims = expected_claims();
+    let result = check_for_update(&http_client(), &ctx, None).await;
+    let UpdateCheckResult::ClaimsChanged { comparison, .. } = result else {
+        panic!("expected the fixture to verify and differ elsewhere, got: {result:#?}");
+    };
+    assert!(
+        comparison
+            .attested
+            .iter()
+            .any(|c| c.key == "artifacts.eidola-cli-macos-universal"),
+        "the fixture has to record the retiring row to prove anything"
+    );
+    let cli: Vec<_> = comparison
+        .deltas
+        .iter()
+        .filter(|d| d.key.starts_with("artifacts.eidola-cli"))
+        .collect();
+    assert!(cli.is_empty(), "CLI rows read as changed: {cli:#?}");
+}
+
+#[test]
+fn this_build_tolerates_both_sides_of_the_cli_rotation() {
+    // What a shipped client shows for these rows: each is expected, and
+    // each may be absent, because this build reads a manifest from either
+    // side of schema 5.
+    let expected = expected_claims();
+    let value = |key: &str| {
+        expected
+            .iter()
+            .find(|c| c.key == key)
+            .map(|c| c.value.as_str())
+    };
+    assert_eq!(
+        value("artifacts.eidola-cli-macos-universal"),
+        Some("nix (darwin/universal) or absent")
+    );
+    assert_eq!(
+        value("artifacts.eidola-cli-linux-static-amd64"),
+        Some("file (linux/amd64) or absent")
+    );
+    assert_eq!(value("artifacts.eidola-cli"), Some("oci (linux/amd64)"));
+}
+
+#[test]
+fn the_committed_manifest_is_held_to_its_own_cli_rows() {
+    // The manifest releases emit now, through the public surface: clean as
+    // committed, and refusing either half of the CLI rotation applied
+    // without the schema that records it.
+    let manifest = workspace_manifest();
+    let declared = manifest["schema_version"]
+        .as_u64()
+        .expect("an integer schema");
+    assert!(cli_deltas(&manifest).is_empty());
+
+    if declared < 5 {
+        let mut dropped = manifest.clone();
+        dropped["artifacts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("eidola-cli-macos-universal");
+        assert_eq!(
+            cli_deltas(&dropped),
+            [(
+                "artifacts.eidola-cli-macos-universal".to_string(),
+                Some("missing (recorded through schema 4)".to_string())
+            )]
+        );
+
+        let mut early = manifest.clone();
+        early["artifacts"]["eidola-cli-linux-static-amd64"] = serde_json::json!({
+            "platform": "linux/amd64",
+            "sha256": format!("sha256:{}", "9".repeat(64)),
+            "type": "file"
+        });
+        assert_eq!(
+            cli_deltas(&early),
+            [(
+                "artifacts.eidola-cli-linux-static-amd64".to_string(),
+                Some(format!(
+                    "present, but schema {declared} records it only from schema 5 on"
+                ))
+            )]
+        );
+    } else {
+        let mut kept = manifest.clone();
+        kept["artifacts"]["eidola-cli-macos-universal"] = serde_json::json!({
+            "archiveSha256": format!("sha256:{}", "a".repeat(64)),
+            "narHash": "sha256-aa",
+            "platform": "darwin/universal",
+            "type": "nix"
+        });
+        assert_eq!(
+            cli_deltas(&kept),
+            [(
+                "artifacts.eidola-cli-macos-universal".to_string(),
+                Some(format!(
+                    "present, but schema {declared} records it only through schema 4"
+                ))
+            )]
+        );
+
+        let mut dropped = manifest.clone();
+        dropped["artifacts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("eidola-cli-linux-static-amd64");
+        assert_eq!(
+            cli_deltas(&dropped),
+            [(
+                "artifacts.eidola-cli-linux-static-amd64".to_string(),
+                Some("missing (recorded from schema 5 on)".to_string())
+            )]
+        );
     }
 }

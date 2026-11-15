@@ -62,23 +62,24 @@
 //!
 //! | Claim key | Expected value | Derivation |
 //! |---|---|---|
-//! | `manifest.schema_version` | `2 or 3 or 4` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shapes this module's parser understands; a jump outside the set is a release-gated trust event (`docs/trust-root.md`) |
+//! | `manifest.schema_version` | `2 or 3 or 4 or 5` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shapes this module's parser understands; a jump outside the set is a release-gated trust event (`docs/trust-root.md`) |
 //! | `enclave.cvm_version` | `platform release with its manifest pinned (VERSION@sha256)` | the embedded trust root pins the paired server's SEV-SNP launch identity in the IGVM launch model (`trust_root::SERVER_SNP_MEASUREMENT` and friends), which is the launch of one release image |
 //! | `enclave.igvm_sha256` | `SEV-SNP IGVM image hash (32-byte hex)` | ditto: the image the digest is computed over |
 //! | `enclave.sev_snp.measurement` | `SEV-SNP launch measurement (48-byte hex)` | ditto, `trust_root::SERVER_SNP_MEASUREMENT` |
 //! | `enclave.sev_snp.host_data` | `SEV-SNP HOST_DATA, the config hash (32-byte hex)` | ditto, `trust_root::SERVER_SNP_HOST_DATA`: what binds the server's config, since the digest is the same for every deployment of an image |
 //! | `enclave.sev_snp.guest_policy` | `SEV-SNP guest policy (0x-prefixed hex)` | ditto, `trust_root::SERVER_SNP_GUEST_POLICY` |
 //! | `artifacts.eidola-cli` | `oci (linux/amd64)` | [`EXPECTED_ARTIFACTS`] — the artifact set every accepted schema records |
-//! | `artifacts.eidola-cli-macos-universal` | `nix (darwin/universal)` | ditto |
 //! | `artifacts.eidola-gui-macos-universal` | `nix (darwin/universal)` | ditto |
 //! | `artifacts.eidola-postgres` | `oci (linux/amd64)` | ditto |
 //! | `artifacts.eidola-server` | `oci (linux/amd64)` | ditto |
 //! | `artifacts.eidola-gui-linux-amd64` | `nix (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`] — the Linux Nix installable's schema-2 key. Schema 3 records it as `…-nix-amd64` instead, so a manifest declaring 3 must *not* carry it |
+//! | `artifacts.eidola-cli-macos-universal` | `nix (darwin/universal) or absent` | [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4`] — the standalone macOS CLI archive, recorded through schema 4. Every GUI payload carries the CLI built beside it, so schema 5 records no separate macOS CLI and a manifest declaring 5 must *not* carry it |
 //! | `artifacts.eidola-gui-linux-deb-amd64` | `file (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] — the Debian package a user installs with `apt install ./…`; the `.deb` itself is the hashed byte stream |
 //! | `artifacts.eidola-gui-linux-deb-arm64` | `file (linux/arm64) or absent` | ditto, 64-bit ARM |
 //! | `artifacts.eidola-gui-linux-nix-amd64` | `nix (linux/amd64) or absent` | ditto — the Linux Nix installable under the name schema 3 gives it |
 //! | `artifacts.eidola-gui-macos-universal-zip` | `file (darwin/universal) or absent` | ditto — the macOS unsigned shipping zip |
 //! | `artifacts.eidola-server-engine` | `oci (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_4`] — the inference node's image, the one every Eidola-hosted engine deployment pins by digest |
+//! | `artifacts.eidola-cli-linux-static-amd64` | `file (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_5`] — the static Linux CLI binary, the one file of the `eidola-cli` image, published on its own so a host binary needs no container runtime |
 //!
 //! The `or absent` rows are the schema-conditional half: absent from the
 //! older manifests this build also accepts, required of any manifest
@@ -107,7 +108,11 @@
 //! because schema 3 renames the Linux Nix installable's key rather than
 //! adding to it. A rename is two schema-conditional rows, one arriving and
 //! one retiring, so that each spelling is expected exactly under the schema
-//! that records it.
+//! that records it. Schema 5 moves the command-line client the same way
+//! without a rename: the standalone macOS CLI archive, which every GUI
+//! payload makes redundant, retires, and the static Linux CLI arrives as a
+//! file of its own — one retiring row and one arriving row, each held to
+//! the schema a manifest declares.
 //!
 //! That two-sided tolerance is the shape of every manifest schema rotation:
 //! a build **accepts** the new schema one release before any release
@@ -133,7 +138,7 @@ use crate::updater::ci_sigstore;
 /// manifest shape [`attested_claims`] walks. A version outside this set is a
 /// *claims change* (authentic but unintelligible to this build), not a
 /// verification failure.
-pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4];
+pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4, 5];
 
 /// The schema the current artifact set was introduced at:
 /// [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] rows become required at it, and
@@ -145,12 +150,16 @@ const ARTIFACT_SET_SCHEMA: u64 = 3;
 /// [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_4`] rows become required at it.
 const ENGINE_IMAGE_SCHEMA: u64 = 4;
 
+/// The schema the command-line client's artifact set takes its current shape
+/// at: [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_5`] rows become required at it, and
+/// [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4`] rows retire at it.
+const CLI_ARTIFACT_SET_SCHEMA: u64 = 5;
+
 /// The artifact entries every accepted `artifact-manifest.json` records, as
 /// `(name, type, platform)`. Structure only — digests / narHashes /
 /// archiveSha256 are values and legitimately change every release.
 pub const EXPECTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     ("eidola-cli", "oci", "linux/amd64"),
-    ("eidola-cli-macos-universal", "nix", "darwin/universal"),
     ("eidola-gui-macos-universal", "nix", "darwin/universal"),
     ("eidola-postgres", "oci", "linux/amd64"),
     // The gateway image (`ghcr.io/eidola-ai/eidola-server-gateway`). The key
@@ -212,6 +221,34 @@ pub const EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2: &[(&str, &str, &str)] =
 pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_4: &[(&str, &str, &str)] =
     &[("eidola-server-engine", "oci", "linux/amd64")];
 
+/// Artifact entries schema 5 adds: the static Linux CLI, published as the
+/// one file it is. It is the binary the `eidola-cli` image carries,
+/// extracted from that image and hashed (`scripts/artifact-manifest.sh
+/// extract-cli`), so a user installing a host binary needs neither a
+/// container runtime nor a registry. `type: "file"` for the reason the
+/// `.deb` is: the download *is* the byte stream its hash covers. The key
+/// says `static` because the CLI also ships inside every Linux GUI payload,
+/// and an unqualified `eidola-cli-linux-amd64` would imply it ships once.
+///
+/// The same tolerance as [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`], two schemas
+/// later.
+pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_5: &[(&str, &str, &str)] =
+    &[("eidola-cli-linux-static-amd64", "file", "linux/amd64")];
+
+/// Artifact entries schema 5 *retires*: the standalone macOS CLI archive.
+/// Every GUI payload carries the CLI built from the same source as the app
+/// (`Contents/MacOS/eidola-cli` in the macOS `.app`), so a separate macOS
+/// build is a further copy of the same client that could only drift from
+/// it.
+///
+/// The same two-sided reading as [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`]: a
+/// manifest declaring schema 2, 3 or 4 without this row has dropped an
+/// artifact, one declaring 5 with it has recorded an artifact its schema
+/// does not have, and the row leaves the expected set once 4 leaves
+/// [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`].
+pub const EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4: &[(&str, &str, &str)] =
+    &[("eidola-cli-macos-universal", "nix", "darwin/universal")];
+
 /// One slice of the artifact set, as `(name, type, platform)` rows.
 type ArtifactRows = &'static [(&'static str, &'static str, &'static str)];
 
@@ -221,11 +258,14 @@ type ArtifactRows = &'static [(&'static str, &'static str, &'static str)];
 const ARRIVING_ARTIFACTS: &[(u64, ArtifactRows)] = &[
     (ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_3),
     (ENGINE_IMAGE_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_4),
+    (CLI_ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_5),
 ];
 
 /// Every retiring slice, with the first schema that no longer records it.
-const RETIRING_ARTIFACTS: &[(u64, ArtifactRows)] =
-    &[(ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2)];
+const RETIRING_ARTIFACTS: &[(u64, ArtifactRows)] = &[
+    (ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2),
+    (CLI_ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4),
+];
 
 /// How often the background poll re-checks while the app is running.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
@@ -799,7 +839,7 @@ fn accepts_schema(supported: &[u32], pred: impl Fn(u64) -> bool) -> bool {
 }
 
 /// The oldest manifest schema this build accepts — the lower bound of the
-/// range [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`] rows are recorded in.
+/// range every retiring row ([`RETIRING_ARTIFACTS`]) is recorded in.
 fn oldest_supported_schema() -> u64 {
     SUPPORTED_MANIFEST_SCHEMA_VERSIONS
         .iter()
@@ -1352,16 +1392,17 @@ mod tests {
                 "enclave.sev_snp.host_data",
                 "enclave.sev_snp.guest_policy",
                 "artifacts.eidola-cli",
-                "artifacts.eidola-cli-macos-universal",
                 "artifacts.eidola-gui-macos-universal",
                 "artifacts.eidola-postgres",
                 "artifacts.eidola-server",
                 "artifacts.eidola-gui-linux-amd64",
+                "artifacts.eidola-cli-macos-universal",
                 "artifacts.eidola-gui-linux-deb-amd64",
                 "artifacts.eidola-gui-linux-deb-arm64",
                 "artifacts.eidola-gui-linux-nix-amd64",
                 "artifacts.eidola-gui-macos-universal-zip",
                 "artifacts.eidola-server-engine",
+                "artifacts.eidola-cli-linux-static-amd64",
             ]
         );
     }
@@ -1426,6 +1467,40 @@ mod tests {
             Some("nix (linux/amd64)")
         );
         assert_eq!(value(&only_4, "artifacts.eidola-gui-linux-amd64"), None);
+
+        // The command-line client's boundary, at schema 5: one row retires
+        // and one arrives there, so each tightens from its own side.
+        assert_eq!(
+            value(&only_4, "artifacts.eidola-cli-macos-universal").as_deref(),
+            Some("nix (darwin/universal)")
+        );
+        assert_eq!(
+            value(&only_4, "artifacts.eidola-cli-linux-static-amd64"),
+            None
+        );
+        let four_and_five = expected_claims_for(&[4, 5]);
+        assert_eq!(
+            value(&four_and_five, "artifacts.eidola-cli-macos-universal").as_deref(),
+            Some("nix (darwin/universal) or absent")
+        );
+        assert_eq!(
+            value(&four_and_five, "artifacts.eidola-cli-linux-static-amd64").as_deref(),
+            Some("file (linux/amd64) or absent")
+        );
+        let only_5 = expected_claims_for(&[5]);
+        assert_eq!(value(&only_5, "artifacts.eidola-cli-macos-universal"), None);
+        assert_eq!(
+            value(&only_5, "artifacts.eidola-cli-linux-static-amd64").as_deref(),
+            Some("file (linux/amd64)")
+        );
+        assert_eq!(
+            value(&only_5, "artifacts.eidola-server-engine").as_deref(),
+            Some("oci (linux/amd64)")
+        );
+        assert_eq!(
+            value(&only_5, "artifacts.eidola-cli").as_deref(),
+            Some("oci (linux/amd64)")
+        );
     }
 
     /// A schema-3 manifest — the shape a later release will emit. It adds
@@ -1477,6 +1552,169 @@ mod tests {
         manifest["artifacts"]["eidola-server-engine"] =
             serde_json::json!({"digest": "sha256:dd", "platform": "linux/amd64", "type": "oci"});
         manifest
+    }
+
+    /// A schema-5 manifest: schema 4's shape without the standalone macOS
+    /// CLI archive, and with the static Linux CLI as a file of its own.
+    fn schema_5_manifest() -> serde_json::Value {
+        let mut manifest = schema_4_manifest();
+        manifest["schema_version"] = serde_json::json!(5);
+        let artifacts = manifest["artifacts"].as_object_mut().unwrap();
+        artifacts.remove("eidola-cli-macos-universal");
+        artifacts.insert(
+            "eidola-cli-linux-static-amd64".into(),
+            serde_json::json!({
+                "platform": "linux/amd64",
+                "sha256": format!("sha256:{}", "9".repeat(64)),
+                "type": "file"
+            }),
+        );
+        manifest
+    }
+
+    /// The command-line client's two rows as a schema-4 and a schema-5
+    /// manifest record them, for the tests that move one across the
+    /// boundary.
+    fn macos_cli_row() -> serde_json::Value {
+        schema_4_manifest()["artifacts"]["eidola-cli-macos-universal"].clone()
+    }
+
+    fn static_cli_row() -> serde_json::Value {
+        schema_5_manifest()["artifacts"]["eidola-cli-linux-static-amd64"].clone()
+    }
+
+    #[test]
+    fn schema_5_manifest_with_its_own_rows_is_not_a_claims_change() {
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&schema_5_manifest()));
+        assert!(deltas.is_empty(), "unexpected deltas: {deltas:#?}");
+    }
+
+    #[test]
+    fn schema_5_manifest_missing_the_static_cli_is_a_delta() {
+        let mut manifest = schema_5_manifest();
+        manifest["artifacts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("eidola-cli-linux-static-amd64");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-cli-linux-static-amd64");
+        assert_eq!(
+            deltas[0].attested.as_deref(),
+            Some("missing (recorded from schema 5 on)")
+        );
+    }
+
+    #[test]
+    fn the_static_cli_before_schema_5_is_a_delta() {
+        // Emission without the bump, at every older schema this build reads.
+        for (mut manifest, declared) in [
+            (current_manifest(), 2),
+            (schema_3_manifest(), 3),
+            (schema_4_manifest(), 4),
+        ] {
+            manifest["artifacts"]["eidola-cli-linux-static-amd64"] = static_cli_row();
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "schema {declared}: deltas {deltas:#?}");
+            assert_eq!(deltas[0].key, "artifacts.eidola-cli-linux-static-amd64");
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some(
+                    format!("present, but schema {declared} records it only from schema 5 on")
+                        .as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn the_macos_cli_at_schema_5_is_a_delta() {
+        // Schema 5 retires the row, so a manifest declaring 5 that still
+        // carries it has recorded an artifact its own schema does not have —
+        // and the static Linux CLI beside it does not excuse it.
+        let mut manifest = schema_5_manifest();
+        manifest["artifacts"]["eidola-cli-macos-universal"] = macos_cli_row();
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-cli-macos-universal");
+        assert_eq!(
+            deltas[0].attested.as_deref(),
+            Some("present, but schema 5 records it only through schema 4")
+        );
+    }
+
+    #[test]
+    fn a_manifest_before_schema_5_missing_the_macos_cli_is_a_delta() {
+        // The "or absent" on the expected side covers schema 5 having
+        // retired the row, not an older schema having lost it.
+        for (mut manifest, declared) in [
+            (current_manifest(), 2),
+            (schema_3_manifest(), 3),
+            (schema_4_manifest(), 4),
+        ] {
+            manifest["artifacts"]
+                .as_object_mut()
+                .unwrap()
+                .remove("eidola-cli-macos-universal");
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "schema {declared}: deltas {deltas:#?}");
+            assert_eq!(deltas[0].key, "artifacts.eidola-cli-macos-universal");
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some("missing (recorded through schema 4)"),
+                "schema {declared}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_5_manifest_missing_an_older_arriving_row_is_a_delta() {
+        // Schema 5 is schema 4's set with the CLI rows moved, not instead of
+        // it: every row that arrived earlier is still promised.
+        for (since, rows) in [
+            (3, EXPECTED_ARTIFACTS_SINCE_SCHEMA_3),
+            (4, EXPECTED_ARTIFACTS_SINCE_SCHEMA_4),
+        ] {
+            for (row, _, _) in rows {
+                let mut manifest = schema_5_manifest();
+                manifest["artifacts"].as_object_mut().unwrap().remove(*row);
+                let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+                assert_eq!(deltas.len(), 1, "{row}: unexpected deltas: {deltas:#?}");
+                assert_eq!(
+                    deltas[0].attested.as_deref(),
+                    Some(format!("missing (recorded from schema {since} on)").as_str()),
+                    "{row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_cli_rows_swapped_without_the_bump_are_two_deltas() {
+        // The whole schema-5 artifact set under schema 4's number: the
+        // retirement and the arrival each read as a claim out of shape, so
+        // neither half of the rotation can be emitted alone.
+        let mut manifest = schema_5_manifest();
+        manifest["schema_version"] = serde_json::json!(4);
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        let mut got: Vec<(&str, Option<&str>)> = deltas
+            .iter()
+            .map(|d| (d.key.as_str(), d.attested.as_deref()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                (
+                    "artifacts.eidola-cli-linux-static-amd64",
+                    Some("present, but schema 4 records it only from schema 5 on")
+                ),
+                (
+                    "artifacts.eidola-cli-macos-universal",
+                    Some("missing (recorded through schema 4)")
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1620,21 +1858,21 @@ mod tests {
     }
 
     #[test]
-    fn the_retired_linux_key_gets_no_verdict_below_the_oldest_accepted_schema() {
+    fn retired_keys_get_no_verdict_below_the_oldest_accepted_schema() {
         // A retiring row is bounded on both sides. The captured schema-1
         // release predates the Linux GUI entirely, so neither its absence
-        // nor its presence there says anything about the rename — the only
+        // nor its presence there says anything about the rename — and the
+        // same holds for the macOS CLI row schema 5 retires. The only
         // honest complaint about such a manifest is its schema version, and
-        // piling a row verdict on top would make every captured old release
-        // read as two problems instead of one.
+        // piling row verdicts on top would make every captured old release
+        // read as several problems instead of one.
         for present in [false, true] {
             let mut manifest = current_manifest();
             manifest["schema_version"] = serde_json::json!(1);
             if !present {
-                manifest["artifacts"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("eidola-gui-linux-amd64");
+                let artifacts = manifest["artifacts"].as_object_mut().unwrap();
+                artifacts.remove("eidola-gui-linux-amd64");
+                artifacts.remove("eidola-cli-macos-universal");
             }
             let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
             assert_eq!(deltas.len(), 1, "present={present}: deltas {deltas:#?}");
@@ -1698,11 +1936,14 @@ mod tests {
         // Every `file` row's whole claim is one hash of one published byte
         // stream — the shipping zip and both Debian packages alike — so a
         // hash that isn't one is the row saying nothing.
-        for (row, ty, _) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3 {
+        for (row, ty, _) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3
+            .iter()
+            .chain(EXPECTED_ARTIFACTS_SINCE_SCHEMA_5)
+        {
             if *ty != "file" {
                 continue;
             }
-            let mut manifest = schema_3_manifest();
+            let mut manifest = schema_5_manifest();
             manifest["artifacts"][*row]["sha256"] = serde_json::json!("sha256:nope");
             let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
             assert_eq!(deltas.len(), 1, "{row}: unexpected deltas: {deltas:#?}");
@@ -1736,12 +1977,12 @@ mod tests {
     fn schema_version_jump_is_a_delta() {
         // Built on the newest shape this build knows, so the schema row is
         // the only thing that can differ.
-        let mut manifest = schema_4_manifest();
+        let mut manifest = schema_5_manifest();
         manifest["schema_version"] = serde_json::json!(99);
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].key, "manifest.schema_version");
-        assert_eq!(deltas[0].expected.as_deref(), Some("2 or 3 or 4"));
+        assert_eq!(deltas[0].expected.as_deref(), Some("2 or 3 or 4 or 5"));
         assert_eq!(deltas[0].attested.as_deref(), Some("99"));
     }
 
