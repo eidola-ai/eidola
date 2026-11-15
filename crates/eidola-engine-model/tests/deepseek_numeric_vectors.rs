@@ -881,6 +881,21 @@ fn generate() -> String {
         i.extend(bits32(&scores[..n as usize]));
         case(&mut out, "top_k", &i);
     }
+    // A NaN of any sign and payload ranks as negative infinity: the three NaNs and the
+    // infinity tie, in index order, behind every other score.
+    let nans = [
+        0x7f80_0001u32,
+        0xffa1_2345,
+        0xff80_0000,
+        0x3f80_0000,
+        0x7fc0_0000,
+        0xc000_0000,
+    ];
+    for k in [6u64, 2, 3] {
+        let mut i = vec![6, k];
+        i.extend(nans.iter().map(|b| u64::from(*b)));
+        case(&mut out, "top_k", &i);
+    }
 
     // Sweeps.
     for (name, _) in UNARY {
