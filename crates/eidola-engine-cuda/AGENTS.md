@@ -195,7 +195,7 @@ A staged feed-forward (`HalfNet::moe` with a backbone layer and a cache) runs th
 | Weights without them: decoder (the layer-14 table, head, drafter and its embedding copy) | 115,397,941,176 |
 | Scratch and KV at steps of 96, sequences of 4,096 | about 0.9 GB |
 | Total beside the caches | 222,780,432,372 |
-| Left after a 4 GiB reserve | 61,324,943,372: 3,261 experts of 15,360 (18,800,640 bytes each, 289 GB in all) |
+| Left after a 4 GiB reserve | 61,324,943,372: 3,261 experts of 15,360 for both halves together, about 1,630 a half (18,800,640 bytes each, 289 GB in all) |
 
 Both Engram tables (101.4 GB each) fit beside a useful cache, so they stay on the device (`ds::staged`'s `the_released_model_leaves_room_for_thousands_of_experts_on_one_device` holds the figures). The executor's halves are two streams of the device's one primary context (`devices: [0, 0]`), so the crossing is the production code.
 
@@ -210,7 +210,17 @@ cargo test -p eidola-engine-cuda --features dev-staged-experts --example ds_whol
 cargo test -p eidola-engine-cuda --test ds_staged_release
 ```
 
-`examples/ds_whole.rs` runs the released checkpoint whole: `compare` runs `ds_halves`' text and steps through both halves at once and compares every layer's streams, the boundary, the bank entries and the logits with that example's recordings bit for bit (its own recordings are written in the same form); `generate` generates greedily from `eidola-server-engine`'s `ds_generate` prompts through the engine at draft widths 0 and 5, requires the same tokens at both, and records each step's time by part, the caches' read-backs, copies and hit rate, and each draft slot's acceptance. Its tests run both phases on the fixture over the host device. `scripts/ds_staged_session.sh` is the device session (the host scenarios, the tiny model staged on the device, then `whole_compare` and `whole_generate` with `CHECKPOINT`); the reading of the experts needs about 270 GiB of host memory (`HOST_MODE=mapped` needs none beyond the page cache). None of it has run on a device yet.
+`examples/ds_whole.rs` runs the released checkpoint whole: `compare` runs `ds_halves`' text and steps through both halves at once and compares every layer's streams, the boundary, the bank entries and the logits with that example's recordings bit for bit (its own recordings are written in the same form); `generate` generates greedily from `eidola-server-engine`'s `ds_generate` prompts through the engine at draft widths 0 and 5, requires the same tokens at both, and records each step's time by part, the caches' read-backs, copies and hit rate, and each draft slot's acceptance. Its tests run both phases on the fixture over the host device. `scripts/ds_staged_session.sh` is the device session (the host scenarios, the tiny model staged on the device, then `whole_compare` and `whole_generate` with `CHECKPOINT`); the reading of the experts needs about 270 GiB of host memory (`HOST_MODE=mapped` needs none beyond the page cache).
+
+**Measured on a B300** (the session above, every step passing):
+
+- The staged tiny scenarios, plain and drafted with the memory scenarios, equal the CPU reference executor on the device, as on the host.
+- `whole_compare`: every one of the 44 compared arrays (each encoder and decoder layer's streams, the bank entries, the boundary's streams and collapse weights, the logits at all 555 positions) equal bit for bit to the one-half-at-a-time recording, so the whole model on one device in one process computes what the two halves did and what the model crate's forward does.
+- `whole_generate`: the tokens of all four prompts the same at draft widths 0 and 5, and the same as the CPU reference executor's for those prompts. At width 5, 160 of 255 drafts were accepted (per slot 46, 38, 29, 25 and 22 of 51 drafting steps).
+- The experts (288.8 GB) read into host memory in 62.5 s on 24 threads (4.6 GB/s), the rest loaded in 111 to 121 s.
+- `Capacity::Fill` sizes each half's cache from what the device has free once both halves are loaded: 1,607 experts a half for generation (the drafter and its embedding copy on the device, as in the table), 1,850 for the comparison, which loads no drafter (about 9.3 GB, roughly 490 experts more in all). Either way the device is full: 141.3 and 141.1 GB a half in the comparison.
+
+What these show is exactness and that generation works end to end. They are not a speed figure for the executor: the copies of missed experts dominate a step. Decoding took about 0.37 to 0.40 s a step at width 0 on the short prompts with a hit rate of about 0.54. The comparison's steps of 96 positions touch nearly every expert of every layer, more than a half's cache holds, so in that cyclic pattern least-recently-used eviction hits almost never (rate near 0): each step copied about 45 GB a half, about 5 s a half of a step of about 13 s.
 
 ## The dev-only oracle
 

@@ -14,7 +14,8 @@
 //!   forward), the first difference named by array, position and element.
 //! - `generate`: greedy generation through the serving core's engine over the staged
 //!   executor, for the chat prompts of `eidola-server-engine`'s `ds_generate` example,
-//!   at each draft width of `EIDOLA_DS_WHOLE_WIDTHS` (0 and 5 by default). The tokens
+//!   at each draft width of `EIDOLA_DS_WHOLE_WIDTHS` (0 and 5 by default; one executor
+//!   built for the widest, each run's engine asking a row for at most its own). The tokens
 //!   must be the same at every width; each step's time (by part, and the cache's
 //!   read-backs and copies) and each drafting row's acceptance are recorded.
 //!
@@ -570,6 +571,9 @@ fn stats_delta(a: &StagedStats, b: &StagedStats) -> Value {
 /// caches' work, and each drafting row's drafts and acceptance.
 struct Probe<'a> {
     x: &'a mut DsCudaExecutor,
+    /// The executor's spec with the run's draft width: the engine asks a row for at
+    /// most that many drafts, and the executor drafts what a row asks for.
+    spec: ModelSpec,
     steps: Vec<Value>,
     /// Per draft slot: rows that proposed it, and rows that accepted it.
     proposed: Vec<u64>,
@@ -578,7 +582,7 @@ struct Probe<'a> {
 
 impl Executor for Probe<'_> {
     fn spec(&self) -> &ModelSpec {
-        self.x.spec()
+        &self.spec
     }
 
     fn execute(&mut self, step: &StepInput) -> std::result::Result<StepOutput, ExecutorError> {
@@ -643,7 +647,18 @@ fn generate(
     let mut results = Vec::new();
     let mut outputs: Vec<Vec<Vec<u32>>> = vec![Vec::new(); prompts.len()];
     for &width in widths {
-        let mut probe = Probe {
+        let most = x.spec().max_draft_tokens;
+        if width > most {
+            return Err(fail(format!(
+                "draft width {width}: the executor drafts at most {most}"
+            )));
+        }
+        let mut spec = x.spec().clone();
+        if width > 0 {
+            spec.max_draft_tokens = width;
+        }
+        let probe = Probe {
+            spec,
             x: &mut *x,
             steps: Vec::new(),
             proposed: Vec::new(),
@@ -658,7 +673,6 @@ fn generate(
             cache: CachePolicy::default(),
             sweep_interval_ms: 1000,
         };
-        let _ = &mut probe;
         let mut eng = Engine::new(probe, sched).map_err(|e| fail(format!("{e:?}")))?;
         for (i, p) in prompts.iter().enumerate() {
             let id = u64::try_from(i).expect("a few prompts");
@@ -1169,7 +1183,7 @@ mod tests {
         )
         .unwrap();
         let decode = |ids: &[u32]| format!("{ids:?}");
-        let (v, same) = generate(&mut x, &prompts, &[0, 4], 24, 16, &[], &decode).unwrap();
+        let (v, same) = generate(&mut x, &prompts, &[0, 2, 4], 24, 16, &[], &decode).unwrap();
         assert!(same, "{v:#}");
         let results = v["results"].as_array().unwrap();
         let a0 = results
@@ -1182,6 +1196,22 @@ mod tests {
             .find(|r| r["width"] == 4 && r.get("acceptance").is_some())
             .unwrap()["acceptance"];
         assert!(acceptance["drafted"].as_u64().unwrap() > 0);
+        // Each width drafts at most its own number a step, and the widest reaches it.
+        for width in [0u64, 2, 4] {
+            let drafts: Vec<u64> = results
+                .iter()
+                .filter(|r| r["width"] == width && r.get("steps").is_some())
+                .flat_map(|r| r["steps"].as_array().unwrap().iter())
+                .flat_map(|s| s["rows"].as_array().unwrap().iter())
+                .map(|row| row["drafts"].as_u64().unwrap())
+                .collect();
+            assert!(!drafts.is_empty());
+            assert!(
+                drafts.iter().all(|d| *d <= width),
+                "width {width}: {drafts:?}"
+            );
+            assert_eq!(drafts.iter().max(), Some(&width), "width {width}");
+        }
         let step = &a0["steps"][0];
         assert!(step["cache"][0]["needed"].as_u64().unwrap() > 0);
         assert!(x.staged_stats()[1].evictions > 0);
