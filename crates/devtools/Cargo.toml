@@ -1,27 +1,21 @@
 [package]
-# Anchor crate for Rust-based developer tools. Each tool below is a normal
-# `[dependencies]` entry, which pulls the upstream crate into the workspace
-# dep graph so its version is pinned by `Cargo.lock`. `.envrc` then builds
-# each tool's binary by its own package name (e.g. `cargo build -p rumdl
-# -p just`) into `target/debug/` and direnv puts that directory on `PATH`,
-# so contributors get the pinned tools from a `cargo` + `direnv` install
-# alone — no separate `brew install just` / `cargo install rumdl` step.
+# Pins the Rust-based developer tools. Each tool is an exact `=X.Y.Z`
+# dependency, so this crate's own `Cargo.lock` pins its whole graph. This is
+# a separate workspace (the root excludes it), so the tools' graphs never
+# enter the product's lockfile, its `cargo-deny` gate or its Nix checks.
+# `.envrc` builds each tool by package name into this workspace's
+# `target/debug/` and direnv puts that on `PATH`:
 #
-# The package name intentionally differs from every tool it anchors so
-# `cargo build -p <tool>` resolves unambiguously to the registry crate.
-# Only tools that expose a `lib` target can be anchored this way (a
-# bin-only crate cannot be a `[dependencies]` entry); rumdl, just, and
-# cargo-deny all do. We build debug, not release — these tools' runtimes
-# are sub-second on a tree this size even unoptimized, and debug keeps cold
-# compile cost down.
-# No bin/lib code of our own — everything is upstream, version-pinned via
-# the `=X.Y.Z` deps below. Bumping a tool is a single edit here.
+#   cargo build --manifest-path crates/devtools/Cargo.toml -p just
+#
+# Only crates with a `lib` target can be pinned this way (a bin-only crate
+# cannot be a dependency). The package name differs from every tool so
+# `-p <tool>` resolves to the registry crate. Adding a tool is a dependency
+# here plus a `-p <tool>` in `.envrc`.
 name = "eidola-devtools"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-publish.workspace = true
+version = "0.1.0"
+edition = "2024"
+publish = false
 license = "MIT OR Apache-2.0"
 
 [lib]
@@ -31,3 +25,10 @@ path = "src/lib.rs"
 rumdl = "=0.3.0"
 just = "=1.59.0"
 cargo-deny = "=0.20.2"
+
+[workspace]
+
+# The tools run on every `just check`; optimized dependencies keep
+# cargo-deny's whole-graph walk quick, as in the root workspace.
+[profile.dev.package."*"]
+opt-level = 2

@@ -94,8 +94,11 @@
             # Explicit path
             [ pattern ];
 
-        # Get all workspace member paths (e.g., ["crates/foo", "crates/bar"])
-        workspaceMemberPaths = builtins.concatMap expandMemberPattern memberPatterns;
+        # Get all workspace member paths (e.g., ["crates/foo", "crates/bar"]),
+        # less `workspace.exclude` (the dev tools' own workspace).
+        workspaceMemberPaths = builtins.filter (
+          p: !(builtins.elem p (workspaceCargoToml.workspace.exclude or [ ]))
+        ) (builtins.concatMap expandMemberPattern memberPatterns);
 
         # Map from Cargo package name to its path
         cratePaths = builtins.listToAttrs (

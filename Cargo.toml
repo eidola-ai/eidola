@@ -3,6 +3,8 @@
 members = [
     "crates/*",
 ]
+# The pinned dev tools are their own workspace, with their own lockfile.
+exclude = ["crates/devtools"]
 resolver = "2"
 
 [workspace.package]

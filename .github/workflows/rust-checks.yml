@@ -280,6 +280,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+          # The pinned dev tools are their own workspace with their own
+          # target directory; rust-cache keeps only the dependencies of the
+          # workspaces listed here.
+          workspaces: |
+            . -> target
+            crates/devtools -> target
 
       - name: Check formatting
         if: steps.scope.outputs.rust == 'true'
@@ -294,15 +300,15 @@ jobs:
 
       - name: Markdown lint
         if: steps.scope.outputs.markdown == 'true'
-        # rumdl is pinned by the crates/devtools anchor crate and, locally,
-        # is on PATH via direnv (.envrc). CI deliberately doesn't install
+        # rumdl is pinned by the crates/devtools workspace and, locally, is
+        # on PATH via direnv (.envrc). CI deliberately doesn't install
         # direnv (no apt in the build chain); instead it emulates .envrc —
-        # build the one tool it needs and prepend target/debug to PATH — so
-        # the `rumdl` invocation matches the local one without compiling the
-        # rest of the pinned toolset (e.g. just).
+        # build the one tool it needs and prepend its target/debug to PATH —
+        # so the `rumdl` invocation matches the local one without compiling
+        # the rest of the pinned toolset (e.g. just).
         run: |
-          cargo build --quiet -p rumdl
-          export PATH="$PWD/target/debug:$PATH"
+          cargo build --quiet --manifest-path crates/devtools/Cargo.toml -p rumdl
+          export PATH="$PWD/crates/devtools/target/debug:$PATH"
           rumdl check .
 
       - name: Run tests
@@ -384,8 +390,11 @@ jobs:
         # advisories publish on their own clock, so gating PRs on them fails
         # work that didn't introduce anything — the scheduled advisories
         # workflow covers those. cargo-deny is pinned by the crates/devtools
-        # anchor and built from the lockfile, same as rumdl above.
+        # workspace and built from its lockfile, same as rumdl above. That
+        # workspace's own graph is checked for licenses and sources; the
+        # bans describe what the product builds (the tools need `ring`).
         if: steps.scope.outputs.rust == 'true'
         run: |
-          cargo build --quiet -p cargo-deny
-          ./target/debug/cargo-deny check licenses bans sources
+          cargo build --quiet --manifest-path crates/devtools/Cargo.toml -p cargo-deny
+          ./crates/devtools/target/debug/cargo-deny check licenses bans sources
+          ./crates/devtools/target/debug/cargo-deny --manifest-path crates/devtools/Cargo.toml check licenses sources
