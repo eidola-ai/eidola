@@ -450,7 +450,8 @@ pub struct EngramWeights {
 /// The gathered rows go through `lin8` into one key per copy and a shared
 /// value. Per copy `j`, all in f32:
 /// `dot = Σ_d (x_j·w_j·key_j) · rsqrt(mean(x_j²) + eps) · rsqrt(mean(key_j²) + eps) · dim^-0.5`,
-/// `gate = sigmoid(sign(dot) · sqrt(max(|dot|, 1e-6)))`, `x_j ← bf16(x_j + gate · value)`.
+/// `gate = sigmoid(sign(dot) · sqrt(max(|dot|, 1e-6)))` with a NaN `dot` taken as `+0`,
+/// `x_j ← bf16(x_j + gate · value)`.
 pub fn inject(
     w: &EngramWeights,
     rows: &[u64],
@@ -497,6 +498,8 @@ pub fn inject_gathered(
             terms[d] = xj[d] * w.gate_weight.row(j)[d] * key[d];
         }
         let dot = pinned_sum(&terms) * rstd * scale;
+        // A NaN counts as +0: its sign is the processor's, and the gate takes a sign.
+        let dot = if dot.is_nan() { 0.0 } else { dot };
         let gate = sigmoid32(dot.abs().max(1e-6f64 as f32).sqrt().copysign(dot));
         for d in 0..dim {
             xj[d] = bf16_round(xj[d] + gate * value[d]);
@@ -557,6 +560,39 @@ mod tests {
         assert_eq!(&layout[0].primes[..3], &[16000057, 16000079, 16000081]);
         assert_eq!(layout[1].primes[23], 16000889);
         assert_eq!(layout[0].offsets[1], 16000057);
+    }
+
+    /// A NaN in a key makes the gate's product a NaN of the processor's sign; it counts
+    /// as `+0`, so the gate is the floor's and the stream stays finite.
+    #[test]
+    fn a_nan_product_gates_as_positive_zero() {
+        let (hc, dim) = (2usize, 32usize);
+        let w = EngramWeights {
+            table: Arc::new(SparseEngramTable::from_stored(1, 32, &[], &[], &[]).unwrap()),
+            wkv: Fp8Linear::from_bytes(dim * (hc + 1), 32, &vec![0x38; dim * 3 * 32], &[127; 3]),
+            gate_weight: Matrix::from_vec(hc, dim, vec![0.5; hc * dim]),
+        };
+        let gathered: Vec<f32> = (0..32)
+            .map(|i| bf16_round(0.1 * (i as f32 - 15.0)))
+            .collect();
+        let mut kv = vec![0.0f32; dim * (hc + 1)];
+        lin8(&gathered, &w.wkv, &mut kv);
+        let floor = sigmoid32((1e-6f64 as f32).sqrt());
+        for bits in [0x7fc0_0000u32, 0xffc0_0000, 0x7f80_0001, 0xffa1_2345] {
+            let mut x: Vec<f32> = (0..hc * dim).map(|i| bf16_round(1.0 + i as f32)).collect();
+            x[3] = f32::from_bits(bits);
+            let before = x.clone();
+            inject_gathered(&w, &gathered, &mut x, hc, 1e-6);
+            // Copy 0 holds the NaN: its product is NaN and its gate the floor's.
+            for d in (0..dim).filter(|d| *d != 3) {
+                assert_eq!(
+                    x[d].to_bits(),
+                    bf16_round(before[d] + floor * kv[hc * dim + d]).to_bits(),
+                    "element {d} under NaN {bits:#x}"
+                );
+            }
+            assert!(x[3].is_nan());
+        }
     }
 
     #[test]

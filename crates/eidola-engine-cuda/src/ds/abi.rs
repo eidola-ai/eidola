@@ -33,6 +33,10 @@ pub const KV_FP8: u32 = 0;
 pub const KV_FP4_E4M3: u32 = 1;
 /// E2M1 nibbles, a power-of-two scale byte per 32: index keys and queries.
 pub const KV_FP4_E8M0: u32 = 2;
+/// Not a packed format: [`RotQuantParams::format`] for a rotation with no quantisation
+/// (the attention queries). The row's BF16 values go to `dst_codes` as
+/// `[rows, heads · head_dim]` BF16; there are no scales and no pool target.
+pub const KV_BF16: u32 = 3;
 
 /// Bytes of one entry's codes.
 pub const fn kv_code_bytes(format: u32, width: u32) -> u32 {
@@ -65,6 +69,12 @@ pub const DT_F32: u32 = 1;
 /// [`WindowSlotsParams::order`].
 pub const ORDER_POSITION: u32 = 0;
 pub const ORDER_RING: u32 = 1;
+
+/// [`AttnParams::layout`]: a slot's index in the row's `a_slots + b_slots` words is its place.
+pub const ATTN_FIXED: u32 = 0;
+/// [`AttnParams::layout`]: the row's `a` part ends after its last listed slot and the `b` slots
+/// follow it there.
+pub const ATTN_PACKED: u32 = 1;
 
 /// f32 words of one mix row ([`MhcMixParams::out`]).
 pub const fn mix_words(copies: u32) -> u32 {
@@ -389,7 +399,9 @@ layout!(GroupedDotParams, 56, {
 /// value is read from its codes and scales (`ds::dequant_*`). For a layer of the backbone `a` is
 /// its window plane (`a_slots` the window, position order, right-aligned) and `b` the global KV
 /// plane of the bank it reads (ascending entries); for a drafter block `a` is its window plane in
-/// ring order and `b` the draft slots' KV in scratch.
+/// ring order and `b` the draft slots' KV in scratch, under [`ATTN_PACKED`]: the reference lists a
+/// drafter's window without the slots a short sequence has not reached, so the draft slots follow
+/// the row's last listed window slot, whatever `a_slots` is.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AttnParams {
@@ -414,11 +426,11 @@ pub struct AttnParams {
     pub slot_stride: u32,
     /// `softmax_scale`.
     pub scale: f32,
-    /// 0.
-    pub reserved: u32,
+    /// `ATTN_*`.
+    pub layout: u32,
 }
 layout!(AttnParams, 160, {
-    q: 0, slots: 8, sink: 16, out: 24, a: 32, b: 80, rows: 128, heads: 132, head_dim: 136, a_slots: 140, b_slots: 144, slot_stride: 148, scale: 152, reserved: 156,
+    q: 0, slots: 8, sink: 16, out: 24, a: 32, b: 80, rows: 128, heads: 132, head_dim: 136, a_slots: 140, b_slots: 144, slot_stride: 148, scale: 152, layout: 156,
 });
 
 /// `DsLinearParams`. A plain product in the pinned order (`linear::linear_f32` / `linear_bf16`):
@@ -635,7 +647,7 @@ pub struct PlaceParams {
     pub row_weight: u64,
     /// Out: `[groups]`.
     pub group_end: u64,
-    /// Per-block counts for a multi-block launch, or null.
+    /// `[groups]`: each group's pair count, written by the count launch and read by the placement.
     pub scratch: u64,
     pub rows: u32,
     pub active: u32,
@@ -676,6 +688,30 @@ pub struct SwigluParams {
 }
 layout!(SwigluParams, 56, {
     gate: 0, up: 8, weight: 16, codes: 24, scales: 32, rows: 40, width: 44, in_stride: 48, limit: 52,
+});
+
+/// `DsPlaceRowsParams`. The routed rows of a byte array, copied into the expert-major layout: row
+/// `r` of `src` goes to row `row_of[r · active + s]` of `dst` for every slot `s`, `row_bytes` bytes
+/// each. The activation codes and their scale bytes reach the layout this way; a scale row need
+/// not be whole words. A layout row at or past `layout_rows` copies nothing and raises
+/// `DS_STATUS_BAD_INDEX`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlaceRowsParams {
+    /// `[rows, row_bytes]`.
+    pub src: u64,
+    /// `[layout_rows, row_bytes]`.
+    pub dst: u64,
+    /// `[rows, active]` (`DsPlaceParams::row_of`).
+    pub row_of: u64,
+    pub status: u64,
+    pub rows: u32,
+    pub active: u32,
+    pub row_bytes: u32,
+    pub layout_rows: u32,
+}
+layout!(PlaceRowsParams, 48, {
+    src: 0, dst: 8, row_of: 16, status: 24, rows: 32, active: 36, row_bytes: 40, layout_rows: 44,
 });
 
 /// `DsCombineParams`. The feed-forward sum (`forward::moe_forward`): from +0, a row's routed

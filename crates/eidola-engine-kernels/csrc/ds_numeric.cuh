@@ -113,6 +113,12 @@ DS_FN float bf16_round(float x) {
 }
 // The 16 stored bits of a BF16-valued f32 (after `bf16_round`), and back.
 DS_FN uint16_t bf16_bits(float x) { return static_cast<uint16_t>(f32_bits(x) >> 16); }
+// The stored bits of a BF16 result (after `bf16_round`). A NaN is stored as
+// one quiet NaN: the payload of a NaN may sit wholly in the 16 bits a BF16
+// drops, which would leave an infinity, and which NaN an operation returns
+// differs between processors. Every kernel stores a computed BF16 through
+// this.
+DS_FN uint16_t bf16_store(float x) { return is_nan(x) ? uint16_t{0x7fc0} : bf16_bits(x); }
 DS_FN float bf16_value(uint16_t b) { return f32_from_bits(static_cast<uint32_t>(b) << 16); }
 
 // ---- storage formats: decodes (`crate::numeric`) ----
@@ -539,10 +545,10 @@ DS_FN float swiglu_hidden(float gate, float up, float limit, bool weighted, floa
 
 // ---- the total order of every top-k (`attention::top_k`) ----
 
-// A score's rank key: unsigned, larger is better, `-0` and `+0` one key, NaN
-// ordered as `f32::total_cmp` orders it.
+// A score's rank key: unsigned, larger is better, `-0` and `+0` one key, a NaN
+// of any sign and payload the key of negative infinity.
 DS_FN uint32_t topk_key(float score) {
-  uint32_t b = score == 0.0f ? 0u : f32_bits(score);
+  uint32_t b = is_nan(score) ? 0xff800000u : score == 0.0f ? 0u : f32_bits(score);
   // `total_cmp`'s map to a signed integer, then to unsigned order.
   b ^= static_cast<uint32_t>(static_cast<int32_t>(b) >> 31) >> 1;
   return b ^ kSign32;

@@ -82,9 +82,20 @@ pub fn sparse_attend(
 }
 
 /// The total order every top-k uses: higher score first, then lower index.
-/// `-0.0` and `0.0` are one score.
+/// `-0.0` and `0.0` are one score, and a NaN of any sign and payload ranks as
+/// negative infinity: which NaN an operation returns differs between
+/// processors, and a selection may not depend on it.
 fn by_score_then_index(scores: &[f32], a: usize, b: usize) -> std::cmp::Ordering {
-    let key = |i: usize| if scores[i] == 0.0 { 0.0 } else { scores[i] };
+    let key = |i: usize| {
+        let s = scores[i];
+        if s.is_nan() {
+            f32::NEG_INFINITY
+        } else if s == 0.0 {
+            0.0
+        } else {
+            s
+        }
+    };
     key(b).total_cmp(&key(a)).then(a.cmp(&b))
 }
 
@@ -149,6 +160,23 @@ mod tests {
         let scores = [1.0, 3.0, 3.0, -0.0, 0.0, 2.0, 3.0];
         assert_eq!(top_k(&scores, 0..7, 4), [1, 2, 6, 5]);
         assert_eq!(top_k(&scores, 0..5, 9), [1, 2, 0, 3, 4]);
+    }
+
+    /// A NaN of either sign and any payload ranks as negative infinity: behind every
+    /// other score, tied with a real negative infinity, in index order.
+    #[test]
+    fn top_k_ranks_a_nan_as_negative_infinity() {
+        let nan = |bits: u32| f32::from_bits(bits);
+        let scores = [
+            nan(0x7fc0_0000),
+            -1.0,
+            nan(0xffc0_0000),
+            f32::NEG_INFINITY,
+            nan(0x7f80_0001),
+            2.0,
+        ];
+        assert_eq!(top_k(&scores, 0..6, 6), vec![5, 1, 0, 2, 3, 4]);
+        assert_eq!(top_k(&scores, 0..6, 3), vec![5, 1, 0]);
     }
 
     #[test]
