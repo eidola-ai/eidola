@@ -21,6 +21,7 @@ on:
     branches:
       - next
       - main
+      - deepseek-v41-flash
     tags:
       - "v*"
   pull_request:
@@ -267,11 +268,13 @@ jobs:
         # branch — this is what warms feature PRs, which restore from their
         # base) and `main` (the default branch — the universal restore fallback
         # and the promotion PR's base). PRs into `next` and `main` never save
-        # (github.ref is a PR ref), so there's no per-PR thrash. PRs into the
-        # `deepseek-v41-flash` integration branch do save: nothing pushes to
-        # that branch to warm a cache from, its PRs take many pushes, and a
-        # cache saved under a PR ref is restored only by that same PR's later
-        # runs. This job only runs tests; no artifact from here is published.
+        # (github.ref is a PR ref), so there's no per-PR thrash. The
+        # `deepseek-v41-flash` integration branch saves from its own pushes
+        # (its merges), which warm every PR into it, and its PRs save too:
+        # they take many pushes, and a cache saved under a PR ref is restored
+        # only by that same PR's later runs. A cold run of the whole workspace
+        # can outlast the job's timeout. This job only runs tests; no artifact
+        # from here is published.
         #
         # A failed job saves too. The key's environment half is the Rust
         # version, and a restore never crosses it, so the first trunk push
@@ -282,7 +285,7 @@ jobs:
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true' || steps.scope.outputs.markdown == 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' || github.base_ref == 'deepseek-v41-flash' }}
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/deepseek-v41-flash' || github.base_ref == 'deepseek-v41-flash' }}
           cache-on-failure: true
 
       - name: Check formatting
