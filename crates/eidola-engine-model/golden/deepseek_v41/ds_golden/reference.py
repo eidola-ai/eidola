@@ -124,8 +124,12 @@ def place_weights(model, ckpt: dict[str, st.Entry], layer_map=None, routed_exper
     `layer_map[i]` is the checkpoint layer that model layer `i` is.
     `routed_experts = (backbone, drafter)` keeps only the first N routed
     experts (each router's rows are cut to match). `engram_tables` maps a
-    model layer to a compact `(weight, scale)` pair replacing the stored table."""
-    used = set()
+    model layer to a compact `(weight, scale)` pair replacing the stored table.
+
+    Strict both ways: every parameter is assigned exactly once, from a tensor
+    of its own shape, and every checkpoint tensor that belongs to the model as
+    built is consumed (`unconsumed`)."""
+    used, assigned = set(), []
     for name, param in model.named_parameters():
         parts = name.split(".")
         if layer_map is not None and parts[0] == "layers":
@@ -151,7 +155,38 @@ def place_weights(model, ckpt: dict[str, st.Entry], layer_map=None, routed_exper
             value = value.float()
         assert value.shape == param.shape, (name, tuple(value.shape), tuple(param.shape))
         param.data = value.contiguous()
+        assigned.append(model_name)
+    assert len(assigned) == len(set(assigned)) == sum(1 for _ in model.named_parameters()), "every parameter is assigned exactly once"
+    left = unconsumed(ckpt, used, model, layer_map, routed_experts, engram_tables)
+    assert not left, f"{len(left)} checkpoint tensors of this model were not loaded, e.g. {left[:4]}"
     return used
+
+
+def unconsumed(ckpt, used: set, model, layer_map=None, routed_experts=None, engram_tables=None) -> list[str]:
+    """Checkpoint tensors the model should have taken and did not.
+
+    What a text model built here has no parameter for, and so may be left:
+    the vision tower, the image-span routing bias, layers and routed experts a
+    truncation drops, the draft blocks when it has none, and Engram tables the
+    caller supplied in compact form."""
+    layers = set(range(len(model.layers))) if layer_map is None else set(layer_map)
+    drafter = len(getattr(model, "mtp", None) or []) > 0
+    left = []
+    for name in ckpt:
+        if name in used or name.startswith(("vision.", "aligner.", "image_")) or name.endswith(".bias_vl"):
+            continue
+        parts = name.split(".")
+        if parts[0] in ("layers", "mtp"):
+            if parts[0] == "layers" and int(parts[1]) not in layers:
+                continue
+            if parts[0] == "mtp" and not drafter:
+                continue
+            if routed_experts is not None and parts[2:4] == ["ffn", "experts"] and int(parts[4]) >= routed_experts[parts[0] == "mtp"]:
+                continue
+            if ".engram.embed." in name and engram_tables is not None:
+                continue
+        left.append(name)
+    return sorted(left)
 
 
 class Reference:

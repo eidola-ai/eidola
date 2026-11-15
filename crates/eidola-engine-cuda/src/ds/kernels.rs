@@ -42,6 +42,7 @@ pub trait DsKernels {
     unsafe fn pool(&self, p: &PoolParams) -> Result<()>;
     unsafe fn index_score(&self, p: &IndexScoreParams) -> Result<()>;
     unsafe fn select(&self, p: &SelectParams) -> Result<()>;
+    unsafe fn stream_mean(&self, p: &StreamMeanParams) -> Result<()>;
     unsafe fn route(&self, p: &RouteParams) -> Result<()>;
     /// Both placement launches; `scratch` holds `groups` words.
     unsafe fn place(&self, p: &PlaceParams) -> Result<()>;
@@ -70,6 +71,7 @@ pub const FAMILIES: &[&str] = &[
     "pool",
     "index_score",
     "select",
+    "stream_mean",
     "route",
     "place",
     "place_rows",

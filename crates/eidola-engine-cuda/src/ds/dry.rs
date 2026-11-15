@@ -15,7 +15,7 @@ use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::secret::KvKey;
 
 use super::abi::*;
-use super::half::{Device, SampleArgs};
+use super::half::{AcceptArgs, Device, SampleArgs};
 use super::kernels::DsKernels;
 use super::{attention, gemm_ref, head, index, ops};
 use crate::{CudaError, Result};
@@ -93,6 +93,28 @@ impl Device for DryDevice {
         Ok(())
     }
 
+    unsafe fn accept(&self, _: &AcceptArgs) -> Result<()> {
+        Ok(())
+    }
+
+    fn alloc_host(&self, _: usize) -> Result<(*mut u8, Box<dyn Any>)> {
+        Ok((std::ptr::NonNull::dangling().as_ptr(), Box::new(())))
+    }
+
+    unsafe fn copy_to_host(&self, _: *mut u8, _: u64, _: usize) -> Result<()> {
+        Ok(())
+    }
+
+    unsafe fn copy_from_host(&self, _: u64, _: *const u8, _: usize) -> Result<()> {
+        Ok(())
+    }
+
+    unsafe fn zero_host(&self, _: *mut u8, _: usize) {}
+
+    unsafe fn read_host(&self, _: *const u8, dst: &mut [u8]) {
+        dst.fill(0);
+    }
+
     fn synchronize(&self) -> Result<()> {
         Ok(())
     }
@@ -152,6 +174,7 @@ families! {
         index::check_select(p)?;
         Ok([p.rows, 1, 1])
     },
+    stream_mean: StreamMeanParams, rows => ops::stream_mean_grid,
     route: RouteParams, rows => ops::route_grid,
     place: PlaceParams, groups => ops::place_grid,
     place_rows: PlaceRowsParams, rows => ops::place_rows_grid,

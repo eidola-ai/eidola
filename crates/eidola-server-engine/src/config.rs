@@ -44,9 +44,12 @@ pub enum ExecutorConfig {
     Cuda {
         /// The kernel build output (images checked against the compiled-in manifest).
         kernels_dir: PathBuf,
-        /// Device memory for the KV pools; the node derives the per-group block counts
-        /// from it (`crate::cuda::derive_kv_blocks`).
+        /// Device memory for device 0's KV pools; the node derives the per-group block
+        /// counts from it (`crate::cuda::derive_kv_blocks`).
         kv_device_bytes: u64,
+        /// The KV budgets of devices 1 onwards, for a model split across devices (empty
+        /// for one on a single device; [`crate::check_device_budgets`]).
+        further_kv_device_bytes: Vec<u64>,
         /// Whether decode steps replay captured graphs.
         graphs: eidola_engine_cuda::CudaGraphs,
         /// Whether the GPUs must be in confidential-computing mode before the device opens
@@ -135,11 +138,13 @@ impl Config {
             ExecutorSettings::Cuda {
                 kernels_dir,
                 kv_device_bytes,
+                further_kv_device_bytes,
                 graphs,
                 gpu_cc,
             } => ExecutorConfig::Cuda {
                 kernels_dir: PathBuf::from(kernels_dir),
                 kv_device_bytes,
+                further_kv_device_bytes,
                 graphs: match graphs {
                     eidola_common::engine_deployment::CudaGraphs::On => {
                         eidola_engine_cuda::CudaGraphs::On

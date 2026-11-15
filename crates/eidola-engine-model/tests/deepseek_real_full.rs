@@ -9,11 +9,27 @@
 //!
 //! Every `golden/reference-*.safetensors` is compared on final logits, with
 //! our forward and with the other goldens. `reference-pinned` must be equalled
-//! exactly; the others are reported. Without it nothing is asserted.
+//! exactly; the others are reported.
+//!
+//! Agreement with a reference is not health: both read the same files, and on
+//! damaged files they agree about a model that is not the released one. So,
+//! whatever goldens are present, the test also asserts against the world:
+//!
+//! - every checkpoint file is the recorded upstream one
+//!   (`golden/deepseek_v41/upstream-sha256.json`), before anything loads;
+//! - next-token accuracy over the goldens' passage reaches its floor, for our
+//!   forward and for every golden;
+//! - with `golden/health.safetensors` (`health_check.py`), our forward
+//!   answers the `hello` request with the publicly reported reply, token for
+//!   token (at the one position reported as a near three-way tie: with one of
+//!   the three), and reaches the floor over the story as a chat reply.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod deepseek_upstream;
+
+use deepseek_upstream::{PASSAGE_FLOOR, STORY_FLOOR, argmax_rows, next_token_accuracy};
 use eidola_engine_model::WeightSet;
 use eidola_engine_model::compare::compare_logits;
 use eidola_engine_model::deepseek::engram::{EngramTable, SparseEngramTable};
@@ -88,6 +104,8 @@ fn whole_model_against_the_reference_run_in_halves() {
     // The checkpoint as published: every layer, every expert, the Engram
     // tables read by row from their shards. The draft blocks are not loaded.
     let store = Arc::new(WeightSet::open_dir(&dir).unwrap());
+    // A partial checkpoint here is the fetched first-four-layers truncation.
+    deepseek_upstream::verify(&store, &dir, first_layers.map(|_| "prefix"));
     let mut config = config_of(&store).unwrap();
     let mut engram_tables: Vec<(usize, Arc<dyn EngramTable>)> = Vec::new();
     if let Some(n) = first_layers {
@@ -189,6 +207,111 @@ fn whole_model_against_the_reference_run_in_halves() {
     let ours = compare_logits(&prefill.logits.data, &canonical.logits.data, v).unwrap();
     println!("our canonical layout against our reproduction of the prefill layout: {ours}");
 
+    // Health, which agreement cannot show. Only the whole model is held to
+    // the floors: its first layers alone are not a language model.
+    let whole = first_layers.is_none();
+    let mut unhealthy = Vec::new();
+    let health = |unhealthy: &mut Vec<String>, what: String, accuracy: f64, floor: f64| {
+        let held = if whole {
+            ""
+        } else {
+            ", not asserted of a partial model"
+        };
+        println!("next-token accuracy of {what}: {accuracy:.3} (floor {floor}{held})");
+        if whole && accuracy < floor {
+            unhealthy.push(format!(
+                "{what}: next-token accuracy {accuracy:.3} is under {floor}"
+            ));
+        }
+    };
+    for (what, logits) in [
+        ("our canonical layout", &canonical.logits.data),
+        ("our prefill layout", &prefill.logits.data),
+    ] {
+        health(
+            &mut unhealthy,
+            format!("{what} over the passage"),
+            next_token_accuracy(logits, &tokens, v, 0),
+            PASSAGE_FLOOR,
+        );
+    }
+    for (name, golden) in &goldens {
+        for pattern in ["prefill", "decode", "reshaped"] {
+            if golden.contains(&format!("{pattern}.logits")) {
+                let logits = f32s(golden, &format!("{pattern}.logits"));
+                health(
+                    &mut unhealthy,
+                    format!("{name}'s {pattern} pattern over the passage"),
+                    next_token_accuracy(&logits, &tokens, v, 0),
+                    PASSAGE_FLOOR,
+                );
+            }
+        }
+    }
+    let health_path = golden_dir.join("health.safetensors");
+    if whole && health_path.exists() {
+        let set = open(&health_path);
+        for name in ["hello", "story"] {
+            if !set.contains(&format!("{name}.tokens")) {
+                continue;
+            }
+            let sequence: Vec<u32> = ints(&set, &format!("{name}.tokens"))
+                .iter()
+                .map(|t| *t as u32)
+                .collect();
+            let start = ints(&set, &format!("{name}.start"))[0] as usize;
+            let logits = model
+                .forward(&mut model.new_state(), &sequence, &Default::default())
+                .unwrap()
+                .logits
+                .data;
+            let mine = argmax_rows(&logits, v);
+            let theirs = ints(&set, &format!("{name}.argmax"));
+            let same = mine
+                .iter()
+                .zip(&theirs)
+                .filter(|(a, b)| **a as i64 == **b)
+                .count();
+            println!(
+                "{name}: our most likely token equals the reference's at {same} of {} positions",
+                mine.len()
+            );
+            if name == "hello" {
+                // The publicly reported reply: every token of it must be our
+                // most likely one, except at the position the report gives as
+                // a near three-way tie, where ours must be one of the three.
+                let fork = ints(&set, "hello.fork")[0] as usize;
+                let tied = ints(&set, "hello.fork_tokens");
+                let wrong = (start - 1..sequence.len() - 1)
+                    .filter(|&i| match i == fork {
+                        true => !tied.contains(&(mine[i] as i64)),
+                        false => mine[i] != sequence[i + 1],
+                    })
+                    .count();
+                println!(
+                    "hello: {wrong} positions of the reported reply are not answered as reported; at the tie our most likely token is {} (reported: {tied:?}, the reply's first)",
+                    mine[fork]
+                );
+                if wrong != 0 {
+                    unhealthy.push(format!(
+                        "hello: {wrong} positions of the reported reply are not answered as reported"
+                    ));
+                }
+            } else {
+                health(
+                    &mut unhealthy,
+                    format!("our canonical layout over the {name} reply"),
+                    next_token_accuracy(&logits, &sequence, v, start - 1),
+                    STORY_FLOOR,
+                );
+            }
+        }
+    } else if whole {
+        println!(
+            "no golden/health.safetensors (health_check.py): the reported reply and the chat floor were not checked"
+        );
+    }
+
     let mut failures = Vec::new();
     for (name, golden) in &goldens {
         let exact_expected = name == "reference-pinned";
@@ -258,10 +381,38 @@ fn whole_model_against_the_reference_run_in_halves() {
         }
     }
     if goldens[0].0 != "reference-pinned" {
-        println!("no reference-pinned golden present: nothing was asserted beyond finite values");
+        println!(
+            "no reference-pinned golden present: exact agreement was not asserted, only the recorded hashes and health"
+        );
     }
+    assert!(
+        unhealthy.is_empty(),
+        "this is not the released model, whatever agrees with it: {unhealthy:#?}"
+    );
     assert!(
         failures.is_empty(),
         "the pinned reference must be equalled exactly: {failures:#?}"
     );
+}
+
+/// The scoring the health floors rest on: position `i` is right when row
+/// `i`'s most likely token is token `i + 1`, counted from `from`, and the
+/// last row predicts nothing that is scored.
+#[test]
+fn next_token_accuracy_scores_each_row_against_the_token_after_it() {
+    let tokens = [7u32, 2, 0, 1, 2];
+    // Rows predict 2, 0, 2, 2 and (unscored) 1 over a vocabulary of 3.
+    #[rustfmt::skip]
+    let logits = [
+        0.0, 0.1, 0.9,
+        0.5, 0.1, 0.2,
+        0.0, 0.1, 0.9,
+        0.0, 0.1, 0.9,
+        0.0, 0.9, 0.1f32,
+    ];
+    assert_eq!(argmax_rows(&logits, 3), [2, 0, 2, 2, 1]);
+    assert_eq!(next_token_accuracy(&logits, &tokens, 3, 0), 0.75);
+    assert_eq!(next_token_accuracy(&logits, &tokens, 3, 2), 0.5);
+    // Equal logits: the lowest index.
+    assert_eq!(argmax_rows(&[0.5, 0.5, 0.1], 3), [0]);
 }

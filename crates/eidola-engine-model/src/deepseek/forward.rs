@@ -1046,26 +1046,36 @@ pub fn moe_forward(
         .map(|x| route(spec, &w.router, &w.bias, x))
         .collect();
     let mut y = Matrix::zeros(inputs.len(), dim);
-    for e in 0..spec.n_routed {
-        let users: Vec<(usize, f32)> = routing
-            .iter()
-            .enumerate()
-            .filter_map(|(t, r)| {
-                r.experts
-                    .iter()
-                    .position(|x| *x == e)
-                    .map(|i| (t, r.weights[i]))
-            })
-            .collect();
-        if users.is_empty() {
-            continue;
-        }
-        let expert = weights.expert(w, spec, e)?;
-        let outs: Vec<Vec<f32>> = users
-            .par_iter()
-            .map(|&(t, weight)| routed_expert(&expert, inputs[t], spec.swiglu_limit, weight))
-            .collect();
-        for (&(t, _), out) in users.iter().zip(&outs) {
+    let used: Vec<(usize, Vec<(usize, f32)>)> = (0..spec.n_routed)
+        .map(|e| {
+            let users: Vec<(usize, f32)> = routing
+                .iter()
+                .enumerate()
+                .filter_map(|(t, r)| {
+                    r.experts
+                        .iter()
+                        .position(|x| *x == e)
+                        .map(|i| (t, r.weights[i]))
+                })
+                .collect();
+            (e, users)
+        })
+        .filter(|(_, users)| !users.is_empty())
+        .collect();
+    // Experts are decoded and run in parallel (each decoded expert is dropped once its
+    // users are computed); the sums below still accumulate in ascending expert index.
+    let outs: Vec<Vec<Vec<f32>>> = used
+        .par_iter()
+        .map(|(e, users)| {
+            let expert = weights.expert(w, spec, *e)?;
+            Ok(users
+                .par_iter()
+                .map(|&(t, weight)| routed_expert(&expert, inputs[t], spec.swiglu_limit, weight))
+                .collect())
+        })
+        .collect::<Result<_>>()?;
+    for ((_, users), outs) in used.iter().zip(&outs) {
+        for (&(t, _), out) in users.iter().zip(outs) {
             for (a, b) in y.row_mut(t).iter_mut().zip(out) {
                 *a += *b;
             }

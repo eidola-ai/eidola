@@ -373,6 +373,7 @@ async fn real_flash_serves_what_the_executor_computes() {
             kv_device_bytes,
             graphs,
             gpu_cc,
+            ..
         } => (kernels_dir.clone(), *kv_device_bytes, *graphs, *gpu_cc),
         _ => unreachable!(),
     };
