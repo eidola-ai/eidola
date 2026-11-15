@@ -81,6 +81,11 @@ fn greedy_speculation_equals_plain_decoding_at_every_width() {
 }
 
 #[test]
+fn drafting_at_the_length_limit() {
+    drafting(false, 4, |r| r.length_limit());
+}
+
+#[test]
 fn seeded_sampled_speculation() {
     run(false, |r| r.sampled_speculation());
 }

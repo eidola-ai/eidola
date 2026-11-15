@@ -9,6 +9,7 @@
 
 use eidola_engine_model::deepseek::DsConfig;
 
+use super::weights::Half;
 use crate::support::Unsupported;
 
 /// The model as the executor splits it.
@@ -54,6 +55,18 @@ impl DsShape {
     /// after any accepted length of a step.
     pub fn open_cap(&self) -> u32 {
         self.ratio + self.draft_width + 1
+    }
+
+    /// Positions a half's RoPE tables hold for sequences of `max_model_len`. A draft
+    /// pass computes every slot of the drafter, whatever number of drafts the row asked
+    /// for, so on the decoder a pass at the last position a sequence holds stands at
+    /// `slots - 1` positions past it.
+    pub fn rope_positions(&self, half: Half, max_model_len: u32) -> Option<u32> {
+        let past = match (half, self.drafting()) {
+            (Half::Decoder, true) => u32::try_from(self.draft_slots).ok()?.checked_sub(1)?,
+            _ => 0,
+        };
+        max_model_len.checked_add(past)
     }
 
     /// The encoder bank's layer of source layer `l`.

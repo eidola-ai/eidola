@@ -250,6 +250,8 @@ pub struct Drafting {
     pub markov: bool,
     /// Blocks per group of a host tier; 0 for none.
     pub host_blocks: u32,
+    /// Longest sequence.
+    pub max_model_len: u32,
 }
 
 impl Default for Drafting {
@@ -259,6 +261,7 @@ impl Default for Drafting {
             sampleable: VOCAB,
             markov: true,
             host_blocks: 0,
+            max_model_len: 1024,
         }
     }
 }
@@ -296,6 +299,8 @@ pub struct Paired {
     pub sampled: Vec<(u32, Vec<u32>)>,
     /// Per drafting row: the drafts accepted.
     pub accepted_counts: Vec<u32>,
+    /// Drafting rows whose pass stood at or past the length limit.
+    pub short_passes: u64,
     /// Per draft slot of every drafting row: the row's last host position, the drafts
     /// before the slot, and the slot's logits' bits.
     pub drafted_rows: Vec<(u32, Vec<u32>, Vec<u32>)>,
@@ -318,7 +323,7 @@ impl Paired {
             block_size: 8,
             num_blocks: blocks,
             num_state_slots: 16,
-            max_model_len: 1024,
+            max_model_len: how.max_model_len,
             buckets: buckets(),
             sampleable_vocab_size: how.sampleable,
             devices: [0, 0],
@@ -372,6 +377,7 @@ impl Paired {
             pools: vec![Vec::new(); groups],
             sampled: Vec::new(),
             accepted_counts: Vec::new(),
+            short_passes: 0,
             drafted_rows: Vec::new(),
         }
     }
@@ -518,6 +524,11 @@ impl Executor for Paired {
         self.compared.chain_work = self.dev.chain_layer_positions();
         for (e, produced) in step.seqs.iter().zip(&got.num_tokens) {
             if e.sample && e.num_drafts > 0 {
+                let last = e.context_len + e.num_tokens - 1;
+                let slots = self.dev.half(Half::Decoder).drafting().unwrap().1.slots;
+                if last + slots > self.cpu.spec().max_model_len {
+                    self.short_passes += 1;
+                }
                 self.compared.drafted += u64::from(e.num_drafts);
                 self.compared.accepted += u64::from(*produced - 1);
                 self.accepted_counts.push(*produced - 1);
@@ -1103,7 +1114,7 @@ impl Run<'_> {
                     width,
                     sampleable,
                     markov,
-                    host_blocks: 0,
+                    ..Drafting::default()
                 };
                 let mut h = Harness::drafting(self.model, self.device, 256, chunked(64), how);
                 for (i, p) in prompts.iter().enumerate() {
@@ -1131,6 +1142,40 @@ impl Run<'_> {
             "accepted-count coverage {seen:?}"
         );
         self.record("greedy_speculation", at, done);
+    }
+
+    /// Sequences run to the length limit with drafts on. The engine asks for fewer
+    /// drafts than the drafter has slots as a sequence nears the limit, and the pass
+    /// still computes every slot, at positions up to `slots - 2` past the last one a
+    /// sequence can hold.
+    pub fn length_limit(&mut self) {
+        let at = Instant::now();
+        let limit = 64;
+        let how = Drafting {
+            width: self.model.slots,
+            max_model_len: limit,
+            ..Drafting::default()
+        };
+        let mut h = Harness::drafting(self.model, self.device, 256, sched(), how);
+        let mut rng = TestRng(15);
+        for id in 0..6u64 {
+            let prompt = rng.var_tokens(40, 20);
+            let room = limit - u32::try_from(prompt.len()).unwrap();
+            h.submit(request(id, prompt, params(id), room, CacheScope::Private));
+        }
+        h.run();
+        h.flush();
+        for id in 0..6 {
+            assert!(!h.outputs[&id].is_empty());
+        }
+        // A drafting step whose pass reached past the limit: fewer drafts than slots.
+        let c = h.compared();
+        assert!(c.drafted > 0);
+        assert!(
+            h.eng.executor().short_passes > 0,
+            "no pass ran with fewer drafts than slots at the limit"
+        );
+        self.record("length_limit", at, vec![h]);
     }
 
     /// Seeded sampled rows with drafting on: the draft chain on the draft stream, each
@@ -1551,6 +1596,7 @@ pub fn drafting_scenarios(run: &mut Run<'_>, wide: bool) {
     assert_eq!(run.width, run.model.slots);
     run.greedy_speculation();
     run.sampled_speculation();
+    run.length_limit();
     run.hits();
     run.batch_invariance();
     if wide {

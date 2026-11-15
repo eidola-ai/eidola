@@ -89,7 +89,8 @@ pub enum Form {
     /// The tensors as the checkpoint stores them, every tensor of the half's layers
     /// (the image router bias and every stored router row included).
     Checkpoint,
-    /// What [`HalfWeights::load`] puts on the device for `positions` positions.
+    /// What [`HalfWeights::load`] puts on the device for sequences of `positions`
+    /// positions.
     Device { positions: u32 },
 }
 
@@ -223,6 +224,9 @@ pub fn weight_bytes(c: &DsConfig, shape: &DsShape, half: Half, form: Form) -> We
     }
     if let Form::Device { positions } = form {
         let kinds = rope_kinds(c, shape, half);
+        let positions = shape
+            .rope_positions(half, positions)
+            .expect("checked when the half was laid out");
         out.rope = (kinds.len() * positions as usize * c.attention.rope_dim * 4) as u64;
     }
     out
@@ -765,8 +769,9 @@ impl<'a> Loader<'a> {
 }
 
 impl HalfWeights {
-    /// Uploads `half`'s weights from `store`, with RoPE tables for `positions`
-    /// positions. Without a store every tensor is allocated at its size and left zero:
+    /// Uploads `half`'s weights from `store`, with RoPE tables for sequences of
+    /// `max_model_len` positions ([`DsShape::rope_positions`]). Without a store every
+    /// tensor is allocated at its size and left zero:
     /// the half's layout and accounting with no checkpoint. Without `tables` the Engram tables the half's device would hold stay
     /// off it (a half run alone, whose table rows are gathered elsewhere).
     pub fn load(
@@ -775,7 +780,7 @@ impl HalfWeights {
         c: &DsConfig,
         shape: &DsShape,
         half: Half,
-        positions: u32,
+        max_model_len: u32,
         tables: bool,
     ) -> Result<HalfWeights> {
         let mut ld = Loader {
@@ -882,6 +887,9 @@ impl HalfWeights {
             });
             ld.drafter = false;
         }
+        let positions = shape
+            .rope_positions(half, max_model_len)
+            .ok_or_else(|| CudaError::new("RoPE positions overflow"))?;
         let mut rope = Vec::new();
         for kind in rope_kinds(c, shape, half) {
             let table = rope_table(c, kind);

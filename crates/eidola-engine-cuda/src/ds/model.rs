@@ -154,7 +154,9 @@ impl Dims {
             mask_words: score_stride.div_ceil(candidate_entries).div_ceil(32),
             candidate_blocks,
             candidate_entries,
-            positions: max_model_len,
+            positions: shape
+                .rope_positions(half, max_model_len)
+                .ok_or_else(|| CudaError::new("RoPE positions overflow"))?,
             moe: MoeDims::new(m)?,
             draft: match (&c.drafter, shape.drafting()) {
                 (Some(dr), true) => Some(DraftDims {

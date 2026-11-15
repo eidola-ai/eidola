@@ -1170,8 +1170,14 @@ impl DsCudaExecutor {
             for row in pre.chunks_exact_mut(d.mix_words as usize) {
                 row[0] = 1.0;
             }
+            let positions = plan.positions();
+            if positions.iter().any(|p| *p >= d.positions) {
+                return Err(CudaError::new(
+                    "a draft pass stands past the positions the RoPE tables hold",
+                ));
+            }
             n.s.tokens.write(dev, 0, &tokens)?;
-            n.s.positions.write(dev, 0, &plan.positions())?;
+            n.s.positions.write(dev, 0, &positions)?;
             n.s.mix_b.write(dev, 0, &pre)?;
             n.s.status.write(dev, 0, &[0u32])?;
             ds.slots.write(dev, 0, &slots)?;
