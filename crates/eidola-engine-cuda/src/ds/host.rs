@@ -28,10 +28,10 @@ use eidola_engine_model::numeric::{E2M1_VALUES, e8m0_to_f32, fp8_e4m3_to_f32};
 use eidola_engine_model::tensor::dot;
 
 use super::abi::*;
-use super::half::{Device, SampleArgs};
+use super::half::{AcceptArgs, Device, SampleArgs};
 use super::kernels::DsKernels;
 use super::plan;
-use crate::sampler::STATUS_NON_FINITE;
+use crate::sampler::{STATUS_NON_FINITE, SampleRow};
 use crate::{CudaError, Result};
 
 /// The host device.
@@ -503,13 +503,24 @@ impl DsKernels for HostDevice {
                     p.slots + (r * us(p.slot_stride) * 4) as u64,
                     us(p.a_slots + p.b_slots),
                 );
-                let entries: Vec<Option<Vec<f32>>> = list
+                let (a, b) = list.split_at(us(p.a_slots));
+                // Packed: the `a` part ends after its last listed slot.
+                let a = match p.layout {
+                    ATTN_PACKED => {
+                        let listed = a
+                            .iter()
+                            .rposition(|e| *e != SLOT_EMPTY)
+                            .map_or(0, |i| i + 1);
+                        &a[..listed]
+                    }
+                    _ => a,
+                };
+                let read =
+                    |plane: &KvPlane, e: &u32| (*e != SLOT_EMPTY).then(|| read_entry(plane, *e));
+                let entries: Vec<Option<Vec<f32>>> = a
                     .iter()
-                    .enumerate()
-                    .map(|(i, &e)| {
-                        let plane = if i < us(p.a_slots) { &p.a } else { &p.b };
-                        (e != SLOT_EMPTY).then(|| read_entry(plane, e))
-                    })
+                    .map(|e| read(&p.a, e))
+                    .chain(b.iter().map(|e| read(&p.b, e)))
                     .collect();
                 let slots: Vec<Option<&[f32]>> = entries.iter().map(|e| e.as_deref()).collect();
                 let mut out = vec![0.0; width];
@@ -552,6 +563,18 @@ impl DsKernels for HostDevice {
 
     unsafe fn head(&self, p: &LinearParams) -> Result<()> {
         unsafe { self.linear(p) }
+    }
+
+    unsafe fn stream_mean(&self, p: &StreamMeanParams) -> Result<()> {
+        let (dim, hc) = (us(p.dim), us(p.copies));
+        unsafe {
+            for r in 0..us(p.rows) {
+                let x = widen(rd::<u16>(p.x + (r * hc * dim * 2) as u64, hc * dim));
+                let mean = eidola_engine_model::deepseek::forward::stream_mean(&x, hc);
+                store_bf16(&mean, wr(p.out + (r * us(p.out_stride) * 2) as u64, dim));
+            }
+        }
+        Ok(())
     }
 
     unsafe fn pool(&self, p: &PoolParams) -> Result<()> {
@@ -877,15 +900,14 @@ impl Device for HostDevice {
     }
 
     unsafe fn sample(&self, a: &SampleArgs<'_>) -> Result<()> {
-        let stride = us(a.logits_stride);
+        let (stride, n) = (us(a.logits_stride), us(a.n));
         unsafe {
-            let tokens = wr::<u32>(a.tokens, a.rows.len());
-            for (token, row) in tokens.iter_mut().zip(a.rows) {
+            for (r, row) in a.rows.iter().enumerate() {
                 if row.logit_row >= a.logit_rows {
                     return Err(CudaError::new("sample: a logit row outside the step's"));
                 }
                 let logits = rd::<f32>(a.logits + (us(row.logit_row) * stride * 4) as u64, stride);
-                if logits[..us(a.n)]
+                if logits[..n]
                     .iter()
                     .any(|l| l.is_nan() || *l == f32::INFINITY)
                 {
@@ -895,10 +917,78 @@ impl Device for HostDevice {
                 let params =
                     SamplingParams::new(row.temperature, row.top_k, row.top_p, row.min_p, row.seed)
                         .map_err(|e| CudaError::new(e.to_string()))?;
-                *token =
-                    sampling::sample(Logits::new(logits, a.n), &params, u64::from(row.position));
+                let view = Logits::new(logits, a.n);
+                let probs = sampling::processed_probs(view, &params);
+                wr::<f64>(a.probs + (r * n * 8) as u64, n).copy_from_slice(&probs);
+                let Some(stream) = a.draw else { continue };
+                let token = if params.is_greedy() {
+                    sampling::argmax(view)
+                } else {
+                    let u = sampling::uniform(params.seed(), u64::from(row.position), stream);
+                    sampling::sample_from(&probs, u)
+                };
+                wr::<u32>(a.tokens + (r * 4) as u64, 1)[0] = token;
             }
         }
+        Ok(())
+    }
+
+    unsafe fn accept(&self, a: &AcceptArgs) -> Result<()> {
+        let (rows, n) = (us(a.num_rows), us(a.n));
+        unsafe {
+            let sample_rows = rd::<SampleRow>(a.rows, rows);
+            let (target_row, draft_row, num_drafts) = (
+                rd::<u32>(a.target_row, rows),
+                rd::<u32>(a.draft_row, rows),
+                rd::<u32>(a.num_drafts, rows),
+            );
+            for r in 0..rows {
+                let row = &sample_rows[r];
+                let params =
+                    SamplingParams::new(row.temperature, row.top_k, row.top_p, row.min_p, row.seed)
+                        .map_err(|e| CudaError::new(e.to_string()))?;
+                let k = us(num_drafts[r]);
+                let dist = |base: u64, at: usize| rd::<f64>(base + (at * n * 8) as u64, n).to_vec();
+                let target: Vec<Vec<f64>> = (0..=k)
+                    .map(|i| dist(a.target, us(target_row[r]) + i))
+                    .collect();
+                let at = |i: usize| us(draft_row[r]) + i * us(a.draft_step);
+                let draft: Vec<Vec<f64>> = (0..k).map(|i| dist(a.draft, at(i))).collect();
+                let drafts: Vec<u32> = (0..k)
+                    .map(|i| rd::<u32>(a.drafts + (at(i) * 4) as u64, 1)[0])
+                    .collect();
+                let counts = wr::<u32>(a.counts + (r * 4) as u64, 1);
+                if drafts.iter().any(|d| *d >= a.n) {
+                    wr::<u32>(a.status, 1)[0] |= crate::sampler::STATUS_BAD_TOKEN;
+                    counts[0] = 0;
+                    continue;
+                }
+                let out = sampling::chain_accept(
+                    &target,
+                    &draft,
+                    &drafts,
+                    &params,
+                    u64::from(row.position),
+                );
+                wr::<u32>(a.out + (r * us(a.stride) * 4) as u64, out.len()).copy_from_slice(&out);
+                counts[0] = u32::try_from(out.len()).expect("at most k + 1 tokens");
+            }
+        }
+        Ok(())
+    }
+
+    fn alloc_host(&self, bytes: usize) -> Result<(*mut u8, Box<dyn Any>)> {
+        let mut buf = vec![0u8; bytes].into_boxed_slice();
+        Ok((buf.as_mut_ptr(), Box::new(buf)))
+    }
+
+    unsafe fn copy_to_host(&self, dst: *mut u8, src: u64, bytes: usize) -> Result<()> {
+        unsafe { std::slice::from_raw_parts_mut(dst, bytes).copy_from_slice(rd::<u8>(src, bytes)) };
+        Ok(())
+    }
+
+    unsafe fn copy_from_host(&self, dst: u64, src: *const u8, bytes: usize) -> Result<()> {
+        unsafe { wr::<u8>(dst, bytes).copy_from_slice(std::slice::from_raw_parts(src, bytes)) };
         Ok(())
     }
 

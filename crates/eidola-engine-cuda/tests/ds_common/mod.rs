@@ -8,12 +8,18 @@
 //! compared in the reference executor's cell order; the same blocks held encrypted; the
 //! same set crossing between the two halves; and the same chain work. The CPU suites
 //! hold the reference executor to the dense oracle, so nothing here repeats that.
+//!
+//! Ciphertext is not comparable between the two (their block images order the keystream
+//! differently), so the memory scenarios hold the executor under test to itself: idle KV
+//! is ciphertext, a host block is the ciphertext of the block demoted into it byte for
+//! byte, and a recomputed block seals to the same bytes where its group's coverage says
+//! it must.
 
 #![allow(dead_code)]
 
 pub mod compiled;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,9 +29,10 @@ use eidola_engine::executor::{Executor, ExecutorError, StepInput, StepOutput};
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::{SamplingParams, mix64};
 use eidola_engine::secret::{BootKey, CacheKey, Lineage, SaltDeriver};
-use eidola_engine::spec::{Bucket, ModelSpec};
+use eidola_engine::spec::{Bucket, Coverage, ModelSpec};
 use eidola_engine_cpu::deepseek::{DsCpuExecutor, DsCpuExecutorConfig};
 use eidola_engine_cuda::ds::half::Device;
+use eidola_engine_cuda::ds::weights::Half;
 use eidola_engine_cuda::ds::{DsCudaExecutor, DsCudaExecutorConfig, StepStats};
 use eidola_engine_model::WeightSet;
 use eidola_engine_model::deepseek::{DsConfig, DsLoadOptions, DsModel, config_of, load_reference};
@@ -55,6 +62,24 @@ impl TestRng {
     }
 }
 
+/// Raises the soft memory-lock limit for the reference executor's host-tier pools and
+/// serializes the tests that build them.
+pub fn memlock_guard() -> std::sync::MutexGuard<'static, ()> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let l = getrlimit(Resource::Memlock);
+    if l.current.is_some() && l.current != l.maximum {
+        let _ = setrlimit(
+            Resource::Memlock,
+            Rlimit {
+                current: l.maximum,
+                maximum: l.maximum,
+            },
+        );
+    }
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn salt(n: u8) -> Lineage {
     SaltDeriver::with_boot_key(BootKey::from_bytes([0; 32])).lineage(&CacheKey::from_bytes([n; 32]))
 }
@@ -82,7 +107,11 @@ pub struct Model {
     pub store: Arc<WeightSet>,
     pub token_map: Vec<u32>,
     pub reference: Arc<DsModel>,
+    /// The same with the drafter's Markov term removed.
+    pub plain_markov: Arc<DsModel>,
     pub window: u32,
+    /// The drafter's slots.
+    pub slots: u32,
 }
 
 /// The committed fixture, or (with `wide`) its weights under a window of 80, which no
@@ -102,15 +131,33 @@ pub fn model(wide: bool) -> Model {
     let window = if wide { WIDE_WINDOW } else { WINDOW };
     let widen = move |mut c: DsConfig| {
         c.attention.window = window as usize;
+        if wide {
+            // The released drafter's five slots.
+            c.drafter.as_mut().expect("the fixture has a drafter").slots = 5;
+        }
         Ok(c)
     };
     let store = Arc::new(WeightSet::open_dir(&dir).unwrap());
     let config = widen(config_of(&store).unwrap()).unwrap();
+    let mut plain_markov = load_reference(
+        &dir,
+        widen,
+        &DsLoadOptions::default(),
+        Some(token_map.clone()),
+    )
+    .unwrap();
+    plain_markov
+        .weights
+        .drafter
+        .as_mut()
+        .unwrap()
+        .markov_head
+        .data
+        .fill(0.0);
     let reference = load_reference(
         &dir,
         widen,
         &DsLoadOptions {
-            skip_drafter: true,
             ..DsLoadOptions::default()
         },
         Some(token_map.clone()),
@@ -122,7 +169,9 @@ pub fn model(wide: bool) -> Model {
         store,
         token_map,
         reference: Arc::new(reference),
+        plain_markov: Arc::new(plain_markov),
         window,
+        slots: if wide { 5 } else { 4 },
     }
 }
 
@@ -192,6 +241,31 @@ fn bits(x: &[f32]) -> Vec<u32> {
     x.iter().map(|v| v.to_bits()).collect()
 }
 
+/// How a pair drafts.
+#[derive(Clone, Copy, Debug)]
+pub struct Drafting {
+    pub width: u32,
+    pub sampleable: u32,
+    /// Whether the drafter keeps its Markov term.
+    pub markov: bool,
+    /// Blocks per group of a host tier; 0 for none.
+    pub host_blocks: u32,
+    /// Longest sequence.
+    pub max_model_len: u32,
+}
+
+impl Default for Drafting {
+    fn default() -> Self {
+        Drafting {
+            width: 0,
+            sampleable: VOCAB,
+            markov: true,
+            host_blocks: 0,
+            max_model_len: 1024,
+        }
+    }
+}
+
 /// What a run compared.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Compared {
@@ -205,6 +279,11 @@ pub struct Compared {
     /// Rows whose chain started after the row did.
     pub triangles: u64,
     pub chain_work: u64,
+    /// Drafts made, and drafts accepted.
+    pub drafted: u64,
+    pub accepted: u64,
+    /// Draft slots' logit rows equal bit for bit.
+    pub draft_rows: u64,
 }
 
 /// The executor under test beside the CPU reference executor, given the same steps.
@@ -218,18 +297,39 @@ pub struct Paired {
     pools: Vec<Vec<Vec<u32>>>,
     /// Per sampling row since the last take: its position and its logits' bits.
     pub sampled: Vec<(u32, Vec<u32>)>,
+    /// Per drafting row: the drafts accepted.
+    pub accepted_counts: Vec<u32>,
+    /// Drafting rows whose pass stood at or past the length limit.
+    pub short_passes: u64,
+    /// Per draft slot of every drafting row: the row's last host position, the drafts
+    /// before the slot, and the slot's logits' bits.
+    pub drafted_rows: Vec<(u32, Vec<u32>, Vec<u32>)>,
 }
 
 impl Paired {
     pub fn new(m: &Model, device: &dyn Fn() -> Box<dyn Device>, blocks: u32) -> Paired {
+        Paired::drafting(m, device, blocks, Drafting::default())
+    }
+
+    /// The pair under a draft width, a sampleable vocabulary and, optionally, with the
+    /// drafter's Markov term removed on both executors.
+    pub fn drafting(
+        m: &Model,
+        device: &dyn Fn() -> Box<dyn Device>,
+        blocks: u32,
+        how: Drafting,
+    ) -> Paired {
         let cfg = DsCudaExecutorConfig {
             block_size: 8,
             num_blocks: blocks,
             num_state_slots: 16,
-            max_model_len: 1024,
+            max_model_len: how.max_model_len,
             buckets: buckets(),
-            sampleable_vocab_size: VOCAB,
+            sampleable_vocab_size: how.sampleable,
             devices: [0, 0],
+            draft_width: how.width,
+            host_blocks: how.host_blocks,
+            position_tags: true,
             record: true,
         };
         let dev = DsCudaExecutor::with_devices(
@@ -241,17 +341,29 @@ impl Paired {
             &cfg,
         )
         .expect("the executor under test");
+        if !how.markov && how.width > 0 {
+            // The Markov head's weight, zeroed on the device as in `plain_markov`.
+            let n = dev.half(Half::Decoder);
+            let w = n.w.drafter.as_ref().expect("a drafting decoder");
+            let c = &m.config;
+            let bytes = c.vocab_size * c.drafter.as_ref().unwrap().markov_rank * 2;
+            // SAFETY: the Markov head's own allocation, `[vocab, rank]` BF16.
+            unsafe { n.dev.zero(w.markov_head, bytes) }.unwrap();
+        }
         let cpu = DsCpuExecutor::new(
-            m.reference.clone(),
+            match how.markov {
+                true => m.reference.clone(),
+                false => m.plain_markov.clone(),
+            },
             DsCpuExecutorConfig {
                 block_size: cfg.block_size,
                 num_blocks: blocks,
-                host_blocks: 0,
+                host_blocks: how.host_blocks,
                 num_state_slots: cfg.num_state_slots,
                 max_model_len: cfg.max_model_len,
                 buckets: buckets(),
-                draft_width: 0,
-                sampleable_vocab_size: VOCAB,
+                draft_width: how.width,
+                sampleable_vocab_size: how.sampleable,
                 record: true,
             },
         );
@@ -264,7 +376,19 @@ impl Paired {
             stats: Vec::new(),
             pools: vec![Vec::new(); groups],
             sampled: Vec::new(),
+            accepted_counts: Vec::new(),
+            short_passes: 0,
+            drafted_rows: Vec::new(),
         }
+    }
+
+    /// Whether a host-tier block of the executor under test is zero.
+    pub fn host_block_is_zero(&self, group: u32, host: u32) -> bool {
+        let bytes = self
+            .dev
+            .host_block_bytes(group, host)
+            .expect("a host block");
+        bytes.iter().all(|b| *b == 0)
     }
 
     /// Whether a block held only zeros on the device after the last step.
@@ -337,8 +461,11 @@ impl Executor for Paired {
                     e.num_tokens
                 );
                 self.compared.logit_rows += 1;
-                self.sampled
-                    .push((e.context_len + e.num_tokens - 1, bits(a)));
+            }
+            for (j, a) in a.iter().enumerate() {
+                let e = &step.seqs[row];
+                let at = e.context_len + e.num_tokens - 1 + u32::try_from(j).unwrap();
+                self.sampled.push((at, bits(a)));
             }
         }
         assert_eq!(
@@ -346,6 +473,26 @@ impl Executor for Paired {
             self.cpu.chain_layer_positions() - work.1,
             "the chain's work"
         );
+        // Each draft slot's logits, given the token drafted before it.
+        let ours = self.dev.take_draft_logits();
+        let records = self.cpu.take_records();
+        let theirs: Vec<_> = records.iter().filter(|r| !r.drafts.is_empty()).collect();
+        assert_eq!(ours.len(), theirs.len(), "drafting rows");
+        for ((slot, ours), t) in ours.iter().zip(theirs) {
+            assert_eq!(*slot, t.slot);
+            assert_eq!(ours.len(), t.draft_logits.len(), "slot {slot}: draft slots");
+            for (i, (a, b)) in ours.iter().zip(&t.draft_logits).enumerate() {
+                assert_eq!(
+                    bits(a),
+                    bits(b),
+                    "slot {slot} draft {i}: draft logits differ from the reference executor's"
+                );
+                self.compared.draft_rows += 1;
+                let at = t.context_len + t.num_tokens - 1;
+                self.drafted_rows
+                    .push((at, t.drafts[..i].to_vec(), bits(a)));
+            }
+        }
         let ours = self.dev.take_transfers();
         // The reference executor records a (blank) transfer for a rowless step too.
         let mut theirs = self.cpu.transfers();
@@ -358,9 +505,9 @@ impl Executor for Paired {
             assert_eq!(o.bank_entries, t.bank_entries, "bank entries");
             assert_eq!(o.bank_entry_bytes, t.bank_entry_bytes);
             assert_eq!(o.boundary_rows, t.boundary_rows, "boundary rows");
-            assert!(t.drafts.is_empty() && t.taps.is_empty());
+            assert_eq!(o.drafts, t.drafts, "drafted tokens");
+            assert_eq!(o.taps, t.taps, "boundary rows with drafter taps");
         }
-        self.cpu.take_records();
         self.compare_memory();
         self.compared.steps += 1;
         self.compared.rows += step
@@ -375,6 +522,18 @@ impl Executor for Paired {
             .filter(|(e, s)| **s > e.context_len)
             .count() as u64;
         self.compared.chain_work = self.dev.chain_layer_positions();
+        for (e, produced) in step.seqs.iter().zip(&got.num_tokens) {
+            if e.sample && e.num_drafts > 0 {
+                let last = e.context_len + e.num_tokens - 1;
+                let slots = self.dev.half(Half::Decoder).drafting().unwrap().1.slots;
+                if last + slots > self.cpu.spec().max_model_len {
+                    self.short_passes += 1;
+                }
+                self.compared.drafted += u64::from(e.num_drafts);
+                self.compared.accepted += u64::from(*produced - 1);
+                self.accepted_counts.push(*produced - 1);
+            }
+        }
         self.stats.extend(self.dev.take_stats());
         Ok(StepOutput {
             logits: step.return_logits.then(|| got.logits.clone().unwrap()),
@@ -399,7 +558,18 @@ impl Harness {
         blocks: u32,
         sched: SchedulerConfig,
     ) -> Self {
-        let exec = Paired::new(m, device, blocks);
+        Harness::drafting(m, device, blocks, sched, Drafting::default())
+    }
+
+    pub fn drafting(
+        m: &Model,
+        device: &dyn Fn() -> Box<dyn Device>,
+        blocks: u32,
+        mut sched: SchedulerConfig,
+        how: Drafting,
+    ) -> Self {
+        sched.speculative = how.width > 0;
+        let exec = Paired::drafting(m, device, blocks, how);
         let spec = exec.spec().clone();
         Self {
             eng: Engine::new(exec, sched).expect("valid configuration"),
@@ -439,6 +609,52 @@ impl Harness {
                     x.dev.slot_state_is_zero(slot).unwrap(),
                     "free slot {slot} holds model state with no reset pending"
                 );
+            }
+        }
+        // Idle blocks are ciphertext and mapped ones plaintext; a free host block is
+        // zero and a held one ciphertext, on both executors.
+        let idle = kv.idle_blocks();
+        let crypts = kv.pending_crypts();
+        let transfers = kv.pending_transfers();
+        let landing: BTreeSet<(u32, u32)> = transfers
+            .iter()
+            .filter(|t| !t.3)
+            .map(|t| (t.0, t.1))
+            .collect();
+        let demoting: BTreeSet<(u32, u32)> = transfers
+            .iter()
+            .filter(|t| t.3)
+            .map(|t| (t.0, t.2))
+            .collect();
+        let host_zeros = kv.pending_host_zeros();
+        for (g, hb) in kv.free_host_set() {
+            if !host_zeros.contains(&(g, hb)) {
+                assert!(
+                    x.cpu.host_block_is_zero(g, hb) && x.host_block_is_zero(g, hb),
+                    "free host block {g}/{hb} holds data with no zero pending"
+                );
+            }
+        }
+        for (g, hb) in kv.host_cache_blocks() {
+            if !demoting.contains(&(g, hb)) {
+                assert!(
+                    x.cpu.host_block_is_encrypted(g, hb) && x.dev.host_block_is_encrypted(g, hb),
+                    "held host block {g}/{hb} holds no ciphertext"
+                );
+            }
+        }
+        for (g, b) in kv.cache_blocks().union(&kv.sequence_blocks()) {
+            if landing.contains(&(*g, *b)) {
+                continue;
+            }
+            let want = idle.contains(&(*g, *b));
+            let device = x.dev.block_is_encrypted(*g, *b);
+            match crypts.get(&(*g, *b)) {
+                Some(&encrypt) => assert!(
+                    encrypt == want && device != want,
+                    "block {g}/{b}: queued crypt disagrees with its state"
+                ),
+                None => assert_eq!(device, want, "block {g}/{b}: encryption != idle"),
             }
         }
     }
@@ -509,11 +725,17 @@ pub struct Run<'a> {
     pub model: &'a Model,
     pub device: &'a dyn Fn() -> Box<dyn Device>,
     pub outcomes: Vec<Outcome>,
+    /// Drafted tokens per speculative step in every scenario; 0 for none.
+    pub width: u32,
 }
 
 impl Run<'_> {
     fn harness(&self, blocks: u32, sched: SchedulerConfig) -> Harness {
-        Harness::new(self.model, self.device, blocks, sched)
+        let how = Drafting {
+            width: self.width,
+            ..Drafting::default()
+        };
+        Harness::drafting(self.model, self.device, blocks, sched, how)
     }
 
     fn record(&mut self, name: &str, started: Instant, harnesses: Vec<Harness>) {
@@ -528,6 +750,9 @@ impl Run<'_> {
             compared.blocks += c.blocks;
             compared.triangles += c.triangles;
             compared.chain_work += c.chain_work;
+            compared.drafted += c.drafted;
+            compared.accepted += c.accepted;
+            compared.draft_rows += c.draft_rows;
             stats.extend(x.stats.iter().copied());
         }
         let seconds = started.elapsed().as_secs_f64();
@@ -570,7 +795,8 @@ impl Run<'_> {
 
     /// Prompts below, around and past the chain's reach, keyed and private, at chunk
     /// sizes that cut the triangles everywhere: outputs and the chain's work do not
-    /// depend on the chunking.
+    /// depend on the chunking. With drafts on the steps that draft depend on it, so the
+    /// chain's work does and a sampled row's draws do: every request is greedy then.
     pub fn chunked_prefill(&mut self, chunks: &[u32]) {
         let at = Instant::now();
         let mut rng = TestRng(2);
@@ -597,7 +823,11 @@ impl Run<'_> {
                 } else {
                     keyed(u8::try_from(i).unwrap())
                 };
-                h.submit(request(i as u64, p.clone(), params(i as u64), 5, cache));
+                let sampling = match self.width {
+                    0 => params(i as u64),
+                    _ => SamplingParams::greedy(),
+                };
+                h.submit(request(i as u64, p.clone(), sampling, 5, cache));
             }
             h.run();
             h.flush();
@@ -610,7 +840,9 @@ impl Run<'_> {
         }
         for (outs, work) in &results[1..] {
             assert_eq!(outs, &results[0].0, "outputs depend on chunking");
-            assert_eq!(*work, results[0].1, "the chain's work depends on chunking");
+            if self.width == 0 {
+                assert_eq!(*work, results[0].1, "the chain's work depends on chunking");
+            }
         }
         self.record("chunked_prefill", at, done);
     }
@@ -632,7 +864,11 @@ impl Run<'_> {
             ));
             h.run();
             let triangle: u64 = (0..4).map(|j| top + (3 - j) * (w - 1) + 1).sum();
-            assert_eq!(h.compared().chain_work, triangle + 3 * 4);
+            match self.width {
+                0 => assert_eq!(h.compared().chain_work, triangle + 3 * 4),
+                // Drafted positions run the chain too.
+                _ => assert!(h.compared().chain_work >= triangle + 3 * 4),
+            }
             done.push(h);
         }
         self.record("one_triangle", at, done);
@@ -777,8 +1013,11 @@ impl Run<'_> {
         self.record("shedding", at, done);
     }
 
-    /// A request's tokens and logits are the same alone and beside others in other
-    /// slots, at another chunking.
+    /// A request's logits are the same bits alone and beside others: in another slot,
+    /// in larger buckets (alone, its decode steps run in the bucket of one sequence),
+    /// its prompt cut into other chunks, other rows before and after it in the step.
+    /// That is every target row it samples from or verifies a draft with and, with
+    /// drafts on, every draft slot's logits.
     pub fn batch_invariance(&mut self) {
         let at = Instant::now();
         let prompt = TestRng(12).tokens(self.reach() as usize + 15);
@@ -786,39 +1025,406 @@ impl Run<'_> {
         let mut alone = self.harness(512, chunked(64));
         alone.submit(request(0, prompt.clone(), p, 12, CacheScope::Private));
         alone.run();
-        let want: Vec<(u32, Vec<u32>)> = alone.eng.executor().sampled.clone();
-        assert_eq!(want.len(), 12);
+        let x = alone.eng.executor();
+        let want: Vec<(u32, Vec<u32>)> = x.sampled.clone();
+        let want_drafts = x.drafted_rows.clone();
+        assert!(want.len() >= 12);
+        assert_eq!(want_drafts.is_empty(), self.width == 0);
 
-        let mut rng = TestRng(13);
-        let mut busy = self.harness(512, chunked(29));
-        for id in 1..=4 {
-            busy.submit(request(
-                id,
-                rng.var_tokens(30, 200),
-                params(id),
-                30,
-                CacheScope::Private,
-            ));
+        let mut done = vec![alone];
+        // Beside four others that started first, then beside eleven that arrive with
+        // it and after it.
+        for (others, early, chunk) in [(4u64, true, 29), (11, false, 61)] {
+            let mut rng = TestRng(13 + others);
+            let mut busy = self.harness(512, chunked(chunk));
+            let mut ids = 1..=others;
+            let mut other = |busy: &mut Harness, id| {
+                let prompt = rng.var_tokens(30, 200);
+                busy.submit(request(id, prompt, params(id), 30, CacheScope::Private));
+            };
+            if early {
+                for id in ids.by_ref() {
+                    other(&mut busy, id);
+                }
+                for _ in 0..3 {
+                    busy.step();
+                }
+            } else {
+                for id in ids.by_ref().take(5) {
+                    other(&mut busy, id);
+                }
+            }
+            busy.submit(request(0, prompt.clone(), p, 12, CacheScope::Private));
+            for id in ids {
+                busy.step();
+                other(&mut busy, id);
+            }
+            busy.run();
+            assert_eq!(busy.outputs[&0], done[0].outputs[&0]);
+            let x = busy.eng.executor();
+            for row in &want {
+                assert!(
+                    x.sampled.contains(row),
+                    "logits at {} depend on the batch",
+                    row.0
+                );
+            }
+            for row in &want_drafts {
+                assert!(
+                    x.drafted_rows.contains(row),
+                    "draft logits at {} after {:?} depend on the batch",
+                    row.0,
+                    row.1
+                );
+            }
+            done.push(busy);
         }
-        for _ in 0..3 {
-            busy.step();
+        self.record("batch_invariance", at, done);
+    }
+
+    /// Greedy speculation never changes a token, at every draft width the drafter has
+    /// and across acceptance patterns from every draft rejected to every draft
+    /// accepted: the patterns come from narrowing the sampleable vocabulary and from a
+    /// drafter whose Markov term is removed.
+    pub fn greedy_speculation(&mut self) {
+        let at = Instant::now();
+        let g = SamplingParams::greedy();
+        let slots = self.model.slots;
+        let mut seen = vec![0usize; slots as usize + 1];
+        let mut done = Vec::new();
+        for (sampleable, markov) in [
+            (VOCAB, true),
+            (VOCAB, false),
+            (3, true),
+            (2, false),
+            (1, true),
+        ] {
+            let mut rng = TestRng(10);
+            let prompts: Vec<Vec<u32>> = (0..5)
+                .map(|_| {
+                    let n = 2 + usize::try_from(rng.below(70)).unwrap();
+                    (0..n)
+                        .map(|_| u32::try_from(rng.below(u64::from(sampleable))).unwrap())
+                        .collect()
+                })
+                .collect();
+            let mut plain = None;
+            for width in 0..=slots {
+                let how = Drafting {
+                    width,
+                    sampleable,
+                    markov,
+                    ..Drafting::default()
+                };
+                let mut h = Harness::drafting(self.model, self.device, 256, chunked(64), how);
+                for (i, p) in prompts.iter().enumerate() {
+                    h.submit(request(i as u64, p.clone(), g, 20, CacheScope::Private));
+                }
+                h.run();
+                h.flush();
+                let outs: Vec<Vec<u32>> = (0..prompts.len() as u64)
+                    .map(|i| h.outputs[&i].clone())
+                    .collect();
+                assert!(outs.iter().flatten().all(|t| *t < sampleable));
+                assert_eq!(plain.get_or_insert(outs.clone()), &outs, "width {width}");
+                let x = h.eng.executor();
+                assert_eq!(x.compared.drafted > 0, width > 0, "width {width}");
+                if width == slots {
+                    for a in &x.accepted_counts {
+                        seen[*a as usize] += 1;
+                    }
+                }
+                done.push(h);
+            }
         }
-        busy.submit(request(0, prompt.clone(), p, 12, CacheScope::Private));
-        busy.run();
-        assert_eq!(busy.outputs[&0], alone.outputs[&0]);
-        let got = &busy.eng.executor().sampled;
-        for row in &want {
-            assert!(got.contains(row), "logits at {} depend on the batch", row.0);
+        assert!(
+            seen.iter().all(|n| *n > 0),
+            "accepted-count coverage {seen:?}"
+        );
+        self.record("greedy_speculation", at, done);
+    }
+
+    /// Sequences run to the length limit with drafts on. The engine asks for fewer
+    /// drafts than the drafter has slots as a sequence nears the limit, and the pass
+    /// still computes every slot, at positions up to `slots - 2` past the last one a
+    /// sequence can hold.
+    pub fn length_limit(&mut self) {
+        let at = Instant::now();
+        let limit = 64;
+        let how = Drafting {
+            width: self.model.slots,
+            max_model_len: limit,
+            ..Drafting::default()
+        };
+        let mut h = Harness::drafting(self.model, self.device, 256, sched(), how);
+        let mut rng = TestRng(15);
+        for id in 0..6u64 {
+            let prompt = rng.var_tokens(40, 20);
+            let room = limit - u32::try_from(prompt.len()).unwrap();
+            h.submit(request(id, prompt, params(id), room, CacheScope::Private));
         }
-        self.record("batch_invariance", at, vec![alone, busy]);
+        h.run();
+        h.flush();
+        for id in 0..6 {
+            assert!(!h.outputs[&id].is_empty());
+        }
+        // A drafting step whose pass reached past the limit: fewer drafts than slots.
+        let c = h.compared();
+        assert!(c.drafted > 0);
+        assert!(
+            h.eng.executor().short_passes > 0,
+            "no pass ran with fewer drafts than slots at the limit"
+        );
+        self.record("length_limit", at, vec![h]);
+    }
+
+    /// Seeded sampled rows with drafting on: the draft chain on the draft stream, each
+    /// slot conditioned on the draft before it, and chain acceptance over the
+    /// conditional distributions.
+    pub fn sampled_speculation(&mut self) {
+        let at = Instant::now();
+        let mut done = Vec::new();
+        for width in [2, self.model.slots] {
+            let how = Drafting {
+                width,
+                ..Drafting::default()
+            };
+            let mut h = Harness::drafting(self.model, self.device, 256, sched(), how);
+            let mut rng = TestRng(11);
+            for id in 0..6u64 {
+                let k = usize::try_from(id % 3).unwrap();
+                let p = SamplingParams::new(
+                    0.8 + 0.1 * k as f32,
+                    [0, 5, 40][k],
+                    [1.0, 0.95, 0.8][k],
+                    0.0,
+                    77 + id,
+                )
+                .unwrap();
+                h.submit(request(
+                    id,
+                    rng.var_tokens(3, 50),
+                    p,
+                    14,
+                    CacheScope::Private,
+                ));
+            }
+            h.run();
+            h.flush();
+            let c = h.compared();
+            assert!(c.drafted > 0 && c.accepted < c.drafted && c.draft_rows > 0);
+            done.push(h);
+        }
+        self.record("sampled_speculation", at, done);
+    }
+
+    /// A harness with `width` drafts and a host tier of `host_blocks`.
+    fn memory_harness(
+        &self,
+        blocks: u32,
+        width: u32,
+        host_blocks: u32,
+        sched: SchedulerConfig,
+    ) -> Harness {
+        let how = Drafting {
+            width,
+            host_blocks,
+            ..Drafting::default()
+        };
+        Harness::drafting(self.model, self.device, blocks, sched, how)
+    }
+
+    /// Idle KV of every group is ciphertext over the block's image on the device, and a
+    /// hit decrypts it into the bits the reference executor computes, with drafts off
+    /// and on.
+    pub fn idle_encryption(&mut self) {
+        let at = Instant::now();
+        let mut done = Vec::new();
+        for width in [0, self.model.slots] {
+            let mut h = self.memory_harness(512, width, 0, sched());
+            let groups: BTreeSet<u32> =
+                (0..u32::try_from(h.spec.kv_groups.len()).unwrap()).collect();
+            let prompt = TestRng(40).tokens(210);
+            let g = SamplingParams::greedy();
+            h.submit(request(1, prompt.clone(), g, 6, keyed(1)));
+            let mut seen = Images::new();
+            run_recording(&mut h, &mut seen);
+            let cached = h.eng.kv().cache_blocks();
+            h.flush();
+            assert_eq!(h.eng.kv_keys_held(), 0);
+            let mut held = BTreeSet::new();
+            for (gr, b) in &cached {
+                let x = &h.eng.executor().dev;
+                assert!(x.block_is_encrypted(*gr, *b));
+                let c = x.block_bytes(*gr, *b).unwrap();
+                let p = &seen[&(*gr, *b)];
+                assert!(
+                    same_bytes(&c, p) * 20 < c.len(),
+                    "group {gr} block {b}: idle KV is not ciphertext"
+                );
+                held.insert(*gr);
+            }
+            assert_eq!(held, groups, "every group is retained");
+
+            // Another lineage, same prompt: a miss.
+            assert_eq!(h.run_one(2, &prompt, g, 6, keyed(2)), 0);
+            // The first lineage again: a hit, decrypted in every group, bit-exact.
+            let mark = h.eng.executor().cpu.crypt_log().len();
+            h.submit(request(3, prompt.clone(), g, 6, keyed(1)));
+            h.step();
+            assert_eq!(h.eng.cached_prompt_tokens(3), Some(208));
+            let decrypted: BTreeSet<u32> = h.eng.executor().cpu.crypt_log()[mark..]
+                .iter()
+                .filter(|e| !e.3)
+                .map(|e| e.1)
+                .collect();
+            assert_eq!(decrypted, groups);
+            h.run();
+            assert_eq!(h.outputs[&3], h.outputs[&1]);
+            assert_eq!(h.outputs[&2], h.outputs[&1]);
+            h.flush();
+            assert_eq!(h.eng.kv_keys_held(), 0);
+            done.push(h);
+        }
+        self.record("idle_encryption", at, done);
+    }
+
+    /// A block of a group whose coverage is `All` is sealed under a nonce fixed by its
+    /// hash and group, so its bytes must be the same every time it is sealed: one
+    /// lineage's request recomputed beside another sequence, and in other prefill
+    /// chunks, seals every such block to the same ciphertext byte for byte on the
+    /// device. The chain-covered groups' blocks seal under a nonce per attachment.
+    pub fn resealing(&mut self) {
+        let at = Instant::now();
+        let width = self.model.slots;
+        let prompt = TestRng(41).tokens(210);
+        let other = TestRng(42).tokens(150);
+        let g = SamplingParams::greedy();
+        let mine = |id| request(id, prompt.clone(), g, 6, keyed(1));
+        let beside = |id| request(id, other.clone(), g, 9, CacheScope::Private);
+
+        let mut h = self.memory_harness(512, width, 0, sched());
+        h.submit(mine(1));
+        h.run();
+        h.flush();
+        let first = sealed(&h);
+        assert_eq!(
+            first.len(),
+            h.spec.kv_groups.len(),
+            "every group is retained"
+        );
+        let check = |h: &Harness, what: &str, same_engine: bool| {
+            let again = sealed(h);
+            for (group, spec) in h.spec.kv_groups.iter().enumerate() {
+                let g = u32::try_from(group).unwrap();
+                assert_eq!(again[&g].len(), first[&g].len(), "{what}: group {g}");
+                match spec.coverage {
+                    Coverage::All => assert!(
+                        again[&g] == first[&g],
+                        "{what}: a block of group {g} sealed to other ciphertext"
+                    ),
+                    Coverage::Chain if same_engine => assert!(
+                        again[&g].iter().all(|c| !first[&g].contains(c)),
+                        "{what}: two attachments of group {g} share a keystream"
+                    ),
+                    Coverage::Chain => {}
+                }
+            }
+        };
+
+        // Expired and zeroed, then recomputed beside a private request that started
+        // first.
+        h.now += CachePolicy::default().max_age_ms + 1;
+        h.eng.sweep(h.now).unwrap();
+        h.check();
+        assert!(h.eng.kv().cache_blocks().is_empty());
+        h.submit(beside(2));
+        h.step();
+        h.now += 1;
+        h.submit(mine(3));
+        h.run();
+        h.flush();
+        assert_eq!(h.cached[&3], 0, "a recompute, not a hit");
+        assert_eq!(h.outputs[&3], h.outputs[&1]);
+        check(&h, "beside another sequence", true);
+
+        // Another engine, prefilling 13 tokens a step, the other request beside it.
+        let mut c = self.memory_harness(512, width, 0, chunked(13));
+        c.submit(mine(1));
+        c.submit(beside(2));
+        c.run();
+        c.flush();
+        assert_eq!(c.outputs[&1], h.outputs[&1]);
+        check(&c, "in other chunks", false);
+        self.record("resealing", at, vec![h, c]);
+    }
+
+    /// Device pressure demotes a lineage's idle entries to the host tier as the
+    /// ciphertext they are, in every group, byte for byte; the hit that promotes them
+    /// back is the reference executor's.
+    pub fn host_tier(&mut self) {
+        let at = Instant::now();
+        let _guard = memlock_guard();
+        let mut h = self.memory_harness(48, self.model.slots, 256, sched());
+        let groups: BTreeSet<u32> = (0..u32::try_from(h.spec.kv_groups.len()).unwrap()).collect();
+        let mut rng = TestRng(43);
+        let g = SamplingParams::greedy();
+        let prompt = rng.tokens(120);
+        assert_eq!(h.run_one(1, &prompt, g, 6, keyed(1)), 0);
+        let first = h.eng.kv().cache_blocks();
+        let ciphertext = images(&h, &first);
+        let mark = h.eng.executor().cpu.transfer_log().len();
+        for i in 0..4u8 {
+            let other = rng.tokens(120);
+            h.run_one(10 + u64::from(i), &other, g, 5, keyed(100 + i));
+        }
+        let demoted: Vec<(u32, u32, u32)> = h.eng.executor().cpu.transfer_log()[mark..]
+            .iter()
+            .filter(|t| t.4)
+            .map(|t| (t.1, t.2, t.3))
+            .collect();
+        let blocks: BTreeSet<(u32, u32)> = demoted.iter().map(|d| (d.0, d.1)).collect();
+        assert!(first.iter().all(|b| blocks.contains(b)), "all demoted");
+        assert_eq!(blocks.iter().map(|b| b.0).collect::<BTreeSet<_>>(), groups);
+        // The first entry's blocks arrived on the host byte for byte.
+        let mut arrived = BTreeSet::new();
+        for (g, b, host) in &demoted {
+            let x = &h.eng.executor().dev;
+            if let Some(c) = ciphertext.get(&(*g, *b))
+                && h.eng.kv().host_cache_blocks().contains(&(*g, *host))
+                && x.host_block_bytes(*g, *host).unwrap() == *c
+            {
+                arrived.insert(*g);
+            }
+        }
+        assert_eq!(
+            arrived, groups,
+            "a demoted block of every group is on the host"
+        );
+        let stats = h.eng.kv().tier_stats();
+        assert_eq!((stats.host_drops, stats.device_drops), (0, 0));
+
+        let mark = h.eng.executor().cpu.transfer_log().len();
+        assert_eq!(h.run_one(2, &prompt, g, 6, keyed(1)), 112);
+        let promoted: BTreeSet<u32> = h.eng.executor().cpu.transfer_log()[mark..]
+            .iter()
+            .filter(|t| !t.4)
+            .map(|t| t.1)
+            .collect();
+        assert_eq!(promoted, groups);
+        assert_eq!(h.outputs[&2], h.outputs[&1]);
+        self.record("host_tier", at, vec![h]);
     }
 
     /// Randomized interleavings: multi-turn keyed conversations, private requests,
-    /// cancellations, expiry, small pools; then a drain that leaves every block and
-    /// every slot zero on the device.
+    /// cancellations, expiry, small pools, on odd seeds a host tier; then a drain that
+    /// leaves every block and every slot zero on the device.
     pub fn randomized(&mut self, seeds: std::ops::Range<u64>) {
         let at = Instant::now();
+        let _guard = memlock_guard();
         let (mut preempted, mut hits, mut triangles) = (0, 0, 0);
+        let (mut demoted, mut promoted) = (0, 0);
+        let mut tiered = false;
         let mut done = Vec::new();
         for seed in seeds {
             let mut rng = TestRng(700 + seed);
@@ -829,7 +1435,9 @@ impl Run<'_> {
             cfg.cache.idle_ttl_ms = 500;
             cfg.cache.max_age_ms = 2000;
             cfg.sweep_interval_ms = 50;
-            let mut h = self.harness(blocks, cfg);
+            let host_blocks = if seed % 2 == 1 { 2 * blocks } else { 0 };
+            tiered |= host_blocks > 0;
+            let mut h = self.memory_harness(blocks, self.width, host_blocks, cfg);
             let mut convo: HashMap<u8, Vec<u32>> = HashMap::new();
             let mut live: BTreeSet<u64> = BTreeSet::new();
             let mut next_id = 0u64;
@@ -887,6 +1495,9 @@ impl Run<'_> {
             hits += h.cached.values().filter(|c| **c > 0).count();
             preempted += h.eng.stats().preemptions;
             triangles += h.compared().triangles;
+            let tier = h.eng.kv().tier_stats();
+            demoted += tier.demoted_blocks;
+            promoted += tier.promoted_blocks;
             // Drain: everything expires, and every block of every group and every slot
             // is zero on the device.
             h.eng.sweep(h.now + 10_000).unwrap();
@@ -910,11 +1521,96 @@ impl Run<'_> {
             preempted > 0 && hits > 0 && triangles > 0,
             "{preempted} {hits} {triangles}"
         );
+        assert!(
+            !tiered || (demoted > 0 && promoted > 0),
+            "the host tier was not used: {demoted} demoted, {promoted} promoted"
+        );
         self.record("randomized", at, done);
     }
 }
 
-/// Every scenario, in the order the device run takes them.
+/// Device bytes of blocks, by `(group, block)`.
+pub type Images = BTreeMap<(u32, u32), Vec<u8>>;
+
+fn images<'a>(h: &Harness, blocks: impl IntoIterator<Item = &'a (u32, u32)>) -> Images {
+    let x = &h.eng.executor().dev;
+    blocks
+        .into_iter()
+        .map(|&(g, b)| ((g, b), x.block_bytes(g, b).expect("a block")))
+        .collect()
+}
+
+/// Steps until every request has finished, keeping the latest plaintext image of every
+/// block: after a step, a block is plaintext in the pool if a sequence maps it or its
+/// encryption is still queued.
+fn run_recording(h: &mut Harness, plain: &mut Images) {
+    while h.eng.unfinished() > 0 {
+        h.step();
+        h.now += 1;
+        let kv = h.eng.kv();
+        let crypts = kv.pending_crypts();
+        let mut blocks: Vec<(u32, u32)> = kv
+            .sequence_blocks()
+            .into_iter()
+            .filter(|b| !crypts.contains_key(b))
+            .collect();
+        blocks.extend(crypts.iter().filter(|(_, e)| **e).map(|(b, _)| *b));
+        let fresh = images(h, &blocks);
+        plain.extend(fresh);
+    }
+}
+
+fn same_bytes(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).filter(|(x, y)| x == y).count()
+}
+
+/// Every cached block's ciphertext on the device, per group, in a canonical order.
+fn sealed(h: &Harness) -> BTreeMap<u32, Vec<Vec<u8>>> {
+    let x = &h.eng.executor().dev;
+    let mut out: BTreeMap<u32, Vec<Vec<u8>>> = BTreeMap::new();
+    for (g, b) in h.eng.kv().cache_blocks() {
+        assert!(x.block_is_encrypted(g, b));
+        out.entry(g).or_default().push(x.block_bytes(g, b).unwrap());
+    }
+    for images in out.values_mut() {
+        images.sort();
+    }
+    out
+}
+
+/// The memory scenarios, on the fixture: idle encryption, resealing, the host tier's
+/// round trip, and randomized traffic with and without a host tier.
+pub fn memory_scenarios(run: &mut Run<'_>, wide: bool) {
+    if wide {
+        return;
+    }
+    run.idle_encryption();
+    run.resealing();
+    run.host_tier();
+    run.randomized(2..4);
+}
+
+/// The drafting scenarios: every width and acceptance pattern and seeded sampling, then
+/// scenarios of the plain run with every slot drafted (`run.width` the model's slots).
+pub fn drafting_scenarios(run: &mut Run<'_>, wide: bool) {
+    assert_eq!(run.width, run.model.slots);
+    run.greedy_speculation();
+    run.sampled_speculation();
+    run.length_limit();
+    run.hits();
+    run.batch_invariance();
+    if wide {
+        return;
+    }
+    run.single_requests();
+    run.chunked_prefill(&[7, 1000]);
+    run.cancelled_mid_triangle();
+    run.preemption();
+    run.shedding();
+    run.randomized(0..2);
+}
+
+/// Every scenario, in the order the device run takes them, with `run.width` drafts.
 pub fn all_scenarios(run: &mut Run<'_>, wide: bool) {
     if wide {
         run.chunked_prefill(&[7, 1000]);
@@ -954,10 +1650,14 @@ pub fn summary(device: &str, outcomes: &[Outcome]) -> serde_json::Value {
             "blocks_equal": o.compared.blocks,
             "triangles": o.compared.triangles,
             "chain_layer_positions": o.compared.chain_work,
+            "drafted": o.compared.drafted,
+            "accepted": o.compared.accepted,
+            "draft_logit_rows_equal": o.compared.draft_rows,
             "step_ms": {
                 "mean": mean(&|s| s.total_ms),
                 "max": max,
                 "maintenance": mean(&|s| s.maintenance_ms),
+                "draft": mean(&|s| s.draft_ms),
                 "gather": mean(&|s| s.gather_ms),
                 "encoder": mean(&|s| s.encoder_ms),
                 "crossing": mean(&|s| s.crossing_ms),
@@ -968,6 +1668,7 @@ pub fn summary(device: &str, outcomes: &[Outcome]) -> serde_json::Value {
                 "chain_layer_positions": s.chain_work,
                 "sampled": s.sampled,
                 "maintenance_ms": s.maintenance_ms,
+                "draft_ms": s.draft_ms,
                 "gather_ms": s.gather_ms,
                 "encoder_ms": s.encoder_ms,
                 "crossing_ms": s.crossing_ms,

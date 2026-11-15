@@ -15,7 +15,7 @@
 
 use eidola_engine_model::WeightSet;
 use eidola_engine_model::deepseek::DsConfig;
-use eidola_engine_model::deepseek::config::RopeKind;
+use eidola_engine_model::deepseek::config::{DsLayerSpec, DsMoeSpec, RopeKind};
 use eidola_engine_model::deepseek::rope::{RopeTable, Yarn};
 use eidola_engine_model::safetensors::Dtype;
 
@@ -61,6 +61,9 @@ pub struct WeightBytes {
     pub head: u64,
     /// RoPE tables (device form only).
     pub rope: u64,
+    /// The drafter: its blocks, projection, norms and Markov head, and on a device the
+    /// embedding copy its slots read.
+    pub drafter: u64,
 }
 
 impl WeightBytes {
@@ -71,6 +74,7 @@ impl WeightBytes {
             + self.engram_modules
             + self.head
             + self.rope
+            + self.drafter
     }
 
     /// The layers' own tensors, Engram aside.
@@ -85,7 +89,8 @@ pub enum Form {
     /// The tensors as the checkpoint stores them, every tensor of the half's layers
     /// (the image router bias and every stored router row included).
     Checkpoint,
-    /// What [`HalfWeights::load`] puts on the device for `positions` positions.
+    /// What [`HalfWeights::load`] puts on the device for sequences of `positions`
+    /// positions.
     Device { positions: u32 },
 }
 
@@ -93,12 +98,18 @@ fn fp8_bytes(n: usize, k: usize) -> u64 {
     (n * k + n.div_ceil(32) * (k / 32)) as u64
 }
 
-/// The weight bytes of `half`, by kind.
-pub fn weight_bytes(c: &DsConfig, shape: &DsShape, half: Half, form: Form) -> WeightBytes {
-    let device = matches!(form, Form::Device { .. });
-    let (d, a, ix, m) = (c.dim, &c.attention, &c.indexer, &c.moe);
+/// One block's tensors (a backbone layer's or a draft block's), Engram aside.
+fn block_bytes(
+    c: &DsConfig,
+    m: &DsMoeSpec,
+    kv_source: Option<bool>,
+    index_source: bool,
+    device: bool,
+) -> WeightBytes {
+    let (d, a, ix) = (c.dim, &c.attention, &c.indexer);
     let hc = c.hc_mult;
     let mixes = (2 + hc) * hc;
+    let mut out = WeightBytes::default();
     // A norm weight: BF16 as stored, f32 on the device.
     let norm = |n: usize, out: &mut WeightBytes| {
         if device {
@@ -107,52 +118,69 @@ pub fn weight_bytes(c: &DsConfig, shape: &DsShape, half: Half, form: Form) -> We
             out.bf16 += (2 * n) as u64;
         }
     };
-    let compressor = |gated: bool, out: &mut WeightBytes| {
-        norm(a.head_dim, out);
-        norm(ix.head_dim, out);
-        out.bf16 += (2 * a.head_dim * d * (1 + usize::from(gated))) as u64;
-        out.bf16 += (2 * ix.head_dim * a.head_dim) as u64;
-    };
-    let mut out = WeightBytes::default();
-    let layers = match half {
-        Half::Encoder => 0..shape.split,
-        Half::Decoder => shape.split..shape.layers,
-    };
     let experts = if device {
         m.n_routed
     } else {
         m.source_n_routed
     };
+    out.f32 += (4 * a.n_heads + 4 * experts) as u64;
+    if !device {
+        // The image router bias, which nothing reads.
+        out.f32 += (4 * experts) as u64;
+    }
+    out.f32 += 2 * (4 * mixes * hc * d + 4 * mixes + 12) as u64;
+    for n in [d, d, a.q_lora_rank, a.head_dim] {
+        norm(n, &mut out);
+    }
+    out.bf16 += (2 * experts * d) as u64;
+    if let Some(gated) = kv_source {
+        norm(a.head_dim, &mut out);
+        norm(ix.head_dim, &mut out);
+        out.bf16 += (2 * a.head_dim * d * (1 + usize::from(gated))) as u64;
+        out.bf16 += (2 * ix.head_dim * a.head_dim) as u64;
+    }
+    let rank = a.o_groups * a.o_lora_rank;
+    out.fp8 += fp8_bytes(a.q_lora_rank, d)
+        + fp8_bytes(a.n_heads * a.head_dim, a.q_lora_rank)
+        + fp8_bytes(a.head_dim, d)
+        + fp8_bytes(rank, a.n_heads * a.head_dim / a.o_groups)
+        + fp8_bytes(d, rank)
+        + 2 * fp8_bytes(m.inter_dim, d)
+        + fp8_bytes(d, m.inter_dim);
+    if index_source {
+        out.bf16 += (2 * ix.n_heads * d) as u64;
+        out.fp8 += fp8_bytes(ix.n_heads * ix.head_dim, a.q_lora_rank);
+    }
+    let per_expert = 2 * (m.inter_dim * d / 2 + m.inter_dim * d / 32)
+        + d * m.inter_dim / 2
+        + d * m.inter_dim / 32;
+    out.experts += (experts * per_expert) as u64;
+    out
+}
+
+/// The weight bytes of `half`, by kind. The drafter is counted when `shape` drafts (a
+/// device form) or, in the checkpoint's form, whenever the configuration has one.
+pub fn weight_bytes(c: &DsConfig, shape: &DsShape, half: Half, form: Form) -> WeightBytes {
+    let device = matches!(form, Form::Device { .. });
+    let (d, hc) = (c.dim, c.hc_mult);
+    let mut out = WeightBytes::default();
+    let layers = match half {
+        Half::Encoder => 0..shape.split,
+        Half::Decoder => shape.split..shape.layers,
+    };
     for l in layers {
         let spec = &c.layers[l];
-        out.f32 += (4 * a.n_heads + 4 * experts) as u64;
-        if !device {
-            out.f32 += (4 * experts) as u64;
-        }
-        out.f32 += 2 * (4 * mixes * hc * d + 4 * mixes + 12) as u64;
-        for n in [d, d, a.q_lora_rank, a.head_dim] {
-            norm(n, &mut out);
-        }
-        out.bf16 += (2 * experts * d) as u64;
-        if spec.is_kv_source {
-            compressor(spec.compress_ratio > 1, &mut out);
-        }
-        let rank = a.o_groups * a.o_lora_rank;
-        out.fp8 += fp8_bytes(a.q_lora_rank, d)
-            + fp8_bytes(a.n_heads * a.head_dim, a.q_lora_rank)
-            + fp8_bytes(a.head_dim, d)
-            + fp8_bytes(rank, a.n_heads * a.head_dim / a.o_groups)
-            + fp8_bytes(d, rank)
-            + 2 * fp8_bytes(m.inter_dim, d)
-            + fp8_bytes(d, m.inter_dim);
-        if spec.is_index_source {
-            out.bf16 += (2 * ix.n_heads * d) as u64;
-            out.fp8 += fp8_bytes(ix.n_heads * ix.head_dim, a.q_lora_rank);
-        }
-        let per_expert = 2 * (m.inter_dim * d / 2 + m.inter_dim * d / 32)
-            + d * m.inter_dim / 2
-            + d * m.inter_dim / 32;
-        out.experts += (experts * per_expert) as u64;
+        let b = block_bytes(
+            c,
+            &c.moe,
+            spec.is_kv_source.then_some(spec.compress_ratio > 1),
+            spec.is_index_source,
+            device,
+        );
+        out.experts += b.experts;
+        out.fp8 += b.fp8;
+        out.bf16 += b.bf16;
+        out.f32 += b.f32;
         if let (Some(_), Some(e)) = (spec.engram, &c.engram) {
             out.engram_modules +=
                 fp8_bytes(d * (hc + 1), e.lookups() * e.head_dim) + (4 * hc * d) as u64;
@@ -165,22 +193,41 @@ pub fn weight_bytes(c: &DsConfig, shape: &DsShape, half: Half, form: Form) -> We
             }
         }
     }
+    let norm = |n: usize| if device { 4 * n } else { 2 * n } as u64;
     match half {
         Half::Encoder => {
             out.embed = (2 * c.vocab_size * d) as u64;
             if device {
                 // The split layer's bank stub: its attention-input norm and compressor.
-                norm(d, &mut out);
-                compressor(false, &mut out);
+                let (a, ix) = (&c.attention, &c.indexer);
+                out.f32 += norm(d) + norm(a.head_dim) + norm(ix.head_dim);
+                out.bf16 += (2 * a.head_dim * d + 2 * ix.head_dim * a.head_dim) as u64;
             }
         }
         Half::Decoder => {
-            out.head = (2 * c.vocab_size * d) as u64 + if device { 4 * d } else { 2 * d } as u64;
+            out.head = (2 * c.vocab_size * d) as u64 + norm(d);
+            let counted = if device { shape.drafting() } else { true };
+            if let (Some(dr), true) = (&c.drafter, counted) {
+                let b = block_bytes(c, &dr.moe, None, false, device);
+                out.drafter = dr.blocks as u64 * (b.experts + b.fp8 + b.bf16 + b.f32)
+                    + fp8_bytes(d, d * dr.target_layers.len())
+                    + 2 * norm(d)
+                    + 2 * (2 * c.vocab_size * dr.markov_rank) as u64;
+                out.drafter += match device {
+                    // The embedding rows the slots read: a copy of the table.
+                    true => (2 * c.vocab_size * d) as u64,
+                    // The confidence head, which nothing here reads.
+                    false => (2 * (d + dr.markov_rank)) as u64,
+                };
+            }
         }
     }
     if let Form::Device { positions } = form {
         let kinds = rope_kinds(c, shape, half);
-        out.rope = (kinds.len() * positions as usize * a.rope_dim * 4) as u64;
+        let positions = shape
+            .rope_positions(half, positions)
+            .expect("checked when the half was laid out");
+        out.rope = (kinds.len() * positions as usize * c.attention.rope_dim * 4) as u64;
     }
     out
 }
@@ -197,6 +244,10 @@ fn rope_kinds(c: &DsConfig, shape: &DsShape, half: Half) -> Vec<RopeKind> {
         if !kinds.contains(&c.layers[l].rope) {
             kinds.push(c.layers[l].rope);
         }
+    }
+    // The drafter rotates with the plain table.
+    if half == Half::Decoder && shape.drafting() && !kinds.contains(&RopeKind::Plain) {
+        kinds.push(RopeKind::Plain);
     }
     kinds
 }
@@ -315,9 +366,27 @@ pub struct HalfWeights {
     /// `(cos, sin)` tables `[positions, rope_dim / 2, 2]`, by variant.
     pub rope: Vec<(RopeKind, u64)>,
     pub positions: u32,
+    /// The drafter (decoder, when drafting).
+    pub drafter: Option<DrafterWeights>,
     /// What was uploaded, by kind.
     pub bytes: WeightBytes,
     _buffers: Vec<Buffer>,
+}
+
+/// The drafter on the decoder's device.
+#[derive(Clone, Debug)]
+pub struct DrafterWeights {
+    pub blocks: Vec<LayerWeights>,
+    /// `[dim, dim · target layers]`.
+    pub main_proj: Fp8,
+    pub main_norm: u64,
+    /// The drafter's final norm.
+    pub norm: u64,
+    /// BF16 `[vocab, markov_rank]`, each.
+    pub markov_embed: u64,
+    pub markov_head: u64,
+    /// BF16 `[vocab, dim]`: the embedding rows the slots read.
+    pub embed: u64,
 }
 
 impl HalfWeights {
@@ -380,11 +449,17 @@ struct Loader<'a> {
     store: Option<&'a WeightSet>,
     buffers: Vec<Buffer>,
     bytes: WeightBytes,
+    /// Count what is loaded as the drafter's.
+    drafter: bool,
 }
 
 impl<'a> Loader<'a> {
     fn count(&mut self, kind: Count, bytes: usize) {
         let b = &mut self.bytes;
+        if self.drafter {
+            b.drafter += bytes as u64;
+            return;
+        }
         let field = match kind {
             Count::Embed => &mut b.embed,
             Count::Experts => &mut b.experts,
@@ -536,8 +611,8 @@ impl<'a> Loader<'a> {
         })
     }
 
-    fn experts(&mut self, c: &DsConfig, p: &str) -> Result<Experts> {
-        let (d, m) = (c.dim, &c.moe);
+    fn experts(&mut self, c: &DsConfig, p: &str, m: &DsMoeSpec) -> Result<Experts> {
+        let d = c.dim;
         let (inter, n) = (m.inter_dim, m.n_routed);
         let dev = self.dev;
         // (per-expert bytes of the up array's two halves and of the down array)
@@ -580,17 +655,24 @@ impl<'a> Loader<'a> {
         })
     }
 
-    fn layer(&mut self, c: &DsConfig, l: usize) -> Result<LayerWeights> {
-        let spec = &c.layers[l];
-        let p = format!("layers.{}", spec.source_index);
-        let (d, a, m, ix) = (c.dim, &c.attention, &c.moe, &c.indexer);
+    /// A block's weights: a backbone layer's (with its sharing structure) or a draft
+    /// block's.
+    fn block(
+        &mut self,
+        c: &DsConfig,
+        p: &str,
+        m: &DsMoeSpec,
+        spec: Option<&DsLayerSpec>,
+    ) -> Result<LayerWeights> {
+        let p = p.to_owned();
+        let (d, a, ix) = (c.dim, &c.attention, &c.indexer);
         let rank = a.o_groups * a.o_lora_rank;
         let s = format!("{p}.ffn.shared_experts");
-        let compressor = match spec.is_kv_source {
-            true => Some(self.compressor(c, &p, spec.compress_ratio > 1)?),
-            false => None,
+        let compressor = match spec {
+            Some(l) if l.is_kv_source => Some(self.compressor(c, &p, l.compress_ratio > 1)?),
+            _ => None,
         };
-        let indexer = match spec.is_index_source {
+        let indexer = match spec.is_some_and(|l| l.is_index_source) {
             true => Some(Indexer {
                 wq_b: self.fp8(
                     Count::Fp8,
@@ -608,7 +690,7 @@ impl<'a> Loader<'a> {
             }),
             false => None,
         };
-        let engram = match (spec.engram, &c.engram) {
+        let engram = match (spec.and_then(|l| l.engram), &c.engram) {
             (Some(slot), Some(e)) => {
                 let read =
                     |this: &Self, name: &str| this.values(name, Dtype::Bf16, &[c.hc_mult, d]);
@@ -680,15 +762,16 @@ impl<'a> Loader<'a> {
             w1: self.fp8(Count::Fp8, &format!("{s}.w1"), m.inter_dim, d)?,
             w2: self.fp8(Count::Fp8, &format!("{s}.w2"), d, m.inter_dim)?,
             w3: self.fp8(Count::Fp8, &format!("{s}.w3"), m.inter_dim, d)?,
-            experts: self.experts(c, &p)?,
+            experts: self.experts(c, &p, m)?,
             engram,
         })
     }
 }
 
 impl HalfWeights {
-    /// Uploads `half`'s weights from `store`, with RoPE tables for `positions`
-    /// positions. Without a store every tensor is allocated at its size and left zero:
+    /// Uploads `half`'s weights from `store`, with RoPE tables for sequences of
+    /// `max_model_len` positions ([`DsShape::rope_positions`]). Without a store every
+    /// tensor is allocated at its size and left zero:
     /// the half's layout and accounting with no checkpoint. Without `tables` the Engram tables the half's device would hold stay
     /// off it (a half run alone, whose table rows are gathered elsewhere).
     pub fn load(
@@ -697,7 +780,7 @@ impl HalfWeights {
         c: &DsConfig,
         shape: &DsShape,
         half: Half,
-        positions: u32,
+        max_model_len: u32,
         tables: bool,
     ) -> Result<HalfWeights> {
         let mut ld = Loader {
@@ -705,6 +788,7 @@ impl HalfWeights {
             store,
             buffers: Vec::new(),
             bytes: WeightBytes::default(),
+            drafter: false,
         };
         let (v, d) = (c.vocab_size, c.dim);
         let mut layers = vec![None; shape.layers];
@@ -713,7 +797,13 @@ impl HalfWeights {
             Half::Decoder => shape.split..shape.layers,
         };
         for l in range {
-            layers[l] = Some(ld.layer(c, l)?);
+            let spec = &c.layers[l];
+            layers[l] = Some(ld.block(
+                c,
+                &format!("layers.{}", spec.source_index),
+                &c.moe,
+                Some(spec),
+            )?);
         }
         let load_tables = tables;
         let mut tables = vec![None; shape.engram_device.len()];
@@ -764,6 +854,42 @@ impl HalfWeights {
                 ));
             }
         }
+        let mut drafter = None;
+        if let (Half::Decoder, true, Some(dr)) = (half, shape.drafting(), &c.drafter) {
+            ld.drafter = true;
+            let mut blocks = Vec::with_capacity(dr.blocks);
+            for i in 0..dr.blocks {
+                blocks.push(ld.block(c, &format!("mtp.{i}"), &dr.moe, None)?);
+            }
+            let last = format!("mtp.{}", dr.blocks - 1);
+            let rank = dr.markov_rank;
+            let bf16 = Dtype::Bf16;
+            drafter = Some(DrafterWeights {
+                blocks,
+                main_proj: ld.fp8(Count::Fp8, "mtp.0.main_proj", d, d * dr.target_layers.len())?,
+                main_norm: ld.norm(Count::F32, "mtp.0.main_norm.weight", d)?,
+                norm: ld.norm(Count::F32, &format!("{last}.norm.weight"), d)?,
+                markov_embed: ld.raw(
+                    Count::Bf16,
+                    &format!("{last}.markov_head.embed.weight"),
+                    bf16,
+                    &[v, rank],
+                    None,
+                )?,
+                markov_head: ld.raw(
+                    Count::Bf16,
+                    &format!("{last}.markov_head.head.weight"),
+                    bf16,
+                    &[v, rank],
+                    None,
+                )?,
+                embed: ld.raw(Count::Embed, "embed.weight", bf16, &[v, d], None)?,
+            });
+            ld.drafter = false;
+        }
+        let positions = shape
+            .rope_positions(half, max_model_len)
+            .ok_or_else(|| CudaError::new("RoPE positions overflow"))?;
         let mut rope = Vec::new();
         for kind in rope_kinds(c, shape, half) {
             let table = rope_table(c, kind);
@@ -784,6 +910,7 @@ impl HalfWeights {
             tables,
             rope,
             positions,
+            drafter,
             bytes: ld.bytes,
             _buffers: ld.buffers,
         })
@@ -817,7 +944,8 @@ mod tests {
         assert_eq!(dec.head, 1_323_827_200 + 10_240);
         assert_eq!((enc.head, dec.embed, enc.rope, dec.rope), (0, 0, 0, 0));
         assert_eq!(enc.total(), 250_855_098_528);
-        assert_eq!(dec.total(), 250_527_512_880);
+        assert_eq!(dec.drafter, 7_932_874_632);
+        assert_eq!(dec.total(), 250_527_512_880 + 7_932_874_632);
         // One routed expert: 18.8 MB; a layer's experts: 7.2 GB.
         assert_eq!(enc.experts, 20 * 384 * 18_800_640);
 
