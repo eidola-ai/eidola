@@ -1840,6 +1840,48 @@ fn a_stale_dev_model_is_rebuilt() {
     assert!(out.join("marker").exists());
 }
 
+/// The dev model's JSON is written in its canonical form (every object's keys sorted), so
+/// its bytes, and its weights hash, do not depend on whether something else in the build
+/// enabled serde_json's `preserve_order`; and the header's offsets ascend in its order.
+#[test]
+fn the_dev_model_json_is_canonical() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture::write_dev_model(dir.path()).unwrap();
+    let config = std::fs::read(dir.path().join("config.json")).unwrap();
+    let value: Value = serde_json::from_slice(&config).unwrap();
+    let text = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap();
+    assert_eq!(
+        text(&config),
+        text(&fixture::canonical_json(&value, true)),
+        "config.json"
+    );
+
+    let shard = std::fs::read(dir.path().join("model.safetensors")).unwrap();
+    let len = u64::from_le_bytes(shard[..8].try_into().unwrap()) as usize;
+    let padded = &shard[8..8 + len];
+    let header = padded.trim_ascii_end();
+    assert!(len.is_multiple_of(8) && len - header.len() < 8, "padding");
+    let value: Value = serde_json::from_slice(header).unwrap();
+    assert_eq!(
+        text(header),
+        text(&fixture::canonical_json(&value, false)),
+        "header"
+    );
+    let mut end = 0;
+    for (name, entry) in value.as_object().unwrap() {
+        if name != "__metadata__" {
+            let offsets = &entry["data_offsets"];
+            assert_eq!(offsets[0].as_u64().unwrap(), end, "{name}");
+            end = offsets[1].as_u64().unwrap();
+        }
+    }
+    assert_eq!(
+        end as usize,
+        shard.len() - 8 - len,
+        "the data is exactly the tensors"
+    );
+}
+
 /// Concurrent builders of one stale directory all return with the current model in
 /// place: none moves aside a model another has just published.
 #[test]
