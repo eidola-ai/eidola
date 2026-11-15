@@ -75,7 +75,7 @@ export HOST_MODE="${HOST_MODE:-read}" MAX_NEW="${MAX_NEW:-64}" WIDTHS="${WIDTHS:
 export HERE REPO WORK OUT KERNELS="${KERNELS:-}"
 export EIDOLA_ENGINE_KERNELS_DIR="$KERNELS"
 export EIDOLA_DS_SUMMARY_DIR="$OUT"
-FEATURE=dev-staged-experts
+export FEATURE=dev-staged-experts
 
 mkdir -p "$WORK" "$OUT/done" "$OUT/logs"
 
