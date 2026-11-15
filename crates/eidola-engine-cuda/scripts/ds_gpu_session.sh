@@ -5,6 +5,14 @@
 #   ds_gpu_session.sh [step ...]        (no argument: every step, in order)
 #
 #   steps: setup build kernels ds_ops ds_gemm_ref ds_attention ds_index ds_tiny mimo summary
+#   with the released checkpoint (never run by default; name them):
+#          halves_build halves_encoder halves_decoder halves_reference
+#
+# The `halves_*` steps are the released model on the exact executor, one half
+# at a time (`examples/ds_halves.rs`): the encoder half's boundary and the
+# decoder half's logits over real text, then the model crate's forward on the
+# CPU over the same tokens, compared bit for bit. `halves_reference` needs no
+# GPU. Their recordings and `ds_halves.json` are under $OUT/ds_halves.
 #
 # Run from a checkout (or an unpacked `git archive`) of this repository on a
 # Linux x86_64 machine with one NVIDIA Blackwell GPU and its driver (CUDA 13
@@ -26,6 +34,10 @@
 #   OUT      results                                   (default $WORK/out)
 #   KERNELS  the kernel build output directory         (default: target/engine-kernels/amd64,
 #            else .../arm64, under the checkout, else $WORK/kernels)
+#   CHECKPOINT  the released checkpoint directory, for the `halves_*` steps; its
+#            golden/ holds a reference-*.safetensors with the tokens and the Engram map
+#   EIDOLA_DS_HALVES_TOKENS, EIDOLA_DS_HALVES_CHUNK   tokens of the text and positions
+#            per step                                  (default 256 and 96)
 #
 # Expected time on one B300, after `setup` and `build` (about 10 minutes
 # together on a fresh machine): kernels under 1 minute; ds_ops 5 to 10
@@ -50,6 +62,7 @@ if [ -z "${KERNELS:-}" ]; then
         if [ -d "$dir/cubin" ]; then KERNELS="$dir"; break; fi
     done
 fi
+export CHECKPOINT="${CHECKPOINT:-}"
 export HERE REPO WORK OUT KERNELS="${KERNELS:-}"
 export EIDOLA_ENGINE_KERNELS_DIR="$KERNELS"
 export EIDOLA_DS_SUMMARY_DIR="$OUT" EIDOLA_DS_BENCH_DIR="$OUT" EIDOLA_DS_TINY_SUMMARY="$OUT/ds_tiny.json"
@@ -139,6 +152,23 @@ mimo() {
         quant_ops moe_ops preconditions
 }
 
+# The released model, one half at a time. Each device step loads its half
+# (about 251 GB and 149 GB of weights from the checkpoint's files, the long
+# part), runs the tokens in chunks and leaves its recording; the reference is
+# the CPU's.
+halves() {
+    [ -n "${CHECKPOINT:-}" ] && [ -d "$CHECKPOINT" ] || die "CHECKPOINT names no directory"
+    (cd "$REPO" && EIDOLA_DEEPSEEK_FULL_DIR="$CHECKPOINT" EIDOLA_DS_HALVES_OUT="$OUT/ds_halves" \
+        EIDOLA_DS_HALVES_PHASES="$1" \
+        cargo run --release --locked -p eidola-engine-cuda --example ds_halves)
+}
+halves_build() {
+    (cd "$REPO" && cargo build --release --locked -p eidola-engine-cuda --example ds_halves)
+}
+halves_encoder() { halves encoder; }
+halves_decoder() { halves decoder; }
+halves_reference() { halves reference; }
+
 summary() {
     {
         printf '{\n  "gpu": "%s",\n  "kernels": "%s",\n  "steps": [\n' \
@@ -158,10 +188,11 @@ summary() {
 }
 
 ALL="setup build kernels ds_ops ds_gemm_ref ds_attention ds_index ds_tiny mimo summary"
+NAMED="halves_build halves_encoder halves_decoder halves_reference"
 for step in ${*:-$ALL}; do
-    case " $ALL " in
+    case " $ALL $NAMED " in
         *" $step "*) ;;
-        *) die "unknown step $step (steps: $ALL)" ;;
+        *) die "unknown step $step (steps: $ALL $NAMED)" ;;
     esac
     if [ "$step" = summary ]; then
         # Always rewritten: it reports whatever ran.

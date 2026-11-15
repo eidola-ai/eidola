@@ -194,6 +194,9 @@ impl Buffer {
     }
 }
 
+/// Bytes of one host-to-device copy.
+const UPLOAD_PIECE: usize = 1 << 28;
+
 /// A half on a CUDA device: its own stream of an opened device, the sampler and cipher
 /// images, and the forward's kernel images behind their launch wrappers.
 pub struct CudaDevice {
@@ -250,17 +253,22 @@ impl Device for CudaDevice {
 
     unsafe fn upload(&self, addr: u64, src: &[u8]) -> Result<()> {
         self.bind()?;
-        // SAFETY: the caller's range; a copy from pageable memory has left `src` when
-        // the call returns.
-        unsafe {
-            sys::cuMemcpyHtoDAsync_v2(
-                addr,
-                src.as_ptr().cast(),
-                src.len(),
-                self.gpu.stream().cu_stream(),
-            )
+        // In pieces: a weight tensor may be tens of gigabytes of mapped file.
+        let mut at = addr;
+        for piece in src.chunks(UPLOAD_PIECE) {
+            // SAFETY: the caller's range; a copy from pageable memory has left `piece`
+            // when the call returns.
+            unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    at,
+                    piece.as_ptr().cast(),
+                    piece.len(),
+                    self.gpu.stream().cu_stream(),
+                )
+            }
+            .result()?;
+            at += piece.len() as u64;
         }
-        .result()?;
         Ok(())
     }
 

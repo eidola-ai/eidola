@@ -270,7 +270,15 @@ impl DsCudaExecutor {
         let cap = shape.ratio + 1;
         let mut halves = Vec::new();
         for (half, dev) in [(Half::Encoder, encoder), (Half::Decoder, decoder)] {
-            let w = HalfWeights::load(dev.as_ref(), store, c, &shape, half, cfg.max_model_len)?;
+            let w = HalfWeights::load(
+                dev.as_ref(),
+                Some(store.as_ref()),
+                c,
+                &shape,
+                half,
+                cfg.max_model_len,
+                true,
+            )?;
             let kv = KvStore::new(
                 dev.as_ref(),
                 geometry(c, &spec, half)?,
@@ -632,16 +640,25 @@ impl DsCudaExecutor {
 
     /// The encoder over every position of the step, then the split layer's bank stub;
     /// returns what crosses to the decoder.
-    fn encode(
-        &mut self,
+    /// Runs `after` on a half once layer `l` has been queued (a tap for measurements).
+    fn no_tap(_: usize, _: &HalfNet) -> Result<()> {
+        Ok(())
+    }
+
+    /// The encoder half over every position of the step, then the split layer's bank
+    /// stub; returns what crosses to the decoder. `tap` runs after each layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_half(
+        n: &mut HalfNet,
+        c: &DsConfig,
+        shape: &DsShape,
         plan: &StepPlan,
         rows: &[PlanRow],
         tokens: &[u32],
         ids: &[Vec<u32>],
         from_decoder: &ToEncoder,
+        tap: &mut dyn FnMut(usize, &HalfNet) -> Result<()>,
     ) -> Result<ToDecoder> {
-        let (c, shape) = (&self.c, &self.shape);
-        let n = &mut self.encoder;
         let count = plan.rows();
         Self::step_arrays(n, plan, count, count)?;
         let d = n.d.clone();
@@ -713,6 +730,7 @@ impl DsCudaExecutor {
                 },
             };
             n.layer(l, &run)?;
+            tap(l, n)?;
         }
 
         // The stub: the split layer's attention input, compressed to its bank entry.
@@ -831,14 +849,17 @@ impl DsCudaExecutor {
 
     /// The decoder: the bank entries stored, the chain by the row rule, the head and
     /// the sampler. Returns each sampling row's token and, when asked, its logits.
-    fn decode(
-        &mut self,
+    /// The decoder half up to the head: the bank entries stored, the chain by the row
+    /// rule, and the logits of the plan's head rows left in the half's scratch. Returns
+    /// the head rows. `tap` runs after each layer.
+    pub fn decode_half(
+        n: &mut HalfNet,
+        c: &DsConfig,
+        shape: &DsShape,
         plan: &StepPlan,
-        step: &StepInput,
         crossing: &ToDecoder,
-    ) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
-        let (c, shape) = (&self.c, &self.shape);
-        let n = &mut self.decoder;
+        tap: &mut dyn FnMut(usize, &HalfNet) -> Result<()>,
+    ) -> Result<u32> {
         let d = n.d.clone();
         let boundary = plan.boundary_rows();
 
@@ -881,19 +902,13 @@ impl DsCudaExecutor {
                 build: None,
             };
             n.layer(l, &run)?;
+            tap(l, n)?;
         }
 
         let top = plan.top_rows;
-        let samples: Vec<SampleRow> = step
-            .seqs
-            .iter()
-            .zip(&plan.last_row)
-            .filter(|(e, _)| e.sample)
-            .map(|(e, row)| SampleRow::new(&e.sampling, e.context_len + e.num_tokens, *row))
-            .collect();
         if top == 0 {
             check_status(n.status()?)?;
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(0);
         }
         let (head, final_norm) = n.w.head.expect("the decoder holds the head");
         n.collapse(&n.s.mix_b, top)?;
@@ -926,7 +941,39 @@ impl DsCudaExecutor {
                 ..LinearParams::default()
             })?;
         }
-        // SAFETY: as above.
+        Ok(top)
+    }
+
+    /// The decoder: [`DsCudaExecutor::decode_half`], then the sampler. Returns each
+    /// sampling row's token and, when asked, its logits.
+    fn decode(
+        &mut self,
+        plan: &StepPlan,
+        step: &StepInput,
+        crossing: &ToDecoder,
+    ) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
+        let top = Self::decode_half(
+            &mut self.decoder,
+            &self.c,
+            &self.shape,
+            plan,
+            crossing,
+            &mut Self::no_tap,
+        )?;
+        if top == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let n = &self.decoder;
+        let (d, dev) = (&n.d, n.dev.as_ref());
+        let samples: Vec<SampleRow> = step
+            .seqs
+            .iter()
+            .zip(&plan.last_row)
+            .filter(|(e, _)| e.sample)
+            .map(|(e, row)| SampleRow::new(&e.sampling, e.context_len + e.num_tokens, *row))
+            .collect();
+        // SAFETY: the logits of `top` rows; the sampler's buffers hold a row per
+        // sampling row of the largest step.
         unsafe {
             dev.sample(&SampleArgs {
                 logits: n.s.logits.addr,
@@ -1019,7 +1066,17 @@ impl DsCudaExecutor {
         stats.gather_ms = ms(at);
 
         let at = Instant::now();
-        let crossing = self.encode(&plan, &rows, &tokens, &ids, &to_encoder)?;
+        let crossing = Self::encode_half(
+            &mut self.encoder,
+            &self.c,
+            &self.shape,
+            &plan,
+            &rows,
+            &tokens,
+            &ids,
+            &to_encoder,
+            &mut Self::no_tap,
+        )?;
         stats.encoder_ms = ms(at);
 
         let at = Instant::now();

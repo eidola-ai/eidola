@@ -6,11 +6,13 @@
 //! over two [`half`]s whose forward is [`model`], with [`plan`] ordering a step's rows,
 //! [`kv`] and [`weights`] laying out each half's memory, and [`boundary`] what crosses
 //! between them. [`host`] runs the same executor on host memory with the reference
-//! numerics.
+//! numerics, and [`dry`] with no memory at all: the accounting and the launch checks
+//! of a configuration at any scale.
 
 pub mod abi;
 pub mod attention;
 pub mod boundary;
+pub mod dry;
 pub mod executor;
 pub mod gemm_ref;
 pub mod half;

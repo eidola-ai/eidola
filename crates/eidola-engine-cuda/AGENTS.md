@@ -84,6 +84,7 @@ EIDOLA_ENGINE_KERNELS_DIR=<build output> EIDOLA_DS_BENCH_DIR=<dir> \
 | `boundary.rs` | `ToEncoder`, `ToDecoder` and its check, `StepTransfer`. |
 | `executor.rs` | The seam: maintenance, the step's order, sampling, timings. |
 | `host.rs` | `HostDevice`: host memory and every family computed with the model crate's functions. Tests only. |
+| `dry.rs` | `DryDevice`: no memory at all. Allocations are addresses, read-backs zeros, and a launch runs its wrapper's checks and grid only. With a half laid out without its checkpoint (`HalfWeights::load` with no store) it gives a configuration's device bytes by kind and whether every launch of a step is accepted, at any scale. |
 
 **Two logical devices.** An `Encoder` half and a `Decoder` half each own a `Device`, their weights, pools, tables, scratch and state as separate allocations, and hand kernels only their own addresses. `DsCudaExecutorConfig::devices` names each half's ordinal: the same one twice is two streams of one GPU; two ordinals is two GPUs, with no other change (not exercised).
 
@@ -131,6 +132,21 @@ EIDOLA_ENGINE_KERNELS_DIR=<kernel build output> EIDOLA_DS_TINY_SUMMARY=ds_tiny.j
 
 It prints a line per scenario and writes a JSON summary: per scenario what was compared and each step's time by part (maintenance, gather, encoder, crossing, decoder).
 
+### The released model, one half at a time
+
+`examples/ds_halves.rs` (dev-only) runs the released checkpoint on the exact executor on one GPU, which holds one half and not both. Through the executor's own step path (`DsCudaExecutor::encode_half`, `decode_half`): the encoder half over real text in chunks, every position in the chain, recording the split layer's bank entry and the boundary row of every position and each layer's residual copies; then, the encoder freed, the decoder half teacher-forced from that recording, with logits at every position. The Engram table the decoder's device would hold stays off it: its rows are gathered on the host from the mapped checkpoint, as the boundary carries them. The reference is the model crate's `DsModel` on the CPU over the same tokens (the encoder layers and the bank stub, then the decoder from the recorded boundary); every layer's streams, the boundary, the bank and the logits are compared bit for bit, the first difference named by array, position and element, with top-1 and KL beside. `ds_halves.json` holds each half's memory by kind, load time, per-step times and positions per second, and the comparison. Phases (`encoder`, `decoder`, `reference`) read what earlier ones left, so the CPU reference can run after the device is released.
+
+**It has not run on a device.** What holds here: the whole flow on the fixture over `HostDevice`, equal to the reference, with a flipped recorded bit named exactly; and the released configuration laid out with no checkpoint on a `DryDevice` of one B300's memory, both halves over 555 tokens in steps of 96, every launch accepted by its wrapper (`cargo test -p eidola-engine-cuda --example ds_halves`). The example repeats that dry run before it loads a half.
+
+| Released model, on a device (555 positions, steps of 96) | Encoder half | Decoder half, no Engram table |
+|---|---|---|
+| Weights | 250,861,236,640 | 149,147,714,272 |
+| KV pools, tables, state | 6,604,792 | 6,462,552 |
+| Scratch | 57,873,608 | 200,786,120 |
+| Total | 250,925,715,040 | 149,354,962,944 |
+
+Weights are copied tensor by tensor from the mapped checkpoint, in pieces of 256 MB, so no second copy is held on the host; a layer's experts are written expert by expert into their expert-major arrays.
+
 ### The device session
 
 `scripts/ds_gpu_session.sh` runs every device test that needs no checkpoint, in order and unattended, on a Linux x86_64 machine with one Blackwell GPU, from a checkout or an unpacked `git archive`. It compiles nothing for the GPU: the kernel images are the reproducible build's output directory (`target/engine-kernels/<builder arch>`, the same bytes from either builder architecture), copied to the machine and named by `KERNELS`; every image is checked against the compiled-in manifest when it is loaded. Each step is idempotent (a marker under `$OUT/done/`), logged to `$OUT/logs/`, timed, and fails loudly; a device test that skipped fails its step. Results are JSON in `$OUT`, with `session.json` listing the steps.
@@ -146,6 +162,7 @@ It prints a line per scenario and writes a JSON summary: per scenario what was c
 | `ds_tiny` | the executor against the CPU reference executor (`ds_tiny.json`) | 10 to 15 |
 | `mimo` | MiMo's device suites that need no checkpoint: `gemm`, `moe_gemm`, `attention`, `sampler`, `kv`, `kv_cipher`, `copy_rows`, `qkv_rope_kv`, `quant_ops`, `moe_ops`, `preconditions` | 3 to 6 |
 | `summary` | `session.json` | |
+| `halves_build`, `halves_encoder`, `halves_decoder`, `halves_reference` | named only, with `CHECKPOINT`: the released model one half at a time (above); the last needs no GPU | loading 251 GB and 149 GB dominates and depends on the volume; a position costs about 20 ms a half on the exact kernels; the CPU reference is the model crate's whole forward |
 
 The times are estimates; none was measured.
 

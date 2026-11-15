@@ -376,7 +376,8 @@ enum Count {
 
 struct Loader<'a> {
     dev: &'a dyn Device,
-    store: &'a WeightSet,
+    /// The checkpoint, or none to lay the half out without its bytes.
+    store: Option<&'a WeightSet>,
     buffers: Vec<Buffer>,
     bytes: WeightBytes,
 }
@@ -413,11 +414,13 @@ impl<'a> Loader<'a> {
     }
 
     /// A tensor's stored bytes, its dtype and shape checked.
-    fn stored(&self, name: &str, dtype: Dtype, shape: &[usize]) -> Result<&'a [u8]> {
-        let store: &'a WeightSet = self.store;
+    fn stored(&self, name: &str, dtype: Dtype, shape: &[usize]) -> Result<Option<&'a [u8]>> {
+        let Some(store) = self.store else {
+            return Ok(None);
+        };
         let t = store.get(name).map_err(model_err)?;
         t.expect(name, dtype, shape).map_err(model_err)?;
-        Ok(t.data)
+        Ok(Some(t.data))
     }
 
     /// A tensor as stored, or its first `take` bytes.
@@ -430,29 +433,34 @@ impl<'a> Loader<'a> {
         take: Option<usize>,
     ) -> Result<u64> {
         let data = self.stored(name, dtype, shape)?;
-        let data = &data[..take.unwrap_or(data.len())];
+        let len = take.unwrap_or(shape.iter().product::<usize>() * dtype.size());
         let dev = self.dev;
-        let buf = self.buffer(kind, data.len())?;
-        buf.write(dev, 0, data)?;
+        let buf = self.buffer(kind, len)?;
+        if let Some(data) = data {
+            buf.write(dev, 0, &data[..len])?;
+        }
         Ok(buf.addr)
     }
 
-    fn values(&self, name: &str, dtype: Dtype, n: usize) -> Result<Vec<f32>> {
-        let t = self.store.get(name).map_err(model_err)?;
-        t.expect(name, dtype, &[n]).map_err(model_err)?;
+    fn values(&self, name: &str, dtype: Dtype, shape: &[usize]) -> Result<Vec<f32>> {
+        let Some(store) = self.store else {
+            return Ok(vec![0.0; shape.iter().product()]);
+        };
+        let t = store.get(name).map_err(model_err)?;
+        t.expect(name, dtype, shape).map_err(model_err)?;
         t.to_f32(name).map_err(model_err)
     }
 
     /// A BF16 norm weight, widened to f32.
     fn norm(&mut self, kind: Count, name: &str, n: usize) -> Result<u64> {
-        let v = self.values(name, Dtype::Bf16, n)?;
+        let v = self.values(name, Dtype::Bf16, &[n])?;
         self.put(kind, &v)
     }
 
     fn fp8(&mut self, kind: Count, prefix: &str, n: usize, k: usize) -> Result<Fp8> {
         let (wn, sn) = (format!("{prefix}.weight"), format!("{prefix}.scale"));
         let codes = self.stored(&wn, Dtype::F8E4M3, &[n, k])?;
-        if let Some(at) = first_nan_e4m3(codes) {
+        if let Some(at) = codes.and_then(first_nan_e4m3) {
             return Err(CudaError::new(format!(
                 "{wn}: element {at} is a NaN E4M3 code, which no block product is defined over"
             )));
@@ -483,7 +491,7 @@ impl<'a> Loader<'a> {
             &[n],
             None,
         )?;
-        let scale = self.values(&format!("{p}.hc_{sub}_scale"), Dtype::F32, 3)?;
+        let scale = self.values(&format!("{p}.hc_{sub}_scale"), Dtype::F32, &[3])?;
         // The three scales travel in the launch's struct; they are counted with the
         // layer's f32 tensors all the same.
         self.count(Count::F32, 12);
@@ -559,8 +567,9 @@ impl<'a> Loader<'a> {
                 (3, 0, name("w2", "scale"), Dtype::F8E8M0, [d, inter / 32]),
             ];
             for (array, offset, tensor, dtype, shape) in parts {
-                let data = self.stored(&tensor, dtype, &shape)?;
-                self.buffers[first + array].write(dev, e * sizes[array] + offset, data)?;
+                if let Some(data) = self.stored(&tensor, dtype, &shape)? {
+                    self.buffers[first + array].write(dev, e * sizes[array] + offset, data)?;
+                }
             }
         }
         Ok(Experts {
@@ -601,12 +610,8 @@ impl<'a> Loader<'a> {
         };
         let engram = match (spec.engram, &c.engram) {
             (Some(slot), Some(e)) => {
-                let read = |this: &Self, name: &str| -> Result<Vec<f32>> {
-                    let t = this.store.get(name).map_err(model_err)?;
-                    t.expect(name, Dtype::Bf16, &[c.hc_mult, d])
-                        .map_err(model_err)?;
-                    t.to_f32(name).map_err(model_err)
-                };
+                let read =
+                    |this: &Self, name: &str| this.values(name, Dtype::Bf16, &[c.hc_mult, d]);
                 let q = read(self, &format!("{p}.engram.q_weight"))?;
                 let k = read(self, &format!("{p}.engram.k_weight"))?;
                 let product: Vec<f32> = q.iter().zip(&k).map(|(a, b)| a * b).collect();
@@ -683,14 +688,17 @@ impl<'a> Loader<'a> {
 
 impl HalfWeights {
     /// Uploads `half`'s weights from `store`, with RoPE tables for `positions`
-    /// positions.
+    /// positions. Without a store every tensor is allocated at its size and left zero:
+    /// the half's layout and accounting with no checkpoint. Without `tables` the Engram tables the half's device would hold stay
+    /// off it (a half run alone, whose table rows are gathered elsewhere).
     pub fn load(
         dev: &dyn Device,
-        store: &WeightSet,
+        store: Option<&WeightSet>,
         c: &DsConfig,
         shape: &DsShape,
         half: Half,
         positions: u32,
+        tables: bool,
     ) -> Result<HalfWeights> {
         let mut ld = Loader {
             dev,
@@ -707,8 +715,9 @@ impl HalfWeights {
         for l in range {
             layers[l] = Some(ld.layer(c, l)?);
         }
+        let load_tables = tables;
         let mut tables = vec![None; shape.engram_device.len()];
-        if let Some(e) = &c.engram {
+        if let (Some(e), true) = (&c.engram, load_tables) {
             for (slot, spec) in e.layers.iter().enumerate() {
                 let Some(layer) = shape.engram_layer[slot] else {
                     continue;
