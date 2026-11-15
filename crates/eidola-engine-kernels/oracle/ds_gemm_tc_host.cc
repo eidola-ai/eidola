@@ -44,6 +44,8 @@ struct Rng {
 };
 
 int failures = 0;
+// Steps staged with each path of the scale bytes.
+uint64_t word_staged = 0, byte_staged = 0;
 
 void check(bool ok, const char* what) {
   if (!ok) {
@@ -304,8 +306,22 @@ void fill(dstc::Stage<C>& s, const dstc::Pass& p, uint32_t step) {
       std::memset(&s.x[row][off], 0, 16);
     }
   }
-  for (uint32_t i = 0; i < (C::kFeatures + C::kTokens) * C::kStepBlocks; ++i) {
-    dstc::stage_scale<C>(p, step, i, s);
+  if (dstc::scales_by_words(p)) {
+    ++word_staged;
+    for (uint32_t i = 0; i < (C::kFeatures + C::kTokens) * (C::kStepBlocks / 4); ++i) {
+      uint8_t* dst;
+      const uint8_t* src = dstc::scale_copy<C>(p, step, i, s, &dst);
+      if (src) {
+        std::memcpy(dst, src, 4);
+      } else {
+        std::memset(dst, 0, 4);
+      }
+    }
+  } else {
+    ++byte_staged;
+    for (uint32_t i = 0; i < (C::kFeatures + C::kTokens) * C::kStepBlocks; ++i) {
+      dstc::stage_scale<C>(p, step, i, s);
+    }
   }
 }
 
@@ -582,6 +598,9 @@ int main() {
   std::printf("lin4: %llu outputs, banded differing %llu, tolerance differing %llu\n",
               static_cast<unsigned long long>(t4.outputs), static_cast<unsigned long long>(t4.banded_diff),
               static_cast<unsigned long long>(t4.tolerance_diff));
+  std::printf("scale staging: %llu steps by words, %llu by bytes\n",
+              static_cast<unsigned long long>(word_staged), static_cast<unsigned long long>(byte_staged));
+  check(word_staged > 1000 && byte_staged > 1000, "both scale staging paths ran");
   std::printf("failures: %d\n", failures);
   return failures == 0 ? 0 : 1;
 }

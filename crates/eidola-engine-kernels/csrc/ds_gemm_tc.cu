@@ -70,6 +70,13 @@ __device__ __forceinline__ void copy16(uint8_t* dst, const uint8_t* src, const u
                "l"(src != nullptr ? src : any), "r"(src != nullptr ? 16u : 0u)
                : "memory");
 }
+// 4 bytes, or 4 zero bytes when `src` is null.
+__device__ __forceinline__ void copy4(uint8_t* dst, const uint8_t* src, const uint8_t* any) {
+  const uint32_t to = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(to),
+               "l"(src != nullptr ? src : any), "r"(src != nullptr ? 4u : 0u)
+               : "memory");
+}
 __device__ __forceinline__ void commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int kPending>
 __device__ __forceinline__ void wait_copies() {
@@ -89,8 +96,16 @@ __device__ __forceinline__ void fill(Stage<C>& s, const Pass& p, uint32_t step) 
     const uint8_t* src = dstc::x_copy<C>(p, step, i, &row, &off);
     copy16(&s.x[row][off], src, p.x);
   }
-  for (uint32_t i = t; i < (C::kFeatures + C::kTokens) * C::kStepBlocks; i += kThreads) {
-    dstc::stage_scale<C>(p, step, i, s);
+  if (dstc::scales_by_words(p)) {
+    for (uint32_t i = t; i < (C::kFeatures + C::kTokens) * (C::kStepBlocks / 4); i += kThreads) {
+      uint8_t* dst;
+      const uint8_t* src = dstc::scale_copy<C>(p, step, i, s, &dst);
+      copy4(dst, src, p.ws);
+    }
+  } else {
+    for (uint32_t i = t; i < (C::kFeatures + C::kTokens) * C::kStepBlocks; i += kThreads) {
+      dstc::stage_scale<C>(p, step, i, s);
+    }
   }
 }
 

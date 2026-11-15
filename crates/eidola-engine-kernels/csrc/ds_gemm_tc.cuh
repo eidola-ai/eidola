@@ -46,6 +46,7 @@
 #include "ds_numeric.cuh"
 
 #include <cstddef>
+#include <cstdint>
 
 #if defined(__CUDACC__)
 #define DSTC_FN __host__ __device__ __forceinline__
@@ -88,6 +89,7 @@ struct Cfg {
   static constexpr uint32_t kWRow = kWBytes + kPad;
   static constexpr uint32_t kXRow = kXBytes + kPad;
   static_assert(kWarps % kFeatureWarps == 0 && kStepBlocks % (kWarps / kFeatureWarps) == 0);
+  static_assert(kStepBlocks % 4 == 0, "scales are staged in 4-block words");
 };
 
 // The tiles: four warps side by side over the outputs, each computing every
@@ -179,6 +181,37 @@ DSTC_FN const uint8_t* x_copy(const Pass& p, uint32_t step, uint32_t i, uint32_t
   const uint32_t valid = blocks_in_step<C>(p, step) * 32u;
   if (*row < p.lo || *row >= p.hi || *off >= valid) return nullptr;
   return p.x + static_cast<uint64_t>(*row) * p.k + static_cast<uint64_t>(step) * C::kXBytes + *off;
+}
+
+// Whether a pass's scale bytes can be staged by 4-byte asynchronous copies:
+// every row's scale bytes start on a multiple of 4 (`k / 32` a multiple of 4
+// and both arrays 4-byte aligned), so a step's 4-block groups are whole
+// words, each wholly inside `k` or wholly past it. Otherwise they are staged
+// byte by byte (`stage_scale`), which waits for each load.
+DSTC_FN bool scales_by_words(const Pass& p) {
+  return (p.k / 32) % 4 == 0 && reinterpret_cast<uintptr_t>(p.ws) % 4 == 0 &&
+         reinterpret_cast<uintptr_t>(p.xs) % 4 == 0;
+}
+
+// Copy `i` of the step's 4-byte scale copies (`i < (kFeatures + kTokens) ·
+// kStepBlocks / 4`, weight scales first) when `scales_by_words`: where it
+// lands, and its source, or `nullptr` for a zero-filled word (an output or a
+// row outside the pass, blocks past `k`: nothing reads those scales).
+template <class C>
+DSTC_FN const uint8_t* scale_copy(const Pass& p, uint32_t step, uint32_t i, Stage<C>& s,
+                                  uint8_t** dst) {
+  constexpr uint32_t groups = C::kStepBlocks / 4;
+  const uint32_t kb = p.k / 32, first = step * C::kStepBlocks + (i % groups) * 4;
+  if (i < C::kFeatures * groups) {
+    const uint32_t r = i / groups, f = p.f0 + r;
+    *dst = &s.ws[r][(i % groups) * 4];
+    if (f >= p.n || first >= kb) return nullptr;
+    return p.ws + (C::kFp4 ? static_cast<uint64_t>(f) * kb : static_cast<uint64_t>(f / 32) * kb) + first;
+  }
+  const uint32_t r = (i - C::kFeatures * groups) / groups;
+  *dst = &s.xs[r][(i % groups) * 4];
+  if (r < p.lo || r >= p.hi || first >= kb) return nullptr;
+  return p.xs + static_cast<uint64_t>(r) * kb + first;
 }
 
 // The scale bytes of the step, item `i < (kFeatures + kTokens) · kStepBlocks`:
