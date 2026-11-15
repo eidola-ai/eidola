@@ -98,6 +98,53 @@ pub fn env_map() -> HashMap<&'static str, String> {
     ])
 }
 
+pub const DEEPSEEK_MODEL_ID: &str = "deepseek-test";
+
+/// The DeepSeek-V4.1 dev model directory (built once, cached under the target
+/// directory).
+pub fn deepseek_model_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("engine-dev-model-deepseek");
+        fixture::ensure_deepseek_dev_model(&dir).expect("build the DeepSeek dev model");
+        dir
+    })
+}
+
+/// The DeepSeek-V4.1 dev model's weights hash, computed independently of the crate.
+pub fn deepseek_weights_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| fixture::weights_hash_of(deepseek_model_dir()))
+}
+
+/// The DeepSeek-V4.1 dev model, verified and loaded once per test binary.
+pub fn deepseek_loaded() -> Arc<LoadedModel> {
+    static MODEL: OnceLock<Arc<LoadedModel>> = OnceLock::new();
+    MODEL
+        .get_or_init(|| {
+            Arc::new(
+                LoadedModel::load(
+                    deepseek_model_dir(),
+                    deepseek_weights_hash(),
+                    WeightsStorage::DevWritable,
+                    ExecutorKind::Cpu,
+                )
+                .unwrap(),
+            )
+        })
+        .clone()
+}
+
+/// A complete, valid environment for the DeepSeek-V4.1 dev model: [`env_map`] with its
+/// directory, hash and id, and a draft width the drafter's four slots hold.
+pub fn deepseek_env_map() -> HashMap<&'static str, String> {
+    let mut map = env_map();
+    map.insert(env::MODEL_ID, DEEPSEEK_MODEL_ID.to_string());
+    map.insert(env::WEIGHTS_DIR, deepseek_model_dir().display().to_string());
+    map.insert(env::WEIGHTS_SHA256, deepseek_weights_hash().to_string());
+    map
+}
+
 /// A swap list naming no active area, for tests that boot a node the swap check applies
 /// to and assert what happens after it.
 pub fn no_swap_list() -> &'static std::path::Path {
@@ -124,6 +171,8 @@ pub fn config_from(map: &HashMap<&'static str, String>) -> Result<Config, String
 /// A running node.
 pub struct TestNode {
     pub base: String,
+    /// The weights hash the node serves, sent in every request's header.
+    pub weights: String,
     pub engine: EngineHandle,
     pub admission: Arc<eidola_server_engine::worker::Admission>,
     pub client: reqwest::Client,
@@ -148,15 +197,29 @@ impl TestNode {
         Self::serve(node).await
     }
 
+    /// Starts a node over the shared DeepSeek-V4.1 dev model, with `overrides` applied to
+    /// [`deepseek_env_map`].
+    pub async fn start_deepseek(overrides: &[(&'static str, &str)]) -> TestNode {
+        let mut map = deepseek_env_map();
+        for (k, v) in overrides {
+            map.insert(k, v.to_string());
+        }
+        let config = config_from(&map).unwrap();
+        let node = eidola_server_engine::start(config, deepseek_loaded()).unwrap();
+        Self::serve(node).await
+    }
+
     pub async fn serve(node: eidola_server_engine::Node) -> TestNode {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let router = node.router;
+        let weights = node.weights_hash;
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
         TestNode {
             base,
+            weights,
             engine: node.engine,
             admission: node.admission,
             client: http_client(),
@@ -182,7 +245,7 @@ impl TestNode {
         self.client
             .post(format!("{}/v1/chat/completions", self.base))
             .bearer_auth(TOKEN)
-            .header("x-eidola-weights-sha256", weights_hash())
+            .header("x-eidola-weights-sha256", &self.weights)
             .json(&body)
     }
 

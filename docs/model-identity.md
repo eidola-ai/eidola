@@ -64,7 +64,7 @@ The published per-file manifest lets you check one file at a time, and its sizes
 
 ## What the hash pins, and what it does not
 
-The hash pins **the bytes of the weights**, and with them the tokenizer, the chat template and the default sampling settings. A node refuses a request naming any other hash before the request is admitted, and the gateway names the hash on every request it sends.
+The hash pins **the bytes of the weights**, and with them the tokenizer, the chat template where the engine reads one, and the default sampling settings. A prompt format compiled into the engine (DeepSeek-V4.1's) is pinned with the engine build, below. A node refuses a request naming any other hash before the request is admitted, and the gateway names the hash on every request it sends.
 
 It does **not** pin exact behaviour. The engine's code and version, its numerics (the kernels, the order floating-point work is done in, the batch a request shares) and the sampling seed are outside it. The engine build is pinned separately, by the deployment's launch identity ([Inference engine](engine.md#what-pins-the-engine)); two engines serving the same hash run the same model, not necessarily to the same bit.
 
