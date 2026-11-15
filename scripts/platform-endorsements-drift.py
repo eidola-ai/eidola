@@ -8,6 +8,14 @@ release tags, one per line (any tag; only `platform-vX.Y.Z` ones count).
 Exits 1 on drift, 2 when either side lists no platform release at all (a
 check that found nothing to compare must not pass), 0 otherwise. Standard
 library only.
+
+"Behind" means what the gateway's build means by it: a deployment that names
+a release older than the newest one is drift unless its sidecar states why it
+stays (`tdx.platform_endorsements.hold`). The build refuses such a deployment
+without a hold when the newer release is vendored; here, against the
+provider's releases, a held deployment is reported with its reason and is not
+drift. A newer release than the newest vendored one is always drift: adopting
+it is the decision the hold records, and it has not been made.
 """
 
 import json
@@ -56,17 +64,20 @@ def main(root, upstream_file):
             "what changed (raised floors, machines added or removed)"
         )
     for sidecar in sorted((root / "deploy/engine").glob("*/*/deployment.json")):
-        release = (
-            json.loads(sidecar.read_text())
-            .get("tdx", {})
-            .get("platform_endorsements", {})
-            .get("release")
+        endorsements = (
+            json.loads(sidecar.read_text()).get("tdx", {}).get("platform_endorsements", {})
         )
+        release = endorsements.get("release")
+        hold = endorsements.get("hold")
         at = sidecar.relative_to(root)
         if release is None:
             continue
         print(f"{at}: {release}")
-        if version(release) is None or version(release) < version(newest):
+        if version(release) is not None and version(release) >= version(newest):
+            continue
+        if isinstance(hold, str) and hold.strip():
+            print(f"::notice::{at} stays on {release} ({newest} is published): {hold}")
+        else:
             drift.append(f"{at} names {release}; {newest} is published")
     for line in drift:
         print(f"::error::{line}")

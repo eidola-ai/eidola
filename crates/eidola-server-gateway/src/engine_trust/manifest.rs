@@ -44,6 +44,10 @@
 //! - Every deployment directory committed under `deploy/engine/` is pinned
 //!   ([`require_every_deployment_pinned`]), so the file is a function of the
 //!   tree in both directions.
+//! - The vendored platform material is exactly what the deployments use
+//!   ([`require_vendored_releases_named`]): each TDX deployment names the
+//!   newest vendored platform endorsements release or states why it holds
+//!   back, and no vendored release or release manifest is one nothing names.
 //!
 //! - **A TDX pin's MRTD is the platform release's statement of it**: the
 //!   release manifest `cvm-version` pins, vendored under
@@ -239,6 +243,100 @@ pub fn require_every_deployment_pinned(
             return Err(format!(
                 "{config} is committed but not pinned in releases/trust/engine-enclaves.json \
                  (measure it with measure-enclave's measure-engine-enclaves)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The vendored platform material is exactly what the committed deployments
+/// use, and each deployment uses the newest of it or says why not.
+/// `committed` is the config path of every committed deployment (which
+/// [`require_every_deployment_pinned`] has held to the checked pins), and
+/// `vendored` the workspace path of every file under
+/// `releases/trust/platform-endorsements/` and `releases/trust/cvm-releases/`.
+///
+/// - A TDX deployment names the newest vendored platform endorsements
+///   release, or names an older one and states why in
+///   `tdx.platform_endorsements.hold`; a hold on the newest release is
+///   refused, since it holds nothing back. Vendoring a newer release so makes
+///   every deployment move to it or state its reason in the same change, and
+///   moving a deployment back to an older release needs a stated reason.
+/// - Every vendored file is a release's endorsements file or Sigstore bundle
+///   that a deployment names, or the newest release's (kept while no
+///   deployment names it, as the baseline the scheduled drift check compares
+///   the provider's releases against), or the release manifest a
+///   deployment's `cvm-version` pins. Anything else is an orphan: no build
+///   reads it, so no change to it would be seen.
+pub fn require_vendored_releases_named(
+    committed: &[String],
+    vendored: &[String],
+    read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+) -> Result<(), String> {
+    use eidola_common::platform_release;
+    let newest = vendored
+        .iter()
+        .filter_map(|path| {
+            let rest =
+                path.strip_prefix(&format!("{}/", deployment::PLATFORM_ENDORSEMENTS_ROOT))?;
+            let (tag, _) = rest.split_once('/')?;
+            Some((platform_release::version(tag)?, tag))
+        })
+        .max()
+        .map(|(_, tag)| tag.to_owned());
+
+    let mut used: Vec<String> = Vec::new();
+    if let Some(newest) = &newest {
+        let (file, bundle) = deployment::platform_endorsement_files(newest);
+        used.extend([file, bundle]);
+    }
+    for config_path in committed {
+        let directory = config_path
+            .strip_suffix("/tinfoil-config.yml")
+            .ok_or_else(|| format!("{config_path}: not a deployment config path"))?;
+        let sidecar_path = format!("{directory}/deployment.json");
+        let checked = deployment::check_deployment(
+            config_path,
+            &read(config_path)?,
+            &sidecar_path,
+            &read(&sidecar_path)?,
+        )
+        .map_err(|e| format!("{config_path}: {e}"))?;
+        used.push(
+            deployment::release_manifest_file(&checked.cvm_version)
+                .map_err(|e| format!("{config_path}: {e}"))?,
+        );
+        let Some(machines) = &checked.tdx else {
+            continue;
+        };
+        let (file, bundle) = deployment::platform_endorsement_files(&machines.release);
+        used.extend([file, bundle]);
+        let at = format!("{sidecar_path}: tdx.platform_endorsements");
+        let is_newest = newest.as_deref() == Some(machines.release.as_str());
+        match (&machines.hold, is_newest) {
+            (None, false) => {
+                return Err(format!(
+                    "{at}: names {}, but the newest vendored release is {}; move the \
+                     deployment to it, or state why it stays in `hold`",
+                    machines.release,
+                    newest.as_deref().unwrap_or("none"),
+                ));
+            }
+            (Some(_), true) => {
+                return Err(format!(
+                    "{at}: states a hold, but {} is the newest vendored release; remove it",
+                    machines.release
+                ));
+            }
+            _ => {}
+        }
+    }
+    for path in vendored {
+        if !used.contains(path) {
+            return Err(format!(
+                "{path} is vendored, but no committed deployment names it; remove it (only \
+                 the newest platform endorsements release stays unnamed, as the drift check's \
+                 baseline)"
             ));
         }
     }

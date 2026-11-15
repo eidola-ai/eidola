@@ -13,8 +13,11 @@ name: Platform Endorsements Drift
 # not one: an upstream release is not something a pull request introduced. It
 # runs daily against the default branch (plus on demand), and a newer release
 # than the newest vendored one, or than one a committed engine deployment
-# names, shows up as a red scheduled run. Adopting it is a maintainer step:
-# `just engine-platform-endorsements <tag>` (deploy/engine/README.md).
+# names, shows up as a red scheduled run, unless that deployment's sidecar
+# states why it stays (`hold`, which the gateway's build also requires of a
+# deployment behind the newest vendored release). Adopting it is a
+# maintainer step: `just engine-platform-endorsements <tag>`
+# (deploy/engine/README.md).
 #
 # Only the release listing is fetched here; the comparison is
 # scripts/platform-endorsements-drift.py (standard library only), which also
