@@ -214,6 +214,7 @@ check:
     cargo fmt --check
     rumdl check .
     cargo-deny check licenses bans sources
+    cargo-deny --manifest-path crates/devtools/Cargo.toml check licenses sources
     ./scripts/check-manifest-determinism.sh
     ./scripts/check-rust-toolchain.sh
     ./scripts/test-check-rust-toolchain.sh

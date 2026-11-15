@@ -95,7 +95,9 @@ platform-endorsements = ["dep:const-oid", "dep:spki", "dep:p256", "dep:p384", "d
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-rustls = { version = "0.23", features = ["ring"] }
+# The live and mock-shim tests install the RustCrypto provider, as production
+# callers do.
+rustls-rustcrypto = "0.0.2-alpha"
 # Live integration tests pull in WebPKI roots so they can talk to
 # inference.tinfoil.sh. Production callers (eidola-server-gateway) bring their
 # own.

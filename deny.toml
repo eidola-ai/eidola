@@ -39,6 +39,11 @@ targets = [
 # so it should be used with care. The identifiers are [Package ID Specifications]
 # (https://doc.rust-lang.org/cargo/reference/pkgid-spec.html)
 #exclude = []
+# gpui-kit-assets' wasm-only reqwest (`cfg(target_family = "wasm")`), which
+# enables rustls' `ring` provider. No native build compiles it; pruning it
+# keeps the `ring` ban below about what native builds compile. Its exclusive
+# dependencies (wasm- and Windows-only) leave these checks with it.
+exclude = ["gpui-pre-reqwest"]
 # If true, metadata will be collected with `--all-features`. Note that this can't
 # be toggled off if true, if you want to conditionally enable `--all-features` it
 # is recommended to pass `--all-features` on the cmd line instead
@@ -223,6 +228,7 @@ allow = [
 allow-workspace = false
 # List of crates to deny
 deny = [
+    { crate = "ring", reason = "RustCrypto is the crypto backend; ring refuses the Nix checks' `-C target-cpu=generic` on aarch64-darwin" },
     #"ansi_term@0.11.0",
     #{ crate = "ansi_term@0.11.0", reason = "you can specify a reason it is banned" },
     # Wrapper crates can optionally be specified to allow the crate when it
