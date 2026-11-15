@@ -42,8 +42,9 @@ Its `id` is the model's first tag, or `sha256:<hex>` when it has none.
 The hash covers files at the top level of the engine's weights directory only. A published checkpoint may hold subdirectories (MiMo-V2.6-Flash's carries a drafter and an audio tokenizer in two); the engine reads nothing in them, and they are not hashed. The hash **covers** these files:
 
 - every file whose name ends in `.safetensors` (the shards);
-- `config.json`, `tokenizer.json`, `chat_template.jinja` and `generation_config.json`, all required;
-- `model.safetensors.index.json`, when present.
+- `config.json`, `tokenizer.json`, `chat_template.jinja`, `generation_config.json` and `model.safetensors.index.json`, each when present.
+
+`config.json` and `tokenizer.json` are always required. A model whose engine reads the other two requires them as well: MiMo-V2.6's reads its template and its sampling defaults; DeepSeek-V4.1's encodes its prompt with code compiled into the engine and reads `generation_config.json` only when there is one. A covered file the engine does not read is hashed all the same.
 
 Every covered name must match `[A-Za-z0-9_][A-Za-z0-9._-]*`: ASCII letters, digits, `.`, `_` and `-`, not starting with `.` or `-`. The engine refuses a directory holding a covered file named otherwise. Files that are not covered are not read.
 
@@ -63,7 +64,7 @@ The published per-file manifest lets you check one file at a time, and its sizes
 
 ## What the hash pins, and what it does not
 
-The hash pins **the bytes of the weights**, and with them the tokenizer, the chat template and the default sampling settings. A node refuses a request naming any other hash before the request is admitted, and the gateway names the hash on every request it sends.
+The hash pins **the bytes of the weights**, and with them the tokenizer, the chat template where the engine reads one, and the default sampling settings. A prompt format compiled into the engine (DeepSeek-V4.1's) is pinned with the engine build, below. A node refuses a request naming any other hash before the request is admitted, and the gateway names the hash on every request it sends.
 
 It does **not** pin exact behaviour. The engine's code and version, its numerics (the kernels, the order floating-point work is done in, the batch a request shares) and the sampling seed are outside it. The engine build is pinned separately, by the deployment's launch identity ([Inference engine](engine.md#what-pins-the-engine)); two engines serving the same hash run the same model, not necessarily to the same bit.
 
