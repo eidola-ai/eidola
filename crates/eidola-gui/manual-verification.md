@@ -1,4 +1,4 @@
-# Manual verification — macOS status item, the background app, login item, the startup dialog
+# Manual verification — macOS status item, the background app, login item, the command-line link, the startup dialog
 
 The AppKit half of the app lifecycle (task 17, waves 3 and 3b) is a live-system surface no test platform reaches (see AGENTS.md → App lifecycle → "What only a human can verify"). This is the release-verification procedure for it. The cheap oracle for the activation policy:
 
@@ -41,7 +41,7 @@ Build: `just build gui` (or `cargo build -p eidola-gui -p eidola-cli && ./script
 
 ## Open at login
 
-17. Settings → General ends with a **Startup** section: "Open at login" with a switch and one muted line.
+17. Settings → General has a **Startup** section: "Open at login" with a switch and one muted line.
 18. **Known gap, not a bug to file:** turning this on makes login open the ordinary **windowed** app, not the background/menu-bar layer — `SMAppService.mainAppService` takes no arguments, so `--windowless` is unreachable through it (options recorded in `src/login_item.rs`). The row's copy says "Eidola opens with your session" for exactly that reason; if it ever promises the menu bar again without the LaunchAgent change landing, that is the bug.
 19. Running from `crates/eidola-gui/build/Eidola.app` (ad-hoc signed, not in /Applications), expect the honest unavailable state: switch dimmed and inert, line reads "Unavailable — this needs macOS 13 or later, and an installed, signed app." **This is the expected dev-build state**, not a bug. If it *is* settable in your build, so much the better — go on.
 20. Copy the bundle to /Applications and launch it from there. Turn the switch on: System Settings → General → Login Items should list Eidola under "Open at Login". Turn it off: the entry disappears.
@@ -49,24 +49,39 @@ Build: `just build gui` (or `cargo build -p eidola-gui -p eidola-cli && ./script
 22. A refusal (unsigned bundle, denied) shows macOS's own wording in a red banner under the row and leaves the switch where the system actually is — it never flips optimistically.
 23. Nothing is remembered app-side: the switch's state comes only from the system, so deleting `~/Library/Application Support/eidola` must not change it.
 
+## The command-line link
+
+Settings → General → **Command line** links `/usr/local/bin/eidola` to the running bundle's `Contents/MacOS/eidola-cli`. The tests write only into temporary directories and never raise the administrator prompt, so this half is checked here. Note what is at `/usr/local/bin/eidola` before you start (`ls -l /usr/local/bin/eidola`) and put it back afterwards.
+
+24. With nothing at `/usr/local/bin/eidola`, open Settings → General. The row reads "Not installed…" and names `/usr/local/bin`. On a stock Mac that directory is root-owned or missing, so the verb reads **Install…** and the line above it says macOS will ask for an administrator's password.
+25. Press **Install…**. The verb becomes "Waiting for an administrator's password…" and macOS shows its own authorization dialog (from `osascript`). **Cancel it.** Expected: nothing at `/usr/local/bin/eidola`, the verb back, and a box saying nothing was changed with the exact Terminal command and a **Copy** button. Paste the copied command into a text editor: the bundle path is single-quoted.
+26. Press **Install…** again and authenticate. Expected: the row reads "Installed — … through /usr/local/bin/eidola", no verb. In a **new** Terminal window, `which eidola` prints `/usr/local/bin/eidola`, `readlink /usr/local/bin/eidola` prints this bundle's `Contents/MacOS/eidola-cli`, and `eidola --help` runs. With a local model downloaded, `eidola model list` shows it as the app does (the linked CLI finds the bundle's engine through the link).
+27. **Moved app.** Quit Eidola fully (status menu ▸ Quit Eidola), move `Eidola.app` to another folder, and open it from there. Settings → General now says the link points at a copy of Eidola that is no longer there, naming the old path, and offers **Update link…**. Press it and authenticate; the row reads Installed again and `readlink` names the new location.
+28. **Another copy.** With two copies of the app on disk, install from one and open Settings in the other: the row says `/usr/local/bin/eidola` runs another copy and offers **Update link…**.
+29. **Never clobber.** Replace the link with a regular file (`sudo rm /usr/local/bin/eidola && echo 'echo mine' | sudo tee /usr/local/bin/eidola`), then switch away from General and back. The row names the file, says Eidola won't replace it, and offers **no verb**. Repeat with a link to something else (`sudo ln -sf /bin/echo /usr/local/bin/eidola`): the row names `/bin/echo` and offers no verb. Neither is touched.
+30. **Translocation.** Download a build, leave it quarantined in `~/Downloads` and open it from there (macOS runs it from an `AppTranslocation` path). The row says macOS is running it from a temporary location and asks you to move it to Applications; there is no verb.
+31. **Development builds** (`crates/eidola-gui/build/Eidola.app`) are real bundles, so the row works there too and links to the build directory. Remember to update or remove that link afterwards.
+32. **Locale.** With `language = "fr"` in the profile's `config.toml`, the whole General pane, the command-line row included, reads in French; the Terminal command and the paths do not change.
+33. On Linux the General pane has no Command line section.
+
 ## The app icon
 
-24. The Dock icon, the ⌘Tab switcher, and Finder's Get Info all show the hexagon-grid mark — ink on paper in Circadian Day, a warm cluster on the night tile in Night, never the generic blank-document icon (which is what a missing or misnamed `Contents/Resources/AppIcon.icns` / `Assets.car` gives you). On Tahoe, Appearance → Icon style Tinted should recolor the ground and leave the mark white. `mdls -name kMDItemDisplayName crates/eidola-gui/build/Eidola.app` is not the oracle here; look at it.
-25. Shrink a Finder window to list view and check the 16 pt slot: the cells should still be countable, not a smudge. That slot is drawn from the reduced-detail master into the `.icns` (`brand/AGENTS.md`), so if it looks like the full-detail mark scaled down, the `.icns` was built from the wrong source. Tahoe may serve the catalog instead; the `.icns` is the fallback and the pre-Tahoe path.
+34. The Dock icon, the ⌘Tab switcher, and Finder's Get Info all show the hexagon-grid mark — ink on paper in Circadian Day, a warm cluster on the night tile in Night, never the generic blank-document icon (which is what a missing or misnamed `Contents/Resources/AppIcon.icns` / `Assets.car` gives you). On Tahoe, Appearance → Icon style Tinted should recolor the ground and leave the mark white. `mdls -name kMDItemDisplayName crates/eidola-gui/build/Eidola.app` is not the oracle here; look at it.
+35. Shrink a Finder window to list view and check the 16 pt slot: the cells should still be countable, not a smudge. That slot is drawn from the reduced-detail master into the `.icns` (`brand/AGENTS.md`), so if it looks like the full-detail mark scaled down, the `.icns` was built from the wrong source. Tahoe may serve the catalog instead; the `.icns` is the fallback and the pre-Tahoe path.
 
 ## The startup-failure dialog
 
 The other AppKit surface no test platform reaches: it is an `NSAlert` presented before `Application::run`, so neither the driver nor the visual tier can render it (see AGENTS.md → Startup failures).
 
-26. With Eidola already running, launch a **second** copy from a terminal: `crates/eidola-gui/build/Eidola.app/Contents/MacOS/Eidola`. Expected: a critical alert titled **"Eidola is already open"** whose body names the holding pid and the database path and says to quit it and try again, with a single **Quit** button. Pressing Quit ends that second process (exit status 1) and leaves the first one untouched — same pid, same windows, engines still loaded.
-27. The same line is on stderr either way, so a terminal launch is legible without the dialog.
-28. **No crash report.** The failure this replaced was a `panic_cannot_unwind` inside AppKit's `applicationDidFinishLaunching:` — SIGABRT, exit 134, and macOS's "Eidola quit unexpectedly" report. If you see that report, the construction has moved back inside `Application::run`.
-29. An ordinary launch with nothing else holding the database is unchanged: no dialog, no extra window, the usual first window.
-30. **A refused schema reaches the same dialog.** Hard to stage by hand — turso keeps `user_version` in the WAL, so patching the `.db` header does nothing — so this one is normally taken on trust from `a_refused_schema_surfaces_at_open_database_not_at_construction`. If you do end up with a database from an older build (a `git checkout` across a `LATEST_VERSION` bump), the launch must show "Eidola can't start" quoting the "delete your dev database" message, **not** a window full of failed panes.
+36. With Eidola already running, launch a **second** copy from a terminal: `crates/eidola-gui/build/Eidola.app/Contents/MacOS/Eidola`. Expected: a critical alert titled **"Eidola is already open"** whose body names the holding pid and the database path and says to quit it and try again, with a single **Quit** button. Pressing Quit ends that second process (exit status 1) and leaves the first one untouched — same pid, same windows, engines still loaded.
+37. The same line is on stderr either way, so a terminal launch is legible without the dialog.
+38. **No crash report.** The failure this replaced was a `panic_cannot_unwind` inside AppKit's `applicationDidFinishLaunching:` — SIGABRT, exit 134, and macOS's "Eidola quit unexpectedly" report. If you see that report, the construction has moved back inside `Application::run`.
+39. An ordinary launch with nothing else holding the database is unchanged: no dialog, no extra window, the usual first window.
+40. **A refused schema reaches the same dialog.** Hard to stage by hand — turso keeps `user_version` in the WAL, so patching the `.db` header does nothing — so this one is normally taken on trust from `a_refused_schema_surfaces_at_open_database_not_at_construction`. If you do end up with a database from an older build (a `git checkout` across a `LATEST_VERSION` bump), the launch must show "Eidola can't start" quoting the "delete your dev database" message, **not** a window full of failed panes.
 
 ## Regression sweep (nothing here should have moved)
 
-31. Every window still opens and closes normally: space, Library, Record, Settings, Participants, About, Updates, onboarding.
-32. Dock right-click → New Space / Library… still works while a window is open.
-33. `--windowless` still runs with no window and quits on `SIGTERM`. On macOS it starts retired (`UIElement`) with a status item, and its status-menu Quit is a full shutdown.
-34. **Linux is unchanged:** no tray, the windowed app quits with its last window / Ctrl+Q (a full shutdown), and the background layer is `eidola service` + `--windowless`.
+41. Every window still opens and closes normally: space, Library, Record, Settings, Participants, About, Updates, onboarding.
+42. Dock right-click → New Space / Library… still works while a window is open.
+43. `--windowless` still runs with no window and quits on `SIGTERM`. On macOS it starts retired (`UIElement`) with a status item, and its status-menu Quit is a full shutdown.
+44. **Linux is unchanged:** no tray, the windowed app quits with its last window / Ctrl+Q (a full shutdown), and the background layer is `eidola service` + `--windowless`.

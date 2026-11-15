@@ -75,7 +75,7 @@ When billing is enabled, its receiver also listens on `http://localhost:8081`; i
 
 ### CLI
 
-Every desktop install carries the `eidola` command-line client from the same build as the app, so the two never drift apart. The Debian package installs it as `/usr/bin/eidola`, and the Linux Nix payload has it at `bin/eidola`. On macOS it is `Eidola.app/Contents/MacOS/eidola-cli` (the name differs because the default macOS volume is case-insensitive and `eidola` would collide with the app's own `Eidola`); link it onto your `PATH` as `eidola` (any directory on it will do):
+Every desktop install carries the `eidola` command-line client from the same build as the app, so the two never drift apart. The Debian package installs it as `/usr/bin/eidola`, and the Linux Nix payload has it at `bin/eidola`. On macOS it is `Eidola.app/Contents/MacOS/eidola-cli` (the name differs because the default macOS volume is case-insensitive and `eidola` would collide with the app's own `Eidola`). To put it on your `PATH`, open **Settings → General → Command line** and choose **Install**: the app links `/usr/local/bin/eidola` to the copy of Eidola you are running (asking for an administrator's password when that directory is not yours to write), shows whether the link is installed, and offers to update it when the app has moved. It never replaces an `eidola` that some other program put there. To do the same by hand, link it onto your `PATH` as `eidola` (any directory on it will do):
 
 ```bash
 ln -s /Applications/Eidola.app/Contents/MacOS/eidola-cli /usr/local/bin/eidola

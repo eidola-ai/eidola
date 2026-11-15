@@ -166,8 +166,8 @@ impl SettingsView {
         self.activated = Some(pane);
         match pane {
             SettingsPane::Account => self.account.update(cx, |v, cx| v.pane_activated(cx)),
-            SettingsPane::General
-            | SettingsPane::Backends
+            SettingsPane::General => self.general.update(cx, |v, cx| v.pane_activated(cx)),
+            SettingsPane::Backends
             | SettingsPane::Templates
             | SettingsPane::Agents
             | SettingsPane::Proxy

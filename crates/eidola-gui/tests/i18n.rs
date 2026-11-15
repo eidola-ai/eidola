@@ -397,6 +397,13 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("hash", "a13d92b1d4bd…");
                 args.set("source", "example/fixture@4444444");
                 args.set("url", "https://www.eidola.ai/docs/model-identity/");
+                args.set("choice", "Auto");
+                args.set("percent", "100%");
+                args.set("dir", "/usr/local/bin");
+                args.set(
+                    "target",
+                    "/Applications/Eidola.app/Contents/MacOS/eidola-cli",
+                );
                 args.set(
                     "path",
                     "/home/reader/.config/eidola/account-recovery-1.toml",
