@@ -181,9 +181,9 @@ jobs:
 
       - name: Test the platform endorsements drift script
         # Deliberately ungated: scripts/platform-endorsements-drift.py runs
-        # only on a schedule against the default branch, so a change to it,
-        # or to the sidecar's hold it reads, is otherwise first exercised by
-        # a scheduled run. python3 stdlib, no toolchain.
+        # only on a schedule against the default branch, so a change to it
+        # is otherwise first exercised by a scheduled run. python3 stdlib, no
+        # toolchain.
         run: ./scripts/test-platform-endorsements-drift.sh
 
       - name: Check legal document versioning

@@ -265,7 +265,6 @@ pub(crate) mod tests {
             release: TAG.into(),
             sha256: SHA256.into(),
             policy: policy.into(),
-            hold: None,
             dynamic_platform: SidecarFlag::True,
             cached_keys: SidecarFlag::True,
             smt_enabled: SidecarFlag::False,

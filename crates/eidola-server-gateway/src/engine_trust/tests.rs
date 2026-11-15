@@ -359,16 +359,17 @@ impl Tree {
     }
 
     fn check_vendored(&self) -> Result<(), String> {
-        manifest::require_vendored_releases_named(
-            &[CONFIG.to_string()],
-            &self.vendored(),
-            &mut |path| {
-                self.files
-                    .get(path)
-                    .cloned()
-                    .ok_or_else(|| format!("read {path}: no such file"))
-            },
-        )
+        self.check_vendored_with(&[CONFIG.to_string()])
+    }
+
+    /// As [`Tree::check_vendored`], with `committed` as the deployments.
+    fn check_vendored_with(&self, committed: &[String]) -> Result<(), String> {
+        manifest::require_vendored_releases_named(committed, &self.vendored(), &mut |path| {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| format!("read {path}: no such file"))
+        })
     }
 
     /// Vendor platform endorsements release `tag` (its files' bytes do not
@@ -377,18 +378,6 @@ impl Tree {
         let (file, bundle) = engine_deployment::deployment::platform_endorsement_files(tag);
         self.files.insert(file, b"{}".to_vec());
         self.files.insert(bundle, b"{}".to_vec());
-    }
-
-    fn set_hold(&mut self, hold: Option<&str>) {
-        let mut sidecar = self.sidecar();
-        let endorsements = &mut sidecar["tdx"]["platform_endorsements"];
-        match hold {
-            Some(reason) => endorsements["hold"] = reason.into(),
-            None => {
-                endorsements.as_object_mut().unwrap().remove("hold");
-            }
-        }
-        self.set_sidecar(sidecar);
     }
 }
 
@@ -408,10 +397,10 @@ fn the_fixture_vendors_what_its_deployment_names() {
     tree.check_vendored().unwrap();
 }
 
-/// A deployment behind the newest vendored release states why, and only
-/// then; the hold is a reason, not an empty string.
+/// A TDX deployment names the newest vendored release, with no exception:
+/// vendoring a newer one moves every deployment in the same change.
 #[test]
-fn a_deployment_on_an_older_release_states_its_hold() {
+fn a_deployment_names_the_newest_vendored_release() {
     let mut tree = Tree::fixture();
     tree.vendor_release("platform-v0.1.12");
     vendored_refused(
@@ -419,7 +408,8 @@ fn a_deployment_on_an_older_release_states_its_hold() {
         "names platform-v0.1.11, but the newest vendored release is platform-v0.1.12",
     );
 
-    // Ordered by version, not by text.
+    // Ordered by version, not by text: an older release is an orphan, and
+    // the deployment still names the newest.
     let mut tree = Tree::fixture();
     tree.vendor_release("platform-v0.1.9");
     vendored_refused(
@@ -427,21 +417,13 @@ fn a_deployment_on_an_older_release_states_its_hold() {
         "platform-v0.1.9/attestation.sigstore.json is vendored, but no committed deployment",
     );
 
+    // A deployment staying behind cannot say why: the sidecar has no such
+    // member.
     let mut tree = Tree::fixture();
-    tree.vendor_release("platform-v0.1.12");
-    tree.set_hold(Some("v0.1.12 retires this deployment's host"));
-    tree.check_vendored().unwrap();
-    // The held deployment still passes the whole pin check: the hold is
-    // part of the sidecar's grammar.
-    tree.check().unwrap();
-
-    let mut tree = Tree::fixture();
-    tree.set_hold(Some("nothing newer"));
-    vendored_refused(&tree, "states a hold, but platform-v0.1.11 is the newest");
-
-    let mut tree = Tree::fixture();
-    tree.set_hold(Some("  "));
-    refused(&tree, "hold must state the reason");
+    let mut sidecar = tree.sidecar();
+    sidecar["tdx"]["platform_endorsements"]["hold"] = "a reason".into();
+    tree.set_sidecar(sidecar);
+    refused(&tree, "unknown field `hold`");
 }
 
 /// Nothing is vendored that no deployment names, except the newest
@@ -450,9 +432,12 @@ fn a_deployment_on_an_older_release_states_its_hold() {
 fn an_orphaned_vendored_file_is_refused() {
     // The newest release stays while nothing names it.
     let mut tree = Tree::fixture();
-    tree.vendor_release("platform-v0.1.12");
-    tree.set_hold(Some("adopting it is a separate change"));
-    tree.check_vendored().unwrap();
+    tree.files
+        .retain(|path, _| !path.starts_with(engine_deployment::deployment::CVM_RELEASES_ROOT));
+    tree.check_vendored_with(&[]).unwrap();
+    tree.vendor_release("platform-v0.1.10");
+    let err = tree.check_vendored_with(&[]).unwrap_err();
+    assert!(err.contains("platform-v0.1.10/"), "{err}");
 
     // An older release nothing names.
     let mut tree = Tree::fixture();

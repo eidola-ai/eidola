@@ -46,8 +46,8 @@
 //!   tree in both directions.
 //! - The vendored platform material is exactly what the deployments use
 //!   ([`require_vendored_releases_named`]): each TDX deployment names the
-//!   newest vendored platform endorsements release or states why it holds
-//!   back, and no vendored release or release manifest is one nothing names.
+//!   newest vendored platform endorsements release, and no vendored release
+//!   or release manifest is one nothing names.
 //!
 //! - **A TDX pin's MRTD is the platform release's statement of it**: the
 //!   release manifest `cvm-version` pins, vendored under
@@ -250,18 +250,17 @@ pub fn require_every_deployment_pinned(
 }
 
 /// The vendored platform material is exactly what the committed deployments
-/// use, and each deployment uses the newest of it or says why not.
+/// use, and each deployment uses the newest of it.
 /// `committed` is the config path of every committed deployment (which
 /// [`require_every_deployment_pinned`] has held to the checked pins), and
 /// `vendored` the workspace path of every file under
 /// `releases/trust/platform-endorsements/` and `releases/trust/cvm-releases/`.
 ///
 /// - A TDX deployment names the newest vendored platform endorsements
-///   release, or names an older one and states why in
-///   `tdx.platform_endorsements.hold`; a hold on the newest release is
-///   refused, since it holds nothing back. Vendoring a newer release so makes
-///   every deployment move to it or state its reason in the same change, and
-///   moving a deployment back to an older release needs a stated reason.
+///   release, with no exception: vendoring a newer release moves every
+///   deployment to it in the same change, and no deployment can be moved
+///   back to an older one. A deployment the newer release would cut off is
+///   moved or retired before the release is vendored.
 /// - Every vendored file is a release's endorsements file or Sigstore bundle
 ///   that a deployment names, or the newest release's (kept while no
 ///   deployment names it, as the baseline the scheduled drift check compares
@@ -311,24 +310,14 @@ pub fn require_vendored_releases_named(
         };
         let (file, bundle) = deployment::platform_endorsement_files(&machines.release);
         used.extend([file, bundle]);
-        let at = format!("{sidecar_path}: tdx.platform_endorsements");
-        let is_newest = newest.as_deref() == Some(machines.release.as_str());
-        match (&machines.hold, is_newest) {
-            (None, false) => {
-                return Err(format!(
-                    "{at}: names {}, but the newest vendored release is {}; move the \
-                     deployment to it, or state why it stays in `hold`",
-                    machines.release,
-                    newest.as_deref().unwrap_or("none"),
-                ));
-            }
-            (Some(_), true) => {
-                return Err(format!(
-                    "{at}: states a hold, but {} is the newest vendored release; remove it",
-                    machines.release
-                ));
-            }
-            _ => {}
+        if newest.as_deref() != Some(machines.release.as_str()) {
+            return Err(format!(
+                "{sidecar_path}: tdx.platform_endorsements names {}, but the newest vendored \
+                 release is {}; move the deployment to it (a deployment it would cut off is \
+                 moved or retired before the release is vendored)",
+                machines.release,
+                newest.as_deref().unwrap_or("none"),
+            ));
         }
     }
     for path in vendored {

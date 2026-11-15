@@ -64,12 +64,6 @@ pub struct TdxMachines {
     pub sha256: String,
     /// The endorsements' policy name, e.g. `tdx-b300-prod`.
     pub policy: String,
-    /// Why the deployment stays on `release` although a newer one is
-    /// vendored. A deployment names the newest vendored release unless it
-    /// states a reason here, and states none when it does: the gateway's
-    /// build holds both, and the scheduled drift check reports a held
-    /// deployment rather than failing on it.
-    pub hold: Option<String>,
     pub dynamic_platform: PckFlag,
     pub cached_keys: PckFlag,
     pub smt_enabled: PckFlag,
@@ -837,8 +831,6 @@ struct SidecarEndorsements {
     release: String,
     sha256: String,
     policy: String,
-    #[serde(default)]
-    hold: Option<String>,
 }
 
 /// A PCK certificate platform flag's expected value, which the pin states
@@ -901,17 +893,10 @@ impl Sidecar {
                          [a-z0-9][a-z0-9._-]*"
                     ));
                 }
-                if e.hold.as_deref().is_some_and(|h| h.trim().is_empty()) {
-                    return Err(format!(
-                        "{path}: tdx.platform_endorsements.hold must state the reason the \
-                         deployment stays on its release"
-                    ));
-                }
                 Ok(TdxMachines {
                     release: e.release,
                     sha256: e.sha256,
                     policy: e.policy,
-                    hold: e.hold,
                     dynamic_platform: t.dynamic_platform,
                     cached_keys: t.cached_keys,
                     smt_enabled: t.smt_enabled,
