@@ -10,12 +10,20 @@
 //! and a device-less machine failing closed, in process and as the real binary, with
 //! nothing served and no CPU fallback.
 //!
+//! DeepSeek-V4.1 (its dev model), without a device: one KV budget per device, graphs
+//! refused, the weights hash and the executor's own refusals before the devices, the KV
+//! and host-tier budgets refused before the devices, the CC check (with the GPU count)
+//! before the devices, and the node's executor configuration run over host devices
+//! answering token for token as the CPU executor does.
+//!
 //! With a device (`EIDOLA_TEST_CUDA_WEIGHTS` and `EIDOLA_ENGINE_KERNELS_DIR`): the node
 //! booted on real MiMo-V2.6-Flash weights answers a chat request end to end, and its
 //! output equals, token for token, the engine core driven directly over a CUDA executor
 //! built from the same configuration; and a generation cut off at a small ceiling, in its
 //! reasoning and in its answer, continues into exactly the uninterrupted output, served
-//! from the prefix the cut-off request cached.
+//! from the prefix the cut-off request cached. On two GPUs (ignored; `EIDOLA_ENGINE_KERNELS_DIR`):
+//! the node booted on the DeepSeek-V4.1 dev model answers greedy requests with exactly the
+//! CPU executor's text.
 
 #![cfg(feature = "cuda")]
 
@@ -324,6 +332,297 @@ fn the_binary_refuses_to_serve_without_a_usable_executor() {
     assert!(!log.contains("engine started"), "{log}");
     if !Gpu::available() {
         assert!(log.contains(NO_DEVICE), "{log}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// DeepSeek-V4.1 without a device.
+// ---------------------------------------------------------------------------------------
+
+/// The CUDA executor's settings over the DeepSeek-V4.1 dev model: one 64 MiB KV budget
+/// per device.
+fn ds_cuda_env() -> HashMap<&'static str, String> {
+    let mut map = cuda_env(deepseek_model_dir(), deepseek_weights_hash());
+    map.insert(env::MODEL_ID, DEEPSEEK_MODEL_ID.into());
+    map.insert(env::KV_DEVICE_BYTES, format!("{0},{0}", 64u64 << 20));
+    map
+}
+
+/// Whether the driver here reports the GPUs in production confidential-computing mode,
+/// and at least two of them.
+fn driver_reports_two_cc_gpus() -> bool {
+    eidola_server_engine::gpu_cc::query_devices()
+        .is_ok_and(|(state, n)| eidola_server_engine::gpu_cc::check_devices(&state, n, 2).is_ok())
+}
+
+/// A DeepSeek-V4.1 configuration the executor accepts on the host goes on to the devices
+/// and, without one, fails closed there; with drafting within the drafter's slots too.
+/// Never a CPU fallback.
+#[test]
+fn deepseek_reaches_the_devices_and_fails_closed_without_them() {
+    for k in ["0", "3"] {
+        let mut map = ds_cuda_env();
+        map.insert(env::DRAFT_TOKENS, k.into());
+        let err = boot_err(&map);
+        assert!(!err.contains("unsupported"), "{k}: {err}");
+        assert!(!err.contains(env::KV_DEVICE_BYTES), "{k}: {err}");
+        if !Gpu::available() {
+            assert!(err.contains(NO_DEVICE), "{k}: {err}");
+        }
+    }
+}
+
+/// `KV_DEVICE_BYTES` names one budget per device: DeepSeek-V4.1 runs on two.
+#[test]
+fn deepseek_names_one_kv_budget_per_device() {
+    for budgets in [
+        format!("{}", 64u64 << 20),
+        format!("{0},{0},{0}", 64u64 << 20),
+    ] {
+        let mut map = ds_cuda_env();
+        map.insert(env::KV_DEVICE_BYTES, budgets.clone());
+        let err = boot_err(&map);
+        assert!(
+            err.contains(env::KV_DEVICE_BYTES) && err.contains("device budgets"),
+            "{budgets}: {err}"
+        );
+        assert!(!err.contains(NO_DEVICE), "{err}");
+    }
+}
+
+/// DeepSeek-V4.1's executor captures no decode graphs: `CUDA_GRAPHS=on` is refused before
+/// the devices, `off` accepted.
+#[test]
+fn deepseek_refuses_decode_graphs() {
+    let mut map = ds_cuda_env();
+    map.insert(env::CUDA_GRAPHS, "on".into());
+    let err = boot_err(&map);
+    assert!(
+        err.contains(env::CUDA_GRAPHS) && err.contains("no decode graphs"),
+        "{err}"
+    );
+    assert!(!err.contains(NO_DEVICE), "{err}");
+    map.insert(env::CUDA_GRAPHS, "off".into());
+    let err = boot_err(&map);
+    assert!(!err.contains(env::CUDA_GRAPHS), "{err}");
+}
+
+/// Storage, the weights hash and the model's files come before anything of the
+/// executor's: a wrong expected hash is the refusal, graphs on or not, whatever the
+/// devices.
+#[test]
+fn deepseek_checks_the_weights_hash_before_the_executor() {
+    for graphs in ["off", "on"] {
+        let mut map = ds_cuda_env();
+        map.insert(env::CUDA_GRAPHS, graphs.into());
+        map.insert(env::WEIGHTS_SHA256, "ab".repeat(32));
+        let err = boot_err(&map);
+        assert!(err.contains("weights hash"), "{err}");
+        assert!(!err.contains(NO_DEVICE), "{err}");
+        assert!(!err.contains(env::CUDA_GRAPHS), "{err}");
+    }
+}
+
+/// Before the devices: a device budget that cannot hold one `MAX_MODEL_LEN` sequence
+/// (either device's), a host tier under two blocks, and what the executor's preflight
+/// refuses (a block size the pooling ratio does not divide). A draft width past the
+/// cuda cap never parses.
+#[test]
+fn deepseek_budgets_are_refused_before_the_devices() {
+    for (budgets, device) in [
+        (format!("{},{}", 4096, 64u64 << 20), "device 0"),
+        (format!("{},{}", 64u64 << 20, 4096), "device 1"),
+    ] {
+        let mut map = ds_cuda_env();
+        map.insert(env::KV_DEVICE_BYTES, budgets);
+        let err = boot_err(&map);
+        assert!(
+            err.contains(env::KV_DEVICE_BYTES)
+                && err.contains(env::MAX_MODEL_LEN)
+                && err.contains(device),
+            "{err}"
+        );
+        assert!(!err.contains(NO_DEVICE), "{err}");
+    }
+    let mut map = ds_cuda_env();
+    map.insert(env::KV_HOST_BYTES, "4096".into());
+    let err = boot_err(&map);
+    assert!(err.contains(env::KV_HOST_BYTES), "{err}");
+    assert!(!err.contains(NO_DEVICE), "{err}");
+
+    let mut map = ds_cuda_env();
+    map.insert(env::KV_BLOCK_SIZE, "1".into());
+    map.insert(env::PREFIX_CACHE, "false".into());
+    let err = boot_err(&map);
+    assert!(err.contains("must divide the block size"), "{err}");
+    assert!(!err.contains(NO_DEVICE), "{err}");
+
+    let mut map = ds_cuda_env();
+    map.insert(env::DRAFT_TOKENS, "4".into());
+    let err = config_from(&map).unwrap_err();
+    assert!(
+        err.contains(env::DRAFT_TOKENS) && err.contains("cuda"),
+        "{err}"
+    );
+}
+
+/// With `GPU_CC=required`, DeepSeek-V4.1 is refused before any device opens unless the
+/// driver reports the production CC state and at least two GPUs; where it does, the
+/// boot goes on to the devices.
+#[test]
+fn deepseek_gpu_cc_required_is_checked_before_the_devices() {
+    let mut map = ds_cuda_env();
+    map.insert(env::GPU_CC, "required".into());
+    let err = boot_err(&map);
+    let refusal = "EIDOLA_ENGINE_GPU_CC is required, but the driver does not report 2 GPUs in \
+                   production confidential-computing mode";
+    if driver_reports_two_cc_gpus() {
+        assert!(!err.contains(env::GPU_CC), "{err}");
+    } else {
+        assert!(err.contains(refusal), "{err}");
+        assert!(!err.contains(NO_DEVICE), "{err}");
+    }
+}
+
+/// Greedy generation of `prompt` through the engine core over `exec`.
+fn greedy<E: eidola_engine::executor::Executor>(
+    exec: E,
+    speculative: bool,
+    prompt: Vec<u32>,
+    max_tokens: u32,
+) -> Vec<u32> {
+    use eidola_engine::engine::{CacheScope, Engine, Request, SchedulerConfig};
+    use eidola_engine::kv::CachePolicy;
+    use eidola_engine::sampling::SamplingParams;
+    let model = deepseek_loaded();
+    let mut engine = Engine::new(
+        exec,
+        SchedulerConfig {
+            max_batched_tokens: 256,
+            max_seqs: 4,
+            max_prefill_chunk: 256,
+            eos_token_ids: model.tokenizer().eos_token_ids().to_vec(),
+            speculative,
+            cache: CachePolicy::default(),
+            sweep_interval_ms: 1000,
+        },
+    )
+    .unwrap();
+    engine
+        .submit(Request {
+            id: 1,
+            prompt,
+            sampling: SamplingParams::greedy(),
+            max_tokens,
+            required_cached_tokens: 0,
+            stop_token_ids: Vec::new(),
+            cache: CacheScope::Private,
+        })
+        .unwrap();
+    let mut out = Vec::new();
+    for now in 0.. {
+        for ev in engine.step(now).unwrap() {
+            out.extend(ev.tokens);
+            if ev.finish.is_some() {
+                return out;
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// The executor configuration the node derives for DeepSeek-V4.1 (`cuda::deepseek_config`,
+/// over the dev model's verified configuration, its Engram map and its sampleable
+/// vocabulary), run over host devices in place of the GPUs, generates exactly the CPU
+/// executor's greedy tokens, without drafts and drafting two.
+#[test]
+fn the_nodes_deepseek_configuration_computes_what_the_cpu_executor_does() {
+    use eidola_engine_cpu::deepseek::{DsCpuExecutor, DsCpuExecutorConfig};
+    use eidola_engine_cuda::ds::DsCudaExecutor;
+    use eidola_engine_cuda::ds::host::HostDevice;
+    use eidola_server_engine::model::Served;
+
+    let model = deepseek_loaded();
+    let Served::DeepSeek {
+        config: ds,
+        token_map,
+        model: Some(reference),
+    } = model.served()
+    else {
+        panic!("the DeepSeek dev model, loaded for the cpu executor");
+    };
+    assert!(token_map.is_some(), "the dev model has Engram layers");
+    let input = eidola_engine_chat::ChatInput::from_json(
+        &json!([{"role": "user", "content": "Name three primary colours."}]).to_string(),
+        None,
+    )
+    .unwrap();
+    let prompt = eidola_engine_chat::deepseek_v4_1::encode(
+        &input,
+        eidola_server_engine::pipeline::deepseek_options(),
+    )
+    .unwrap();
+    let prompt = model.tokenizer().encode_prompt(&prompt).unwrap();
+    let max_tokens = 12;
+
+    let cpu = DsCpuExecutor::new(
+        reference.clone(),
+        DsCpuExecutorConfig {
+            block_size: 16,
+            num_blocks: 256,
+            host_blocks: 0,
+            num_state_slots: 4,
+            max_model_len: 1024,
+            buckets: vec![eidola_engine::spec::Bucket {
+                max_seqs: 4,
+                max_tokens: 256,
+            }],
+            draft_width: 0,
+            sampleable_vocab_size: model.sampleable_vocab_size(),
+            record: false,
+        },
+    );
+    let expected = greedy(cpu, false, prompt.clone(), max_tokens);
+    assert!(!expected.is_empty());
+
+    for k in ["0", "2"] {
+        let mut map = ds_cuda_env();
+        map.insert(env::DRAFT_TOKENS, k.into());
+        let config = config_from(&map).unwrap();
+        let ExecutorConfig::Cuda {
+            kv_device_bytes,
+            further_kv_device_bytes,
+            graphs,
+            ..
+        } = &config.executor
+        else {
+            unreachable!()
+        };
+        let exec_config = eidola_server_engine::cuda::deepseek_config(
+            ds,
+            &config.sizing,
+            [*kv_device_bytes, further_kv_device_bytes[0]],
+            config.kv_host_bytes,
+            *graphs,
+            model.sampleable_vocab_size(),
+        )
+        .unwrap();
+        let exec = DsCudaExecutor::with_devices(
+            Box::new(HostDevice),
+            Box::new(HostDevice),
+            model.store(),
+            ds,
+            token_map.clone(),
+            &exec_config,
+        )
+        .unwrap();
+        let got = greedy(
+            exec,
+            config.sizing.draft_tokens > 0,
+            prompt.clone(),
+            max_tokens,
+        );
+        assert_eq!(got, expected, "draft width {k}");
     }
 }
 
@@ -799,4 +1098,111 @@ async fn real_flash_continues_a_cut_off_generation_exactly() {
         .await
         .expect("the engine thread stops once nothing can reach it")
         .ok();
+}
+
+// ---------------------------------------------------------------------------------------
+// With two devices: the DeepSeek-V4.1 dev model.
+// ---------------------------------------------------------------------------------------
+
+/// **The node serves DeepSeek-V4.1 on two GPUs as the CPU executor does.** Boots the node
+/// on the DeepSeek-V4.1 dev model with `cuda` (device 0 on GPU 0, device 1 on GPU 1; no
+/// decode graphs), at draft widths 0 and 2, and holds its greedy answers (reasoning,
+/// content, finish reason, prompt and completion tokens) to a node on the same model with
+/// the CPU executor: the dev model on the GPU computes the CPU executor's bits, so the
+/// text is identical. Needs two GPUs and `EIDOLA_ENGINE_KERNELS_DIR` (the kernel build
+/// output), and fails without them; `EIDOLA_ENGINE_GPU_CC` as for the other device tests
+/// (`not-required` when unset).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs two GPUs and EIDOLA_ENGINE_KERNELS_DIR"]
+async fn deepseek_dev_model_on_two_gpus_answers_as_the_cpu_executor() {
+    let kernels = std::env::var_os("EIDOLA_ENGINE_KERNELS_DIR")
+        .expect("EIDOLA_ENGINE_KERNELS_DIR names the kernel build output");
+    assert!(
+        Gpu::open(0).is_ok() && Gpu::open(1).is_ok(),
+        "DeepSeek-V4.1 runs on two GPUs, device d on GPU d"
+    );
+    let cuda_model = Arc::new(
+        tokio::task::spawn_blocking(|| {
+            eidola_server_engine::model::LoadedModel::load(
+                deepseek_model_dir(),
+                deepseek_weights_hash(),
+                WeightsStorage::DevWritable,
+                ExecutorKind::Cuda,
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap(),
+    );
+    let requests = [
+        json!({
+            "model": DEEPSEEK_MODEL_ID,
+            "messages": [{"role": "user", "content": "Name three primary colours."}],
+            "max_completion_tokens": 32,
+            "temperature": 0.0,
+        }),
+        json!({
+            "model": DEEPSEEK_MODEL_ID,
+            "messages": [
+                {"role": "system", "content": "Answer briefly."},
+                {"role": "user", "content": "The quick brown fox jumps over the lazy dog. \
+                    What does the fox jump over, and why might it?"},
+            ],
+            "max_completion_tokens": 48,
+            "temperature": 0.0,
+        }),
+    ];
+    for k in ["0", "2"] {
+        let cpu = TestNode::start_deepseek(&[(env::DRAFT_TOKENS, k)]).await;
+        let mut map = ds_cuda_env();
+        map.insert(env::DRAFT_TOKENS, k.into());
+        map.insert(
+            env::KERNELS_DIR,
+            PathBuf::from(&kernels).display().to_string(),
+        );
+        let config = config_from(&map).unwrap();
+        let node = {
+            let model = cuda_model.clone();
+            tokio::task::spawn_blocking(move || eidola_server_engine::start(config, model))
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let gpu = TestNode::serve(node).await;
+
+        let info: Value = gpu
+            .client
+            .get(format!("{}/v1/engine/info", gpu.base))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        eprintln!("info: {info}");
+        assert_eq!(info["executor"], "cuda");
+        assert!(!info["device"]["name"].as_str().unwrap().is_empty());
+
+        for body in &requests {
+            let (status, want) = cpu.chat_json(body).await;
+            assert_eq!(status, 200, "{want}");
+            let (status, got) = gpu.chat_json(body).await;
+            assert_eq!(status, 200, "{got}");
+            eprintln!("k={k} cuda: {got}");
+            for key in ["reasoning_content", "content"] {
+                assert_eq!(
+                    got["choices"][0]["message"][key], want["choices"][0]["message"][key],
+                    "k={k} {key}"
+                );
+            }
+            assert_eq!(
+                got["choices"][0]["finish_reason"], want["choices"][0]["finish_reason"],
+                "k={k}"
+            );
+            for count in ["prompt_tokens", "completion_tokens"] {
+                assert_eq!(got["usage"][count], want["usage"][count], "k={k} {count}");
+            }
+        }
+    }
 }
