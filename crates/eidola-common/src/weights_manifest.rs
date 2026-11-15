@@ -10,10 +10,31 @@
 //! name>\n` (exactly `sha256sum`'s output), sorted by file name in byte
 //! order. The weights hash is the SHA-256 of the manifest's bytes, in
 //! lowercase hex. `docs/model-identity.md` specifies it for reimplementation.
+//!
+//! **The covered names are the same for every architecture** ([`is_covered`]:
+//! the shards and [`COVERED_FILES`]), and the hash covers every covered file
+//! the directory holds, so one offline procedure computes it for any model.
+//! What differs is which of them must be there: the files an architecture's
+//! node reads ([`required_files`]). A covered file it does not read (a
+//! template a compiled-in prompt encoder makes unnecessary, a shard of tensors
+//! a text-only model never reads) is hashed all the same.
 
-/// The files the hash covers besides the shards (`*.safetensors`): the
-/// model's semantic files (`config.json`, and the shard index when present)
-/// and the chat artifacts (tokenizer, template, generation defaults).
+use crate::architecture::Architecture;
+
+/// The files the hash covers besides the shards (`*.safetensors`) when the
+/// directory holds them: the model's semantic files (`config.json`, the
+/// shard index) and the chat artifacts (tokenizer, template, generation
+/// defaults).
+pub const COVERED_FILES: [&str; 5] = [
+    "config.json",
+    "model.safetensors.index.json",
+    "tokenizer.json",
+    "chat_template.jinja",
+    "generation_config.json",
+];
+
+/// The files a MiMo-V2.6 manifest must list besides its shards: the semantic
+/// file and the chat artifacts its node reads ([`required_files`]).
 pub const REQUIRED_FILES: [&str; 4] = [
     "config.json",
     "tokenizer.json",
@@ -21,8 +42,25 @@ pub const REQUIRED_FILES: [&str; 4] = [
     "generation_config.json",
 ];
 
-/// Covered when present.
+/// Covered when present, for MiMo-V2.6: the covered files outside
+/// [`REQUIRED_FILES`].
 pub const OPTIONAL_FILES: [&str; 1] = ["model.safetensors.index.json"];
+
+/// The files a DeepSeek-V4.1 manifest must list besides its shards: the
+/// configuration and the tokenizer. Its prompt encoder is compiled in, so
+/// its node reads no template, and its sampling defaults are a
+/// `generation_config.json` when the directory holds one (the released
+/// checkpoint does not).
+pub const DEEPSEEK_V4_1_REQUIRED_FILES: [&str; 2] = ["config.json", "tokenizer.json"];
+
+/// The covered files a manifest of `architecture` must list besides its
+/// shards: those its node reads whatever else the directory holds.
+pub fn required_files(architecture: Architecture) -> &'static [&'static str] {
+    match architecture {
+        Architecture::MimoV26Flash | Architecture::MimoV26Pro => &REQUIRED_FILES,
+        Architecture::DeepSeekV41Flash => &DEEPSEEK_V4_1_REQUIRED_FILES,
+    }
+}
 
 /// The shards' suffix.
 pub const SHARD_SUFFIX: &str = ".safetensors";
@@ -41,11 +79,10 @@ pub fn is_safe_name(name: &str) -> bool {
 }
 
 /// Whether the hash covers a file named `name` when the directory holds it:
-/// a shard, a required file, or an optional one.
+/// a shard, or one of [`COVERED_FILES`].
 pub fn is_covered(name: &str) -> bool {
     (name.len() > SHARD_SUFFIX.len() && name.ends_with(SHARD_SUFFIX))
-        || REQUIRED_FILES.contains(&name)
-        || OPTIONAL_FILES.contains(&name)
+        || COVERED_FILES.contains(&name)
 }
 
 /// Whether `digest` is a SHA-256 in lowercase hex.
@@ -68,11 +105,21 @@ impl core::fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
-/// The canonical manifest of a **complete** set of covered files, given as
-/// `(file name, sha256 hex)` in any order: every name safe and covered, none
-/// repeated, every required file present, at least one shard, every digest
-/// 64 lowercase hex digits.
+/// The canonical manifest of a **complete** set of a MiMo-V2.6 model's
+/// covered files ([`canonical_manifest_for`] with
+/// [`Architecture::MimoV26Flash`]).
 pub fn canonical_manifest<'a>(
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<String, ManifestError> {
+    canonical_manifest_for(Architecture::MimoV26Flash, files)
+}
+
+/// The canonical manifest of a **complete** set of covered files of a model
+/// of `architecture`, given as `(file name, sha256 hex)` in any order: every
+/// name safe and covered, none repeated, every file [`required_files`] names
+/// present, at least one shard, every digest 64 lowercase hex digits.
+pub fn canonical_manifest_for<'a>(
+    architecture: Architecture,
     files: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<String, ManifestError> {
     let mut sorted: Vec<(&str, &str)> = files.into_iter().collect();
@@ -91,7 +138,7 @@ pub fn canonical_manifest<'a>(
         if !is_covered(name) {
             return Err(ManifestError(format!(
                 "{name} is not a file the weights hash covers (a *{SHARD_SUFFIX} shard, or one \
-                 of {REQUIRED_FILES:?} {OPTIONAL_FILES:?})"
+                 of {COVERED_FILES:?})"
             )));
         }
         if !is_lower_hex_sha256(digest) {
@@ -100,7 +147,7 @@ pub fn canonical_manifest<'a>(
             )));
         }
     }
-    for required in REQUIRED_FILES {
+    for &required in required_files(architecture) {
         if !sorted.iter().any(|(name, _)| *name == required) {
             return Err(ManifestError(format!("{required} is missing")));
         }
@@ -180,6 +227,7 @@ mod tests {
 
         for extra in [
             ("README.md", A),
+            ("tokenizer_config.json", A),
             ("sub/model.safetensors", A),
             (".hidden.safetensors", A),
             ("-x.safetensors", A),
@@ -195,5 +243,113 @@ mod tests {
         let mut with_index = complete();
         with_index.push(("model.safetensors.index.json", A));
         assert!(canonical_manifest(with_index).is_ok());
+    }
+
+    /// A text-only DeepSeek-V4.1 directory, as published: shards (the
+    /// vision tower's among them), the index, the configuration, the
+    /// tokenizer and the model's own template, which its node does not read
+    /// but hashes like any covered file; no generation defaults. Files the
+    /// hash never covers (`tokenizer_config.json`, the reference code) are
+    /// left out of the listing.
+    fn deepseek() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("model-00001-of-00048.safetensors", A),
+            ("model-00048-of-00048.safetensors", A),
+            ("model.safetensors.index.json", A),
+            ("config.json", A),
+            ("tokenizer.json", A),
+            ("chat_template.jinja", A),
+        ]
+    }
+
+    #[test]
+    fn each_architecture_requires_the_files_its_node_reads() {
+        let ds = Architecture::DeepSeekV41Flash;
+        assert_eq!(required_files(ds), ["config.json", "tokenizer.json"]);
+        assert_eq!(required_files(Architecture::MimoV26Flash), REQUIRED_FILES);
+        for arch in Architecture::ALL {
+            for name in required_files(arch) {
+                assert!(is_covered(name), "{arch}: {name}");
+            }
+        }
+        let text = canonical_manifest_for(ds, deepseek()).unwrap();
+        assert_eq!(text.lines().count(), 6);
+        // Without the template it is still complete; without the tokenizer
+        // or the configuration it is not.
+        let without = |name: &str| {
+            deepseek()
+                .into_iter()
+                .filter(|(n, _)| *n != name)
+                .collect::<Vec<_>>()
+        };
+        assert!(canonical_manifest_for(ds, without("chat_template.jinja")).is_ok());
+        assert!(canonical_manifest_for(ds, without("model.safetensors.index.json")).is_ok());
+        for required in ["config.json", "tokenizer.json"] {
+            assert!(canonical_manifest_for(ds, without(required)).is_err());
+        }
+        // The same listing is not a MiMo manifest: it has no generation
+        // defaults.
+        assert!(canonical_manifest(deepseek()).is_err());
+        let mut with_defaults = deepseek();
+        with_defaults.push(("generation_config.json", A));
+        assert!(canonical_manifest_for(ds, with_defaults).is_ok());
+    }
+
+    /// The manifest of a directory is the same text whichever architecture
+    /// reads it: only the required set differs.
+    #[test]
+    fn the_spelling_does_not_depend_on_the_architecture() {
+        assert_eq!(
+            canonical_manifest(complete()).unwrap(),
+            canonical_manifest_for(Architecture::DeepSeekV41Flash, complete()).unwrap()
+        );
+    }
+
+    /// A synthetic text-only DeepSeek directory: the manifest of every
+    /// covered file it holds is the canonical one, and the files the hash
+    /// does not cover are not in it.
+    #[test]
+    fn a_synthetic_deepseek_directory_hashes_its_covered_files() {
+        let dir = std::env::temp_dir().join(format!("eidola-ds-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inference")).unwrap();
+        for name in [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            "model.safetensors.index.json",
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "README.md",
+            "inference/model.py",
+        ] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        let mut listed: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|name| is_covered(name))
+            .map(|name| (name, A.to_string()))
+            .collect();
+        listed.sort();
+        let text = canonical_manifest_for(
+            Architecture::DeepSeekV41Flash,
+            listed.iter().map(|(n, d)| (n.as_str(), d.as_str())),
+        )
+        .unwrap();
+        let names: Vec<&str> = text.lines().map(|l| &l[66..]).collect();
+        assert_eq!(
+            names,
+            [
+                "chat_template.jinja",
+                "config.json",
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+                "model.safetensors.index.json",
+                "tokenizer.json",
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
