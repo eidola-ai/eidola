@@ -97,6 +97,30 @@ fn the_runner_generates_checkpoints_and_resumes() {
             transcript.contains("<｜begin▁of▁sentence｜>"),
             "{transcript}"
         );
+        // The prompt and the output as ids, with each generated token's own piece.
+        let saved = read(&out.path().join(format!(
+            "requests/{}.w{width}.json",
+            r["name"].as_str().unwrap()
+        )));
+        assert_eq!(
+            saved["prompt_token_ids"].as_array().unwrap().len() as u64,
+            saved["prompt_tokens"].as_u64().unwrap()
+        );
+        let pieces = saved["generated_pieces"].as_array().unwrap();
+        let ids: Vec<&Value> = pieces.iter().map(|p| &p["id"]).collect();
+        assert_eq!(
+            ids,
+            saved["token_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            pieces
+                .iter()
+                .all(|p| p["text"].is_string() || p["bytes"].is_string())
+        );
     }
     let checks = summary["width0_checks"].as_array().unwrap();
     assert_eq!(checks.len(), 2);
@@ -134,6 +158,66 @@ fn the_runner_generates_checkpoints_and_resumes() {
         }
     }
 
+    // A saved result made from other inputs is run again, never relabelled. A new token
+    // limit reruns every request (greedy: each a prefix of the longer one's tokens).
+    let snapshot = |out: &Path| -> Vec<Vec<u8>> {
+        names
+            .iter()
+            .map(|n| std::fs::read(out.join(format!("requests/{n}.json"))).unwrap())
+            .collect()
+    };
+    let longer: Vec<Value> = names
+        .iter()
+        .map(|n| read(&out.path().join(format!("requests/{n}.json"))))
+        .collect();
+    let mut shorter = config(out.path());
+    shorter.max_new_tokens = 6;
+    assert_eq!(run(&shorter).unwrap(), Outcome::Complete { mismatches: 0 });
+    for (n, long) in names.iter().zip(&longer) {
+        let short = read(&out.path().join(format!("requests/{n}.json")));
+        let (s, l) = (
+            short["token_ids"].as_array().unwrap(),
+            long["token_ids"].as_array().unwrap(),
+        );
+        assert!(s.len() <= 6 && l.starts_with(s), "{n} was run again");
+        assert_ne!(short["fingerprint"], long["fingerprint"]);
+    }
+    // A changed prompt reruns its own requests only.
+    let mut edited = shorter.clone();
+    edited.prompts[2].messages[0]["content"] = "Write a Rust function that sums a slice.".into();
+    let before = snapshot(out.path());
+    assert_eq!(run(&edited).unwrap(), Outcome::Complete { mismatches: 0 });
+    for (n, (now, then)) in names.iter().zip(snapshot(out.path()).iter().zip(&before)) {
+        assert_eq!(now != then, n == "code.w4", "{n}");
+    }
+    // A result whose fingerprint is not this run's (another build or checkpoint made it)
+    // is run again, and the summary carries this run's.
+    let plain0 = out.path().join("requests/plain.w0.json");
+    let mut foreign = read(&plain0);
+    foreign["fingerprint"] = "0".repeat(64).into();
+    foreign["token_ids"] = serde_json::json!([1, 2, 3]);
+    std::fs::write(&plain0, serde_json::to_vec(&foreign).unwrap()).unwrap();
+    let before = snapshot(out.path());
+    assert_eq!(run(&edited).unwrap(), Outcome::Complete { mismatches: 0 });
+    for (n, (now, then)) in names.iter().zip(snapshot(out.path()).iter().zip(&before)) {
+        assert_eq!(now != then, n == "plain.w0", "{n}");
+    }
+    let summary = read(&out.path().join("summary.json"));
+    let plain = summary["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "plain" && r["draft_width"] == 0)
+        .unwrap();
+    assert_ne!(plain["token_ids"], serde_json::json!([1, 2, 3]));
+    assert!(
+        summary["width0_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["identical"] == true)
+    );
+
     // The wrong hash is refused by the node's loader.
     let mut wrong = config(out.path());
     wrong.weights_sha256 = "0".repeat(64);
@@ -158,9 +242,17 @@ fn the_time_limit_refuses_after_calibration_and_then_up_front() {
         .count();
     assert_eq!(finished, 0, "the calibrating request is not checkpointed");
 
-    // Calibrated: refused before any request runs.
-    let Outcome::Refused(why) = run(&cfg).unwrap() else {
+    // Calibrated: refused before the checkpoint is read (here, one that is not there).
+    let mut elsewhere = cfg.clone();
+    elsewhere.weights_dir = out.path().join("no-checkpoint-here");
+    let Outcome::Refused(why) = run(&elsewhere).unwrap() else {
         panic!("not refused");
     };
-    assert!(why.contains("calibrated earlier"), "{why}");
+    assert!(why.contains("nothing was loaded"), "{why}");
+    // A change to the requests leaves their lengths unknown before loading, so the
+    // refusal waits for the load: the checkpoint is read again.
+    let mut changed = elsewhere.clone();
+    changed.max_new_tokens = 7;
+    let e = run(&changed).unwrap_err();
+    assert!(e.contains("weights directory"), "{e}");
 }

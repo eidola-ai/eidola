@@ -10,8 +10,9 @@
 //! executor's row records, kept to count draft acceptance per slot; they change no
 //! computed value.
 //!
-//! Every request is checkpointed when it finishes, so a rerun over the same output
-//! directory skips the finished ones.
+//! Every request is checkpointed when it finishes, with the fingerprint of the inputs
+//! that made it ([`fingerprint`]), so a rerun over the same output directory skips the
+//! requests finished from the same inputs and runs the others again.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -313,11 +314,130 @@ struct Task {
     spec: PromptSpec,
     width: u32,
     prompt_tokens: u32,
+    /// [`fingerprint`] of the request: a saved result is this task's only if it carries
+    /// the same.
+    fingerprint: String,
 }
 
 impl Task {
     fn key(&self) -> String {
         format!("{}.w{}", self.spec.name, self.width)
+    }
+
+    fn result_path(&self, out_dir: &Path) -> PathBuf {
+        out_dir
+            .join("requests")
+            .join(format!("{}.json", self.key()))
+    }
+
+    /// The saved result, when there is one made from exactly this task's inputs.
+    fn saved(&self, out_dir: &Path) -> Option<Value> {
+        let v: Value =
+            serde_json::from_slice(&std::fs::read(self.result_path(out_dir)).ok()?).ok()?;
+        (v["fingerprint"].as_str() == Some(self.fingerprint.as_str())).then_some(v)
+    }
+
+    fn finished(&self, out_dir: &Path) -> bool {
+        self.saved(out_dir).is_some()
+    }
+}
+
+/// The program computing the tokens: the SHA-256 of the running executable, so a
+/// rebuild (a numerics fix among anything else) never reuses an earlier build's results.
+fn build_identity() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let exe = std::env::current_exe().map_err(|e| format!("the running executable: {e}"))?;
+    let bytes = std::fs::read(&exe).map_err(|e| format!("read {}: {e}", exe.display()))?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
+/// SHA-256 over everything that decides a request's tokens: the weights (by the hash the
+/// loader verifies before anything is generated), the build, the request body (messages,
+/// tools, token limit, greedy sampling), the draft width and the engine's sizing inputs.
+fn fingerprint(cfg: &RunConfig, build: &str, spec: &PromptSpec, width: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let inputs = json!({
+        "runner": 1,
+        "weights_sha256": cfg.weights_sha256,
+        "build": build,
+        "request": spec.body(cfg.max_new_tokens),
+        "draft_width": width,
+        "block_size": cfg.block_size,
+        "prefill_chunk": cfg.prefill_chunk,
+    });
+    hex::encode(Sha256::digest(inputs.to_string().as_bytes()))
+}
+
+/// Every task of a run at main width `width`: each prompt, then the ones checked at width
+/// 0. `tokens` gives a prompt's length; `None` if it does not know one.
+fn task_list(
+    cfg: &RunConfig,
+    build: &str,
+    width: u32,
+    tokens: impl Fn(&PromptSpec, &str) -> Option<u32>,
+) -> Option<Vec<Task>> {
+    let widths = cfg.prompts.iter().map(|s| (s, width)).chain(
+        cfg.prompts
+            .iter()
+            .filter(|s| s.check_width0 && width > 0)
+            .map(|s| (s, 0)),
+    );
+    widths
+        .map(|(spec, w)| {
+            let fingerprint = fingerprint(cfg, build, spec, w);
+            Some(Task {
+                prompt_tokens: tokens(spec, &fingerprint)?,
+                spec: spec.clone(),
+                width: w,
+                fingerprint,
+            })
+        })
+        .collect()
+}
+
+/// What a run learns at load that a later run needs before loading (`run.json`): the
+/// drafter's slot count and each request's prompt length, valid only for the weights hash
+/// and build they were found under.
+#[derive(Debug, Default)]
+struct RunRecord {
+    drafter_slots: Option<u32>,
+    /// By task fingerprint.
+    prompt_tokens: BTreeMap<String, u32>,
+}
+
+impl RunRecord {
+    fn load(path: &Path, weights_sha256: &str, build: &str) -> RunRecord {
+        let Some(v) = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        else {
+            return RunRecord::default();
+        };
+        if v["weights_sha256"].as_str() != Some(weights_sha256)
+            || v["build"].as_str() != Some(build)
+        {
+            return RunRecord::default();
+        }
+        RunRecord {
+            drafter_slots: v["drafter_slots"].as_u64().map(|n| n as u32),
+            prompt_tokens: v["prompt_tokens"]
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_u64()? as u32)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn to_json(&self, weights_sha256: &str, build: &str) -> Value {
+        json!({
+            "weights_sha256": weights_sha256,
+            "build": build,
+            "drafter_slots": self.drafter_slots,
+            "prompt_tokens": self.prompt_tokens,
+        })
     }
 }
 
@@ -540,10 +660,25 @@ fn run_task(
     let prompt_text = tokenizer
         .decode(&prompt, false)
         .map_err(|e| format!("{key}: {e}"))?;
+    // Each generated token's own bytes: its text when they are UTF-8 on their own, else
+    // their hex (a piece of a character).
+    let pieces: Vec<Value> = tokens
+        .iter()
+        .map(|&t| {
+            let bytes = tokenizer.token_bytes(t).unwrap_or_default();
+            match std::str::from_utf8(bytes) {
+                Ok(text) => json!({"id": t, "text": text}),
+                Err(_) => json!({"id": t, "bytes": hex::encode(bytes)}),
+            }
+        })
+        .collect();
     Ok(json!({
         "name": task.spec.name,
         "draft_width": task.width,
+        "fingerprint": task.fingerprint,
         "prompt_tokens": prompt.len(),
+        "prompt_token_ids": prompt,
+        "generated_pieces": pieces,
         "max_tokens": max_tokens,
         "generated_tokens": tokens.len(),
         "engine_finish": format!("{:?}", engine_finish.expect("finished")),
@@ -703,6 +838,34 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome, String> {
         ));
     }
 
+    let build = build_identity()?;
+    let record_path = cfg.out_dir.join("run.json");
+    let mut record = RunRecord::load(&record_path, &cfg.weights_sha256, &build);
+    let cal_path = cfg.out_dir.join("calibration.json");
+    let mut cal = Calibration::load(&cal_path);
+    // With a calibration and every unfinished request's prompt length on file from an
+    // earlier run of these inputs, a run over the limit is refused before the checkpoint
+    // is read.
+    if let Some(width) = cfg.draft_width.or(record.drafter_slots)
+        && let Some(tasks) = task_list(cfg, &build, width, |_, fp| {
+            record.prompt_tokens.get(fp).copied()
+        })
+    {
+        let pending: Vec<&Task> = tasks.iter().filter(|t| !t.finished(&cfg.out_dir)).collect();
+        if !pending.is_empty()
+            && let Some(est) = cal.estimate(&pending, cfg.max_new_tokens)
+            && est > cfg.time_limit_secs
+        {
+            return Ok(Outcome::Refused(format!(
+                "estimated {} for {} requests (calibrated earlier, worst case: no draft \
+                 accepted), over the limit of {}; nothing was loaded",
+                hms(est),
+                pending.len(),
+                hms(cfg.time_limit_secs)
+            )));
+        }
+    }
+
     log(format_args!(
         "loading {} through the node's loader: every covered file is hashed and the \
          weights hash checked first",
@@ -732,7 +895,7 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome, String> {
 
     // Every request rendered and tokenized once, for its length.
     let salts = SaltDeriver::new();
-    let mut tasks = Vec::new();
+    let mut lengths = BTreeMap::new();
     for spec in &cfg.prompts {
         let p = prepare(
             &model,
@@ -742,24 +905,17 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome, String> {
             spec,
             cfg.max_new_tokens,
         )?;
-        tasks.push(Task {
-            spec: spec.clone(),
-            width,
-            prompt_tokens: p.prompt_tokens,
-        });
+        lengths.insert(spec.name.clone(), p.prompt_tokens);
     }
-    for spec in cfg.prompts.iter().filter(|p| p.check_width0 && width > 0) {
-        let prompt_tokens = tasks
-            .iter()
-            .find(|t| t.spec.name == spec.name)
-            .expect("listed")
-            .prompt_tokens;
-        tasks.push(Task {
-            spec: spec.clone(),
-            width: 0,
-            prompt_tokens,
-        });
+    let tasks = task_list(cfg, &build, width, |s, _| lengths.get(&s.name).copied())
+        .expect("every prompt was prepared");
+    record.drafter_slots = Some(slots);
+    for t in &tasks {
+        record
+            .prompt_tokens
+            .insert(t.fingerprint.clone(), t.prompt_tokens);
     }
+    write_json(&record_path, &record.to_json(&cfg.weights_sha256, &build))?;
     let longest = tasks.iter().map(|t| t.prompt_tokens).max().unwrap_or(1);
     let plan = plan(cfg, longest, width, model.max_positions());
     log(format_args!(
@@ -778,15 +934,23 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome, String> {
         plan.sizing.max_batched_tokens
     ));
 
-    let done = |t: &Task| requests_dir.join(format!("{}.json", t.key())).exists();
-    let cal_path = cfg.out_dir.join("calibration.json");
-    let mut cal = Calibration::load(&cal_path);
+    // A saved result counts only if it was made from exactly this request's inputs; one
+    // made from others (another checkpoint, build, prompt or limit) is run again and
+    // overwritten, never relabelled.
+    let done = |t: &Task| t.finished(&cfg.out_dir);
     let pending: Vec<&Task> = tasks.iter().filter(|t| !done(t)).collect();
-    for t in tasks.iter().filter(|t| done(t)) {
-        log(format_args!(
-            "{}: finished in an earlier run; skipped",
-            t.key()
-        ));
+    for t in &tasks {
+        if done(t) {
+            log(format_args!(
+                "{}: finished in an earlier run; skipped",
+                t.key()
+            ));
+        } else if t.result_path(&cfg.out_dir).exists() {
+            log(format_args!(
+                "{}: the saved result was made from other inputs; running it again",
+                t.key()
+            ));
+        }
     }
     if !pending.is_empty() {
         match cal.estimate(&pending, cfg.max_new_tokens) {
@@ -937,13 +1101,14 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome, String> {
         }
     }
     drop(engine);
-    summarize(cfg, &model, &tasks, &plan, width, &cal)
+    summarize(cfg, &model, &build, &tasks, &plan, width, &cal)
 }
 
 /// Writes `summary.json` from every finished request's checkpoint.
 fn summarize(
     cfg: &RunConfig,
     model: &LoadedModel,
+    build: &str,
     tasks: &[Task],
     plan: &Plan,
     width: u32,
@@ -951,13 +1116,12 @@ fn summarize(
 ) -> Result<Outcome, String> {
     let mut results = Vec::new();
     for t in tasks {
-        let path = cfg
-            .out_dir
-            .join("requests")
-            .join(format!("{}.json", t.key()));
-        let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let v: Value =
-            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        let v = t.saved(&cfg.out_dir).ok_or_else(|| {
+            format!(
+                "{}: no result made from this run's inputs",
+                t.result_path(&cfg.out_dir).display()
+            )
+        })?;
         results.push((t, v));
     }
     let mut totals = serde_json::Map::new();
@@ -1052,6 +1216,7 @@ fn summarize(
         "weights_dir": cfg.weights_dir.display().to_string(),
         "weights_sha256": model.weights_hash(),
         "weights_hash_verified": true,
+        "build": build,
         "sampling": "greedy",
         "max_new_tokens": cfg.max_new_tokens,
         "draft_width": width,
@@ -1070,6 +1235,8 @@ fn summarize(
             if let Some(o) = v.as_object_mut() {
                 o.remove("step_log");
                 o.remove("prompt_text");
+                o.remove("prompt_token_ids");
+                o.remove("generated_pieces");
             }
             v
         }).collect::<Vec<_>>(),

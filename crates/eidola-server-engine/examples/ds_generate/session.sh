@@ -29,9 +29,10 @@ OUT="${OUT:-$HOME/eidola-dsgen}"
 [ -n "${CHECKPOINT:-}" ] || { echo "CHECKPOINT is not set" >&2; exit 1; }
 CHECKPOINT="$(cd "$CHECKPOINT" && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
-export HERE ROOT OUT CHECKPOINT
-
+# Absolute, since steps change directory before writing under it.
 mkdir -p "$OUT/done" "$OUT/logs"
+OUT="$(cd "$OUT" && pwd)"
+export HERE ROOT OUT CHECKPOINT
 
 say() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { say "FAILED: $*" >&2; exit 1; }
