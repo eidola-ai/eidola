@@ -251,6 +251,8 @@ pub struct Checked {
     pub accepted: usize,
     /// Rows whose chain started after the row did (a triangle, not every layer).
     pub triangles: usize,
+    /// Per-layer states compared.
+    pub layer_rows: usize,
 }
 
 /// Checks one record bit for bit against the dense oracle over the record's own tokens
@@ -274,6 +276,21 @@ pub fn check_record(
             "{ctx}: target logits at {pos}"
         );
         sum.target_rows += 1;
+    }
+    // Every layer's state at the row's last host position, wherever the row computed it.
+    let last = (r.context_len + r.num_tokens - 1) as usize;
+    assert_eq!(r.layer_streams.len(), dense.layer_streams[last].len());
+    for (layer, (got, want)) in r
+        .layer_streams
+        .iter()
+        .zip(&dense.layer_streams[last])
+        .enumerate()
+    {
+        assert!(
+            *got == 0 || got == want,
+            "{ctx}: the state leaving layer {layer} at {last}"
+        );
+        sum.layer_rows += usize::from(*got != 0);
     }
     sum.records += 1;
     sum.triangles += usize::from(r.chain_start > r.context_len);

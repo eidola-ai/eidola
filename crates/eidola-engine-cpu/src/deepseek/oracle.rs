@@ -27,6 +27,9 @@ pub struct DsDenseRun {
     pub logits: Matrix,
     /// Per draft block: its context KV at every position (`[positions · head_dim]`).
     pub drafter_kv: Vec<Vec<f32>>,
+    /// Per position, per layer: [`super::stream_hash`] of the residual copies leaving
+    /// the layer.
+    pub layer_streams: Vec<Vec<u64>>,
 }
 
 impl DsDenseRun {
@@ -49,7 +52,19 @@ impl DsDenseOracle<'_> {
     pub fn run(&self, tokens: &[u32]) -> Result<DsDenseRun> {
         let m = self.model;
         let c = m.config();
-        let out = m.forward(&mut m.new_state(), tokens, &DsForwardOptions::default())?;
+        let opts = DsForwardOptions {
+            taps: true,
+            ..Default::default()
+        };
+        let out = m.forward(&mut m.new_state(), tokens, &opts)?;
+        let layer_streams = (0..tokens.len())
+            .map(|pos| {
+                out.taps
+                    .iter()
+                    .map(|t| super::stream_hash(t.row(pos)))
+                    .collect()
+            })
+            .collect();
         let mut drafter_kv = Vec::new();
         if let (Some(w), Some(hidden)) = (&m.weights.drafter, &out.main_hidden) {
             drafter_kv = vec![Vec::new(); w.blocks.len()];
@@ -66,6 +81,7 @@ impl DsDenseOracle<'_> {
             tokens: tokens.to_vec(),
             logits: out.logits,
             drafter_kv,
+            layer_streams,
         })
     }
 
