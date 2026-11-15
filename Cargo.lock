@@ -9409,9 +9409,9 @@ dependencies = [
 
 [[package]]
 name = "rumdl"
-version = "0.2.75"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70fa48a5ac2f7d8b530162bac9cfe91b8b07b6ffa0a3e85cc1bd6ac0e5b51467"
+checksum = "921d2d0698c506f7af875f89ce66d820314bcf5da79b35deba13d5a7b16e88e0"
 dependencies = [
  "blake3",
  "chrono",
@@ -9429,6 +9429,7 @@ dependencies = [
  "libc",
  "log",
  "markdown",
+ "memchr",
  "mimalloc",
  "notify 8.2.0",
  "oxc_allocator",
@@ -9450,6 +9451,7 @@ dependencies = [
  "toml 1.1.6+spec-1.1.0",
  "toml_edit 0.25.15+spec-1.1.0",
  "tower-lsp",
+ "unicase",
  "unicode-normalization",
  "unicode-width 0.2.2",
  "windows-sys 0.61.2",
