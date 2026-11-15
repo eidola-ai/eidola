@@ -27,7 +27,7 @@
 //! differing records, the tolerance measurements) under
 //! `EIDOLA_DS_SUMMARY_DIR`, else the test target's temporary directory.
 //! `EIDOLA_DS_PROBE_DOTS` sets the dot products per probe case (default
-//! 2^30). Skipped without a device or `EIDOLA_ENGINE_KERNELS_DIR`.
+//! 2^33, about 8.6 billion). Skipped without a device or `EIDOLA_ENGINE_KERNELS_DIR`.
 
 mod common;
 mod ds_gemm_data;
@@ -744,7 +744,7 @@ fn device_suite() {
     let dots: u64 = std::env::var("EIDOLA_DS_PROBE_DOTS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1 << 30);
+        .unwrap_or(1 << 33);
     let mut r = Report {
         checks: Vec::new(),
         measured: Vec::new(),
