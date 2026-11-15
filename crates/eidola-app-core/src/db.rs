@@ -96,10 +96,12 @@ pub fn default_agent_label(model_ref: &str) -> String {
 /// replace this with "does the file exist / is that pid alive" logic — that
 /// property is the whole reason for the mechanism.
 ///
-/// The lockfile's *contents* are only the holder's pid, written after the lock
-/// is taken, purely so the refusal message can name a process. It is advisory
-/// (never authoritative): a contender that reads a truncated/absent pid still
-/// refuses, it just says less.
+/// The lockfile's *contents* are the holder's pid and what kind of holder it is
+/// ([`LockHolder`]), written after the lock is taken, so a contender can name
+/// the process and know whether waiting is worth it — a one-shot `eidola`
+/// command lets go when its command ends, the app does not. Both are advisory
+/// (never authoritative): a contender that reads a truncated/absent record
+/// still refuses, it just says less, and [`lock_holder`] answers `None`.
 ///
 /// Note `flock` conflicts across separate `open()`s in the *same* process too
 /// (each `open` is its own file description), so a second `AppCore` on one data
@@ -114,11 +116,43 @@ pub struct DbLock {
     path: PathBuf,
 }
 
+/// Who holds a profile's lock, as the holder declared it in the lockfile.
+///
+/// The distinction is the one a contender needs: a [`LockHolder::Command`]
+/// lets go when its command ends, so waiting for it is waiting for something
+/// that will happen; a [`LockHolder::App`] holds the profile for its whole
+/// life, and is asked over its control socket instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockHolder {
+    /// A long-lived Eidola: the app, windowed or as the background service.
+    App,
+    /// A one-shot `eidola` command that opened the profile itself.
+    Command,
+}
+
+impl LockHolder {
+    fn as_str(self) -> &'static str {
+        match self {
+            LockHolder::App => "app",
+            LockHolder::Command => "command",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "app" => Some(LockHolder::App),
+            "command" => Some(LockHolder::Command),
+            _ => None,
+        }
+    }
+}
+
 impl DbLock {
     /// Take the exclusive lock for `data_dir`, creating the directory and the
-    /// lockfile if needed. Fails with [`AppError::DatabaseInUse`] if another
-    /// process (or another `AppCore` in this one) already holds it.
-    pub fn acquire(data_dir: &Path) -> Result<Self, AppError> {
+    /// lockfile if needed, and record `holder` in it. Fails with
+    /// [`AppError::DatabaseInUse`] if another process (or another `AppCore`
+    /// in this one) already holds it.
+    pub fn acquire(data_dir: &Path, holder: LockHolder) -> Result<Self, AppError> {
         use fs4::{FileExt, TryLockError};
 
         std::fs::create_dir_all(data_dir).map_err(|e| AppError::Database {
@@ -138,16 +172,25 @@ impl DbLock {
         match FileExt::try_lock(&file) {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                let pid = read_lock_pid(&path);
-                let who = match pid {
-                    Some(pid) => format!("another Eidola process (pid {pid})"),
-                    None => "another Eidola process".to_string(),
+                let (pid, held_by) = read_lock_record(&path);
+                let who = match (held_by, pid) {
+                    (Some(LockHolder::Command), Some(pid)) => {
+                        format!("an `eidola` command (pid {pid})")
+                    }
+                    (Some(LockHolder::Command), None) => "an `eidola` command".to_string(),
+                    (_, Some(pid)) => format!("another Eidola process (pid {pid})"),
+                    (_, None) => "another Eidola process".to_string(),
+                };
+                let remedy = match held_by {
+                    Some(LockHolder::Command) => {
+                        "Wait for it to finish, or stop it, and try again."
+                    }
+                    _ => "Quit it and try again.",
                 };
                 return Err(AppError::DatabaseInUse {
                     pid,
                     message: format!(
-                        "{who} has this database open ({}). \
-                         Quit it and try again.",
+                        "{who} has this database open ({}). {remedy}",
                         data_dir.join("eidola.db").display()
                     ),
                 });
@@ -159,10 +202,11 @@ impl DbLock {
             }
         }
 
-        // We hold the lock — record who, for the next contender's message.
-        // Best-effort: a lockfile we can't write is still a lock we hold, and
-        // the contender's refusal is correct with or without a pid.
-        let _ = write_lock_pid(&file);
+        // We hold the lock — record who, for the next contender's message and
+        // its decision whether to wait. Best-effort: a lockfile we can't write
+        // is still a lock we hold, and the contender's refusal is correct with
+        // or without the record.
+        let _ = write_lock_record(&file, holder);
 
         Ok(Self { _file: file, path })
     }
@@ -179,21 +223,39 @@ impl std::fmt::Debug for DbLock {
     }
 }
 
-/// Stamp our pid into the (already locked) lockfile.
-fn write_lock_pid(file: &std::fs::File) -> std::io::Result<()> {
+/// Stamp our pid and holder kind into the (already locked) lockfile, as one
+/// line: `<pid> <app|command>`.
+fn write_lock_record(file: &std::fs::File, holder: LockHolder) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
     let mut file = file;
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
-    write!(file, "{}", std::process::id())?;
+    write!(file, "{} {}", std::process::id(), holder.as_str())?;
     file.flush()
 }
 
-/// Read the holder's pid from a lockfile. `None` for an empty/garbage file —
-/// the holder may have been mid-write, which is honest to report as "unknown"
-/// rather than guessed at.
-fn read_lock_pid(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Read the holder's pid and kind from a lockfile. Either is `None` when the
+/// file does not say — the holder may have been mid-write, which is honest to
+/// report as "unknown" rather than guessed at.
+fn read_lock_record(path: &Path) -> (Option<u32>, Option<LockHolder>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let mut words = text.split_whitespace();
+    let pid = words.next().and_then(|w| w.parse().ok());
+    let holder = words.next().and_then(LockHolder::parse);
+    (pid, holder)
+}
+
+/// What kind of process the lockfile in `data_dir` says holds the profile.
+///
+/// Read without taking the lock, so it describes whoever **last** held it: a
+/// caller asks only after being refused with [`AppError::DatabaseInUse`], and
+/// even then the answer can be stale by the time it arrives. That is enough
+/// for the one decision it serves — whether to wait or to refuse — because
+/// the caller looks again before acting either way.
+pub fn lock_holder(data_dir: &Path) -> Option<LockHolder> {
+    read_lock_record(&data_dir.join(LOCK_FILE_NAME)).1
 }
 
 /// Opens (or creates) the local database at `data_dir/eidola.db` and runs any

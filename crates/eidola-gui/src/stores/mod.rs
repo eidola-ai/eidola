@@ -132,7 +132,7 @@ pub fn open_app_core() -> Result<Arc<AppCore>, eidola_app_core::error::AppError>
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .ok_or_else(|| missing("configuration"))?;
     let data_dir = eidola_app_core::config::default_data_dir().ok_or_else(|| missing("data"))?;
-    let core = Arc::new(AppCore::new(config_dir, data_dir)?);
+    let core = Arc::new(open_after_commands(config_dir, data_dir)?);
     core.runtime().block_on(core.open_database())?;
     // **The app drives delegated conversations; nothing else in it will.** A
     // sub-space has no window, so app-core gives it its turns — but only if
@@ -147,6 +147,42 @@ pub fn open_app_core() -> Result<Arc<AppCore>, eidola_app_core::error::AppError>
     // before its first look, and this is the process that holds the profile.
     core.start_credential_provisioner();
     Ok(core)
+}
+
+/// How long a launching app waits for a one-shot `eidola` command holding the
+/// profile to let go, before reporting it through the startup dialog.
+///
+/// Short on purpose: nothing is on screen while it runs. It covers the
+/// common case — a quick command (`eidola spaces list`, a wallet listing)
+/// caught mid-run by a double-click — and a longer one (a chat turn, a
+/// `model load`) still ends in the dialog, whose message names the command
+/// and says it will let go.
+const COMMAND_HOLDER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`AppCore::new`], waiting up to [`COMMAND_HOLDER_WAIT`] when the profile is
+/// held by an `eidola` command rather than another app.
+///
+/// Another app holds the profile for its whole life, so that refusal is
+/// immediate, exactly as before; only a holder the lockfile names as a
+/// command is worth waiting on (`eidola_app_core::db::lock_holder`).
+fn open_after_commands(
+    config_dir: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+) -> Result<AppCore, eidola_app_core::error::AppError> {
+    use eidola_app_core::db::{LockHolder, lock_holder};
+    use eidola_app_core::error::AppError;
+    let deadline = std::time::Instant::now() + COMMAND_HOLDER_WAIT;
+    loop {
+        match AppCore::new(config_dir.clone(), data_dir.clone()) {
+            Err(AppError::DatabaseInUse { .. })
+                if lock_holder(&data_dir) == Some(LockHolder::Command)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
 }
 
 impl Stores {

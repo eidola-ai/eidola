@@ -23,6 +23,12 @@ struct Cli {
     /// profile.
     #[arg(long, global = true)]
     embedded: bool,
+    /// How long to wait, in seconds, for another `eidola` command that holds
+    /// the local profile to finish with it. Commands run against a profile no
+    /// app is serving take turns; 0 refuses at once instead of waiting.
+    #[arg(long, global = true, value_name = "SECONDS",
+          default_value_t = session::DEFAULT_LOCK_WAIT.as_secs())]
+    lock_wait: u64,
 }
 
 #[derive(Subcommand)]
@@ -526,6 +532,14 @@ fn report_startup(e: &Startup) {
             );
         }
         Startup::Dial(e) => failure_hint(e),
+        Startup::Busy { .. } => {
+            eprintln!(
+                "hint: the local database is single-writer, and with no Eidola app \
+                 running each `eidola` command opens it in turn — wait for that \
+                 command to finish (`eidola model load` holds it until stopped), \
+                 raise --lock-wait, or start the Eidola app so commands share it"
+            );
+        }
     }
 }
 
@@ -703,7 +717,23 @@ fn main() {
     // session (and its tokio runtime) is built outside any async context so it
     // can be dropped cleanly when main returns.
     let (config_dir, data_dir) = profile_dirs();
-    let session = match Session::open(config_dir, data_dir, cli.embedded) {
+    let mut announce = |pid: Option<u32>| {
+        let who = match pid {
+            Some(pid) => format!("another `eidola` command (pid {pid})"),
+            None => "another `eidola` command".to_string(),
+        };
+        eprintln!(
+            "waiting for {who} to finish with this profile (up to {}s; --lock-wait changes this)…",
+            cli.lock_wait
+        );
+    };
+    let session = match Session::open_waiting(
+        config_dir,
+        data_dir,
+        cli.embedded,
+        std::time::Duration::from_secs(cli.lock_wait),
+        &mut announce,
+    ) {
         Ok(session) => session,
         Err(e) => {
             report_startup(&e);

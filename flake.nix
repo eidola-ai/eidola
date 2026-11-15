@@ -1277,6 +1277,19 @@ with open(path, "wb") as f:
                 # ad-hoc signature as the main binary; no explicit sign call.
                 cp ${llamaServer}/bin/llama-server "$APP/Contents/MacOS/llama-server"
                 chmod u+w "$APP/Contents/MacOS/llama-server"
+
+                # The command-line client, from the very build this app is,
+                # so the `eidola` a user runs beside the app can never be a
+                # different version of it. Named `eidola-cli` rather than
+                # `eidola` because the default APFS volume is
+                # case-insensitive: `eidola` and the main binary `Eidola`
+                # would be one file. Users reach it through a link on PATH
+                # named `eidola`. It is the universal CLI derivation's own
+                # output (LC_UUID already zeroed), copied rather than
+                # referenced, and the postFixup signing pass (re-)signs it
+                # like every other Mach-O in $out.
+                cp ${eidolaCliMacosUniversal}/bin/eidola "$APP/Contents/MacOS/eidola-cli"
+                chmod u+w "$APP/Contents/MacOS/eidola-cli"
               '';
 
               installPhase = ''
@@ -1502,6 +1515,31 @@ with open(path, "wb") as f:
         # our payload entirely. VK_ADD_DRIVER_FILES is *additive* and set
         # only as a default, so a NixOS host's /run/opengl-driver drivers
         # coexist and a user can override outright.
+        # The command-line client every Linux GUI payload carries beside the
+        # app, built exactly as the GUI is — the same glibc target, the same
+        # release profile — so the Nix payload takes it as built and the .deb
+        # takes it through the same host-generic patch (`eidolaCliLinuxFdo`).
+        # Not the static musl target the standalone CLI image uses: a
+        # dependency links `-ldl`, which only that image's musl supplies, and
+        # a payload that is glibc for its app is no worse for being glibc for
+        # its client.
+        eidolaCliLinux =
+          if !pkgs.stdenv.isLinux then
+            null
+          else
+            mkPackage {
+              pname = "eidola-cli";
+              rustTarget =
+                {
+                  "x86_64-linux" = "x86_64-unknown-linux-gnu";
+                  "aarch64-linux" = "aarch64-unknown-linux-gnu";
+                }
+                .${system};
+              nixCrossSystem = null;
+              # The workspace-wide `checks.tests` target runs its tests.
+              doCheck = false;
+            };
+
         eidolaGuiLinuxNix =
           if eidolaGuiLinux == null then
             null
@@ -1512,6 +1550,10 @@ with open(path, "wb") as f:
                 chmod u+w "$out/bin/.eidola-gui-wrapped"
                 cp ${llamaServer}/bin/llama-server "$out/bin/llama-server"
                 chmod u+w "$out/bin/llama-server"
+                # The command-line client from the same build, beside the app
+                # and the sidecar (its engine rule is the same sibling rule).
+                cp ${eidolaCliLinux}/bin/eidola "$out/bin/eidola"
+                chmod 555 "$out/bin/eidola"
                 icds=$(ls ${pkgs.mesa}/share/vulkan/icd.d/*.json | tr '\n' ':')
                 # The launcher. It finds the binary and the sidecar beside
                 # itself and never names $out: $out is input-addressed, so a
@@ -1608,6 +1650,14 @@ with open(path, "wb") as f:
                 patchelf --set-interpreter ${fdoInterpreter} $out/bin/eidola-gui
                 ${assertGlibcFloor "$out/bin/eidola-gui"}
                 chmod a-w $out/bin/eidola-gui
+
+                # The command-line client, through the same two patches.
+                cp ${eidolaCliLinux}/bin/eidola $out/bin/eidola
+                chmod u+w $out/bin/eidola
+                patchelf --remove-rpath $out/bin/eidola
+                patchelf --set-interpreter ${fdoInterpreter} $out/bin/eidola
+                ${assertGlibcFloor "$out/bin/eidola"}
+                chmod a-w $out/bin/eidola
               '';
 
         # Debian dependencies, grouped by how each one is discovered, because
@@ -1681,8 +1731,8 @@ with open(path, "wb") as f:
 
         # The installed tree, exactly as it lands on the host.
         #
-        # Both executables sit in /usr/libexec/eidola and /usr/bin/eidola-gui
-        # is a symlink to the GUI. That layout is not cosmetic: app-core
+        # Every executable sits in /usr/libexec/eidola; /usr/bin/eidola-gui and
+        # /usr/bin/eidola are symlinks to the GUI and the CLI. That layout is not cosmetic: app-core
         # resolves the inference engine as a `llama-server` sibling of the
         # running executable, and /proc/self/exe reports the symlink's target,
         # so a launch through /usr/bin lands in /usr/libexec/eidola and finds
@@ -1703,8 +1753,11 @@ with open(path, "wb") as f:
                   $out/usr/libexec/eidola/eidola-gui
                 install -Dm755 ${llamaServer}/bin/llama-server \
                   $out/usr/libexec/eidola/llama-server
+                install -Dm755 ${eidolaGuiLinuxFdo}/bin/eidola \
+                  $out/usr/libexec/eidola/eidola
                 mkdir -p $out/usr/bin
                 ln -s ../libexec/eidola/eidola-gui $out/usr/bin/eidola-gui
+                ln -s ../libexec/eidola/eidola $out/usr/bin/eidola
 
                 # Desktop entry — see the Nix installable above for why the
                 # comment header is stripped and why the basename is fixed.
@@ -1761,6 +1814,8 @@ with open(path, "wb") as f:
 
                 ${assertDebNeededCovered "$tree/usr/libexec/eidola/eidola-gui"}
                 ${assertGlibcFloor "$tree/usr/libexec/eidola/eidola-gui"}
+                ${assertDebNeededCovered "$tree/usr/libexec/eidola/eidola"}
+                ${assertGlibcFloor "$tree/usr/libexec/eidola/eidola"}
                 ${assertFullyStatic "$tree/usr/libexec/eidola/llama-server"}
 
                 tarFlags="--format=gnu --sort=name --mtime=@0 \

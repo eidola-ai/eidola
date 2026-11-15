@@ -49,7 +49,8 @@ build system:
         cargo build -p eidola-cli
         ;;
       gui)
-        cargo build -p eidola-gui
+        # The CLI is part of the app's payload on every platform.
+        cargo build -p eidola-gui -p eidola-cli
         # On macOS, also assemble a proper .app bundle. AppKit needs an
         # Info.plist alongside the binary to treat the process as a real
         # app (vs. a command-line tool); otherwise menu key-equivalent

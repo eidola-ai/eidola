@@ -11556,10 +11556,27 @@ impl AppCore {
     /// silently. The lock is released when the returned `AppCore` (and any
     /// task holding its inner `Arc`) drops.
     pub fn new(config_dir: PathBuf, data_dir: PathBuf) -> Result<Self, AppError> {
+        Self::open_as(config_dir, data_dir, db::LockHolder::App)
+    }
+
+    /// [`AppCore::new`] for a one-shot `eidola` command that opens the profile
+    /// itself. The only difference is what the lockfile says about the
+    /// holder ([`db::LockHolder::Command`]): a contender refused while this
+    /// core lives learns that the profile will be let go when the command
+    /// ends, which is what lets another command wait for it rather than fail.
+    pub fn new_for_command(config_dir: PathBuf, data_dir: PathBuf) -> Result<Self, AppError> {
+        Self::open_as(config_dir, data_dir, db::LockHolder::Command)
+    }
+
+    fn open_as(
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        holder: db::LockHolder,
+    ) -> Result<Self, AppError> {
         #[cfg(feature = "test-support")]
-        let core = Self::build(config_dir, data_dir, None);
+        let core = Self::build(config_dir, data_dir, holder, None);
         #[cfg(not(feature = "test-support"))]
-        let core = Self::build(config_dir, data_dir);
+        let core = Self::build(config_dir, data_dir, holder);
         core
     }
 
@@ -11583,7 +11600,7 @@ impl AppCore {
         data_dir: PathBuf,
         client: reqwest::Client,
     ) -> Result<Self, AppError> {
-        Self::build(config_dir, data_dir, Some(client))
+        Self::build(config_dir, data_dir, db::LockHolder::App, Some(client))
     }
 
     /// **Test-only seam.** Treat the eidola backend as though it were reached
@@ -11673,12 +11690,13 @@ impl AppCore {
     fn build(
         config_dir: PathBuf,
         data_dir: PathBuf,
+        holder: db::LockHolder,
         #[cfg(feature = "test-support")] http_override: Option<reqwest::Client>,
     ) -> Result<Self, AppError> {
         // Loud DB contention: claim the single-writer database before
         // building anything else, so a second opener is refused with a typed
         // error instead of silently racing the first.
-        let db_lock = db::DbLock::acquire(&data_dir)?;
+        let db_lock = db::DbLock::acquire(&data_dir, holder)?;
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
