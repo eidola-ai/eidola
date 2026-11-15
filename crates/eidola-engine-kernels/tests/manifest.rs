@@ -439,7 +439,7 @@ fn ds_gemm_tc_runs_on_tensor_cores_and_fuses_nothing() {
     let mut want = vec!["eidola_ds_gemm_probe".to_owned()];
     for product in ["lin4", "lin8"] {
         for form in ["banded", "tolerance"] {
-            for tile in ["t32", "t8"] {
+            for tile in ["s8", "t32", "t8"] {
                 want.push(format!("eidola_ds_{product}_{form}_{tile}"));
             }
         }

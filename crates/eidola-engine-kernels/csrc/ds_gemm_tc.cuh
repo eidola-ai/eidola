@@ -45,6 +45,8 @@
 #include "ds_abi.cuh"
 #include "ds_numeric.cuh"
 
+#include <cstddef>
+
 #if defined(__CUDACC__)
 #define DSTC_FN __host__ __device__ __forceinline__
 #else
@@ -57,41 +59,73 @@ namespace dstc {
 
 constexpr uint32_t kThreads = 128;
 constexpr uint32_t kWarps = kThreads / 32;
-// 32-wide blocks staged per step, and an activation (or FP8 weight) row's
-// bytes in one step.
-constexpr uint32_t kChunkBlocks = 4;
-constexpr uint32_t kChunkBytes = 32 * kChunkBlocks;
 // Padding after each staged row: a fragment load of 8 rows × 4 lanes then
 // touches 32 distinct banks.
 constexpr uint32_t kPad = 16;
 
-// A tile: `kTokens` rows (8 or 32) by `kFeatures` outputs; each warp owns
-// `16 · kMTiles` consecutive outputs and every row of the tile.
-template <bool kFp4, uint32_t kTokens>
+// A block's shape: each warp computes `kMTiles` 16-output MMA tiles by
+// `kNTiles` 8-row tiles; `kFeatureWarps` warps lie side by side over the
+// outputs, and the `kWarps / kFeatureWarps` warps over the same outputs share
+// out each step's blocks. A step stages `kStepBlocks` 32-wide blocks, in
+// `kStages` stages.
+template <bool kFp4_, uint32_t kMTiles_, uint32_t kNTiles_, uint32_t kFeatureWarps_,
+          uint32_t kStepBlocks_, uint32_t kStages_>
 struct Cfg {
-  static_assert(kTokens == 8 || kTokens == 32, "token tiles of 8 or 32 rows");
-  static constexpr uint32_t kMTiles = kTokens == 8 ? 1 : 2;
-  static constexpr uint32_t kNTiles = kTokens / 8;
+  static constexpr bool kFp4 = kFp4_;
+  static constexpr uint32_t kMTiles = kMTiles_;
+  static constexpr uint32_t kNTiles = kNTiles_;
+  static constexpr uint32_t kFeatureWarps = kFeatureWarps_;
+  static constexpr uint32_t kStepBlocks = kStepBlocks_;
+  static constexpr uint32_t kStages = kStages_;
+  static constexpr uint32_t kKWarps = kWarps / kFeatureWarps;
+  static constexpr uint32_t kTokens = 8 * kNTiles;
   static constexpr uint32_t kWarpFeatures = 16 * kMTiles;
-  static constexpr uint32_t kFeatures = kWarps * kWarpFeatures;
-  // Weight bytes of one output row in a step: 128 FP8 codes or 64 bytes of
+  static constexpr uint32_t kFeatures = kFeatureWarps * kWarpFeatures;
+  // Bytes of one row in a step: activation codes, and weight codes (FP8) or
   // packed FP4.
-  static constexpr uint32_t kWBytes = kFp4 ? kChunkBytes / 2 : kChunkBytes;
+  static constexpr uint32_t kXBytes = 32 * kStepBlocks;
+  static constexpr uint32_t kWBytes = kFp4 ? kXBytes / 2 : kXBytes;
   static constexpr uint32_t kWRow = kWBytes + kPad;
-  static constexpr uint32_t kXRow = kChunkBytes + kPad;
+  static constexpr uint32_t kXRow = kXBytes + kPad;
+  static_assert(kWarps % kFeatureWarps == 0 && kStepBlocks % (kWarps / kFeatureWarps) == 0);
 };
+
+// The tiles: four warps side by side over the outputs, each computing every
+// block of a step; steps of 4 blocks, double-buffered. 8 rows by 64 outputs
+// (`_t8`) or 32 rows by 128 (`_t32`).
+template <bool kFp4, uint32_t kTokens>
+using TileCfg = Cfg<kFp4, kTokens == 8 ? 1 : 2, kTokens / 8, kWarps, 4, 2>;
+// The split block (`_s8`): 8 rows by 16 outputs. Each warp computes a
+// quarter of each step's 16 blocks, and the blocks' contributions are then
+// added in ascending block order, one thread per output and row. Many small
+// blocks with deep staging, for row counts whose GEMM is a stream of the
+// weights.
+template <bool kFp4>
+using SplitCfg = Cfg<kFp4, 1, 1, 1, 16, kFp4 ? 8 : 6>;
 
 // One staged step: weight rows, activation rows, and the scale bytes of the
 // step's blocks (a weight scale per output row, expanded from the 32 × 32
 // tile for FP8 weights).
-template <bool kFp4, uint32_t kTokens>
+template <class C>
 struct alignas(16) Stage {
-  using C = Cfg<kFp4, kTokens>;
   uint8_t w[C::kFeatures][C::kWRow];
-  uint8_t x[kTokens][C::kXRow];
-  uint8_t ws[C::kFeatures][kChunkBlocks];
-  uint8_t xs[kTokens][kChunkBlocks];
+  uint8_t x[C::kTokens][C::kXRow];
+  uint8_t ws[C::kFeatures][C::kStepBlocks];
+  uint8_t xs[C::kTokens][C::kStepBlocks];
 };
+
+// The split block's contributions of one step, `(dot · activation scale) ·
+// weight scale` per block, output and row, before they are added in order.
+template <class C>
+struct Contributions {
+  float c[C::kStepBlocks][C::kFeatures][C::kTokens];
+};
+
+// Dynamic shared memory of the split block: its stages, then its contributions.
+template <class C>
+constexpr uint32_t split_smem_bytes() {
+  return static_cast<uint32_t>(C::kStages * sizeof(Stage<C>) + sizeof(Contributions<C>));
+}
 
 // What one pass over K computes: the rows `[lo, hi)` of a tile (relative to
 // its first row) against one weight. `lin8` is one pass a tile; `lin4` one
@@ -107,9 +141,14 @@ struct Pass {
   uint32_t f0;  // the block's first output
 };
 
+template <class C>
+DSTC_FN uint32_t steps(const Pass& p) {
+  return (p.k / 32 + C::kStepBlocks - 1) / C::kStepBlocks;
+}
+template <class C>
 DSTC_FN uint32_t blocks_in_step(const Pass& p, uint32_t step) {
-  const uint32_t kb = p.k / 32, first = step * kChunkBlocks;
-  return kb - first < kChunkBlocks ? kb - first : kChunkBlocks;
+  const uint32_t kb = p.k / 32, first = step * C::kStepBlocks;
+  return kb - first < C::kStepBlocks ? kb - first : C::kStepBlocks;
 }
 
 // ---- staging: the copies of one step, enumerated per thread ----
@@ -117,52 +156,50 @@ DSTC_FN uint32_t blocks_in_step(const Pass& p, uint32_t step) {
 // Copy `i` of the step's 16-byte weight copies (`i < kFeatures · kWBytes /
 // 16`): its staged row and offset, and its source, or `nullptr` for a
 // zero-filled piece (an output past `n`, a block past `k`).
-template <bool kFp4, uint32_t kTokens>
+template <class C>
 DSTC_FN const uint8_t* w_copy(const Pass& p, uint32_t step, uint32_t i, uint32_t* row,
                               uint32_t* off) {
-  using C = Cfg<kFp4, kTokens>;
   constexpr uint32_t segs = C::kWBytes / 16;
   *row = i / segs;
   *off = (i % segs) * 16;
   const uint32_t f = p.f0 + *row;
-  const uint32_t valid = blocks_in_step(p, step) * (kFp4 ? 16u : 32u);
+  const uint32_t valid = blocks_in_step<C>(p, step) * (C::kFp4 ? 16u : 32u);
   if (f >= p.n || *off >= valid) return nullptr;
-  const uint64_t row_bytes = kFp4 ? p.k / 2 : p.k;
+  const uint64_t row_bytes = C::kFp4 ? p.k / 2 : p.k;
   return p.w + f * row_bytes + static_cast<uint64_t>(step) * C::kWBytes + *off;
 }
 
-// Copy `i` of the step's 16-byte activation copies (`i < kTokens · 8`).
-template <uint32_t kTokens>
+// Copy `i` of the step's 16-byte activation copies (`i < kTokens · kXBytes / 16`).
+template <class C>
 DSTC_FN const uint8_t* x_copy(const Pass& p, uint32_t step, uint32_t i, uint32_t* row,
                               uint32_t* off) {
-  constexpr uint32_t segs = kChunkBytes / 16;
+  constexpr uint32_t segs = C::kXBytes / 16;
   *row = i / segs;
   *off = (i % segs) * 16;
-  const uint32_t valid = blocks_in_step(p, step) * 32u;
+  const uint32_t valid = blocks_in_step<C>(p, step) * 32u;
   if (*row < p.lo || *row >= p.hi || *off >= valid) return nullptr;
-  return p.x + static_cast<uint64_t>(*row) * p.k + static_cast<uint64_t>(step) * kChunkBytes + *off;
+  return p.x + static_cast<uint64_t>(*row) * p.k + static_cast<uint64_t>(step) * C::kXBytes + *off;
 }
 
-// The scale bytes of the step, item `i < (kFeatures + kTokens) · 4`: weight
-// scales first. A scale nothing reads (an output or a row outside the pass,
-// a block past `k`) is staged as 127.
-template <bool kFp4, uint32_t kTokens>
-DSTC_FN void stage_scale(const Pass& p, uint32_t step, uint32_t i, Stage<kFp4, kTokens>& s) {
-  using C = Cfg<kFp4, kTokens>;
-  const uint32_t kb = p.k / 32, vb = blocks_in_step(p, step);
-  const uint32_t b = i % kChunkBlocks;
-  const uint32_t blk = step * kChunkBlocks + b;
-  if (i < C::kFeatures * kChunkBlocks) {
-    const uint32_t r = i / kChunkBlocks, f = p.f0 + r;
+// The scale bytes of the step, item `i < (kFeatures + kTokens) · kStepBlocks`:
+// weight scales first. A scale nothing reads (an output or a row outside the
+// pass, a block past `k`) is staged as 127.
+template <class C>
+DSTC_FN void stage_scale(const Pass& p, uint32_t step, uint32_t i, Stage<C>& s) {
+  const uint32_t kb = p.k / 32, vb = blocks_in_step<C>(p, step);
+  const uint32_t b = i % C::kStepBlocks;
+  const uint32_t blk = step * C::kStepBlocks + b;
+  if (i < C::kFeatures * C::kStepBlocks) {
+    const uint32_t r = i / C::kStepBlocks, f = p.f0 + r;
     uint8_t v = 127;
     if (f < p.n && b < vb) {
-      const uint64_t at = kFp4 ? static_cast<uint64_t>(f) * kb + blk
-                               : static_cast<uint64_t>(f / 32) * kb + blk;
+      const uint64_t at = C::kFp4 ? static_cast<uint64_t>(f) * kb + blk
+                                  : static_cast<uint64_t>(f / 32) * kb + blk;
       v = p.ws[at];
     }
     s.ws[r][b] = v;
   } else {
-    const uint32_t r = (i - C::kFeatures * kChunkBlocks) / kChunkBlocks;
+    const uint32_t r = (i - C::kFeatures * C::kStepBlocks) / C::kStepBlocks;
     s.xs[r][b] = (r >= p.lo && r < p.hi && b < vb) ? p.xs[static_cast<uint64_t>(r) * kb + blk] : 127;
   }
 }
@@ -235,15 +272,13 @@ DSTC_FN void e2m1x4_to_f16(uint32_t v, uint32_t* lo, uint32_t* hi) {
 
 // ---- bands ----
 
-// The halves of `x` (two F16 values) whose exponent field lies in
-// `[lo, hi]`, the others replaced by +0. Lane-wise without carries: an
-// exponent field is at most 31, so `e + 128 - lo` and `128 + hi - e` stay
-// within a 16-bit lane and their bit 7 is the comparison.
-DSTC_FN uint32_t band_mask(uint32_t x, uint32_t lo, uint32_t hi) {
-  const uint32_t e = (x >> 10) & 0x001f001fu;
-  const uint32_t ge = (e + (0x80u - lo) * 0x00010001u) & 0x00800080u;
-  const uint32_t le = ((0x80u + hi) * 0x00010001u - e) & 0x00800080u;
-  return x & (((ge & le) >> 7) * 0xffffu);
+// A mask of the halves of `x` (two F16 values) whose exponent field is at
+// least `field`. Lane-wise without carries: a magnitude is at most 0x7fff and
+// `0x8000 - (field << 10)` at most 0x8000, so their sum stays within a 16-bit
+// lane and its bit 15 is the comparison.
+DSTC_FN uint32_t at_least(uint32_t x, uint32_t field) {
+  const uint32_t s = ((x & 0x7fff7fffu) + (0x8000u - (field << 10)) * 0x00010001u) & 0x80008000u;
+  return (s >> 15) * 0xffffu;
 }
 
 // Bands by E4M3 exponent field. Within a band `[lo, hi]` an E4M3 value is
@@ -257,20 +292,30 @@ DSTC_FN uint32_t band_mask(uint32_t x, uint32_t lo, uint32_t hi) {
 //   FP8 × FP4: weights unbanded (twice an E2M1 value is at most 12),
 //   activations {[0, 8], [9, 15]}: 32 · 1,920 · 12 < 2^20.
 //
-// The same bands of F16 exponent fields: an E4M3 field `E` of 1 or more is
-// F16 field `E + 8`, and the E4M3 subnormals (field 0) are F16 fields 6 to 8
-// (zero is 0), so `[0, hi]` is `[0, hi + 8]` and `[lo, hi]` is
-// `[lo + 8, hi + 8]`.
+// They are cut on the F16 values: an E4M3 field `E` of 1 or more is F16 field
+// `E + 8`, and the E4M3 subnormals (field 0) are F16 fields 6 to 8 (zero is
+// 0), so a band starting at E4M3 field `lo` of 1 or more starts at F16 field
+// `lo + 8`. A code outside a band is +0 there.
 constexpr uint32_t kW8Bands = 2;
 constexpr uint32_t kX8Bands = 3;
 constexpr uint32_t kX4Bands = 2;
-DSTC_FN uint32_t e4m3_band_field(uint32_t e) { return e == 0 ? 0u : e + 8u; }
-DSTC_FN uint32_t w8_band_lo(uint32_t b) { return e4m3_band_field(b == 0 ? 0u : 9u); }
-DSTC_FN uint32_t w8_band_hi(uint32_t b) { return (b == 0 ? 8u : 15u) + 8u; }
-DSTC_FN uint32_t x8_band_lo(uint32_t b) { return e4m3_band_field(b == 0 ? 0u : b == 1 ? 6u : 11u); }
-DSTC_FN uint32_t x8_band_hi(uint32_t b) { return (b == 0 ? 5u : b == 1 ? 10u : 15u) + 8u; }
-DSTC_FN uint32_t x4_band_lo(uint32_t b) { return e4m3_band_field(b == 0 ? 0u : 9u); }
-DSTC_FN uint32_t x4_band_hi(uint32_t b) { return (b == 0 ? 8u : 15u) + 8u; }
+constexpr uint32_t kW8Cut = 9 + 8;
+constexpr uint32_t kX8Cut1 = 6 + 8, kX8Cut2 = 11 + 8;
+constexpr uint32_t kX4Cut = 9 + 8;
+
+// `x` cut at F16 field `t`: below it, and from it up.
+DSTC_FN void split2(uint32_t x, uint32_t t, uint32_t* lo, uint32_t* hi) {
+  const uint32_t m = at_least(x, t);
+  *lo = x & ~m;
+  *hi = x & m;
+}
+// `x` cut at F16 fields `t1 < t2`.
+DSTC_FN void split3(uint32_t x, uint32_t t1, uint32_t t2, uint32_t* b0, uint32_t* b1, uint32_t* b2) {
+  const uint32_t m1 = at_least(x, t1), m2 = at_least(x, t2);
+  *b0 = x & ~m1;
+  *b1 = x & m1 & ~m2;
+  *b2 = x & m2;
+}
 
 // A band pair's exact sum (an f32 holding it exactly) as an integer in the
 // block dot's unit: 2^-18 for FP8 × FP8 (below 2^41 in all), 2^-10 for
@@ -321,19 +366,17 @@ DSTC_FN void fp8_word(uint32_t w, uint32_t* lo, uint32_t* hi) {
   *hi = e4m3x2_to_f16x2(w >> 16);
 }
 
-// Warp `warp`'s A fragments (its weight rows) and every B fragment (the
-// tile's rows) of block `blk` of the staged step: `a[mt][h]`, `b[nt][h]` for
-// the two halves `h` of the block.
-template <bool kFp4, uint32_t kTokens>
-DSTC_FN void load_frags(const Stage<kFp4, kTokens>& s, uint32_t warp, uint32_t lane, uint32_t blk,
-                        uint32_t (&a)[Cfg<kFp4, kTokens>::kMTiles][2][4],
-                        uint32_t (&b)[Cfg<kFp4, kTokens>::kNTiles][2][2]) {
-  using C = Cfg<kFp4, kTokens>;
+// The A fragments of the 16-row tiles from staged weight row `frow` and
+// every B fragment (the staged rows) of block `blk` of the step:
+// `a[mt][h]`, `b[nt][h]` for the two halves `h` of the block.
+template <class C>
+DSTC_FN void load_frags(const Stage<C>& s, uint32_t frow, uint32_t lane, uint32_t blk,
+                        uint32_t (&a)[C::kMTiles][2][4], uint32_t (&b)[C::kNTiles][2][2]) {
   const uint32_t g = lane >> 2, q = lane & 3u;
   for (uint32_t mt = 0; mt < C::kMTiles; ++mt) {
-    const uint32_t r = warp * C::kWarpFeatures + mt * 16 + g;
+    const uint32_t r = frow + mt * 16 + g;
     for (uint32_t h = 0; h < 2; ++h) {
-      if (kFp4) {
+      if (C::kFp4) {
         const uint32_t at = blk * 16 + h * 8 + q * 2;
         e2m1x4_to_f16(load16(&s.w[r][at]), &a[mt][h][0], &a[mt][h][2]);
         e2m1x4_to_f16(load16(&s.w[r + 8][at]), &a[mt][h][1], &a[mt][h][3]);
@@ -352,11 +395,9 @@ DSTC_FN void load_frags(const Stage<kFp4, kTokens>& s, uint32_t warp, uint32_t l
   }
 }
 
-// The output (relative to the block's first) and tile row of element `i` of
-// D for tiles `mt`, `nt`.
-template <bool kFp4, uint32_t kTokens>
-DSTC_FN uint32_t d_feature(uint32_t warp, uint32_t lane, uint32_t mt, uint32_t i) {
-  return warp * Cfg<kFp4, kTokens>::kWarpFeatures + mt * 16 + (lane >> 2) + (i >= 2 ? 8u : 0u);
+// The staged output row and tile row of element `i` of D for tiles `mt`, `nt`.
+DSTC_FN uint32_t d_feature(uint32_t frow, uint32_t lane, uint32_t mt, uint32_t i) {
+  return frow + mt * 16 + (lane >> 2) + (i >= 2 ? 8u : 0u);
 }
 DSTC_FN uint32_t d_token(uint32_t lane, uint32_t nt, uint32_t i) {
   return nt * 8 + (lane & 3u) * 2 + (i & 1u);
@@ -366,22 +407,26 @@ DSTC_FN uint32_t d_token(uint32_t lane, uint32_t nt, uint32_t i) {
 DSTC_FN uint32_t ntile_first(const Pass& p) { return p.lo / 8; }
 DSTC_FN uint32_t ntile_last(const Pass& p) { return (p.hi + 7) / 8; }
 
-// The accumulation step of element `i` of D for tiles `mt`, `nt`, block `blk`.
-template <bool kFp4, uint32_t kTokens>
-DSTC_FN float accumulate(const Stage<kFp4, kTokens>& s, uint32_t warp, uint32_t lane, uint32_t mt,
-                         uint32_t nt, uint32_t i, uint32_t blk, float acc, float dot) {
-  const uint32_t f = d_feature<kFp4, kTokens>(warp, lane, mt, i), r = d_token(lane, nt, i);
+// Block `blk`'s contribution to output `f` of row `r`: `(dot · activation
+// scale) · weight scale`, the product `ds::gemm_accumulate` adds.
+template <class C>
+DSTC_FN float contribution(const Stage<C>& s, uint32_t f, uint32_t r, uint32_t blk, float dot) {
+  return dot * ds::act_scale_decode(s.xs[r][blk]) * ds::e8m0_decode(s.ws[f][blk]);
+}
+
+// The accumulation step of staged output `f`, row `r`, block `blk`.
+template <class C>
+DSTC_FN float accumulate(const Stage<C>& s, uint32_t f, uint32_t r, uint32_t blk, float acc,
+                         float dot) {
   return ds::gemm_accumulate(acc, dot, ds::act_scale_decode(s.xs[r][blk]),
                              ds::e8m0_decode(s.ws[f][blk]));
 }
 
-// Store element `i` if it is an output of the pass.
-template <bool kFp4, uint32_t kTokens>
-DSTC_FN void store(const Pass& p, uint32_t warp, uint32_t lane, uint32_t mt, uint32_t nt,
-                   uint32_t i, float acc) {
-  const uint32_t f = p.f0 + d_feature<kFp4, kTokens>(warp, lane, mt, i), r = d_token(lane, nt, i);
-  if (f < p.n && r >= p.lo && r < p.hi) {
-    p.out[static_cast<uint64_t>(r) * p.n + f] = ds::bf16_store(ds::bf16_round(acc));
+// Store staged output `f` of tile row `r` if it is an output of the pass.
+DSTC_FN void store(const Pass& p, uint32_t f, uint32_t r, float acc) {
+  const uint32_t n = p.f0 + f;
+  if (n < p.n && r >= p.lo && r < p.hi) {
+    p.out[static_cast<uint64_t>(r) * p.n + n] = ds::bf16_store(ds::bf16_round(acc));
   }
 }
 

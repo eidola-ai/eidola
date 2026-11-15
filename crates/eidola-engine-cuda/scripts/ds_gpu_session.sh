@@ -4,11 +4,20 @@
 #
 #   ds_gpu_session.sh [step ...]        (no argument: every step, in order)
 #
-#   steps: setup build kernels ds_ops ds_gemm_ref ds_attention ds_index ds_tiny
-#          ds_tiny_drafting ds_tiny_memory mimo summary
+#   steps: setup build kernels ds_ops ds_gemm_ref ds_gemm ds_gemm_bench
+#          ds_attention ds_index ds_tiny ds_tiny_drafting ds_tiny_memory mimo
+#          summary
 #   with the released checkpoint (never run by default; name them):
 #          halves_build halves_encoder halves_decoder halves_reference
 #          halves_invariance
+#
+# `ds_gemm` is the quantised GEMMs on tensor cores: the probe of their block
+# product, both forms against the scalar reference in every block shape, and
+# their batch invariance (`ds_gemm.json`); `ds_gemm_bench` times every form
+# and block shape per row count (`ds_gemm_bench.txt`, and its JSON lines in
+# `ds_gemm_bench.jsonl`). The GEMMs alone, as one command:
+#
+#   ds_gpu_session.sh setup build kernels ds_gemm ds_gemm_bench summary
 #
 # `ds_tiny` is the executor without drafts; `ds_tiny_drafting` is every draft
 # width and acceptance pattern, seeded sampling and the scenarios again with
@@ -61,7 +70,9 @@
 # Expected time on one B300, after `setup` and `build` (about 10 minutes
 # together on a fresh machine): kernels under 1 minute; ds_ops 5 to 10
 # (the casts over every f32 through the probe, the released shapes);
-# ds_gemm_ref 3 to 8 (the whole vocabulary through the head);
+# ds_gemm_ref 3 to 8 (the whole vocabulary through the head); ds_gemm about
+# 12 (the probe is 8.6 billion dot products a case, 48 cases an image) and
+# ds_gemm_bench about 3;
 # ds_attention and ds_index 1 to 3 each; ds_tiny about 1 (the CPU reference
 # executor runs beside the device and is most of it); ds_tiny_drafting 3 to 6
 # and ds_tiny_memory 1 to 3 (not measured); mimo 3 to 6. With the checkpoint:
@@ -163,6 +174,12 @@ kernels() {
 # every f32) before the kernels' cases.
 ds_ops() { device_tests ds_ops; }
 ds_gemm_ref() { device_tests ds_gemm_ref; }
+ds_gemm() { device_tests ds_gemm; }
+ds_gemm_bench() {
+    (cd "$REPO" && cargo run --release --locked -p eidola-engine-cuda --example ds_gemm_bench -- \
+        "$KERNELS" --all-tiles) | tee "$OUT/ds_gemm_bench.txt"
+    grep '^{' "$OUT/ds_gemm_bench.txt" > "$OUT/ds_gemm_bench.jsonl"
+}
 ds_attention() { device_tests ds_attention; }
 ds_index() { device_tests ds_index; }
 # device_test_named <test binary> <test name>: one test of a binary.
@@ -233,7 +250,7 @@ summary() {
     cat "$OUT/session.json"
 }
 
-ALL="setup build kernels ds_ops ds_gemm_ref ds_attention ds_index ds_tiny ds_tiny_drafting ds_tiny_memory mimo summary"
+ALL="setup build kernels ds_ops ds_gemm_ref ds_gemm ds_gemm_bench ds_attention ds_index ds_tiny ds_tiny_drafting ds_tiny_memory mimo summary"
 NAMED="halves_build halves_encoder halves_decoder halves_reference halves_invariance"
 for step in ${*:-$ALL}; do
     case " $ALL $NAMED " in

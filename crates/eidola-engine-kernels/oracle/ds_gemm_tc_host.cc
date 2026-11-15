@@ -89,50 +89,67 @@ void conversions() {
   std::printf("conversions: every E4M3 and E2M1 code\n");
 }
 
-// Every code lies in exactly one band of each set, and each band pair's sum
-// of 32 magnitudes, in units of its smallest product, is below 2^24.
+// Each set of bands, as the kernels cut a word: the parts of `x`.
+uint32_t cut(uint32_t set, uint32_t x, uint32_t (&parts)[3]) {
+  parts[2] = 0;
+  if (set == 0) {
+    dstc::split2(x, dstc::kW8Cut, &parts[0], &parts[1]);
+    return dstc::kW8Bands;
+  }
+  if (set == 1) {
+    dstc::split3(x, dstc::kX8Cut1, dstc::kX8Cut2, &parts[0], &parts[1], &parts[2]);
+    return dstc::kX8Bands;
+  }
+  dstc::split2(x, dstc::kX4Cut, &parts[0], &parts[1]);
+  return dstc::kX4Bands;
+}
+
+// The parts of every word partition it, a code's band does not depend on the
+// other half of its word, and each band pair's sum of 32 magnitudes, in units
+// of its smallest product, is below 2^24.
 void bands() {
-  struct Set {
-    uint32_t count;
-    uint32_t (*lo)(uint32_t);
-    uint32_t (*hi)(uint32_t);
-  };
-  const Set w8{dstc::kW8Bands, dstc::w8_band_lo, dstc::w8_band_hi};
-  const Set x8{dstc::kX8Bands, dstc::x8_band_lo, dstc::x8_band_hi};
-  const Set x4{dstc::kX4Bands, dstc::x4_band_lo, dstc::x4_band_hi};
   bool ok = true;
-  // Per band: the largest magnitude and the smallest non-zero one, times 512.
-  auto extent = [&](const Set& s, uint32_t b, int64_t* big, int64_t* small) {
-    *big = 0;
-    *small = 1ll << 40;
+  // Per set and band: the largest magnitude and the smallest unit, times 512.
+  int64_t big[3][3] = {}, unit[3][3];
+  for (auto& row : unit) {
+    for (auto& u : row) u = 1ll << 40;
+  }
+  for (uint32_t set = 0; set < 3; ++set) {
     for (uint32_t c = 0; c < 256; ++c) {
       if (ds::e4m3_is_nan(static_cast<uint8_t>(c))) continue;
-      const uint32_t h = dstc::e4m3x2_to_f16x2(c) & 0xffffu;
-      uint32_t in = 0;
-      for (uint32_t j = 0; j < s.count; ++j) in += dstc::band_mask(h, s.lo(j), s.hi(j)) == h ? 1 : 0;
-      // A zero contributes nothing in any band; anything else is in exactly one.
-      ok &= (c & 0x7fu) == 0 || in == 1;
-      if (dstc::band_mask(h, s.lo(b), s.hi(b)) != h || (c & 0x7fu) == 0) continue;
-      const int64_t v = std::llabs(ds::e4m3_times_512(static_cast<uint8_t>(c)));
-      *big = std::max(*big, v);
-      *small = std::min(*small, v & -v);  // its unit: the lowest set bit
-    }
-  };
-  for (uint32_t wb = 0; wb < w8.count; ++wb) {
-    for (uint32_t xb = 0; xb < x8.count; ++xb) {
-      int64_t wbig, wsmall, xbig, xsmall;
-      extent(w8, wb, &wbig, &wsmall);
-      extent(x8, xb, &xbig, &xsmall);
-      ok &= 32 * (wbig / wsmall) * (xbig / xsmall) < (1ll << 24);
+      for (uint32_t other : {0x00u, 0x7eu, 0x80u, 0x01u, 0x38u}) {
+        const uint32_t x = dstc::e4m3x2_to_f16x2(c | other << 8);
+        uint32_t parts[3];
+        const uint32_t n = cut(set, x, parts);
+        uint32_t sum = 0, hits = 0, band = 0;
+        for (uint32_t j = 0; j < n; ++j) {
+          ok &= (parts[j] & ~x) == 0 && (sum & parts[j]) == 0;
+          sum |= parts[j];
+          if ((parts[j] & 0xffffu) == (x & 0xffffu) && (x & 0x7fffu) != 0) {
+            ++hits;
+            band = j;
+          }
+        }
+        ok &= sum == x;
+        ok &= (x & 0x7fffu) == 0 || hits == 1;
+        if ((c & 0x7fu) == 0) continue;
+        const int64_t v = std::llabs(ds::e4m3_times_512(static_cast<uint8_t>(c)));
+        big[set][band] = std::max(big[set][band], v);
+        unit[set][band] = std::min(unit[set][band], v & -v);  // the lowest set bit
+      }
     }
   }
-  for (uint32_t xb = 0; xb < x4.count; ++xb) {
-    int64_t xbig, xsmall;
-    extent(x4, xb, &xbig, &xsmall);
-    ok &= 32 * 12 * (xbig / xsmall) < (1ll << 24);
+  for (uint32_t wb = 0; wb < dstc::kW8Bands; ++wb) {
+    for (uint32_t xb = 0; xb < dstc::kX8Bands; ++xb) {
+      ok &= 32 * (big[0][wb] / unit[0][wb]) * (big[1][xb] / unit[1][xb]) < (1ll << 24);
+    }
+  }
+  for (uint32_t xb = 0; xb < dstc::kX4Bands; ++xb) {
+    ok &= 32 * 12 * (big[2][xb] / unit[2][xb]) < (1ll << 24);
   }
   check(ok, "bands partition the codes and bound every pair's sum below 2^24");
-  std::printf("bands: %u x %u FP8 pairs, %u FP4 bands\n", w8.count, x8.count, x4.count);
+  std::printf("bands: %u x %u FP8 pairs, %u FP4 bands\n", dstc::kW8Bands, dstc::kX8Bands,
+              dstc::kX4Bands);
 }
 
 // ---- the emulated MMA ----
@@ -196,108 +213,126 @@ void mma(Adder adder, Rng& rng, const uint32_t (&a)[32][2][4], const uint32_t (&
   }
 }
 
-// ---- one block of the grid, as `ds_gemm_tc.cu` runs it ----
+// ---- the blocks of the grid, as `ds_gemm_tc.cu` runs them ----
 
-template <bool kFp4, uint32_t kTokens, bool kBanded>
-void run_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
-  using C = dstc::Cfg<kFp4, kTokens>;
+// `block_dots` of `ds_gemm_tc.cu` over a warp's 32 lanes.
+template <class C, bool kBanded>
+void block_dots(const dstc::Stage<C>& s, uint32_t frow, uint32_t blk, uint32_t nt0, uint32_t nt1,
+                Adder adder, Rng& rng, float (&dot)[32][C::kMTiles][C::kNTiles][4]) {
   constexpr uint32_t kMT = C::kMTiles, kNT = C::kNTiles;
-  auto s = std::make_unique<dstc::Stage<kFp4, kTokens>>();
-  const uint32_t steps = (p.k / 32 + dstc::kChunkBlocks - 1) / dstc::kChunkBlocks;
-  const uint32_t nt0 = dstc::ntile_first(p), nt1 = dstc::ntile_last(p);
-  static float acc[dstc::kWarps][32][kMT][kNT][4];
-  std::memset(acc, 0, sizeof acc);
-  for (uint32_t step = 0; step < steps; ++step) {
-    // Staged bytes start as garbage: every byte the blocks read is copied or zeroed.
-    std::memset(s.get(), 0xa5, sizeof *s);
-    for (uint32_t i = 0; i < C::kFeatures * (C::kWBytes / 16); ++i) {
-      uint32_t row, off;
-      const uint8_t* src = dstc::w_copy<kFp4, kTokens>(p, step, i, &row, &off);
-      if (src) {
-        std::memcpy(&s->w[row][off], src, 16);
-      } else {
-        std::memset(&s->w[row][off], 0, 16);
+  static uint32_t a[32][kMT][2][4], b[32][kNT][2][2];
+  for (uint32_t l = 0; l < 32; ++l) dstc::load_frags<C>(s, frow, l, blk, a[l], b[l]);
+  for (uint32_t mt = 0; mt < kMT; ++mt) {
+    for (uint32_t nt = nt0; nt < nt1; ++nt) {
+      static uint32_t am[32][2][4], bm[32][2][2];
+      float d[32][4];
+      if (!kBanded) {
+        for (uint32_t l = 0; l < 32; ++l) {
+          std::memcpy(am[l], a[l][mt], sizeof am[l]);
+          std::memcpy(bm[l], b[l][nt], sizeof bm[l]);
+        }
+        mma(adder, rng, am, bm, d);
+        for (uint32_t l = 0; l < 32; ++l) {
+          for (uint32_t i = 0; i < 4; ++i) dot[l][mt][nt][i] = d[l][i];
+        }
+        continue;
       }
-    }
-    for (uint32_t i = 0; i < kTokens * (dstc::kChunkBytes / 16); ++i) {
-      uint32_t row, off;
-      const uint8_t* src = dstc::x_copy<kTokens>(p, step, i, &row, &off);
-      if (src) {
-        std::memcpy(&s->x[row][off], src, 16);
-      } else {
-        std::memset(&s->x[row][off], 0, 16);
-      }
-    }
-    for (uint32_t i = 0; i < (C::kFeatures + kTokens) * dstc::kChunkBlocks; ++i) {
-      dstc::stage_scale(p, step, i, *s);
-    }
-    const uint32_t vb = dstc::blocks_in_step(p, step);
-    for (uint32_t warp = 0; warp < dstc::kWarps; ++warp) {
-      if (p.f0 + warp * C::kWarpFeatures >= p.n) continue;
-      for (uint32_t blk = 0; blk < vb; ++blk) {
-        static uint32_t a[32][kMT][2][4], b[32][kNT][2][2];
-        static float dot[32][kMT][kNT][4];
-        for (uint32_t l = 0; l < 32; ++l) dstc::load_frags(*s, warp, l, blk, a[l], b[l]);
-        for (uint32_t mt = 0; mt < kMT; ++mt) {
-          for (uint32_t nt = nt0; nt < nt1; ++nt) {
-            static uint32_t am[32][2][4], bm[32][2][2];
-            float d[32][4];
-            if (!kBanded) {
-              for (uint32_t l = 0; l < 32; ++l) {
-                std::memcpy(am[l], a[l][mt], sizeof am[l]);
-                std::memcpy(bm[l], b[l][nt], sizeof bm[l]);
-              }
-              mma(adder, rng, am, bm, d);
-              for (uint32_t l = 0; l < 32; ++l) {
-                for (uint32_t i = 0; i < 4; ++i) dot[l][mt][nt][i] = d[l][i];
-              }
-              continue;
-            }
-            int64_t u8[32][4] = {};
-            int32_t u4[32][4] = {};
-            const uint32_t wbands = kFp4 ? 1 : dstc::kW8Bands;
-            const uint32_t xbands = kFp4 ? dstc::kX4Bands : dstc::kX8Bands;
-            for (uint32_t wb = 0; wb < wbands; ++wb) {
-              for (uint32_t xb = 0; xb < xbands; ++xb) {
-                for (uint32_t l = 0; l < 32; ++l) {
-                  for (uint32_t h = 0; h < 2; ++h) {
-                    for (uint32_t j = 0; j < 4; ++j) {
-                      am[l][h][j] = kFp4 ? a[l][mt][h][j]
-                                         : dstc::band_mask(a[l][mt][h][j], dstc::w8_band_lo(wb),
-                                                           dstc::w8_band_hi(wb));
-                    }
-                    for (uint32_t j = 0; j < 2; ++j) {
-                      bm[l][h][j] =
-                          kFp4 ? dstc::band_mask(b[l][nt][h][j], dstc::x4_band_lo(xb), dstc::x4_band_hi(xb))
-                               : dstc::band_mask(b[l][nt][h][j], dstc::x8_band_lo(xb), dstc::x8_band_hi(xb));
-                    }
-                  }
-                }
-                mma(adder, rng, am, bm, d);
-                for (uint32_t l = 0; l < 32; ++l) {
-                  for (uint32_t i = 0; i < 4; ++i) {
-                    if (kFp4) {
-                      u4[l][i] += dstc::band_units4(d[l][i]);
-                    } else {
-                      u8[l][i] += dstc::band_units8(d[l][i]);
-                    }
-                  }
+      int64_t u8[32][4] = {};
+      int32_t u4[32][4] = {};
+      const uint32_t wbands = C::kFp4 ? 1 : dstc::kW8Bands;
+      const uint32_t xbands = C::kFp4 ? dstc::kX4Bands : dstc::kX8Bands;
+      for (uint32_t wb = 0; wb < wbands; ++wb) {
+        for (uint32_t xb = 0; xb < xbands; ++xb) {
+          for (uint32_t l = 0; l < 32; ++l) {
+            for (uint32_t h = 0; h < 2; ++h) {
+              uint32_t parts[3];
+              for (uint32_t j = 0; j < 4; ++j) {
+                if (C::kFp4) {
+                  am[l][h][j] = a[l][mt][h][j];
+                } else {
+                  cut(0, a[l][mt][h][j], parts);
+                  am[l][h][j] = parts[wb];
                 }
               }
+              for (uint32_t j = 0; j < 2; ++j) {
+                cut(C::kFp4 ? 2 : 1, b[l][nt][h][j], parts);
+                bm[l][h][j] = parts[xb];
+              }
             }
-            for (uint32_t l = 0; l < 32; ++l) {
-              for (uint32_t i = 0; i < 4; ++i) {
-                dot[l][mt][nt][i] = kFp4 ? dstc::block_dot4(u4[l][i]) : dstc::block_dot8(u8[l][i]);
+          }
+          mma(adder, rng, am, bm, d);
+          for (uint32_t l = 0; l < 32; ++l) {
+            for (uint32_t i = 0; i < 4; ++i) {
+              if (C::kFp4) {
+                u4[l][i] += dstc::band_units4(d[l][i]);
+              } else {
+                u8[l][i] += dstc::band_units8(d[l][i]);
               }
             }
           }
         }
+      }
+      for (uint32_t l = 0; l < 32; ++l) {
+        for (uint32_t i = 0; i < 4; ++i) {
+          dot[l][mt][nt][i] = C::kFp4 ? dstc::block_dot4(u4[l][i]) : dstc::block_dot8(u8[l][i]);
+        }
+      }
+    }
+  }
+}
+
+// One step's stage, copied or zeroed as `fill` does; staged bytes start as
+// garbage, so every byte a block reads must have been copied or zeroed.
+template <class C>
+void fill(dstc::Stage<C>& s, const dstc::Pass& p, uint32_t step) {
+  std::memset(&s, 0xa5, sizeof s);
+  for (uint32_t i = 0; i < C::kFeatures * (C::kWBytes / 16); ++i) {
+    uint32_t row, off;
+    const uint8_t* src = dstc::w_copy<C>(p, step, i, &row, &off);
+    if (src) {
+      std::memcpy(&s.w[row][off], src, 16);
+    } else {
+      std::memset(&s.w[row][off], 0, 16);
+    }
+  }
+  for (uint32_t i = 0; i < C::kTokens * (C::kXBytes / 16); ++i) {
+    uint32_t row, off;
+    const uint8_t* src = dstc::x_copy<C>(p, step, i, &row, &off);
+    if (src) {
+      std::memcpy(&s.x[row][off], src, 16);
+    } else {
+      std::memset(&s.x[row][off], 0, 16);
+    }
+  }
+  for (uint32_t i = 0; i < (C::kFeatures + C::kTokens) * C::kStepBlocks; ++i) {
+    dstc::stage_scale<C>(p, step, i, s);
+  }
+}
+
+// `tile_pass`: warps side by side, accumulating in registers.
+template <class C, bool kBanded>
+void tile_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
+  constexpr uint32_t kMT = C::kMTiles, kNT = C::kNTiles;
+  auto s = std::make_unique<dstc::Stage<C>>();
+  const uint32_t nt0 = dstc::ntile_first(p), nt1 = dstc::ntile_last(p);
+  static float acc[dstc::kWarps][32][kMT][kNT][4];
+  std::memset(acc, 0, sizeof acc);
+  for (uint32_t step = 0; step < dstc::steps<C>(p); ++step) {
+    fill<C>(*s, p, step);
+    const uint32_t vb = dstc::blocks_in_step<C>(p, step);
+    for (uint32_t warp = 0; warp < dstc::kWarps; ++warp) {
+      const uint32_t frow = warp * C::kWarpFeatures;
+      if (p.f0 + frow >= p.n) continue;
+      for (uint32_t blk = 0; blk < vb; ++blk) {
+        static float dot[32][kMT][kNT][4];
+        block_dots<C, kBanded>(*s, frow, blk, nt0, nt1, adder, rng, dot);
         for (uint32_t l = 0; l < 32; ++l) {
           for (uint32_t mt = 0; mt < kMT; ++mt) {
             for (uint32_t nt = nt0; nt < nt1; ++nt) {
               for (uint32_t i = 0; i < 4; ++i) {
                 acc[warp][l][mt][nt][i] =
-                    dstc::accumulate(*s, warp, l, mt, nt, i, blk, acc[warp][l][mt][nt][i], dot[l][mt][nt][i]);
+                    dstc::accumulate<C>(*s, dstc::d_feature(frow, l, mt, i), dstc::d_token(l, nt, i),
+                                        blk, acc[warp][l][mt][nt][i], dot[l][mt][nt][i]);
               }
             }
           }
@@ -306,42 +341,88 @@ void run_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
     }
   }
   for (uint32_t warp = 0; warp < dstc::kWarps; ++warp) {
-    if (p.f0 + warp * C::kWarpFeatures >= p.n) continue;
+    const uint32_t frow = warp * C::kWarpFeatures;
+    if (p.f0 + frow >= p.n) continue;
     for (uint32_t l = 0; l < 32; ++l) {
       for (uint32_t mt = 0; mt < kMT; ++mt) {
         for (uint32_t nt = 0; nt < kNT; ++nt) {
-          for (uint32_t i = 0; i < 4; ++i) dstc::store<kFp4, kTokens>(p, warp, l, mt, nt, i, acc[warp][l][mt][nt][i]);
+          for (uint32_t i = 0; i < 4; ++i) {
+            dstc::store(p, dstc::d_feature(frow, l, mt, i), dstc::d_token(l, nt, i),
+                        acc[warp][l][mt][nt][i]);
+          }
         }
       }
     }
   }
 }
 
+// `split_pass`: each warp's quarter of a step's blocks into contributions
+// (the warps in descending order), then each thread's ordered sum.
+template <class C, bool kBanded>
+void split_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
+  constexpr uint32_t kPerWarp = C::kStepBlocks / C::kKWarps;
+  auto s = std::make_unique<dstc::Stage<C>>();
+  auto c = std::make_unique<dstc::Contributions<C>>();
+  const uint32_t nt0 = dstc::ntile_first(p), nt1 = dstc::ntile_last(p);
+  float acc[dstc::kThreads] = {};
+  for (uint32_t step = 0; step < dstc::steps<C>(p); ++step) {
+    fill<C>(*s, p, step);
+    std::memset(c.get(), 0x5a, sizeof *c);
+    const uint32_t vb = dstc::blocks_in_step<C>(p, step);
+    for (uint32_t warp = dstc::kWarps; warp-- > 0;) {
+      for (uint32_t j = 0; j < kPerWarp; ++j) {
+        const uint32_t blk = warp * kPerWarp + j;
+        if (blk >= vb) continue;
+        static float dot[32][1][1][4];
+        block_dots<C, kBanded>(*s, 0, blk, nt0, nt1, adder, rng, dot);
+        for (uint32_t l = 0; l < 32; ++l) {
+          for (uint32_t i = 0; i < 4; ++i) {
+            const uint32_t f = dstc::d_feature(0, l, 0, i), r = dstc::d_token(l, 0, i);
+            c->c[blk][f][r] = dstc::contribution<C>(*s, f, r, blk, dot[l][0][0][i]);
+          }
+        }
+      }
+    }
+    for (uint32_t t = 0; t < dstc::kThreads; ++t) {
+      for (uint32_t blk = 0; blk < vb; ++blk) acc[t] = acc[t] + c->c[blk][t / C::kTokens][t % C::kTokens];
+    }
+  }
+  for (uint32_t t = 0; t < dstc::kThreads; ++t) dstc::store(p, t / C::kTokens, t % C::kTokens, acc[t]);
+}
+
+template <class C, bool kSplit, bool kBanded>
+void run_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
+  if constexpr (kSplit) {
+    split_pass<C, kBanded>(p, adder, rng);
+  } else {
+    tile_pass<C, kBanded>(p, adder, rng);
+  }
+}
+
 // The grid of `ds_gemm_tc.cu`'s entries, blocks in descending order.
-template <uint32_t kTokens, bool kBanded>
+template <class C, bool kSplit, bool kBanded>
 void lin8(const DsLin8Params& p, Adder adder, Rng& rng) {
-  using C = dstc::Cfg<false, kTokens>;
-  const uint32_t gx = (p.n + C::kFeatures - 1) / C::kFeatures, gy = (p.rows + kTokens - 1) / kTokens;
+  const uint32_t gx = (p.n + C::kFeatures - 1) / C::kFeatures;
+  const uint32_t gy = (p.rows + C::kTokens - 1) / C::kTokens;
   for (uint32_t y = gy; y-- > 0;) {
     for (uint32_t x = gx; x-- > 0;) {
-      const uint32_t r0 = y * kTokens, r1 = std::min(p.rows, r0 + kTokens);
-      run_pass<false, kTokens, kBanded>(dstc::lin8_pass(p, r0, r1, x * C::kFeatures), adder, rng);
+      const uint32_t r0 = y * C::kTokens, r1 = std::min(p.rows, r0 + C::kTokens);
+      run_pass<C, kSplit, kBanded>(dstc::lin8_pass(p, r0, r1, x * C::kFeatures), adder, rng);
     }
   }
 }
 
-template <uint32_t kTokens, bool kBanded>
+template <class C, bool kSplit, bool kBanded>
 void lin4(const DsLin4Params& p, Adder adder, Rng& rng) {
-  using C = dstc::Cfg<true, kTokens>;
   const uint32_t gx = (p.n + C::kFeatures - 1) / C::kFeatures;
-  const uint32_t gy = (p.layout_rows + kTokens - 1) / kTokens;
+  const uint32_t gy = (p.layout_rows + C::kTokens - 1) / C::kTokens;
   for (uint32_t y = gy; y-- > 0;) {
     for (uint32_t x = gx; x-- > 0;) {
-      const uint32_t r0 = y * kTokens, r1 = std::min(p.layout_rows, r0 + kTokens);
+      const uint32_t r0 = y * C::kTokens, r1 = std::min(p.layout_rows, r0 + C::kTokens);
       for (uint32_t g = dstc::first_group(p, r0); g < p.groups; ++g) {
         if (dstc::group_start(p, g) >= r1) break;
         const dstc::Pass pass = dstc::lin4_pass(p, g, r0, r1, x * C::kFeatures);
-        if (pass.lo < pass.hi) run_pass<true, kTokens, kBanded>(pass, adder, rng);
+        if (pass.lo < pass.hi) run_pass<C, kSplit, kBanded>(pass, adder, rng);
       }
     }
   }
@@ -397,9 +478,13 @@ void lin8_cases(Rng& g, Tally& t) {
     const uint32_t k = 32 * (1 + g.below(c < 24 ? 9 : 20));
     const bool wide = g.below(2) == 0;
     auto x = codes(g, size_t(rows) * k, wide);
-    auto xs = scales(g, size_t(rows) * k / 32, 100, 50);
+    // One case in four over every finite scale: products that underflow,
+    // overflow and turn infinite, where the order of the two scalings shows.
+    const bool extreme = c % 4 == 3;
+    auto xs = extreme ? scales(g, size_t(rows) * k / 32, 1, 254) : scales(g, size_t(rows) * k / 32, 100, 50);
     auto w = codes(g, size_t(n) * k, true);
-    auto ws = scales(g, size_t((n + 31) / 32) * (k / 32), 110, 30);
+    auto ws = extreme ? scales(g, size_t((n + 31) / 32) * (k / 32), 0, 255)
+                      : scales(g, size_t((n + 31) / 32) * (k / 32), 110, 30);
     if (c == 5) xs[0] = 255;  // an infinite activation scale
     std::vector<uint16_t> want(size_t(rows) * n, 0xdead);
     DsLin8Params p{x.data(), xs.data(), w.data(), ws.data(), want.data(), rows, n, k, 0};
@@ -408,17 +493,22 @@ void lin8_cases(Rng& g, Tally& t) {
         for (uint32_t th = dsk::kElementThreads; th-- > 0;) dsk::lin8_thread(p, bx, row, th);
       }
     }
-    for (int form = 0; form < 4; ++form) {
+    for (int form = 0; form < 6; ++form) {
       std::vector<uint16_t> got(want.size(), 0xdead);
       p.out = got.data();
       const Adder adder = c % 2 ? Adder::Shuffled : Adder::Exact;
+      using S = dstc::SplitCfg<false>;
+      using T8 = dstc::TileCfg<false, 8>;
+      using T32 = dstc::TileCfg<false, 32>;
       switch (form) {
-        case 0: lin8<8, true>(p, adder, g); break;
-        case 1: lin8<32, true>(p, adder, g); break;
-        case 2: lin8<8, false>(p, adder, g); break;
-        default: lin8<32, false>(p, adder, g); break;
+        case 0: lin8<S, true, true>(p, adder, g); break;
+        case 1: lin8<T8, false, true>(p, adder, g); break;
+        case 2: lin8<T32, false, true>(p, adder, g); break;
+        case 3: lin8<S, true, false>(p, adder, g); break;
+        case 4: lin8<T8, false, false>(p, adder, g); break;
+        default: lin8<T32, false, false>(p, adder, g); break;
       }
-      compare(want, got, form < 2, t, "lin8");
+      compare(want, got, form < 3, t, "lin8");
     }
   }
 }
@@ -442,10 +532,13 @@ void lin4_cases(Rng& g, Tally& t) {
     if (layout_rows == 0) continue;
     const bool wide = g.below(2) == 0;
     auto x = codes(g, size_t(layout_rows) * k, wide);
-    auto xs = scales(g, size_t(layout_rows) * k / 32, 100, 50);
+    const bool extreme = c % 4 == 3;
+    auto xs = extreme ? scales(g, size_t(layout_rows) * k / 32, 1, 254)
+                      : scales(g, size_t(layout_rows) * k / 32, 100, 50);
     std::vector<uint8_t> w(size_t(groups) * n * k / 2);
     for (auto& b : w) b = static_cast<uint8_t>(g.next());
-    auto ws = scales(g, size_t(groups) * n * (k / 32), 110, 30);
+    auto ws = extreme ? scales(g, size_t(groups) * n * (k / 32), 0, 255)
+                      : scales(g, size_t(groups) * n * (k / 32), 110, 30);
     std::vector<uint16_t> want(size_t(layout_rows) * n, 0xdead);
     DsLin4Params p{x.data(), xs.data(), w.data(), ws.data(), end.data(), want.data(),
                    layout_rows, n, k, groups, row_align, 0};
@@ -454,17 +547,22 @@ void lin4_cases(Rng& g, Tally& t) {
         for (uint32_t th = dsk::kElementThreads; th-- > 0;) dsk::lin4_thread(p, bx, row, th);
       }
     }
-    for (int form = 0; form < 4; ++form) {
+    for (int form = 0; form < 6; ++form) {
       std::vector<uint16_t> got(want.size(), 0xdead);
       p.out = got.data();
       const Adder adder = c % 2 ? Adder::Shuffled : Adder::Exact;
+      using S = dstc::SplitCfg<true>;
+      using T8 = dstc::TileCfg<true, 8>;
+      using T32 = dstc::TileCfg<true, 32>;
       switch (form) {
-        case 0: lin4<8, true>(p, adder, g); break;
-        case 1: lin4<32, true>(p, adder, g); break;
-        case 2: lin4<8, false>(p, adder, g); break;
-        default: lin4<32, false>(p, adder, g); break;
+        case 0: lin4<S, true, true>(p, adder, g); break;
+        case 1: lin4<T8, false, true>(p, adder, g); break;
+        case 2: lin4<T32, false, true>(p, adder, g); break;
+        case 3: lin4<S, true, false>(p, adder, g); break;
+        case 4: lin4<T8, false, false>(p, adder, g); break;
+        default: lin4<T32, false, false>(p, adder, g); break;
       }
-      compare(want, got, form < 2, t, "lin4");
+      compare(want, got, form < 3, t, "lin4");
     }
   }
 }

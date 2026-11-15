@@ -1,25 +1,37 @@
 // DeepSeek-V4.1's quantised GEMMs on tensor cores, and the probe of the MMA
 // they rest on. `ds_gemm_tc.cuh` states the forms and holds every piece a
 // thread computes; this file places them on the grid: staging through
-// shared memory with `cp.async`, the MMAs, and the passes of `lin4`'s groups.
+// shared memory with `cp.async`, the MMAs, the ordered sums of the split
+// block, and the passes of `lin4`'s groups.
 //
 // Entries, each taking the scalar reference's parameter struct unchanged
 // (`DsLin8Params`, `DsLin4Params`; `ds_reference.cu` is the definition):
 //
-//   eidola_ds_{lin8,lin4}_banded_t{8,32}     exact: banded block products
-//   eidola_ds_{lin8,lin4}_tolerance_t{8,32}  one MMA per block
-//   eidola_ds_gemm_probe                     the MMA against the exact sum
+//   eidola_ds_{lin8,lin4}_banded_{s8,t8,t32}     exact: banded block products
+//   eidola_ds_{lin8,lin4}_tolerance_{s8,t8,t32}  one block product per block
+//   eidola_ds_gemm_probe                         the MMA against the exact sum
 //
-// Grid `(ceil(n / features), ceil(rows / tokens))`, 128 threads: a block
-// computes `tokens` rows (8 or 32) by `features` outputs (64 or 128); `lin4`
-// takes `layout_rows` for `rows`. Every output of a row is computed from that
-// row's codes and scales and the weight, by the same instructions whichever
-// tile holds it; the tile size is chosen by the host from the row count.
+// Grid `(ceil(n / features), ceil(rows / tokens))`, 128 threads; `lin4` takes
+// `layout_rows` for `rows`:
+//
+//   _t8, _t32  8 rows by 64 outputs, 32 rows by 128: each warp owns 16 or 32
+//              outputs and computes every block of every step, accumulating
+//              in registers; steps of 4 blocks, double-buffered.
+//   _s8        8 rows by 16 outputs: each warp computes a quarter of each
+//              step's 16 blocks and writes each block's contribution
+//              `(dot · activation scale) · weight scale` to shared memory;
+//              then each thread adds its output's contributions in ascending
+//              block order (the reference's accumulation, the same operations
+//              in the same order); 6 stages (FP8) or 8 (FP4) in flight.
+//
+// Every output of a row is computed from that row's codes and scales and the
+// weight, by the same operations whichever block shape holds it; the shape is
+// chosen by the host from the row count.
 //
 // `lin4`'s tile may meet several groups' runs (any `row_align`): it makes one
 // pass over K per group, each pass computing that group's rows of the tile
-// against that group's weight. A `row_align` that is a multiple of the token
-// tile gives every tile at most one group. Padding rows are not written.
+// against that group's weight. A `row_align` that is a multiple of 8 gives
+// every 8-row tile at most one group. Padding rows are not written.
 
 #include "ds_gemm_tc.cuh"
 #include "eidola_kernel.cuh"
@@ -27,7 +39,6 @@
 namespace {
 
 using dstc::Cfg;
-using dstc::kChunkBlocks;
 using dstc::kThreads;
 using dstc::Pass;
 using dstc::Stage;
@@ -65,22 +76,21 @@ __device__ __forceinline__ void wait_copies() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(kPending) : "memory");
 }
 
-template <bool kFp4, uint32_t kTokens>
-__device__ __forceinline__ void fill(Stage<kFp4, kTokens>& s, const Pass& p, uint32_t step) {
-  using C = Cfg<kFp4, kTokens>;
+template <class C>
+__device__ __forceinline__ void fill(Stage<C>& s, const Pass& p, uint32_t step) {
   const uint32_t t = threadIdx.x;
   for (uint32_t i = t; i < C::kFeatures * (C::kWBytes / 16); i += kThreads) {
     uint32_t row, off;
-    const uint8_t* src = dstc::w_copy<kFp4, kTokens>(p, step, i, &row, &off);
+    const uint8_t* src = dstc::w_copy<C>(p, step, i, &row, &off);
     copy16(&s.w[row][off], src, p.w);
   }
-  for (uint32_t i = t; i < kTokens * (dstc::kChunkBytes / 16); i += kThreads) {
+  for (uint32_t i = t; i < C::kTokens * (C::kXBytes / 16); i += kThreads) {
     uint32_t row, off;
-    const uint8_t* src = dstc::x_copy<kTokens>(p, step, i, &row, &off);
+    const uint8_t* src = dstc::x_copy<C>(p, step, i, &row, &off);
     copy16(&s.x[row][off], src, p.x);
   }
-  for (uint32_t i = t; i < (C::kFeatures + kTokens) * kChunkBlocks; i += kThreads) {
-    dstc::stage_scale(p, step, i, s);
+  for (uint32_t i = t; i < (C::kFeatures + C::kTokens) * C::kStepBlocks; i += kThreads) {
+    dstc::stage_scale<C>(p, step, i, s);
   }
 }
 
@@ -99,32 +109,46 @@ __device__ __forceinline__ bool any_code(const uint32_t (&v)[kN][2][kW]) {
   return __any_sync(0xffffffffu, o != 0);
 }
 
-// The band `[lo, hi]` of every word.
+// Every word cut in two at F16 field `t`.
 template <uint32_t kN, uint32_t kW>
-__device__ __forceinline__ void mask(const uint32_t (&v)[kN][2][kW], uint32_t lo, uint32_t hi,
-                                     uint32_t (&out)[kN][2][kW]) {
+__device__ __forceinline__ void cut2(const uint32_t (&v)[kN][2][kW], uint32_t t,
+                                     uint32_t (&lo)[kN][2][kW], uint32_t (&hi)[kN][2][kW]) {
 #pragma unroll
   for (uint32_t i = 0; i < kN; ++i) {
 #pragma unroll
     for (uint32_t h = 0; h < 2; ++h) {
 #pragma unroll
-      for (uint32_t j = 0; j < kW; ++j) out[i][h][j] = dstc::band_mask(v[i][h][j], lo, hi);
+      for (uint32_t j = 0; j < kW; ++j) dstc::split2(v[i][h][j], t, &lo[i][h][j], &hi[i][h][j]);
     }
   }
 }
 
-// One block of the staged step into the accumulators. A band empty across
-// the warp is skipped: its MMAs would add exact zeros.
-template <bool kFp4, uint32_t kTokens, bool kBanded>
-__device__ __forceinline__ void block(const Stage<kFp4, kTokens>& s, uint32_t warp, uint32_t lane,
-                                      uint32_t blk, uint32_t nt0, uint32_t nt1,
-                                      float (&acc)[Cfg<kFp4, kTokens>::kMTiles]
-                                                  [Cfg<kFp4, kTokens>::kNTiles][4]) {
-  using C = Cfg<kFp4, kTokens>;
+// Every word cut in three at F16 fields `t1 < t2`.
+template <uint32_t kN, uint32_t kW>
+__device__ __forceinline__ void cut3(const uint32_t (&v)[kN][2][kW], uint32_t t1, uint32_t t2,
+                                     uint32_t (&out)[3][kN][2][kW]) {
+#pragma unroll
+  for (uint32_t i = 0; i < kN; ++i) {
+#pragma unroll
+    for (uint32_t h = 0; h < 2; ++h) {
+#pragma unroll
+      for (uint32_t j = 0; j < kW; ++j) {
+        dstc::split3(v[i][h][j], t1, t2, &out[0][i][h][j], &out[1][i][h][j], &out[2][i][h][j]);
+      }
+    }
+  }
+}
+
+// The block dot products of block `blk` of the staged step, for the warp's
+// tiles from staged weight row `frow` and the n-tiles `[nt0, nt1)`. A band
+// empty across the warp is skipped: its products would add exact zeros.
+template <class C, bool kBanded>
+__device__ __forceinline__ void block_dots(const Stage<C>& s, uint32_t frow, uint32_t lane,
+                                           uint32_t blk, uint32_t nt0, uint32_t nt1,
+                                           float (&dot)[C::kMTiles][C::kNTiles][4]) {
   constexpr uint32_t kMT = C::kMTiles, kNT = C::kNTiles;
   uint32_t a[kMT][2][4], b[kNT][2][2];
-  dstc::load_frags(s, warp, lane, blk, a, b);
-  float dot[kMT][kNT][4];
+  dstc::load_frags<C>(s, frow, lane, blk, a, b);
   if (!kBanded) {
 #pragma unroll
     for (uint32_t mt = 0; mt < kMT; ++mt) {
@@ -133,20 +157,20 @@ __device__ __forceinline__ void block(const Stage<kFp4, kTokens>& s, uint32_t wa
         if (nt >= nt0 && nt < nt1) mma(dot[mt][nt], a[mt], b[nt]);
       }
     }
-  } else if (kFp4) {
+  } else if (C::kFp4) {
     int32_t u[kMT][kNT][4] = {};
+    uint32_t bm[2][kNT][2][2];
+    cut2(b, dstc::kX4Cut, bm[0], bm[1]);
 #pragma unroll
     for (uint32_t xb = 0; xb < dstc::kX4Bands; ++xb) {
-      uint32_t bm[kNT][2][2];
-      mask(b, dstc::x4_band_lo(xb), dstc::x4_band_hi(xb), bm);
-      if (!any_code(bm)) continue;
+      if (!any_code(bm[xb])) continue;
 #pragma unroll
       for (uint32_t mt = 0; mt < kMT; ++mt) {
 #pragma unroll
         for (uint32_t nt = 0; nt < kNT; ++nt) {
           if (nt < nt0 || nt >= nt1) continue;
           float d[4];
-          mma(d, a[mt], bm[nt]);
+          mma(d, a[mt], bm[xb][nt]);
 #pragma unroll
           for (uint32_t i = 0; i < 4; ++i) u[mt][nt][i] += dstc::band_units4(d[i]);
         }
@@ -162,18 +186,15 @@ __device__ __forceinline__ void block(const Stage<kFp4, kTokens>& s, uint32_t wa
     }
   } else {
     int64_t u[kMT][kNT][4] = {};
-    uint32_t bm[dstc::kX8Bands][kNT][2][2];
-    bool on[dstc::kX8Bands];
+    uint32_t bm[3][kNT][2][2], am[2][kMT][2][4];
+    cut3(b, dstc::kX8Cut1, dstc::kX8Cut2, bm);
+    cut2(a, dstc::kW8Cut, am[0], am[1]);
+    bool on[3];
 #pragma unroll
-    for (uint32_t xb = 0; xb < dstc::kX8Bands; ++xb) {
-      mask(b, dstc::x8_band_lo(xb), dstc::x8_band_hi(xb), bm[xb]);
-      on[xb] = any_code(bm[xb]);
-    }
+    for (uint32_t xb = 0; xb < dstc::kX8Bands; ++xb) on[xb] = any_code(bm[xb]);
 #pragma unroll
     for (uint32_t wb = 0; wb < dstc::kW8Bands; ++wb) {
-      uint32_t am[kMT][2][4];
-      mask(a, dstc::w8_band_lo(wb), dstc::w8_band_hi(wb), am);
-      if (!any_code(am)) continue;
+      if (!any_code(am[wb])) continue;
 #pragma unroll
       for (uint32_t xb = 0; xb < dstc::kX8Bands; ++xb) {
         if (!on[xb]) continue;
@@ -183,7 +204,7 @@ __device__ __forceinline__ void block(const Stage<kFp4, kTokens>& s, uint32_t wa
           for (uint32_t nt = 0; nt < kNT; ++nt) {
             if (nt < nt0 || nt >= nt1) continue;
             float d[4];
-            mma(d, am[mt], bm[xb][nt]);
+            mma(d, am[wb][mt], bm[xb][nt]);
 #pragma unroll
             for (uint32_t i = 0; i < 4; ++i) u[mt][nt][i] += dstc::band_units8(d[i]);
           }
@@ -199,28 +220,17 @@ __device__ __forceinline__ void block(const Stage<kFp4, kTokens>& s, uint32_t wa
       }
     }
   }
-#pragma unroll
-  for (uint32_t mt = 0; mt < kMT; ++mt) {
-#pragma unroll
-    for (uint32_t nt = 0; nt < kNT; ++nt) {
-      if (nt < nt0 || nt >= nt1) continue;
-#pragma unroll
-      for (uint32_t i = 0; i < 4; ++i) {
-        acc[mt][nt][i] = dstc::accumulate(s, warp, lane, mt, nt, i, blk, acc[mt][nt][i],
-                                          dot[mt][nt][i]);
-      }
-    }
-  }
 }
 
-// One pass over K: stage `s` holds step `j` while step `j + 1` is copied in.
-template <bool kFp4, uint32_t kTokens, bool kBanded>
-__device__ __forceinline__ void run_pass(Stage<kFp4, kTokens> (&s)[2], const Pass& p) {
-  using C = Cfg<kFp4, kTokens>;
+// One pass over K in a tile: stage `step % 2` holds the step while the next
+// is copied in; each warp accumulates its outputs in registers.
+template <class C, bool kBanded>
+__device__ __forceinline__ void tile_pass(Stage<C> (&s)[2], const Pass& p) {
   constexpr uint32_t kMT = C::kMTiles, kNT = C::kNTiles;
   const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-  const uint32_t steps = (p.k / 32 + kChunkBlocks - 1) / kChunkBlocks;
-  const bool warp_on = p.f0 + warp * C::kWarpFeatures < p.n;
+  const uint32_t frow = warp * C::kWarpFeatures;
+  const uint32_t steps = dstc::steps<C>(p);
+  const bool warp_on = p.f0 + frow < p.n;
   const uint32_t nt0 = dstc::ntile_first(p), nt1 = dstc::ntile_last(p);
   float acc[kMT][kNT][4];
 #pragma unroll
@@ -231,11 +241,11 @@ __device__ __forceinline__ void run_pass(Stage<kFp4, kTokens> (&s)[2], const Pas
       for (uint32_t i = 0; i < 4; ++i) acc[mt][nt][i] = 0.0f;
     }
   }
-  fill(s[0], p, 0);
+  fill<C>(s[0], p, 0);
   commit();
   for (uint32_t step = 0; step < steps; ++step) {
     if (step + 1 < steps) {
-      fill(s[(step + 1) & 1u], p, step + 1);
+      fill<C>(s[(step + 1) & 1u], p, step + 1);
       commit();
       wait_copies<1>();
     } else {
@@ -243,11 +253,26 @@ __device__ __forceinline__ void run_pass(Stage<kFp4, kTokens> (&s)[2], const Pas
     }
     __syncthreads();
     if (warp_on) {
-      const Stage<kFp4, kTokens>& cur = s[step & 1u];
-      const uint32_t vb = dstc::blocks_in_step(p, step);
+      const Stage<C>& cur = s[step & 1u];
+      const uint32_t vb = dstc::blocks_in_step<C>(p, step);
 #pragma unroll
-      for (uint32_t blk = 0; blk < kChunkBlocks; ++blk) {
-        if (blk < vb) block<kFp4, kTokens, kBanded>(cur, warp, lane, blk, nt0, nt1, acc);
+      for (uint32_t blk = 0; blk < C::kStepBlocks; ++blk) {
+        if (blk >= vb) continue;
+        float dot[kMT][kNT][4];
+        block_dots<C, kBanded>(cur, frow, lane, blk, nt0, nt1, dot);
+#pragma unroll
+        for (uint32_t mt = 0; mt < kMT; ++mt) {
+#pragma unroll
+          for (uint32_t nt = 0; nt < kNT; ++nt) {
+            if (nt < nt0 || nt >= nt1) continue;
+#pragma unroll
+            for (uint32_t i = 0; i < 4; ++i) {
+              acc[mt][nt][i] = dstc::accumulate<C>(cur, dstc::d_feature(frow, lane, mt, i),
+                                                   dstc::d_token(lane, nt, i), blk, acc[mt][nt][i],
+                                                   dot[mt][nt][i]);
+            }
+          }
+        }
       }
     }
     __syncthreads();
@@ -259,50 +284,141 @@ __device__ __forceinline__ void run_pass(Stage<kFp4, kTokens> (&s)[2], const Pas
     for (uint32_t nt = 0; nt < kNT; ++nt) {
 #pragma unroll
       for (uint32_t i = 0; i < 4; ++i) {
-        dstc::store<kFp4, kTokens>(p, warp, lane, mt, nt, i, acc[mt][nt][i]);
+        dstc::store(p, dstc::d_feature(frow, lane, mt, i), dstc::d_token(lane, nt, i), acc[mt][nt][i]);
       }
     }
   }
 }
 
-template <uint32_t kTokens, bool kBanded>
-__device__ __forceinline__ void lin8(const DsLin8Params& p) {
-  __shared__ Stage<false, kTokens> s[2];
-  const uint32_t r0 = blockIdx.y * kTokens;
-  const uint32_t r1 = p.rows - r0 < kTokens ? p.rows : r0 + kTokens;
-  run_pass<false, kTokens, kBanded>(s, dstc::lin8_pass(p, r0, r1, blockIdx.x * Cfg<false, kTokens>::kFeatures));
+// One pass over K in the split block: `kStages` stages in flight; each warp
+// computes the contributions of its quarter of the step's blocks, then
+// thread `t` adds output `t / 8`'s contributions to row `t % 8` in ascending
+// block order.
+template <class C, bool kBanded>
+__device__ __forceinline__ void split_pass(Stage<C>* s, dstc::Contributions<C>& c, const Pass& p) {
+  static_assert(C::kFeatures * C::kTokens == kThreads, "a thread per output and row");
+  constexpr uint32_t kNS = C::kStages, kPerWarp = C::kStepBlocks / C::kKWarps;
+  const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+  const uint32_t steps = dstc::steps<C>(p);
+  const uint32_t nt0 = dstc::ntile_first(p), nt1 = dstc::ntile_last(p);
+  const uint32_t mine_f = threadIdx.x / C::kTokens, mine_r = threadIdx.x % C::kTokens;
+  float acc = 0.0f;
+#pragma unroll
+  for (uint32_t j = 0; j + 1 < kNS; ++j) {
+    if (j < steps) fill<C>(s[j], p, j);
+    commit();
+  }
+  for (uint32_t step = 0; step < steps; ++step) {
+    if (step + kNS - 1 < steps) fill<C>(s[(step + kNS - 1) % kNS], p, step + kNS - 1);
+    commit();
+    wait_copies<kNS - 1>();
+    __syncthreads();
+    const Stage<C>& cur = s[step % kNS];
+    const uint32_t vb = dstc::blocks_in_step<C>(p, step);
+#pragma unroll
+    for (uint32_t j = 0; j < kPerWarp; ++j) {
+      const uint32_t blk = warp * kPerWarp + j;
+      if (blk >= vb) continue;
+      float dot[1][1][4];
+      block_dots<C, kBanded>(cur, 0, lane, blk, nt0, nt1, dot);
+#pragma unroll
+      for (uint32_t i = 0; i < 4; ++i) {
+        const uint32_t f = dstc::d_feature(0, lane, 0, i), r = dstc::d_token(lane, 0, i);
+        c.c[blk][f][r] = dstc::contribution<C>(cur, f, r, blk, dot[0][0][i]);
+      }
+    }
+    __syncthreads();
+    for (uint32_t blk = 0; blk < vb; ++blk) acc = acc + c.c[blk][mine_f][mine_r];
+  }
+  dstc::store(p, mine_f, mine_r, acc);
+  // The next pass's first contributions are written only after its first
+  // barrier, which every thread reaches after this pass's last sums.
 }
 
 template <uint32_t kTokens, bool kBanded>
-__device__ __forceinline__ void lin4(const DsLin4Params& p) {
-  __shared__ Stage<true, kTokens> s[2];
+__device__ __forceinline__ void lin8_tile(const DsLin8Params& p) {
+  using C = dstc::TileCfg<false, kTokens>;
+  __shared__ Stage<C> s[2];
+  const uint32_t r0 = blockIdx.y * kTokens;
+  const uint32_t r1 = p.rows - r0 < kTokens ? p.rows : r0 + kTokens;
+  tile_pass<C, kBanded>(s, dstc::lin8_pass(p, r0, r1, blockIdx.x * C::kFeatures));
+}
+
+template <uint32_t kTokens, bool kBanded>
+__device__ __forceinline__ void lin4_tile(const DsLin4Params& p) {
+  using C = dstc::TileCfg<true, kTokens>;
+  __shared__ Stage<C> s[2];
   const uint32_t r0 = blockIdx.y * kTokens;
   const uint32_t r1 = p.layout_rows - r0 < kTokens ? p.layout_rows : r0 + kTokens;
-  const uint32_t f0 = blockIdx.x * Cfg<true, kTokens>::kFeatures;
+  const uint32_t f0 = blockIdx.x * C::kFeatures;
   for (uint32_t g = dstc::first_group(p, r0); g < p.groups; ++g) {
     if (dstc::group_start(p, g) >= r1) break;
     const Pass pass = dstc::lin4_pass(p, g, r0, r1, f0);
-    if (pass.lo < pass.hi) run_pass<true, kTokens, kBanded>(s, pass);
+    if (pass.lo < pass.hi) tile_pass<C, kBanded>(s, pass);
   }
 }
 
+extern __shared__ __align__(16) uint8_t split_smem[];
+
+template <class C>
+__device__ __forceinline__ Stage<C>* split_stages() {
+  return reinterpret_cast<Stage<C>*>(split_smem);
+}
+template <class C>
+__device__ __forceinline__ dstc::Contributions<C>& split_contributions() {
+  return *reinterpret_cast<dstc::Contributions<C>*>(split_smem + C::kStages * sizeof(Stage<C>));
+}
+
+template <bool kBanded>
+__device__ __forceinline__ void lin8_split(const DsLin8Params& p) {
+  using C = dstc::SplitCfg<false>;
+  const uint32_t r0 = blockIdx.y * C::kTokens;
+  const uint32_t r1 = p.rows - r0 < C::kTokens ? p.rows : r0 + C::kTokens;
+  split_pass<C, kBanded>(split_stages<C>(), split_contributions<C>(),
+                         dstc::lin8_pass(p, r0, r1, blockIdx.x * C::kFeatures));
+}
+
+template <bool kBanded>
+__device__ __forceinline__ void lin4_split(const DsLin4Params& p) {
+  using C = dstc::SplitCfg<true>;
+  const uint32_t r0 = blockIdx.y * C::kTokens;
+  const uint32_t r1 = p.layout_rows - r0 < C::kTokens ? p.layout_rows : r0 + C::kTokens;
+  const uint32_t f0 = blockIdx.x * C::kFeatures;
+  for (uint32_t g = dstc::first_group(p, r0); g < p.groups; ++g) {
+    if (dstc::group_start(p, g) >= r1) break;
+    const Pass pass = dstc::lin4_pass(p, g, r0, r1, f0);
+    if (pass.lo < pass.hi) {
+      split_pass<C, kBanded>(split_stages<C>(), split_contributions<C>(), pass);
+      // Every thread has read its sums before another pass refills the stages.
+      __syncthreads();
+    }
+  }
+}
+
+constexpr uint32_t kSplit8Smem = dstc::split_smem_bytes<dstc::SplitCfg<false>>();
+constexpr uint32_t kSplit4Smem = dstc::split_smem_bytes<dstc::SplitCfg<true>>();
+
 }  // namespace
 
-#define DS_GEMM_TC_ENTRY(NAME, BODY, PARAMS)                                          \
+#define DS_GEMM_TC_ENTRY(NAME, BODY, PARAMS, SMEM)                                    \
   extern "C" __global__ void __launch_bounds__(kThreads)                              \
       NAME(const __grid_constant__ PARAMS p) {                                        \
     BODY(p);                                                                          \
   }                                                                                   \
-  EIDOLA_KERNEL_META(NAME, kThreads, 1, 1, 0, 1, 1, 1, sizeof(PARAMS))
+  EIDOLA_KERNEL_META(NAME, kThreads, 1, 1, SMEM, 1, 1, 1, sizeof(PARAMS))
 
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t8, (lin8<8, true>), DsLin8Params);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t32, (lin8<32, true>), DsLin8Params);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t8, (lin8<8, false>), DsLin8Params);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t32, (lin8<32, false>), DsLin8Params);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t8, (lin4<8, true>), DsLin4Params);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t32, (lin4<32, true>), DsLin4Params);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t8, (lin4<8, false>), DsLin4Params);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t32, (lin4<32, false>), DsLin4Params);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_s8, (lin8_split<true>), DsLin8Params, kSplit8Smem);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t8, (lin8_tile<8, true>), DsLin8Params, 0);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t32, (lin8_tile<32, true>), DsLin8Params, 0);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_s8, (lin8_split<false>), DsLin8Params, kSplit8Smem);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t8, (lin8_tile<8, false>), DsLin8Params, 0);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t32, (lin8_tile<32, false>), DsLin8Params, 0);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_s8, (lin4_split<true>), DsLin4Params, kSplit4Smem);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t8, (lin4_tile<8, true>), DsLin4Params, 0);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t32, (lin4_tile<32, true>), DsLin4Params, 0);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_s8, (lin4_split<false>), DsLin4Params, kSplit4Smem);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t8, (lin4_tile<8, false>), DsLin4Params, 0);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t32, (lin4_tile<32, false>), DsLin4Params, 0);
 
 // ---- the probe ----
 

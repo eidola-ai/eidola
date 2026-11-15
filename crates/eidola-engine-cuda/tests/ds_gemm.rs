@@ -12,16 +12,18 @@
 //!   unbanded counts are what the tolerance form's block products are: they
 //!   are recorded, not required.
 //! - **The banded form equals the reference** byte for byte (padding rows of
-//!   a layout untouched), in both tiles: small random shapes (every grid
+//!   a layout untouched), in every block shape: small random shapes (every grid
 //!   remainder, K not a multiple of the staged step, layouts with empty
 //!   groups at row alignments 1, 3, 8 and 16), and the released model's
 //!   dense and expert shapes from 1 row up, on model-like and arbitrary codes.
-//! - **The tolerance form is within its bound**, over the same cases: per
-//!   output the distance in BF16 units in the last place from the reference,
-//!   recorded as a histogram with the largest relative error (`TOLERANCE`).
-//! - **Batch invariance**: a row computed alone (an 8-row tile) is the same
+//! - **The tolerance form is within its bound**, over the same cases, and
+//!   the same bits in every block shape: per output the distance in BF16
+//!   units in the last place from the reference, recorded as a histogram with
+//!   the largest relative error (`TOLERANCE_*`).
+//! - **Batch invariance**: a row computed alone (a split block) is the same
 //!   bits as in a batch (32-row tiles), and an expert's rows the same in a
-//!   layout holding only them as in the full layout, in both forms.
+//!   layout holding only them (split blocks) as in the full layout, in both
+//!   forms.
 //!
 //! The suite writes `ds_gemm.json` (every check, the probe's counts and first
 //! differing records, the tolerance measurements) under
@@ -50,11 +52,13 @@ use eidola_engine_cuda::launch::{dptr, dptr_at};
 use eidola_engine_cuda::{Gpu, ImageArch};
 use serde_json::{Value, json};
 
-/// The tolerance form's bound, provisional until a device has measured it:
-/// every output within this many BF16 units in the last place of the
-/// reference, or within `TOLERANCE_RMS` times its row's root mean square
-/// (an output near zero after cancellation). Indexing or band faults move
-/// outputs by far more; the measured histogram is recorded beside it.
+/// The tolerance form's bound: every output within this many BF16 units in
+/// the last place of the reference, or within `TOLERANCE_RMS` times its row's
+/// root mean square (an output near zero after cancellation). On a B300 every
+/// measured output was within it: 286 of 21,284,807 `lin8` outputs differed
+/// (all but 20 by one unit; at most 16 units, 0.0188 of the row's root mean
+/// square), no `lin4` output did. Indexing or band faults move outputs by far
+/// more; the histogram is recorded beside it.
 const TOLERANCE_ULPS: u32 = 2;
 const TOLERANCE_RMS: f64 = 1.0 / 1024.0;
 
@@ -628,10 +632,12 @@ fn products(r: &mut Report, gpu: &Gpu, k: &Kernels, arch: ImageArch) {
     r.check(format!("{arch:?}/lin8/tolerance"), |m| {
         for (name, c) in &lin8 {
             let want = run_lin8(gpu, k, c, Run::Reference);
-            let t8 = run_lin8(gpu, k, c, Run::Tc(TcForm::Tolerance, TokenTile::T8));
-            let t32 = run_lin8(gpu, k, c, Run::Tc(TcForm::Tolerance, TokenTile::T32));
-            same_bytes(&t8, &t32, &format!("{name}: the two tiles"));
-            tol8.add(&want, &t32, us(c.n));
+            let s8 = run_lin8(gpu, k, c, Run::Tc(TcForm::Tolerance, TokenTile::S8));
+            for tile in [TokenTile::T8, TokenTile::T32] {
+                let got = run_lin8(gpu, k, c, Run::Tc(TcForm::Tolerance, tile));
+                same_bytes(&s8, &got, &format!("{name}: {tile:?} against S8"));
+            }
+            tol8.add(&want, &s8, us(c.n));
         }
         m.push(tol8.report(&format!("{arch:?}/lin8")));
         assert_eq!(tol8.out_of_bound, 0, "outputs out of the bound");
@@ -639,18 +645,20 @@ fn products(r: &mut Report, gpu: &Gpu, k: &Kernels, arch: ImageArch) {
     r.check(format!("{arch:?}/lin4/tolerance"), |m| {
         for (name, c) in &lin4 {
             let want = run_lin4(gpu, k, c, Run::Reference);
-            let t8 = run_lin4(gpu, k, c, Run::Tc(TcForm::Tolerance, TokenTile::T8));
-            let t32 = run_lin4(gpu, k, c, Run::Tc(TcForm::Tolerance, TokenTile::T32));
-            same_bytes(&t8, &t32, &format!("{name}: the two tiles"));
-            tol4.add(&want, &t32, us(c.n));
+            let s8 = run_lin4(gpu, k, c, Run::Tc(TcForm::Tolerance, TokenTile::S8));
+            for tile in [TokenTile::T8, TokenTile::T32] {
+                let got = run_lin4(gpu, k, c, Run::Tc(TcForm::Tolerance, tile));
+                same_bytes(&s8, &got, &format!("{name}: {tile:?} against S8"));
+            }
+            tol4.add(&want, &s8, us(c.n));
         }
         m.push(tol4.report(&format!("{arch:?}/lin4")));
         assert_eq!(tol4.out_of_bound, 0, "outputs out of the bound");
     });
 }
 
-/// A row alone (a one-row launch over the same arrays at its offset, an
-/// 8-row tile) against the same row in a batch of 300 (32-row tiles); an
+/// A row alone (a one-row launch over the same arrays at its offset, a
+/// split block) against the same row in a batch of 300 (32-row tiles); an
 /// expert's rows in a layout of only them against the full layout.
 fn invariance(r: &mut Report, gpu: &Gpu, k: &Kernels, arch: ImageArch) {
     for form in [TcForm::Banded, TcForm::Tolerance] {
@@ -678,7 +686,7 @@ fn invariance(r: &mut Report, gpu: &Gpu, k: &Kernels, arch: ImageArch) {
                     reserved: 0,
                 };
                 // SAFETY: one row of the case's arrays, at its offset.
-                unsafe { k.tc.lin8_tile(gpu, form, TokenTile::T8, &p) }.unwrap();
+                unsafe { k.tc.lin8_tile(gpu, form, TokenTile::S8, &p) }.unwrap();
                 gpu.synchronize().unwrap();
                 let alone = s.clone_dtoh(&out).unwrap();
                 same_bytes(
@@ -725,7 +733,7 @@ fn invariance(r: &mut Report, gpu: &Gpu, k: &Kernels, arch: ImageArch) {
                     w: Rc::clone(&full.w),
                     ws: Rc::clone(&full.ws),
                 };
-                let alone = run_lin4(gpu, k, &only, Run::Tc(form, TokenTile::T8));
+                let alone = run_lin4(gpu, k, &only, Run::Tc(form, TokenTile::S8));
                 let n = us(full.n);
                 same_bytes(
                     &all[us(start) * n..us(end) * n],

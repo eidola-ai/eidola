@@ -5,15 +5,16 @@
 //!
 //! ```text
 //! ds_gemm_bench <kernels_dir> [--rows 1,2,4,...] [--iters N] [--forms exact,banded,tolerance]
-//!               [--dense N,K] [--experts N,K] [--both-tiles]
+//!               [--dense N,K] [--experts N,K] [--all-tiles]
 //! ```
 //!
 //! Defaults: rows 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
 //! 8192; the dense shape `wo_b` (5120 × 8192); the experts' fused gate and up
 //! (4608 × 5120, 384 experts, 6 a token, runs aligned to 8 rows); 20
 //! iterations, fewer where a launch is long (each measurement is held to
-//! about two seconds). The tensor-core forms run the tile the row count picks
-//! (`TokenTile::for_rows`), or both with `--both-tiles`.
+//! about two seconds). The tensor-core forms run the block shape the host
+//! picks (`TokenTile::for_lin8`, `for_lin4`), or every shape with
+//! `--all-tiles`.
 //!
 //! Each measurement enqueues its launches back to back and divides the time
 //! between two events around them. Reported per launch: microseconds,
@@ -29,7 +30,7 @@ mod ds_gemm_data;
 use cudarc::driver::sys::CUevent_flags;
 use ds_gemm_data::{Rng, activations, fp4_weights, fp8_weight, layout};
 use eidola_engine_cuda::ds::abi::{Lin4Params, Lin8Params};
-use eidola_engine_cuda::ds::gemm::{DsGemmTc, GemmForm, TokenTile};
+use eidola_engine_cuda::ds::gemm::{DsGemmTc, GemmForm, TcForm, TokenTile};
 use eidola_engine_cuda::ds::gemm_ref::DsGemmRef;
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::{Gpu, KernelDir};
@@ -76,7 +77,7 @@ struct Args {
     forms: Vec<GemmForm>,
     dense: (u32, u32),
     experts: (u32, u32),
-    both_tiles: bool,
+    all_tiles: bool,
 }
 
 fn parse() -> Args {
@@ -94,7 +95,7 @@ fn parse() -> Args {
         forms: GemmForm::ALL.to_vec(),
         dense: (5120, 8192),
         experts: (4608, 5120),
-        both_tiles: false,
+        all_tiles: false,
     };
     let pair = |s: &str| -> (u32, u32) {
         let v: Vec<u32> = s.split(',').map(|x| x.parse().unwrap()).collect();
@@ -132,7 +133,7 @@ fn parse() -> Args {
                 args.experts = pair(&a[i + 1]);
                 i += 1;
             }
-            "--both-tiles" => args.both_tiles = true,
+            "--all-tiles" => args.all_tiles = true,
             other => panic!("unknown argument {other}"),
         }
         i += 1;
@@ -140,18 +141,19 @@ fn parse() -> Args {
     args
 }
 
-/// The (form, tile) pairs to time at `rows`.
-fn runs(args: &Args, rows: u32) -> Vec<(GemmForm, Option<TokenTile>)> {
+/// The (form, shape) pairs to time; `pick` is the host's choice for a
+/// tensor-core form.
+fn runs(args: &Args, pick: &dyn Fn(TcForm) -> TokenTile) -> Vec<(GemmForm, Option<TokenTile>)> {
     let mut out = Vec::new();
     for &form in &args.forms {
         match form.tc() {
             None => out.push((form, None)),
-            Some(_) if args.both_tiles => {
+            Some(_) if args.all_tiles => {
                 for tile in TokenTile::ALL {
                     out.push((form, Some(tile)));
                 }
             }
-            Some(_) => out.push((form, Some(TokenTile::for_rows(rows)))),
+            Some(f) => out.push((form, Some(pick(f)))),
         }
     }
     out
@@ -166,7 +168,7 @@ fn report(
     flops: f64,
     bytes: f64,
 ) {
-    let tile = tile.map_or("-".to_owned(), |t| format!("{}", t.tokens()));
+    let tile = tile.map_or("-", TokenTile::name);
     let tflops = flops / t / 1e6;
     let tbps = bytes / t / 1e6;
     println!(
@@ -218,7 +220,7 @@ fn main() {
         };
         let flops = 2.0 * f64::from(rows) * f64::from(n) * f64::from(k);
         let bytes = f64::from(n) * f64::from(k);
-        for (form, tile) in runs(&args, rows) {
+        for (form, tile) in runs(&args, &|f| TokenTile::for_lin8(f, rows)) {
             let launch = || {
                 // SAFETY: every array holds the largest row count's operands.
                 unsafe {
@@ -272,7 +274,7 @@ fn main() {
         let pairs = tokens * ACTIVE;
         let flops = 2.0 * f64::from(pairs) * f64::from(n) * f64::from(k);
         let bytes = f64::from(reached) * f64::from(n) * f64::from(k) / 2.0;
-        for (form, tile) in runs(&args, rows) {
+        for (form, tile) in runs(&args, &|f| TokenTile::for_lin4(f, rows, GROUPS)) {
             let launch = || {
                 // SAFETY: every array holds the largest layout's operands.
                 unsafe {

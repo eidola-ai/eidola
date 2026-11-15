@@ -21,11 +21,11 @@
 //!   reference's. Deterministic and batch-invariant; held to the reference
 //!   within the measured tolerance (`tests/ds_gemm.rs`).
 //!
-//! A launch computes `tokens` rows (8 or 32, [`TokenTile`]) by `features`
-//! outputs per block, chosen from the row count alone; no bit of a row
-//! depends on the tile (a row's arithmetic is the same instructions over its
-//! own operands in every tile, and the probe holds an MMA element's bits to
-//! its place in the fragment).
+//! A launch's blocks have one of three shapes ([`TokenTile`]), chosen from the
+//! row count alone (and for `lin4` the group count); no bit of a row depends
+//! on the shape (a row's arithmetic is the same operations in the same order
+//! over its own operands in every shape, and the probe holds an MMA element's
+//! bits to its place in the fragment).
 
 use super::abi::{Lin4Params, Lin8Params};
 use super::gemm_ref::DsGemmRef;
@@ -37,10 +37,20 @@ use crate::{Gpu, Result, launch};
 pub const TC_THREADS: u32 = 128;
 /// Activation and weight codes are copied 16 bytes at a time.
 pub const TC_OPERAND_ALIGN: u64 = 16;
-/// At most this many rows (layout rows for `lin4`) run in 8-row tiles; more in
-/// 32-row tiles. Small row counts are bound by streaming the weights, which
-/// smaller tiles spread over more blocks.
-pub const SMALL_TILE_ROWS: u32 = 16;
+/// `lin8` runs split blocks ([`TokenTile::S8`]) up to this many rows: there
+/// the product streams the weights, and only many small blocks with deep
+/// staging keep enough of them in flight.
+pub const SPLIT_MAX_ROWS: u32 = 32;
+/// `lin4` runs split blocks while the layout holds at most this many rows per
+/// group on average.
+pub const SPLIT_MAX_ROWS_PER_GROUP: u32 = 8;
+/// Past the split blocks: `lin8`'s tolerance form runs 32-row tiles above this
+/// many rows (8-row tiles below), its banded form 8-row tiles at every count;
+/// `lin4`'s banded form runs 32-row tiles above this many rows per group on
+/// average, its tolerance form at every count past the split blocks. Measured
+/// on a B300 (`eidola-engine-cuda/AGENTS.md` → DeepSeek-V4.1).
+pub const TOLERANCE_T8_MAX_ROWS: u32 = 128;
+pub const BANDED_T8_MAX_ROWS_PER_GROUP: u32 = 64;
 
 /// How a quantised GEMM is computed. Every form takes the same parameter
 /// structs and layouts.
@@ -72,21 +82,39 @@ impl GemmForm {
     }
 }
 
-/// Rows a block of a tensor-core GEMM computes.
+/// The shape of a tensor-core GEMM's blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TokenTile {
-    /// 8 rows by 64 outputs.
+    /// 8 rows by 16 outputs, the four warps sharing out each step's blocks
+    /// and their contributions added in block order: the split block.
+    S8,
+    /// 8 rows by 64 outputs, a warp per 16.
     T8,
-    /// 32 rows by 128 outputs.
+    /// 32 rows by 128 outputs, a warp per 32.
     T32,
 }
 
 impl TokenTile {
-    pub const ALL: [TokenTile; 2] = [TokenTile::T8, TokenTile::T32];
+    pub const ALL: [TokenTile; 3] = [TokenTile::S8, TokenTile::T8, TokenTile::T32];
 
-    /// The tile for `rows` rows (layout rows for `lin4`).
-    pub fn for_rows(rows: u32) -> TokenTile {
-        if rows <= SMALL_TILE_ROWS {
+    /// The shape `lin8` runs `rows` rows in.
+    pub fn for_lin8(form: TcForm, rows: u32) -> TokenTile {
+        if rows <= SPLIT_MAX_ROWS {
+            TokenTile::S8
+        } else if form == TcForm::Banded || rows <= TOLERANCE_T8_MAX_ROWS {
+            TokenTile::T8
+        } else {
+            TokenTile::T32
+        }
+    }
+
+    /// The shape `lin4` runs a layout of `layout_rows` rows over `groups`
+    /// groups in.
+    pub fn for_lin4(form: TcForm, layout_rows: u32, groups: u32) -> TokenTile {
+        let per_group = layout_rows.div_ceil(groups.max(1));
+        if per_group <= SPLIT_MAX_ROWS_PER_GROUP {
+            TokenTile::S8
+        } else if form == TcForm::Banded && per_group <= BANDED_T8_MAX_ROWS_PER_GROUP {
             TokenTile::T8
         } else {
             TokenTile::T32
@@ -95,23 +123,32 @@ impl TokenTile {
 
     pub fn tokens(self) -> u32 {
         match self {
-            TokenTile::T8 => 8,
+            TokenTile::S8 | TokenTile::T8 => 8,
             TokenTile::T32 => 32,
         }
     }
 
-    /// Outputs per block: four warps of 16 (`T8`) or 32 (`T32`).
     pub fn features(self) -> u32 {
         match self {
+            TokenTile::S8 => 16,
             TokenTile::T8 => 64,
             TokenTile::T32 => 128,
         }
     }
 
+    pub fn name(self) -> &'static str {
+        match self {
+            TokenTile::S8 => "s8",
+            TokenTile::T8 => "t8",
+            TokenTile::T32 => "t32",
+        }
+    }
+
     fn index(self) -> usize {
         match self {
-            TokenTile::T8 => 0,
-            TokenTile::T32 => 1,
+            TokenTile::S8 => 0,
+            TokenTile::T8 => 1,
+            TokenTile::T32 => 2,
         }
     }
 }
@@ -292,8 +329,8 @@ pub fn probe_grid(p: &ProbeParams, blocks: u32) -> Result<[u32; 3]> {
 pub struct DsGemmTc {
     _module: KernelModule,
     /// `[form][tile]`.
-    lin8: [[Kernel; 2]; 2],
-    lin4: [[Kernel; 2]; 2],
+    lin8: [[Kernel; 3]; 2],
+    lin4: [[Kernel; 3]; 2],
     probe: Kernel,
 }
 
@@ -306,44 +343,41 @@ impl DsGemmTc {
 
     pub fn from_module(m: KernelModule) -> Result<DsGemmTc> {
         m.expect_image(Self::IMAGE)?;
+        let entries = |product: &str, form: &str| -> Result<[Kernel; 3]> {
+            let bind_one = |tile: TokenTile| {
+                let symbol = format!("eidola_ds_{product}_{form}_{}", tile.name());
+                if product == "lin8" {
+                    bind::<Lin8Params>(&m, &symbol, TC_THREADS)
+                } else {
+                    bind::<Lin4Params>(&m, &symbol, TC_THREADS)
+                }
+            };
+            Ok([
+                bind_one(TokenTile::S8)?,
+                bind_one(TokenTile::T8)?,
+                bind_one(TokenTile::T32)?,
+            ])
+        };
         Ok(DsGemmTc {
-            lin8: [
-                [
-                    bind::<Lin8Params>(&m, "eidola_ds_lin8_banded_t8", TC_THREADS)?,
-                    bind::<Lin8Params>(&m, "eidola_ds_lin8_banded_t32", TC_THREADS)?,
-                ],
-                [
-                    bind::<Lin8Params>(&m, "eidola_ds_lin8_tolerance_t8", TC_THREADS)?,
-                    bind::<Lin8Params>(&m, "eidola_ds_lin8_tolerance_t32", TC_THREADS)?,
-                ],
-            ],
-            lin4: [
-                [
-                    bind::<Lin4Params>(&m, "eidola_ds_lin4_banded_t8", TC_THREADS)?,
-                    bind::<Lin4Params>(&m, "eidola_ds_lin4_banded_t32", TC_THREADS)?,
-                ],
-                [
-                    bind::<Lin4Params>(&m, "eidola_ds_lin4_tolerance_t8", TC_THREADS)?,
-                    bind::<Lin4Params>(&m, "eidola_ds_lin4_tolerance_t32", TC_THREADS)?,
-                ],
-            ],
+            lin8: [entries("lin8", "banded")?, entries("lin8", "tolerance")?],
+            lin4: [entries("lin4", "banded")?, entries("lin4", "tolerance")?],
             probe: bind::<ProbeParams>(&m, "eidola_ds_gemm_probe", TC_THREADS)?,
             _module: m,
         })
     }
 
-    /// `linear::lin8` after its quantiser, in `form`, in the tile the row
-    /// count picks.
+    /// `linear::lin8` after its quantiser, in `form`, in the shape the row
+    /// count picks ([`TokenTile::for_lin8`]).
     ///
     /// # Safety
     ///
     /// Every address must be valid for the arrays [`Lin8Params`] describes
     /// (`csrc/ds_abi.cuh`) until the launch completes.
     pub unsafe fn lin8(&self, gpu: &Gpu, form: TcForm, p: &Lin8Params) -> Result<()> {
-        unsafe { self.lin8_tile(gpu, form, TokenTile::for_rows(p.rows), p) }
+        unsafe { self.lin8_tile(gpu, form, TokenTile::for_lin8(form, p.rows), p) }
     }
 
-    /// [`DsGemmTc::lin8`] in a given tile (the tests and the bench).
+    /// [`DsGemmTc::lin8`] in a given shape (the tests and the bench).
     ///
     /// # Safety
     ///
@@ -363,7 +397,7 @@ impl DsGemmTc {
     }
 
     /// `linear::lin4` after its quantiser over an expert-major layout, in
-    /// `form`, in the tile the layout's row count picks. Padding rows'
+    /// `form`, in the shape the layout picks ([`TokenTile::for_lin4`]). Padding rows'
     /// outputs are not written.
     ///
     /// # Safety
@@ -372,10 +406,17 @@ impl DsGemmTc {
     /// until the launch completes, and `group_end` must hold a layout of
     /// `layout_rows` rows.
     pub unsafe fn lin4(&self, gpu: &Gpu, form: TcForm, p: &Lin4Params) -> Result<()> {
-        unsafe { self.lin4_tile(gpu, form, TokenTile::for_rows(p.layout_rows), p) }
+        unsafe {
+            self.lin4_tile(
+                gpu,
+                form,
+                TokenTile::for_lin4(form, p.layout_rows, p.groups),
+                p,
+            )
+        }
     }
 
-    /// [`DsGemmTc::lin4`] in a given tile.
+    /// [`DsGemmTc::lin4`] in a given shape.
     ///
     /// # Safety
     ///
@@ -479,19 +520,47 @@ mod tests {
 
     #[test]
     fn tiles_follow_the_row_count() {
-        assert_eq!(TokenTile::for_rows(1), TokenTile::T8);
-        assert_eq!(TokenTile::for_rows(SMALL_TILE_ROWS), TokenTile::T8);
-        assert_eq!(TokenTile::for_rows(SMALL_TILE_ROWS + 1), TokenTile::T32);
-        assert_eq!(TokenTile::for_rows(8192), TokenTile::T32);
+        use TcForm::{Banded, Tolerance};
+        for form in [Banded, Tolerance] {
+            assert_eq!(TokenTile::for_lin8(form, 1), TokenTile::S8);
+            assert_eq!(TokenTile::for_lin8(form, SPLIT_MAX_ROWS), TokenTile::S8);
+            assert_eq!(TokenTile::for_lin8(form, SPLIT_MAX_ROWS + 1), TokenTile::T8);
+            // One token routed to six of 384 experts; 512 tokens.
+            assert_eq!(TokenTile::for_lin4(form, 6, 384), TokenTile::S8);
+            assert_eq!(TokenTile::for_lin4(form, 3072, 384), TokenTile::S8);
+        }
+        assert_eq!(TokenTile::for_lin4(Banded, 3073, 384), TokenTile::T8);
+        assert_eq!(TokenTile::for_lin4(Tolerance, 3073, 384), TokenTile::T32);
+        assert_eq!(TokenTile::for_lin8(Banded, 8192), TokenTile::T8);
+        assert_eq!(
+            TokenTile::for_lin8(Tolerance, TOLERANCE_T8_MAX_ROWS),
+            TokenTile::T8
+        );
+        assert_eq!(
+            TokenTile::for_lin8(Tolerance, TOLERANCE_T8_MAX_ROWS + 1),
+            TokenTile::T32
+        );
+        assert_eq!(TokenTile::for_lin4(Banded, 64 * 384, 384), TokenTile::T8);
+        assert_eq!(
+            TokenTile::for_lin4(Banded, 64 * 384 + 384, 384),
+            TokenTile::T32
+        );
+        assert_eq!(
+            TokenTile::for_lin4(Tolerance, 64 * 384, 384),
+            TokenTile::T32
+        );
+        // No group is no different from one.
+        assert_eq!(TokenTile::for_lin4(Banded, 4, 0), TokenTile::S8);
         for tile in TokenTile::ALL {
-            // Four warps, each 16 outputs per MMA tile.
-            assert_eq!(tile.features() % (4 * 16), 0);
+            // Whole 16-output MMA tiles.
+            assert_eq!(tile.features() % 16, 0);
         }
     }
 
     #[test]
     fn lin8_grids_and_refusals() {
         let p = lin8();
+        assert_eq!(lin8_tc_grid(&p, TokenTile::S8).unwrap(), [2048, 1, 1]);
         assert_eq!(lin8_tc_grid(&p, TokenTile::T8).unwrap(), [512, 1, 1]);
         assert_eq!(lin8_tc_grid(&p, TokenTile::T32).unwrap(), [256, 1, 1]);
         let p = Lin8Params {
@@ -533,6 +602,7 @@ mod tests {
         let p = lin4();
         assert_eq!(lin4_tc_grid(&p, TokenTile::T32).unwrap(), [36, 1688, 1]);
         assert_eq!(lin4_tc_grid(&p, TokenTile::T8).unwrap(), [72, 6750, 1]);
+        assert_eq!(lin4_tc_grid(&p, TokenTile::S8).unwrap(), [288, 6750, 1]);
         // Any alignment of the runs is served (a tile then meets several groups).
         for row_align in [1, 3, 8, 128] {
             assert!(lin4_tc_grid(&Lin4Params { row_align, ..p }, TokenTile::T8).is_ok());
