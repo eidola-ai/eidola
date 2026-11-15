@@ -12,7 +12,9 @@
 //! refund recovery key's wire form ([`refund_key`]), the public
 //! calendar issuer key windows are checked against ([`issuer_calendar`]), the
 //! `credentials` member a spend travels in and the ACT parameter `L`
-//! (`spend_credentials`, behind the `spend-credentials` feature), and the
+//! (`spend_credentials`, behind the `spend-credentials` feature), the
+//! platform-endorsements release tag grammar every reader of a vendored
+//! release and `tinfoil-verifier` parse with ([`platform_release`]), and the
 //! embed-marker recognition rule shared between the
 //! markdown editor's embed plugin and app-core's upstream quote expansion
 //! ([`embed`]). It is intentionally lib-only, pure Rust, and float-free so
@@ -133,6 +135,7 @@ pub mod issuer_calendar;
 #[cfg(feature = "catalog")]
 pub mod model_catalog;
 pub mod model_reference;
+pub mod platform_release;
 pub mod pricing;
 pub mod refund_key;
 #[cfg(feature = "spend-credentials")]
