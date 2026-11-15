@@ -4,15 +4,32 @@
 #
 #   ds_gpu_session.sh [step ...]        (no argument: every step, in order)
 #
-#   steps: setup build kernels ds_ops ds_gemm_ref ds_attention ds_index ds_tiny mimo summary
+#   steps: setup build kernels ds_ops ds_gemm_ref ds_attention ds_index ds_tiny
+#          ds_tiny_drafting ds_tiny_memory mimo summary
 #   with the released checkpoint (never run by default; name them):
 #          halves_build halves_encoder halves_decoder halves_reference
+#          halves_invariance
+#
+# `ds_tiny` is the executor without drafts; `ds_tiny_drafting` is every draft
+# width and acceptance pattern, seeded sampling and the scenarios again with
+# every draft slot drafted; `ds_tiny_memory` is idle encryption, resealing and
+# the host tier (page-locked host memory) with drafts on. Each is the tiny
+# fixture through the engine, held to the CPU reference executor step for
+# step, and needs only the device and the kernel directory. `ds_tiny_memory`
+# also locks a few megabytes of host memory for the reference executor's own
+# host tier: the memory-lock hard limit (`ulimit -H -l`) must allow that.
 #
 # The `halves_*` steps are the released model on the exact executor, one half
 # at a time (`examples/ds_halves.rs`): the encoder half's boundary and the
 # decoder half's logits over real text, then the model crate's forward on the
-# CPU over the same tokens, compared bit for bit. `halves_reference` needs no
-# GPU. Their recordings and `ds_halves.json` are under $OUT/ds_halves.
+# CPU over the same tokens, compared bit for bit. Each device phase ends with
+# its invariance pass (the first positions again in other slots, blocks, rows
+# and steps, equal bit for bit to the first run) and fails if it differs.
+# `halves_reference` needs no GPU. Their recordings and `ds_halves.json` are
+# under $OUT/ds_halves. `halves_invariance` is both device phases over the
+# text's first 192 tokens only, for the invariance pass alone, under
+# $OUT/ds_halves_invariance: it loads both halves again and leaves the
+# recordings of the other steps as they are.
 #
 # Run from a checkout (or an unpacked `git archive`) of this repository on a
 # Linux x86_64 machine with one NVIDIA Blackwell GPU and its driver (CUDA 13
@@ -38,13 +55,20 @@
 #            golden/ holds a reference-*.safetensors with the tokens and the Engram map
 #   EIDOLA_DS_HALVES_TOKENS, EIDOLA_DS_HALVES_CHUNK   tokens of the text and positions
 #            per step                                  (default 256 and 96)
+#   EIDOLA_DS_HALVES_INVARIANCE   positions the invariance pass repeats; 0 for none
+#                                                      (default twice the chunk)
 #
 # Expected time on one B300, after `setup` and `build` (about 10 minutes
 # together on a fresh machine): kernels under 1 minute; ds_ops 5 to 10
 # (the casts over every f32 through the probe, the released shapes);
 # ds_gemm_ref 3 to 8 (the whole vocabulary through the head);
-# ds_attention and ds_index 1 to 3 each; ds_tiny 10 to 15 (the CPU reference
-# executor runs beside the device); mimo 3 to 6. None of these was measured.
+# ds_attention and ds_index 1 to 3 each; ds_tiny about 1 (the CPU reference
+# executor runs beside the device and is most of it); ds_tiny_drafting 3 to 6
+# and ds_tiny_memory 1 to 3 (not measured); mimo 3 to 6. With the checkpoint:
+# a half loads in 2 to 3 minutes, a step of 96 positions computes in about 2
+# seconds a half, the invariance pass adds about 15 seconds a half, and the
+# CPU reference takes about 11 minutes; halves_invariance is two loads and
+# under a minute of steps.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -141,9 +165,22 @@ ds_ops() { device_tests ds_ops; }
 ds_gemm_ref() { device_tests ds_gemm_ref; }
 ds_attention() { device_tests ds_attention; }
 ds_index() { device_tests ds_index; }
+# device_test_named <test binary> <test name>: one test of a binary.
+device_test_named() {
+    (cd "$REPO" && cargo test --release --locked -p eidola-engine-cuda --test "$1" -- \
+        --nocapture --test-threads 1 --exact "$2")
+}
+
 # The executor: the tiny fixture and its wide-window configuration through the
-# engine, equal to the CPU reference executor step for step.
-ds_tiny() { device_tests ds_tiny; }
+# engine, equal to the CPU reference executor step for step; then with drafts,
+# then its memory (idle encryption, resealing, the host tier).
+ds_tiny() { device_test_named ds_tiny the_tiny_model_equals_the_cpu_reference_executor; }
+ds_tiny_drafting() {
+    device_test_named ds_tiny the_tiny_model_drafts_as_the_cpu_reference_executor
+}
+ds_tiny_memory() {
+    device_test_named ds_tiny the_tiny_model_keeps_its_memory_as_the_cpu_reference_executor
+}
 
 # MiMo's device suites that need no checkpoint: nothing of the first model's
 # kernels or wrappers moved.
@@ -168,6 +205,15 @@ halves_build() {
 halves_encoder() { halves encoder; }
 halves_decoder() { halves decoder; }
 halves_reference() { halves reference; }
+# Both device phases over the first 192 tokens, for their invariance passes.
+halves_invariance() {
+    [ -n "${CHECKPOINT:-}" ] && [ -d "$CHECKPOINT" ] || die "CHECKPOINT names no directory"
+    (cd "$REPO" && EIDOLA_DEEPSEEK_FULL_DIR="$CHECKPOINT" \
+        EIDOLA_DS_HALVES_OUT="$OUT/ds_halves_invariance" \
+        EIDOLA_DS_HALVES_PHASES=encoder,decoder EIDOLA_DS_HALVES_TOKENS=192 \
+        EIDOLA_DS_HALVES_CHUNK=96 EIDOLA_DS_HALVES_INVARIANCE=192 \
+        cargo run --release --locked -p eidola-engine-cuda --example ds_halves)
+}
 
 summary() {
     {
@@ -187,8 +233,8 @@ summary() {
     cat "$OUT/session.json"
 }
 
-ALL="setup build kernels ds_ops ds_gemm_ref ds_attention ds_index ds_tiny mimo summary"
-NAMED="halves_build halves_encoder halves_decoder halves_reference"
+ALL="setup build kernels ds_ops ds_gemm_ref ds_attention ds_index ds_tiny ds_tiny_drafting ds_tiny_memory mimo summary"
+NAMED="halves_build halves_encoder halves_decoder halves_reference halves_invariance"
 for step in ${*:-$ALL}; do
     case " $ALL $NAMED " in
         *" $step "*) ;;

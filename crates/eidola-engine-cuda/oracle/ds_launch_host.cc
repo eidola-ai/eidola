@@ -129,6 +129,12 @@ void dsh_head(const DsLinearParams* p, uint32_t gx, uint32_t gy, uint32_t) {
   }
 }
 
+void dsh_stream_mean(const DsStreamMeanParams* p, uint32_t gx, uint32_t gy, uint32_t) {
+  launch(gx, gy, 1, dsk::kElementThreads, [&](uint32_t x, uint32_t y, uint32_t, uint32_t t) {
+    dsk::stream_mean_thread(*p, x, y, t);
+  });
+}
+
 void dsh_pool(const DsPoolParams* p, uint32_t gx, uint32_t gy, uint32_t) {
   launch(gx, gy, 1, dsk::kElementThreads,
          [&](uint32_t x, uint32_t y, uint32_t, uint32_t t) { dsk::pool_thread(*p, x, y, t); });

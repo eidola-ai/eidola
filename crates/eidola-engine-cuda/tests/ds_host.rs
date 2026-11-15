@@ -15,11 +15,16 @@ fn host() -> Box<dyn Device> {
 }
 
 fn run(wide: bool, scenario: impl FnOnce(&mut Run<'_>)) {
+    drafting(wide, 0, scenario);
+}
+
+fn drafting(wide: bool, width: u32, scenario: impl FnOnce(&mut Run<'_>)) {
     let model = model(wide);
     let mut run = Run {
         model: &model,
         device: &host,
         outcomes: Vec::new(),
+        width,
     };
     scenario(&mut run);
     assert!(run.outcomes.iter().all(|o| o.compared.blocks > 0));
@@ -70,6 +75,40 @@ fn randomized_interleavings() {
     run(false, |r| r.randomized(0..3));
 }
 
+#[test]
+fn greedy_speculation_equals_plain_decoding_at_every_width() {
+    run(false, |r| r.greedy_speculation());
+}
+
+#[test]
+fn drafting_at_the_length_limit() {
+    drafting(false, 4, |r| r.length_limit());
+}
+
+#[test]
+fn seeded_sampled_speculation() {
+    run(false, |r| r.sampled_speculation());
+}
+
+/// Every scenario with the drafter's every slot drafted.
+#[test]
+fn the_scenarios_with_drafts() {
+    drafting(false, 4, |r| all_scenarios(r, false));
+}
+
+/// The window of 80 with five slots: the drafter's context list spans two blocks.
+#[test]
+fn drafting_past_one_attention_block() {
+    drafting(true, 5, |r| drafting_scenarios(r, true));
+}
+
+/// Idle KV is ciphertext, a recomputed block reseals to the same bytes, and the host
+/// tier round-trips every group's ciphertext.
+#[test]
+fn the_memory_scenarios() {
+    drafting(false, 4, |r| memory_scenarios(r, false));
+}
+
 /// The window of 80: a query's list spans two 64-slot attention blocks.
 #[test]
 fn a_window_past_one_attention_block() {
@@ -89,6 +128,7 @@ fn the_summary_records_every_scenario() {
         model: &model,
         device: &host,
         outcomes: Vec::new(),
+        width: 0,
     };
     run.single_requests();
     run.shedding();
@@ -103,11 +143,10 @@ fn the_summary_records_every_scenario() {
     assert!(scenarios[0]["step_ms"]["encoder"].as_f64().unwrap() > 0.0);
 }
 
-/// The same scenarios with every launch served by the device kernels' own bodies,
-/// compiled for the host, behind the launch wrappers' checks and grids: the fixture,
-/// then the window of 80. Skipped (after saying why) without a C++ compiler.
-#[test]
-fn the_compiled_kernel_bodies_run_the_scenarios() {
+/// What the device run runs, with every launch served by the device kernels' own
+/// bodies, compiled for the host, behind the launch wrappers' checks and grids: the
+/// fixture, then the window of 80. Skipped (after saying why) without a C++ compiler.
+fn compiled_bodies(drafting: bool, scenarios: impl Fn(&mut Run<'_>, bool)) {
     let Some(lib) = compiled::library() else {
         return;
     };
@@ -119,8 +158,24 @@ fn the_compiled_kernel_bodies_run_the_scenarios() {
             model: &model,
             device: &device,
             outcomes: Vec::new(),
+            width: if drafting { model.slots } else { 0 },
         };
-        all_scenarios(&mut run, wide);
+        scenarios(&mut run, wide);
         assert!(run.outcomes.iter().all(|o| o.compared.blocks > 0));
     }
+}
+
+#[test]
+fn the_compiled_kernel_bodies_run_the_scenarios() {
+    compiled_bodies(false, all_scenarios);
+}
+
+#[test]
+fn the_compiled_kernel_bodies_draft() {
+    compiled_bodies(true, drafting_scenarios);
+}
+
+#[test]
+fn the_compiled_kernel_bodies_keep_their_memory() {
+    compiled_bodies(true, memory_scenarios);
 }

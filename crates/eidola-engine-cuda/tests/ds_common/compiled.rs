@@ -15,7 +15,7 @@ use std::sync::Arc;
 use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::secret::KvKey;
 use eidola_engine_cuda::ds::abi::*;
-use eidola_engine_cuda::ds::half::{Device, SampleArgs};
+use eidola_engine_cuda::ds::half::{AcceptArgs, Device, SampleArgs};
 use eidola_engine_cuda::ds::host::HostDevice;
 use eidola_engine_cuda::ds::kernels::DsKernels;
 use eidola_engine_cuda::ds::{attention, gemm_ref, head, index, ops};
@@ -141,6 +141,7 @@ families! {
         index::check_select(p)?;
         Ok([p.rows, 1, 1])
     },
+    stream_mean: StreamMeanParams, rows => ops::stream_mean_grid,
     route: RouteParams, rows => ops::route_grid,
     // The placement launches whatever the row count, as its wrapper does.
     place: PlaceParams, groups => ops::place_grid,
@@ -173,6 +174,18 @@ impl Device for CompiledDevice {
     }
     unsafe fn sample(&self, a: &SampleArgs<'_>) -> Result<()> {
         unsafe { self.host.sample(a) }
+    }
+    unsafe fn accept(&self, a: &AcceptArgs) -> Result<()> {
+        unsafe { self.host.accept(a) }
+    }
+    fn alloc_host(&self, bytes: usize) -> Result<(*mut u8, Box<dyn Any>)> {
+        self.host.alloc_host(bytes)
+    }
+    unsafe fn copy_to_host(&self, dst: *mut u8, src: u64, bytes: usize) -> Result<()> {
+        unsafe { self.host.copy_to_host(dst, src, bytes) }
+    }
+    unsafe fn copy_from_host(&self, dst: u64, src: *const u8, bytes: usize) -> Result<()> {
+        unsafe { self.host.copy_from_host(dst, src, bytes) }
     }
     fn synchronize(&self) -> Result<()> {
         Ok(())
