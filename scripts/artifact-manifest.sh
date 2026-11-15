@@ -726,8 +726,11 @@ extract_static_cli() {
 
   # The dev `cli` target in either mode: it is the `ci-cli` target's build
   # with a different destination, and the digest check below is what makes
-  # that a fact rather than an assumption.
+  # that a fact rather than an assumption. Bake refuses to write outside its
+  # working directory unless the destination is granted, and the grant is
+  # exactly that one fresh directory.
   if ! docker buildx bake cli \
+    --allow "fs.write=${work}" \
     ${builder_args[@]+"${builder_args[@]}"} \
     ${buildx_set_args[@]+"${buildx_set_args[@]}"} \
     --set "cli.output=type=oci,dest=${work}/image.tar,${REPRODUCIBLE_IMAGE_OPTS}"; then
