@@ -38,6 +38,12 @@ if [[ ! -f "$EXECUTABLE" ]]; then
   echo "  Run 'cargo build -p eidola-gui' (or with --release) first." >&2
   exit 1
 fi
+CLI="$BIN_DIR/eidola"
+if [[ ! -f "$CLI" ]]; then
+  echo "error: command-line client not found at $CLI" >&2
+  echo "  Run 'cargo build -p eidola-gui -p eidola-cli' (or with --release) first." >&2
+  exit 1
+fi
 
 APP_DIR="$REPO_ROOT/crates/eidola-gui/build/Eidola.app"
 rm -rf "$APP_DIR"
@@ -49,6 +55,11 @@ echo "Assembling Eidola.app from $CONFIG build..."
 # Rename to match CFBundleExecutable in Info.plist. macOS uses this to decide
 # whether the binary "owns" the bundle; mismatch falls back to tool-mode.
 cp "$EXECUTABLE" "$APP_DIR/Contents/MacOS/Eidola"
+
+# The command-line client from the same build, as the release bundle carries
+# it: `eidola-cli`, because the default APFS volume is case-insensitive and
+# `eidola` would be the same file as `Eidola` above.
+cp "$CLI" "$APP_DIR/Contents/MacOS/eidola-cli"
 
 cp "$REPO_ROOT/crates/eidola-gui/Support/Info.plist" "$APP_DIR/Contents/"
 
@@ -96,7 +107,8 @@ fi
 # Ad-hoc codesign for local dev. Required on Apple Silicon for the binary
 # to launch at all; on Intel it's not strictly required but harmless. Done
 # after the sidecar copy so the bundle seal covers it; the nix-built sidecar
-# already carries its own ad-hoc signature for subprocess exec regardless.
+# already carries its own ad-hoc signature for subprocess exec regardless, and
+# the linker signs the cargo-built CLI ad hoc the same way.
 codesign --force --sign - "$APP_DIR"
 
 echo "Done: $APP_DIR"

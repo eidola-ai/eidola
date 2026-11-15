@@ -7,7 +7,7 @@ lsappinfo info -only ApplicationType $(pgrep -x Eidola)
 # "Foreground" = Regular (Dock icon); "UIElement" = Accessory (menu-bar-only)
 ```
 
-Build: `just build gui` (or `cargo build -p eidola-gui && ./scripts/package-gui-app.sh debug`), then `open crates/eidola-gui/build/Eidola.app`.
+Build: `just build gui` (or `cargo build -p eidola-gui -p eidola-cli && ./scripts/package-gui-app.sh debug`), then `open crates/eidola-gui/build/Eidola.app`.
 
 **The model in one line:** while the app is open it is an ordinary macOS app — Dock icon and menu bar even with no windows. **⌘Q retires it to the background** (windows close, Dock indicator goes, process and engines stay). **Full shutdown is the status menu's Quit Eidola.**
 

@@ -75,6 +75,14 @@ When billing is enabled, its receiver also listens on `http://localhost:8081`; i
 
 ### CLI
 
+Every desktop install carries the `eidola` command-line client from the same build as the app, so the two never drift apart. The Debian package installs it as `/usr/bin/eidola`, and the Linux Nix payload has it at `bin/eidola`. On macOS it is `Eidola.app/Contents/MacOS/eidola-cli` (the name differs because the default macOS volume is case-insensitive and `eidola` would collide with the app's own `Eidola`); link it onto your `PATH` as `eidola` (any directory on it will do):
+
+```bash
+ln -s /Applications/Eidola.app/Contents/MacOS/eidola-cli /usr/local/bin/eidola
+```
+
+With the app running, the CLI asks it to do the work over a local socket. Without it, each command opens the local profile itself, one at a time: a command started while another holds the profile waits for it (up to ten minutes; `--lock-wait` changes that).
+
 To run the CLI against a local development stack:
 
 `just client-local` performs steps 2 and 3 below — it reads the shim's cert set, writes the overrides, and prints (never runs) the one `sudo` command that has to trust the mock TLS root. `just client-reset` clears every override back to the built-in trust-root pins. The steps below are what those recipes automate, and the reference for doing it by hand. Both the GUI and the CLI read one profile, so either recipe configures both — quit any running Eidola first, since the local database is single-writer.

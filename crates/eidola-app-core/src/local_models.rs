@@ -1501,9 +1501,18 @@ fn resolve_local_engine_path(
 }
 
 /// The `local` (bundled) engine binary, resolved against the live process.
+///
+/// The executable is resolved through any links first. A command reached
+/// through a link on `PATH` — `/usr/local/bin/eidola` pointing into
+/// `Eidola.app` — is still the bundle's executable, and its sibling is the
+/// bundle's sidecar; macOS reports the path the process was started by,
+/// link and all, so without this the sibling looked for would be the link's.
+/// Linux's `/proc/self/exe` is already resolved, so there it changes nothing.
 pub(crate) fn resolve_local_engine(cfg: &Config) -> Option<PathBuf> {
     let env = std::env::var("EIDOLA_LLAMA_SERVER").ok();
-    let exe = std::env::current_exe().ok();
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe));
     resolve_local_engine_path(
         cfg.llama_server_path_override.as_deref(),
         env.as_deref(),
