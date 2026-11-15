@@ -13,6 +13,21 @@
 //! device block is compared with the reference's byte for byte; ciphertext is not
 //! comparable, because the two images order the keystream differently.
 //!
+//! **The host tier** ([`KvStore::set_host_tier`]) is one host allocation per group
+//! ([`Device::alloc_host`]: page-locked on a CUDA device), zeroed, of whole block images.
+//! `Demote` copies a block's image to a host block and `Promote` copies one back, queued
+//! in maintenance order; a demoted block must be held encrypted, so a host block holds
+//! ciphertext or zeros and nothing here reads one otherwise. `ZeroHost` is applied by the
+//! host once the device's queue has drained ([`KvStore::finish_host`], before the step
+//! returns, or before a later copy of the same step touches that host block).
+//!
+//! **Position tags** ([`KvStore::enable_tags`]) are a host-side record, per entry of
+//! every layer of every block, of the position whose KV it holds (plus one; zero for
+//! none). They follow the bytes through `Zero`, `Copy`, `Demote` and `Promote`, a write
+//! sets one and a read checks it, so a step that reads KV no step computed (a chain
+//! layer's window before the layer's start, an entry of a block mapped but never
+//! written) is refused. They cost four bytes of host memory per entry and layer.
+//!
 //! Tables live on the device for the kernels that walk a bank (`[slots, stride]` 32-bit
 //! words, -1 where nothing is mapped, so a kernel reading through one raises its status
 //! bit) and change only through the seam; the host mirror plans every write and read.
@@ -187,6 +202,27 @@ pub struct GroupStore {
     mapped: Vec<u32>,
     dirty: BTreeSet<Slot>,
     encrypted: Vec<bool>,
+    /// Per block, layer and entry: the position held, plus one.
+    tags: Option<Vec<u32>>,
+    host: Option<HostTier>,
+}
+
+/// A group's host tier: whole block images in host memory.
+struct HostTier {
+    /// The allocation's address (an integer, so the store stays `Send`).
+    base: usize,
+    blocks: u32,
+    /// Whether a host block holds ciphertext.
+    encrypted: Vec<bool>,
+    tags: Option<Vec<u32>>,
+    _owner: Box<dyn std::any::Any>,
+}
+
+impl GroupStore {
+    /// Tags of one block.
+    fn block_tags(&self) -> usize {
+        (self.geom.layers * self.geom.entries()) as usize
+    }
 }
 
 /// One half's groups.
@@ -196,6 +232,8 @@ pub struct KvStore {
     pub slots: u32,
     /// Words per table: logical blocks of the longest sequence.
     pub stride: u32,
+    /// Host blocks a step zeroes once the device's queue drains, as `(group, block)`.
+    host_zeros: Vec<(usize, u32)>,
 }
 
 impl KvStore {
@@ -218,6 +256,8 @@ impl KvStore {
                 mapped: vec![0; geom.num_blocks as usize],
                 dirty: BTreeSet::new(),
                 encrypted: vec![false; geom.num_blocks as usize],
+                tags: None,
+                host: None,
                 geom,
                 pool,
                 tables,
@@ -228,7 +268,231 @@ impl KvStore {
             block_size,
             slots,
             stride,
+            host_zeros: Vec::new(),
         })
+    }
+
+    /// Keeps position tags from here on (the pools hold nothing yet).
+    pub fn enable_tags(&mut self) {
+        for gs in &mut self.groups {
+            let per = gs.block_tags();
+            gs.tags = Some(vec![0; gs.geom.num_blocks as usize * per]);
+            if let Some(h) = &mut gs.host {
+                h.tags = Some(vec![0; h.blocks as usize * per]);
+            }
+        }
+    }
+
+    pub fn tagged(&self) -> bool {
+        self.groups.first().is_some_and(|g| g.tags.is_some())
+    }
+
+    /// Allocates the host tier: `blocks` block images per group (the null block 0
+    /// included), zeroed.
+    pub fn set_host_tier(&mut self, dev: &dyn Device, blocks: u32) -> Result<()> {
+        if blocks < 2 {
+            return Err(CudaError::new(format!(
+                "a host tier of {blocks} blocks: at least 2 (the null block and one more)"
+            )));
+        }
+        for gs in &mut self.groups {
+            let bytes = gs
+                .geom
+                .block_bytes()
+                .checked_mul(blocks as usize)
+                .filter(|b| *b < isize::MAX as usize)
+                .ok_or_else(|| CudaError::new("the host tier overflows"))?;
+            let (base, owner) = dev.alloc_host(bytes)?;
+            gs.host = Some(HostTier {
+                base: base as usize,
+                blocks,
+                encrypted: vec![false; blocks as usize],
+                tags: gs
+                    .tags
+                    .as_ref()
+                    .map(|_| vec![0; blocks as usize * gs.block_tags()]),
+                _owner: owner,
+            });
+        }
+        Ok(())
+    }
+
+    /// Host blocks per group; 0 without a host tier.
+    pub fn host_blocks(&self) -> u32 {
+        self.groups
+            .first()
+            .and_then(|g| g.host.as_ref())
+            .map_or(0, |h| h.blocks)
+    }
+
+    /// Bytes of host memory the host tier holds.
+    pub fn host_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .filter_map(|g| Some(g.host.as_ref()?.blocks as u64 * g.geom.block_bytes() as u64))
+            .sum()
+    }
+
+    fn host_range(&self, g: usize, host: u32) -> (*mut u8, usize) {
+        let gs = &self.groups[g];
+        let tier = gs.host.as_ref().expect("a host tier");
+        assert!(
+            host != NULL_BLOCK && host < tier.blocks,
+            "host block {host} outside group {}'s host tier",
+            gs.geom.global
+        );
+        let bytes = gs.geom.block_bytes();
+        ((tier.base + host as usize * bytes) as *mut u8, bytes)
+    }
+
+    /// Copies an encrypted block's image to a host block. Panics on a plaintext block,
+    /// as the reference executor does: the host tier holds ciphertext only.
+    pub fn demote(&mut self, dev: &dyn Device, g: usize, block: u32, host: u32) -> Result<()> {
+        let (from, bytes) = self.block_range(g, block);
+        let (to, _) = self.host_range(g, host);
+        assert!(
+            self.groups[g].encrypted[block as usize],
+            "group {} block {block}: demote of a plaintext block",
+            self.groups[g].geom.global
+        );
+        self.settle_host(dev, g, host)?;
+        let gs = &mut self.groups[g];
+        let per = gs.block_tags();
+        let tier = gs.host.as_mut().expect("a host tier");
+        tier.encrypted[host as usize] = true;
+        if let (Some(t), Some(h)) = (&gs.tags, &mut tier.tags) {
+            h[host as usize * per..][..per].copy_from_slice(&t[block as usize * per..][..per]);
+        }
+        // SAFETY: one block of the pool and one block of the host tier.
+        unsafe { dev.copy_to_host(to, from, bytes) }
+    }
+
+    /// Copies a host block's ciphertext into a zero block. Panics on a host block
+    /// holding none, or a block that is encrypted or (with tags) written.
+    pub fn promote(&mut self, dev: &dyn Device, g: usize, host: u32, block: u32) -> Result<()> {
+        let (to, bytes) = self.block_range(g, block);
+        let (from, _) = self.host_range(g, host);
+        self.settle_host(dev, g, host)?;
+        let gs = &mut self.groups[g];
+        let per = gs.block_tags();
+        let tier = gs.host.as_ref().expect("a host tier");
+        assert!(
+            tier.encrypted[host as usize],
+            "group {} host block {host}: promote of a block holding no ciphertext",
+            gs.geom.global
+        );
+        let written = gs
+            .tags
+            .as_ref()
+            .is_some_and(|t| t[block as usize * per..][..per].iter().any(|t| *t != 0));
+        assert!(
+            !gs.encrypted[block as usize] && !written,
+            "group {} block {block}: promote into a block that is not zero",
+            gs.geom.global
+        );
+        gs.encrypted[block as usize] = true;
+        if let (Some(t), Some(h)) = (&mut gs.tags, &tier.tags) {
+            t[block as usize * per..][..per].copy_from_slice(&h[host as usize * per..][..per]);
+        }
+        // SAFETY: one block of the host tier and one block of the pool.
+        unsafe { dev.copy_from_host(to, from, bytes) }
+    }
+
+    /// Queues a host block's zero for [`KvStore::finish_host`].
+    pub fn zero_host(&mut self, g: usize, host: u32) {
+        self.host_range(g, host);
+        let gs = &mut self.groups[g];
+        let per = gs.block_tags();
+        let tier = gs.host.as_mut().expect("a host tier");
+        tier.encrypted[host as usize] = false;
+        if let Some(h) = &mut tier.tags {
+            h[host as usize * per..][..per].fill(0);
+        }
+        self.host_zeros.push((g, host));
+    }
+
+    /// Applies a queued zero of this host block before a copy touches it.
+    fn settle_host(&mut self, dev: &dyn Device, g: usize, host: u32) -> Result<()> {
+        match self.host_zeros.contains(&(g, host)) {
+            true => self.finish_host(dev),
+            false => Ok(()),
+        }
+    }
+
+    /// Applies the queued host zeros once every copy queued before them has completed.
+    pub fn finish_host(&mut self, dev: &dyn Device) -> Result<()> {
+        if self.host_zeros.is_empty() {
+            return Ok(());
+        }
+        dev.synchronize()?;
+        for (g, host) in std::mem::take(&mut self.host_zeros) {
+            let (at, bytes) = self.host_range(g, host);
+            // SAFETY: one block of the host tier; the queue has drained.
+            unsafe { dev.zero_host(at, bytes) };
+        }
+        Ok(())
+    }
+
+    /// Zeroes the whole host tier.
+    pub fn scrub_host(&mut self, dev: &dyn Device) -> Result<()> {
+        self.host_zeros.clear();
+        dev.synchronize()?;
+        for gs in &mut self.groups {
+            if let Some(tier) = &mut gs.host {
+                let bytes = tier.blocks as usize * gs.geom.block_bytes();
+                // SAFETY: the whole allocation; the queue has drained.
+                unsafe { dev.zero_host(tier.base as *mut u8, bytes) };
+                tier.encrypted.fill(false);
+            }
+        }
+        Ok(())
+    }
+
+    /// A host block's bytes (tests).
+    pub fn read_host_block(&self, dev: &dyn Device, g: usize, host: u32) -> Result<Vec<u8>> {
+        dev.synchronize()?;
+        let (at, bytes) = self.host_range(g, host);
+        let mut out = vec![0u8; bytes];
+        // SAFETY: one block of the host tier; the queue has drained.
+        unsafe { dev.read_host(at, &mut out) };
+        Ok(out)
+    }
+
+    pub fn host_is_encrypted(&self, g: usize, host: u32) -> bool {
+        self.host_range(g, host);
+        self.groups[g].host.as_ref().expect("a host tier").encrypted[host as usize]
+    }
+
+    fn tag_at(&self, g: usize, layer: u32, entry: u32) -> usize {
+        let geom = &self.groups[g].geom;
+        assert!(layer < geom.layers);
+        let e = geom.entries();
+        ((entry / e * geom.layers + layer) * e + entry % e) as usize
+    }
+
+    /// Records that `entry` of `layer` now holds position `pos` (with tags).
+    pub fn tag(&mut self, g: usize, layer: u32, entry: u32, pos: u32) {
+        let at = self.tag_at(g, layer, entry);
+        if let Some(t) = &mut self.groups[g].tags {
+            t[at] = pos + 1;
+        }
+    }
+
+    /// Refuses a read of `entry` of `layer` as position `pos` unless a step wrote it
+    /// (with tags).
+    pub fn check_tag(&self, g: usize, layer: u32, entry: u32, pos: u32) -> Result<()> {
+        let at = self.tag_at(g, layer, entry);
+        match &self.groups[g].tags {
+            Some(t) if t[at] != pos + 1 => Err(CudaError::new(format!(
+                "group {} layer {layer}: a read of position {pos} finds KV {}",
+                self.groups[g].geom.global,
+                match t[at] {
+                    0 => "no step computed".to_string(),
+                    held => format!("of position {}", held - 1),
+                }
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// This half's index of seam group `global`.
@@ -307,7 +571,12 @@ impl KvStore {
 
     pub fn zero(&mut self, dev: &dyn Device, g: usize, block: u32) -> Result<()> {
         let (addr, bytes) = self.block_range(g, block);
-        self.groups[g].encrypted[block as usize] = false;
+        let gs = &mut self.groups[g];
+        gs.encrypted[block as usize] = false;
+        let per = gs.block_tags();
+        if let Some(t) = &mut gs.tags {
+            t[block as usize * per..][..per].fill(0);
+        }
         // SAFETY: one block of the pool.
         unsafe { dev.zero(addr, bytes) }
     }
@@ -319,6 +588,13 @@ impl KvStore {
         let ((from, bytes), (to, _)) = (self.block_range(g, src), self.block_range(g, dst));
         let gs = &mut self.groups[g];
         gs.encrypted[dst as usize] = gs.encrypted[src as usize];
+        let per = gs.block_tags();
+        if let Some(t) = &mut gs.tags {
+            t.copy_within(
+                src as usize * per..(src as usize + 1) * per,
+                dst as usize * per,
+            );
+        }
         // SAFETY: two distinct blocks of the pool.
         unsafe { dev.copy(to, from, bytes) }
     }

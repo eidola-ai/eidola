@@ -59,6 +59,36 @@ pub struct SampleArgs<'a> {
     pub tokens: u64,
     /// One word.
     pub status: u64,
+    /// The stream a token is drawn on; none computes the distributions only.
+    pub draw: Option<Stream>,
+}
+
+/// One chain-acceptance launch (`sampling::chain_accept`, a sequence per row): row `r`
+/// has `num_drafts[r] = k` drafts, target distributions `target_row[r] ..= + k` of
+/// `target`, and draft `i`'s distribution and id at row `draft_row[r] + i · draft_step`
+/// of `draft` and of `drafts`. It writes `1 ..= k + 1` tokens to `out[r · stride ..]` and
+/// their count to `counts[r]`.
+#[derive(Clone, Copy, Debug)]
+pub struct AcceptArgs {
+    /// f64 `[*, n]`.
+    pub target: u64,
+    /// f64 `[*, n]`.
+    pub draft: u64,
+    pub n: u32,
+    /// `[rows]` [`SampleRow`]s, `position` the first drafted position.
+    pub rows: u64,
+    pub target_row: u64,
+    pub draft_row: u64,
+    pub draft_step: u32,
+    pub num_drafts: u64,
+    pub drafts: u64,
+    pub stride: u32,
+    /// f64 `[rows, n]`.
+    pub scratch: u64,
+    pub out: u64,
+    pub counts: u64,
+    pub status: u64,
+    pub num_rows: u32,
 }
 
 /// A device's memory and launches. Every operation is queued in order;
@@ -93,6 +123,45 @@ pub trait Device {
     ///
     /// Every address of `a` holds what its field documents.
     unsafe fn sample(&self, a: &SampleArgs<'_>) -> Result<()>;
+    /// # Safety
+    ///
+    /// Every address of `a` holds what its field documents.
+    unsafe fn accept(&self, a: &AcceptArgs) -> Result<()>;
+    /// `bytes` zeroed bytes of host memory for the host tier, and what keeps them
+    /// allocated. On a CUDA device the memory is page-locked: never paged out.
+    fn alloc_host(&self, bytes: usize) -> Result<(*mut u8, Box<dyn Any>)>;
+    /// Queues a copy of device bytes to host memory.
+    ///
+    /// # Safety
+    ///
+    /// `src` as [`Device::zero`]; `dst .. dst + bytes` lies inside one live
+    /// [`Device::alloc_host`] allocation that nothing else reads or writes until
+    /// [`Device::synchronize`].
+    unsafe fn copy_to_host(&self, dst: *mut u8, src: u64, bytes: usize) -> Result<()>;
+    /// Queues a copy of host memory to device bytes.
+    ///
+    /// # Safety
+    ///
+    /// As [`Device::copy_to_host`], the other way.
+    unsafe fn copy_from_host(&self, dst: u64, src: *const u8, bytes: usize) -> Result<()>;
+    /// Zeroes host memory; the caller has synchronized.
+    ///
+    /// # Safety
+    ///
+    /// `dst .. dst + bytes` lies inside one live [`Device::alloc_host`] allocation.
+    unsafe fn zero_host(&self, dst: *mut u8, bytes: usize) {
+        // SAFETY: the caller's range.
+        unsafe { std::ptr::write_bytes(dst, 0, bytes) }
+    }
+    /// Copies host memory out; the caller has synchronized.
+    ///
+    /// # Safety
+    ///
+    /// As [`Device::zero_host`], for `dst.len()` bytes at `src`.
+    unsafe fn read_host(&self, src: *const u8, dst: &mut [u8]) {
+        // SAFETY: the caller's range.
+        dst.copy_from_slice(unsafe { std::slice::from_raw_parts(src, dst.len()) });
+    }
     fn synchronize(&self) -> Result<()>;
     fn kernels(&self) -> &dyn DsKernels;
     /// Total device memory, when the device has a fixed amount.
@@ -321,13 +390,65 @@ impl Device for CudaDevice {
                     n: a.n,
                     rows: a.rows_dev,
                     num_rows: narrow(a.rows.len(), "sample rows")?,
-                    draw: Some(Stream::Sample),
+                    draw: a.draw,
                     probs: a.probs,
                     tokens: a.tokens,
                     status: a.status,
                 },
             )
         }
+    }
+
+    unsafe fn accept(&self, a: &AcceptArgs) -> Result<()> {
+        // SAFETY: the caller's addresses.
+        unsafe {
+            self.sampler.launch_accept(
+                &self.gpu,
+                crate::sampler::AcceptLaunch {
+                    target: a.target,
+                    draft: a.draft,
+                    n: a.n,
+                    rows: a.rows,
+                    target_row: a.target_row,
+                    draft_row: a.draft_row,
+                    draft_step: a.draft_step,
+                    num_drafts: a.num_drafts,
+                    drafts: a.drafts,
+                    stride: a.stride,
+                    scratch: a.scratch,
+                    out: a.out,
+                    counts: a.counts,
+                    status: a.status,
+                    num_rows: a.num_rows,
+                },
+            )
+        }
+    }
+
+    fn alloc_host(&self, bytes: usize) -> Result<(*mut u8, Box<dyn Any>)> {
+        // SAFETY: the memory is zeroed below, before anything reads it.
+        let mut mem = unsafe { self.gpu.context().alloc_pinned_with_flags::<u8>(bytes, 0) }?;
+        let base = mem.as_mut_ptr()?;
+        // SAFETY: the start of the `bytes`-long allocation just made.
+        unsafe { std::ptr::write_bytes(base, 0, bytes) };
+        Ok((base, Box::new(mem)))
+    }
+
+    unsafe fn copy_to_host(&self, dst: *mut u8, src: u64, bytes: usize) -> Result<()> {
+        self.bind()?;
+        // SAFETY: the caller's ranges; the host range is page-locked and left alone
+        // until the stream drains.
+        unsafe { sys::cuMemcpyDtoHAsync_v2(dst.cast(), src, bytes, self.gpu.stream().cu_stream()) }
+            .result()?;
+        Ok(())
+    }
+
+    unsafe fn copy_from_host(&self, dst: u64, src: *const u8, bytes: usize) -> Result<()> {
+        self.bind()?;
+        // SAFETY: as `copy_to_host`.
+        unsafe { sys::cuMemcpyHtoDAsync_v2(dst, src.cast(), bytes, self.gpu.stream().cu_stream()) }
+            .result()?;
+        Ok(())
     }
 
     fn synchronize(&self) -> Result<()> {
@@ -374,6 +495,7 @@ launches! {
     pool: PoolParams => ops.pool,
     index_score: IndexScoreParams => index.score,
     select: SelectParams => index.select,
+    stream_mean: StreamMeanParams => ops.stream_mean,
     route: RouteParams => ops.route,
     place: PlaceParams => ops.place,
     place_rows: PlaceRowsParams => ops.place_rows,

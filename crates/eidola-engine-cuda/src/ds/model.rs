@@ -12,6 +12,7 @@
 
 use eidola_engine::executor::Slot;
 use eidola_engine_model::deepseek::DsConfig;
+use eidola_engine_model::deepseek::config::{DsMoeSpec, RopeKind};
 
 use super::abi::*;
 use super::half::{Buffer, Device, Kind};
@@ -59,6 +60,51 @@ pub struct Dims {
     pub candidate_blocks: u32,
     pub candidate_entries: u32,
     pub positions: u32,
+    /// The backbone's feed-forward.
+    pub moe: MoeDims,
+    /// The drafter, when the executor drafts.
+    pub draft: Option<DraftDims>,
+}
+
+/// A feed-forward's routing numbers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoeDims {
+    pub experts: u32,
+    pub active: u32,
+    pub inter: u32,
+    pub normalize: bool,
+    pub route_scale: f32,
+    pub limit: f32,
+}
+
+impl MoeDims {
+    fn new(m: &DsMoeSpec) -> Result<MoeDims> {
+        Ok(MoeDims {
+            experts: narrow(m.n_routed, "experts")?,
+            active: narrow(m.n_active, "experts per token")?,
+            inter: narrow(m.inter_dim, "expert width")?,
+            normalize: m.norm_topk_prob && m.n_active > 1,
+            route_scale: m.route_scale,
+            limit: m.swiglu_limit,
+        })
+    }
+}
+
+/// The drafter's numbers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DraftDims {
+    /// Slots a pass computes.
+    pub slots: u32,
+    /// Drafted tokens per step.
+    pub width: u32,
+    pub blocks: u32,
+    pub moe: MoeDims,
+    pub markov_rank: u32,
+    /// Target layers on this half, and on the encoder (whose taps come first).
+    pub targets: u32,
+    pub encoder_targets: u32,
+    /// The token of every slot after the first.
+    pub noise_token: u32,
 }
 
 impl Dims {
@@ -109,6 +155,26 @@ impl Dims {
             candidate_blocks,
             candidate_entries,
             positions: max_model_len,
+            moe: MoeDims::new(m)?,
+            draft: match (&c.drafter, shape.drafting()) {
+                (Some(dr), true) => Some(DraftDims {
+                    slots: n(dr.slots, "draft slots")?,
+                    width: shape.draft_width,
+                    blocks: n(dr.blocks, "draft blocks")?,
+                    moe: MoeDims::new(&dr.moe)?,
+                    markov_rank: n(dr.markov_rank, "markov rank")?,
+                    targets: n(
+                        match half {
+                            Half::Encoder => shape.encoder_targets.len(),
+                            Half::Decoder => dr.target_layers.len(),
+                        },
+                        "target layers",
+                    )?,
+                    encoder_targets: n(shape.encoder_targets.len(), "target layers")?,
+                    noise_token: dr.noise_token,
+                }),
+                _ => None,
+            },
         })
     }
 }
@@ -167,13 +233,14 @@ impl Scratch {
     ) -> Result<Scratch> {
         let r = rows as usize;
         let u = |x: u32| x as usize;
-        let layout = u(
-            super::plan::layout_rows(rows, d.active, d.experts, ROW_ALIGN)
-                .ok_or_else(|| CudaError::new("expert layout rows"))?,
-        );
+        // The widest of the backbone's and the drafter's feed-forwards.
+        let widest = |f: fn(&MoeDims) -> u32| f(&d.moe).max(d.draft.map_or(0, |x| f(&x.moe)));
+        let (experts, active) = (widest(|m| m.experts), widest(|m| m.active));
+        let layout = u(super::plan::layout_rows(rows, active, experts, ROW_ALIGN)
+            .ok_or_else(|| CudaError::new("expert layout rows"))?);
         let (dim, hd, q) = (u(d.dim), u(d.head_dim), u(d.q_rank));
         let (qw, rank) = (u(d.heads) * hd, u(d.o_groups * d.o_rank));
-        let (iw, inter) = (u(d.index_heads * d.index_dim), u(d.inter));
+        let (iw, inter) = (u(d.index_heads * d.index_dim), u(widest(|m| m.inter)));
         let ew = u(d.engram_width);
         let (enc, dec) = (half == Half::Encoder, half == Half::Decoder);
         let t = if dec { u(samples) } else { 0 };
@@ -209,7 +276,7 @@ impl Scratch {
             visible: a("visible", r * 4)?,
             table_row: a("table_row", r * 4)?,
             positions: a("positions", r * 4)?,
-            tokens: a("tokens", only(enc, r * 4))?,
+            tokens: a("tokens", r * 4)?,
             wtargets: a("wtargets", r * 4)?,
             proj_kv: Buffer::new(dev, "proj_kv", Kind::State, only(enc, (r + state) * hd * 4))?,
             proj_score: Buffer::new(
@@ -224,13 +291,13 @@ impl Scratch {
             pool_second: a("pool_second", only(enc, r * 4))?,
             pool_pos: a("pool_pos", only(enc, r * 4))?,
             pool_targets: a("pool_targets", only(enc, r * 4))?,
-            rlogits: a("rlogits", r * u(d.experts) * 4)?,
-            ids: a("ids", r * u(d.active) * 4)?,
-            rweights: a("rweights", r * u(d.active) * 4)?,
-            row_of: a("row_of", r * u(d.active) * 4)?,
+            rlogits: a("rlogits", r * u(experts) * 4)?,
+            ids: a("ids", r * u(active) * 4)?,
+            rweights: a("rweights", r * u(active) * 4)?,
+            row_of: a("row_of", r * u(active) * 4)?,
             row_weight: a("row_weight", layout * 4)?,
-            group_end: a("group_end", u(d.experts) * 4)?,
-            place_scratch: a("place_scratch", u(d.experts) * 4)?,
+            group_end: a("group_end", u(experts) * 4)?,
+            place_scratch: a("place_scratch", u(experts) * 4)?,
             lay_codes: a("lay_codes", layout * dim)?,
             lay_scales: a("lay_scales", layout * dim / 32)?,
             gate_up: a("gate_up", layout * 2 * inter * 2)?,
@@ -299,6 +366,9 @@ pub struct LayerRun<'a> {
     pub bank_layer: Option<u32>,
     /// For a pooled source: its bank layer and the step's pooling.
     pub build: Option<(u32, &'a PoolPlan)>,
+    /// For a drafter target layer: its place among the half's taps (the mean of the
+    /// copies entering the layer is kept there for the rows the layer computes).
+    pub tap: Option<u32>,
 }
 
 /// One half: its device, weights, KV, scratch and per-slot state.
@@ -315,8 +385,120 @@ pub struct HalfNet {
     sources: usize,
     /// Positions of open-entry state kept per source and slot.
     pub cap: u32,
+    /// The step's positions in device row order, for the position tags.
+    pub items: Vec<(Slot, u32)>,
     /// `[slot][source][pos % cap]`: the position held, plus one.
     open_tags: Vec<u32>,
+    /// The drafter's scratch, when the executor drafts.
+    pub ds: Option<DraftScratch>,
+}
+
+/// The scratch drafting adds to a half. The encoder keeps only the taps of its target
+/// layers.
+pub struct DraftScratch {
+    /// BF16 `[rows, targets · dim]`: the means entering the target layers.
+    pub hidden: Buffer,
+    /// The taps quantised for the projection.
+    pub hcodes: Buffer,
+    pub hscales: Buffer,
+    /// BF16 `[rows, dim]`: the projected state the draft blocks' context is written from.
+    pub mainx: Buffer,
+    /// `[rows]`: each row's entry in the drafter's group.
+    pub targets: Buffer,
+    /// A pass's own KV: FP8 codes `[rows, head_dim]`, then scales `[rows, head_dim / 32]`.
+    pub kv: Buffer,
+    /// A pass's slot lists, `[rows, window + slots]`.
+    pub slots: Buffer,
+    /// f32 `[rows, vocab]`: the pass's base logits.
+    pub base: Buffer,
+    /// f32 `[drafting rows, vocab]`: one slot's logits, its Markov term added.
+    pub logits: Buffer,
+    /// f64 `[rows, sampleable]`: each drafted slot's distribution.
+    pub probs: Buffer,
+    /// `[rows]`: the drafted tokens, slot-major.
+    pub tokens: Buffer,
+    /// `[drafting rows]`: the token before slot 0 in the chain.
+    pub previous: Buffer,
+    /// `[drafting rows]` sample rows of one slot, and of the acceptance.
+    pub rows: Buffer,
+    pub accept_rows: Buffer,
+    pub target_row: Buffer,
+    pub draft_row: Buffer,
+    pub num_drafts: Buffer,
+    /// f64 `[drafting rows, sampleable]`.
+    pub residual: Buffer,
+    /// `[drafting rows, width + 1]` produced tokens, and their counts.
+    pub out: Buffer,
+    pub counts: Buffer,
+}
+
+impl DraftScratch {
+    fn new(
+        dev: &dyn Device,
+        d: &Dims,
+        draft: &DraftDims,
+        half: Half,
+        rows: u32,
+        seqs: u32,
+        sampleable: u32,
+    ) -> Result<DraftScratch> {
+        let u = |x: u32| x as usize;
+        let (r, dec) = (u(rows), half == Half::Decoder);
+        // A pass computes every slot of every drafting row.
+        let pass = if dec { u(seqs) * u(draft.slots) } else { 0 };
+        let seqs = if dec { u(seqs) } else { 0 };
+        let taps = u(draft.targets) * u(d.dim);
+        let a = |name: &'static str, bytes: usize| Buffer::new(dev, name, Kind::Scratch, bytes);
+        let only = |bytes: usize| if dec { bytes } else { 0 };
+        let (hd, n) = (u(d.head_dim), u(sampleable));
+        Ok(DraftScratch {
+            hidden: a("draft hidden", r * taps * 2)?,
+            hcodes: a("draft hcodes", only(r * taps))?,
+            hscales: a("draft hscales", only(r * taps / 32))?,
+            mainx: a("draft mainx", only(r * u(d.dim) * 2))?,
+            targets: a("draft targets", only(r * 4))?,
+            kv: a("draft kv", pass * (hd + hd / 32))?,
+            slots: a("draft slots", pass * u(d.window + draft.slots) * 4)?,
+            base: a("draft base", pass * u(d.vocab) * 4)?,
+            logits: a("draft logits", seqs * u(d.vocab) * 4)?,
+            probs: a("draft probs", pass * n * 8)?,
+            tokens: a("draft tokens", pass * 4)?,
+            previous: a("draft previous", seqs * 4)?,
+            rows: a("draft rows", seqs * 32)?,
+            accept_rows: a("accept rows", seqs * 32)?,
+            target_row: a("accept target", seqs * 4)?,
+            draft_row: a("accept draft", seqs * 4)?,
+            num_drafts: a("accept counts in", seqs * 4)?,
+            residual: a("accept residual", seqs * n * 8)?,
+            out: a("accept out", seqs * u(draft.width + 1) * 4)?,
+            counts: a("accept counts", seqs * 4)?,
+        })
+    }
+
+    fn buffers(&self) -> Vec<&Buffer> {
+        vec![
+            &self.hidden,
+            &self.hcodes,
+            &self.hscales,
+            &self.mainx,
+            &self.targets,
+            &self.kv,
+            &self.slots,
+            &self.base,
+            &self.logits,
+            &self.probs,
+            &self.tokens,
+            &self.previous,
+            &self.rows,
+            &self.accept_rows,
+            &self.target_row,
+            &self.draft_row,
+            &self.num_drafts,
+            &self.residual,
+            &self.out,
+            &self.counts,
+        ]
+    }
 }
 
 impl HalfNet {
@@ -331,10 +513,18 @@ impl HalfNet {
         max_model_len: u32,
         max_rows: u32,
         samples: u32,
+        seqs: u32,
         sampleable: u32,
         cap: u32,
     ) -> Result<HalfNet> {
         let d = Dims::new(c, shape, half, max_model_len)?;
+        let ds =
+            match &d.draft {
+                Some(draft) if draft.targets > 0 || half == Half::Decoder => Some(
+                    DraftScratch::new(dev.as_ref(), &d, draft, half, max_rows, seqs, sampleable)?,
+                ),
+                _ => None,
+            };
         let sources = match half {
             Half::Encoder => shape.sources.len(),
             Half::Decoder => 0,
@@ -360,9 +550,28 @@ impl HalfNet {
             sources,
             cap,
             open_tags: vec![0; state],
+            items: Vec::new(),
+            ds,
             kv,
             dev,
         })
+    }
+
+    /// Every scratch buffer of the half.
+    pub fn buffers(&self) -> Vec<&Buffer> {
+        let mut all = self.s.buffers();
+        if let Some(ds) = &self.ds {
+            all.extend(ds.buffers());
+        }
+        all
+    }
+
+    /// The drafter's scratch and numbers; an error when the half does not draft.
+    pub fn drafting(&self) -> Result<(&DraftScratch, DraftDims)> {
+        match (&self.ds, self.d.draft) {
+            (Some(ds), Some(draft)) => Ok((ds, draft)),
+            _ => Err(CudaError::new("this half does not draft")),
+        }
     }
 
     /// The half's memory by kind.
@@ -376,7 +585,7 @@ impl HalfNet {
             m.tables += g.tables.bytes as u64;
         }
         let state = (self.open_tags.len() * self.d.head_dim as usize * 4) as u64;
-        for b in self.s.buffers() {
+        for b in self.buffers() {
             m.scratch += b.bytes as u64;
         }
         // The projection buffers hold the step's rows, then the per-slot state.
@@ -429,7 +638,7 @@ impl HalfNet {
     pub fn scrub_scratch(&self) -> Result<()> {
         let dev = self.dev.as_ref();
         let head = self.max_rows as usize * self.d.head_dim as usize * 4;
-        for b in self.s.buffers() {
+        for b in self.buffers() {
             let bytes = match b.kind {
                 Kind::State => head.min(b.bytes),
                 _ => b.bytes,
@@ -440,17 +649,77 @@ impl HalfNet {
         Ok(())
     }
 
-    /// Zeroes everything that is not a weight: pools, tables, state and scratch.
-    pub fn scrub_all(&self) -> Result<()> {
+    /// Whether every scratch buffer is zero (the step's rows of the projection buffers).
+    pub fn scratch_is_zero(&self) -> Result<bool> {
+        let dev = self.dev.as_ref();
+        let head = self.max_rows as usize * self.d.head_dim as usize * 4;
+        for b in self.buffers() {
+            let bytes = match b.kind {
+                Kind::State => head.min(b.bytes),
+                _ => b.bytes,
+            };
+            if b.read::<u8>(dev, 0, bytes)?.iter().any(|x| *x != 0) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Zeroes everything that is not a weight: pools, tables, state, scratch and the
+    /// host tier.
+    pub fn scrub_all(&mut self) -> Result<()> {
         let dev = self.dev.as_ref();
         for g in &self.kv.groups {
             g.pool.clear(dev)?;
             g.tables.clear(dev)?;
         }
-        for b in self.s.buffers() {
+        for b in self.buffers() {
             b.clear(dev)?;
         }
+        self.kv.scrub_host(dev)?;
         dev.synchronize()
+    }
+
+    /// With position tags: `layer` of group `g` now holds the positions of the step's
+    /// first `rows` rows.
+    pub fn tag_rows(&mut self, g: usize, layer: u32, rows: u32) {
+        if !self.kv.tagged() {
+            return;
+        }
+        for i in 0..rows as usize {
+            let (slot, pos) = self.items[i];
+            let entry = self.kv.entry(g, slot, pos);
+            self.kv.tag(g, layer, entry, pos);
+        }
+    }
+
+    /// With position tags: the window positions `pos + 1 - window ..= pos` of `layer` of
+    /// group `g` hold what a step computed, for a read at `pos` of `slot`.
+    pub fn check_window(&self, g: usize, layer: u32, slot: Slot, pos: u32) -> Result<()> {
+        for p in (pos + 1).saturating_sub(self.d.window)..=pos {
+            self.kv.check_tag(g, layer, self.kv.entry(g, slot, p), p)?;
+        }
+        Ok(())
+    }
+
+    /// With position tags: every entry the first `rows` rows of the step read at a layer
+    /// (its window and, with `bank_layer`, every visible entry of that bank layer) holds
+    /// what a step computed.
+    fn check_reads(&self, run: &LayerRun<'_>, rows: u32) -> Result<()> {
+        if !self.kv.tagged() {
+            return Ok(());
+        }
+        let ratio = self.kv.groups[BANK].geom.ratio;
+        for &(slot, pos) in &self.items[..rows as usize] {
+            self.check_window(WINDOW, run.window_layer, slot, pos)?;
+            let Some(bl) = run.bank_layer else { continue };
+            for e in 0..(pos + 1) / ratio {
+                let close = (e + 1) * ratio - 1;
+                self.kv
+                    .check_tag(BANK, bl, self.kv.entry(BANK, slot, close), close)?;
+            }
+        }
+        Ok(())
     }
 
     fn lin8(
@@ -689,6 +958,22 @@ impl HalfNet {
             }
         }
 
+        if let Some(column) = run.tap {
+            let (ds, draft) = self.drafting()?;
+            let stride = draft.targets * d.dim;
+            // SAFETY: as `lin8`; a row's taps are `targets` vectors side by side.
+            unsafe {
+                self.dev.kernels().stream_mean(&StreamMeanParams {
+                    x: self.s.x.addr,
+                    out: ds.hidden.at((column * d.dim) as usize * 2, 0),
+                    rows: na,
+                    dim: d.dim,
+                    copies: d.copies,
+                    out_stride: stride,
+                })?;
+            }
+        }
+
         // The attention input, and the window KV written from it.
         self.mix(&lw.hc_attn, &self.s.mix_a, na)?;
         self.collapse(&self.s.mix_b, na)?;
@@ -711,12 +996,15 @@ impl HalfNet {
             KV_FP8,
         )?;
 
+        self.tag_rows(WINDOW, run.window_layer, na);
+
         if let Some((source, pool)) = run.build {
             self.build_bank(&lw, source, pool, cis, na)?;
         }
         if ne == 0 {
             return Ok(());
         }
+        self.check_reads(run, ne)?;
 
         // The queries.
         self.lin8(
@@ -889,18 +1177,17 @@ impl HalfNet {
         self.collapse(&self.s.mix_a, ne)?;
         self.rms(&self.s.u, lw.ffn_norm, ne, d.dim)?;
         self.quant(&self.s.u, &self.s.ucodes, &self.s.uscales, ne, d.dim)?;
-        self.moe(&lw, ne)?;
+        self.moe(&lw, ne, &d.moe)?;
         self.expand(&self.s.mix_b, ne)
     }
 
     /// The feed-forward of `rows` rows from their quantised input, into `y`.
-    fn moe(&self, lw: &LayerWeights, rows: u32) -> Result<()> {
+    fn moe(&self, lw: &LayerWeights, rows: u32, m: &MoeDims) -> Result<()> {
         let (d, s, k) = (&self.d, &self.s, self.dev.kernels());
-        let m = &self.c.moe;
         let pairs = rows
-            .checked_mul(d.active)
+            .checked_mul(m.active)
             .ok_or_else(|| CudaError::new("routed pairs"))?;
-        self.linear(&s.u, lw.router, &s.rlogits, rows, d.experts, d.dim, DT_F32)?;
+        self.linear(&s.u, lw.router, &s.rlogits, rows, m.experts, d.dim, DT_F32)?;
         // SAFETY: as `lin8`; the layout buffers hold every pair of the largest step.
         unsafe {
             k.route(&RouteParams {
@@ -909,9 +1196,9 @@ impl HalfNet {
                 ids: s.ids.addr,
                 weights: s.rweights.addr,
                 rows,
-                experts: d.experts,
-                active: d.active,
-                normalize: u32::from(m.norm_topk_prob && d.active > 1),
+                experts: m.experts,
+                active: m.active,
+                normalize: u32::from(m.normalize),
                 route_scale: m.route_scale,
                 reserved: 0,
             })?;
@@ -923,8 +1210,8 @@ impl HalfNet {
                 group_end: s.group_end.addr,
                 scratch: s.place_scratch.addr,
                 rows,
-                active: d.active,
-                groups: d.experts,
+                active: m.active,
+                groups: m.experts,
                 row_align: ROW_ALIGN,
                 layout_rows: pairs,
                 reserved: 0,
@@ -939,7 +1226,7 @@ impl HalfNet {
                     row_of: s.row_of.addr,
                     status: s.status.addr,
                     rows,
-                    active: d.active,
+                    active: m.active,
                     row_bytes,
                     layout_rows: pairs,
                 })?;
@@ -955,7 +1242,7 @@ impl HalfNet {
                     layout_rows: pairs,
                     n,
                     k: kk,
-                    groups: d.experts,
+                    groups: m.experts,
                     row_align: ROW_ALIGN,
                     reserved: 0,
                 })
@@ -966,19 +1253,19 @@ impl HalfNet {
                 &s.lay_scales,
                 (e.up_packed, e.up_scales),
                 &s.gate_up,
-                2 * d.inter,
+                2 * m.inter,
                 d.dim,
             )?;
             k.swiglu(&SwigluParams {
                 gate: s.gate_up.addr,
-                up: s.gate_up.at(d.inter as usize * 2, 0),
+                up: s.gate_up.at(m.inter as usize * 2, 0),
                 weight: s.row_weight.addr,
                 codes: s.hid_codes.addr,
                 scales: s.hid_scales.addr,
                 rows: pairs,
-                width: d.inter,
-                in_stride: 2 * d.inter,
-                limit: m.swiglu_limit,
+                width: m.inter,
+                in_stride: 2 * m.inter,
+                limit: m.limit,
             })?;
             lin4(
                 &s.hid_codes,
@@ -986,7 +1273,7 @@ impl HalfNet {
                 (e.down_packed, e.down_scales),
                 &s.routed,
                 d.dim,
-                d.inter,
+                m.inter,
             )?;
         }
         // The shared expert.
@@ -1001,9 +1288,9 @@ impl HalfNet {
                 codes: s.shcodes.addr,
                 scales: s.shscales.addr,
                 rows,
-                width: d.inter,
-                in_stride: d.inter,
-                limit: m.swiglu_limit,
+                width: m.inter,
+                in_stride: m.inter,
+                limit: m.limit,
             })?;
         }
         self.lin8(&s.shcodes, &s.shscales, &lw.w2, &s.shared, rows)?;
@@ -1015,7 +1302,7 @@ impl HalfNet {
                 row_of: s.row_of.addr,
                 out: s.y.addr,
                 rows,
-                active: d.active,
+                active: m.active,
                 dim: d.dim,
                 reserved: 0,
             })
@@ -1079,7 +1366,9 @@ impl HalfNet {
             }
             let (mut targets, mut positions) = (Vec::new(), Vec::new());
             for (slot, pos) in &pool.closes {
-                targets.push(self.kv.target(BANK, *slot, *pos));
+                let target = self.kv.target(BANK, *slot, *pos);
+                self.kv.tag(BANK, source, target, *pos);
+                targets.push(target);
                 positions.push(*pos - 1);
             }
             let dev = self.dev.as_ref();
@@ -1160,5 +1449,272 @@ impl HalfNet {
     /// The step's status word, after everything queued.
     pub fn status(&self) -> Result<u32> {
         Ok(self.s.status.read::<u32>(self.dev.as_ref(), 0, 1)?[0])
+    }
+}
+
+/// The drafter, on the decoder half.
+impl HalfNet {
+    /// A pass's own KV as a plane: entry `e` is the pass's row `e`.
+    fn draft_plane(&self, ds: &DraftScratch, rows: u32) -> KvPlane {
+        let hd = self.d.head_dim;
+        KvPlane {
+            base: ds.kv.addr,
+            block_bytes: ds.kv.bytes as u64,
+            codes_offset: 0,
+            scales_offset: u64::from(rows) * u64::from(hd),
+            entries_per_block: rows,
+            format: KV_FP8,
+            width: hd,
+            reserved: 0,
+        }
+    }
+
+    /// The draft pass over `rows` rows (every slot of every drafting row, slot-major),
+    /// from their tokens (`tokens` scratch), positions (`positions` scratch) and slot
+    /// lists (the drafter scratch's): the draft blocks, each row attending to its
+    /// sequence's context KV in ring order and to every slot of its own pass, then the
+    /// drafter's norm and the head. Leaves the base logits in the drafter's scratch.
+    pub fn draft_pass(&mut self, rows: u32) -> Result<()> {
+        let d = self.d.clone();
+        let (_, draft) = self.drafting()?;
+        let w = self
+            .w
+            .drafter
+            .clone()
+            .ok_or_else(|| CudaError::new("the drafter is not loaded"))?;
+        let cis = self.w.rope(RopeKind::Plain);
+        let (head, _) = self.w.head.expect("the decoder holds the head");
+        let ds = self.ds.as_ref().expect("checked: the half drafts");
+        let k = self.dev.kernels();
+        // SAFETY: `rows` rows of every scratch array (sized for a pass of the largest
+        // step); tokens were checked against the vocabulary on the host.
+        unsafe {
+            k.embed(&EmbedParams {
+                table: w.embed,
+                tokens: self.s.tokens.addr,
+                out: self.s.x.addr,
+                status: self.s.status.addr,
+                rows,
+                dim: d.dim,
+                copies: d.copies,
+                vocab: d.vocab,
+            })?;
+        }
+        let plane = self.draft_plane(ds, rows);
+        let group = self.kv.groups.len() - 1;
+        for (b, lw) in w.blocks.iter().enumerate() {
+            self.mix(&lw.hc_attn, &self.s.mix_a, rows)?;
+            self.collapse(&self.s.mix_b, rows)?;
+            self.rms(&self.s.u, lw.attn_norm, rows, d.dim)?;
+            self.quant(&self.s.u, &self.s.ucodes, &self.s.uscales, rows, d.dim)?;
+            // The queries.
+            self.lin8(
+                &self.s.ucodes,
+                &self.s.uscales,
+                &lw.wq_a,
+                &self.s.latent,
+                rows,
+            )?;
+            self.rms(&self.s.latent, lw.q_norm, rows, d.q_rank)?;
+            self.quant(
+                &self.s.latent,
+                &self.s.lcodes,
+                &self.s.lscales,
+                rows,
+                d.q_rank,
+            )?;
+            self.lin8(
+                &self.s.lcodes,
+                &self.s.lscales,
+                &lw.wq_b,
+                &self.s.qraw,
+                rows,
+            )?;
+            // SAFETY: as `rot_quant`.
+            unsafe {
+                k.rot_quant(&RotQuantParams {
+                    x: self.s.qraw.addr,
+                    cis,
+                    positions: self.s.positions.addr,
+                    dst_codes: self.s.q.addr,
+                    rows,
+                    heads: d.heads,
+                    head_dim: d.head_dim,
+                    rope_dim: d.rope_dim,
+                    rotation: ROT_ROTATE,
+                    format: KV_BF16,
+                    cis_positions: d.positions,
+                    ..RotQuantParams::default()
+                })?;
+            }
+            // Each slot's own KV, into the pass's scratch plane.
+            self.lin8(&self.s.ucodes, &self.s.uscales, &lw.wkv, &self.s.kv, rows)?;
+            self.rms(&self.s.kv, lw.kv_norm, rows, d.head_dim)?;
+            // SAFETY: as `rot_quant`: dense rows, the plane's codes then its scales.
+            unsafe {
+                k.rot_quant(&RotQuantParams {
+                    x: self.s.kv.addr,
+                    cis,
+                    positions: self.s.positions.addr,
+                    dst_codes: plane.base,
+                    dst_scales: plane.base + plane.scales_offset,
+                    rows,
+                    heads: 1,
+                    head_dim: d.head_dim,
+                    rope_dim: d.rope_dim,
+                    rotation: ROT_ROTATE,
+                    format: KV_FP8,
+                    cis_positions: d.positions,
+                    ..RotQuantParams::default()
+                })?;
+                // The context in ring order, then the pass's slots, packed.
+                k.attention(&AttnParams {
+                    q: self.s.q.addr,
+                    slots: ds.slots.addr,
+                    sink: lw.sink,
+                    out: self.s.attn.addr,
+                    a: self.plane(group, narrow(b, "draft block")?, Plane::Window),
+                    b: plane,
+                    rows,
+                    heads: d.heads,
+                    head_dim: d.head_dim,
+                    a_slots: d.window,
+                    b_slots: draft.slots,
+                    slot_stride: d.window + draft.slots,
+                    scale: self.c.attention.softmax_scale,
+                    layout: ATTN_PACKED,
+                })?;
+            }
+            self.rot_quant(
+                &self.s.attn,
+                cis,
+                &self.s.positions,
+                Dst::Dense(&self.s.ocodes, &self.s.oscales),
+                rows,
+                d.heads,
+                d.head_dim,
+                ROT_UNROTATE,
+                KV_FP8,
+            )?;
+            // SAFETY: as `lin8`.
+            unsafe {
+                k.grouped_dot(&GroupedDotParams {
+                    codes: self.s.ocodes.addr,
+                    act_scales: self.s.oscales.addr,
+                    w_codes: lw.wo_a.codes,
+                    w_scales: lw.wo_a.scales,
+                    out: self.s.z.addr,
+                    rows,
+                    groups: d.o_groups,
+                    rank: d.o_rank,
+                    k: lw.wo_a.k,
+                })?;
+            }
+            let rank = d.o_groups * d.o_rank;
+            self.quant(&self.s.z, &self.s.zcodes, &self.s.zscales, rows, rank)?;
+            self.lin8(&self.s.zcodes, &self.s.zscales, &lw.wo_b, &self.s.y, rows)?;
+            self.expand(&self.s.mix_a, rows)?;
+            self.mix(&lw.hc_ffn, &self.s.mix_b, rows)?;
+            self.collapse(&self.s.mix_a, rows)?;
+            self.rms(&self.s.u, lw.ffn_norm, rows, d.dim)?;
+            self.quant(&self.s.u, &self.s.ucodes, &self.s.uscales, rows, d.dim)?;
+            self.moe(lw, rows, &draft.moe)?;
+            self.expand(&self.s.mix_b, rows)?;
+        }
+        self.collapse(&self.s.mix_b, rows)?;
+        self.rms(&self.s.u, w.norm, rows, d.dim)?;
+        // SAFETY: `rows` normed rows and `rows` rows of base logits.
+        unsafe {
+            k.head(&LinearParams {
+                x: self.s.u.addr,
+                w: head,
+                out: ds.base.addr,
+                rows,
+                n: d.vocab,
+                k: d.dim,
+                x_dtype: DT_BF16,
+                w_dtype: DT_BF16,
+                out_dtype: DT_F32,
+                ..LinearParams::default()
+            })
+        }
+    }
+
+    /// One slot's logits for the first `rows` drafting rows: the base logits of its
+    /// pass rows (from row `base_row`) plus the Markov head over the embedding of each
+    /// row's previous token (`previous`, `[rows]` ids on the device).
+    pub fn draft_logits(&self, rows: u32, base_row: u32, previous: u64) -> Result<()> {
+        let (ds, draft) = self.drafting()?;
+        let w = self
+            .w
+            .drafter
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the drafter is not loaded"))?;
+        let vocab = self.d.vocab as usize;
+        // SAFETY: `rows` rows of base logits from `base_row` and of output; a previous
+        // token is a sampleable id (the sampler's, or checked on the host).
+        unsafe {
+            self.dev.kernels().head(&LinearParams {
+                x: w.markov_embed,
+                x_rows: previous,
+                w: w.markov_head,
+                addend: ds.base.at(base_row as usize * vocab * 4, 0),
+                out: ds.logits.addr,
+                rows,
+                n: self.d.vocab,
+                k: draft.markov_rank,
+                x_dtype: DT_BF16,
+                w_dtype: DT_BF16,
+                out_dtype: DT_F32,
+            })
+        }
+    }
+
+    /// The drafter's context KV of the first `rows` rows, from their taps (the drafter
+    /// scratch's `hidden`): the projection and its norm, then each draft block's window
+    /// KV, written at the rows' entries of the drafter's group (the scratch's
+    /// `targets`).
+    pub fn drafter_context(&mut self, rows: u32) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let d = self.d.clone();
+        let (ds, draft) = self.drafting()?;
+        let w = self
+            .w
+            .drafter
+            .clone()
+            .ok_or_else(|| CudaError::new("the drafter is not loaded"))?;
+        let cis = self.w.rope(RopeKind::Plain);
+        let group = self.kv.groups.len() - 1;
+        self.quant(
+            &ds.hidden,
+            &ds.hcodes,
+            &ds.hscales,
+            rows,
+            draft.targets * d.dim,
+        )?;
+        self.lin8(&ds.hcodes, &ds.hscales, &w.main_proj, &ds.mainx, rows)?;
+        self.rms(&ds.mainx, w.main_norm, rows, d.dim)?;
+        self.quant(&ds.mainx, &self.s.ucodes, &self.s.uscales, rows, d.dim)?;
+        for (b, lw) in w.blocks.iter().enumerate() {
+            self.lin8(&self.s.ucodes, &self.s.uscales, &lw.wkv, &self.s.kv, rows)?;
+            self.rms(&self.s.kv, lw.kv_norm, rows, d.head_dim)?;
+            self.rot_quant(
+                &self.s.kv,
+                cis,
+                &self.s.positions,
+                Dst::Plane(
+                    self.plane(group, narrow(b, "draft block")?, Plane::Window),
+                    &ds.targets,
+                ),
+                rows,
+                1,
+                d.head_dim,
+                ROT_ROTATE,
+                KV_FP8,
+            )?;
+        }
+        Ok(())
     }
 }

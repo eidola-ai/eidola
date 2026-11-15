@@ -28,12 +28,32 @@ pub struct DsShape {
     /// Per Engram layer of the config: the model layer its module runs before, when the
     /// (possibly truncated) model keeps it.
     pub engram_layer: Vec<Option<usize>>,
+    /// Drafted tokens per speculative step; 0 without drafting.
+    pub draft_width: u32,
+    /// Slots a draft pass computes (the drafter's, whatever the width); 0 without
+    /// drafting.
+    pub draft_slots: usize,
+    /// Draft blocks.
+    pub drafter_blocks: usize,
+    /// The drafter's target layers on each side of the split, ascending.
+    pub encoder_targets: Vec<usize>,
+    pub decoder_targets: Vec<usize>,
 }
 
 impl DsShape {
     /// Chain layers: the decoder's.
     pub fn depth(&self) -> usize {
         self.layers - self.split
+    }
+
+    pub fn drafting(&self) -> bool {
+        self.draft_width > 0
+    }
+
+    /// Positions of open-entry state a slot keeps per pooled source: the entry open
+    /// after any accepted length of a step.
+    pub fn open_cap(&self) -> u32 {
+        self.ratio + self.draft_width + 1
     }
 
     /// The encoder bank's layer of source layer `l`.
@@ -61,12 +81,45 @@ fn require(ok: bool, field: &str, found: impl ToString, required: &str) -> Resul
 /// The shape of `c` when the executor can run it with `draft_width` drafts, else the
 /// first field that rules it out.
 pub fn check_supported(c: &DsConfig, draft_width: u32) -> Result<DsShape, Unsupported> {
-    require(
-        draft_width == 0,
-        "draft_width",
-        draft_width,
-        "0 (this executor does not draft)",
-    )?;
+    let mut drafter = None;
+    if draft_width > 0 {
+        let d = c.drafter.as_ref().ok_or_else(|| {
+            unsupported("draft_width", draft_width, "0 for a model with no drafter")
+        })?;
+        require(
+            draft_width as usize <= d.slots,
+            "draft_width",
+            draft_width,
+            &format!("at most the drafter's {} slots", d.slots),
+        )?;
+        require(
+            d.target_layers.is_sorted() && !d.target_layers.is_empty(),
+            "drafter.target_layers",
+            format!("{:?}", d.target_layers),
+            "ascending target layers",
+        )?;
+        require(
+            d.moe.inter_dim.is_multiple_of(32) && d.markov_rank > 0,
+            "drafter.moe.inter_dim",
+            d.moe.inter_dim,
+            "a multiple of 32, and a Markov rank",
+        )?;
+        for (field, found, most) in [
+            (
+                "drafter.moe.n_routed",
+                d.moe.n_routed,
+                super::ops::MAX_EXPERTS as usize,
+            ),
+            (
+                "drafter.moe.n_active",
+                d.moe.n_active,
+                super::ops::MAX_ACTIVE as usize,
+            ),
+        ] {
+            require(found <= most, field, found, &format!("at most {most}"))?;
+        }
+        drafter = Some(d);
+    }
     let a = &c.attention;
     let split = c
         .layers
@@ -276,6 +329,23 @@ pub fn check_supported(c: &DsConfig, draft_width: u32) -> Result<DsShape, Unsupp
         engram_layer: (0..slots)
             .map(|slot| c.layers.iter().position(|l| l.engram == Some(slot)))
             .collect(),
+        draft_width,
+        draft_slots: drafter.map_or(0, |d| d.slots),
+        drafter_blocks: drafter.map_or(0, |d| d.blocks),
+        encoder_targets: drafter.map_or(Vec::new(), |d| {
+            d.target_layers
+                .iter()
+                .copied()
+                .filter(|t| *t < split)
+                .collect()
+        }),
+        decoder_targets: drafter.map_or(Vec::new(), |d| {
+            d.target_layers
+                .iter()
+                .copied()
+                .filter(|t| *t >= split)
+                .collect()
+        }),
     })
 }
 
@@ -320,7 +390,16 @@ pub(crate) mod tests {
     fn each_condition_alone_is_refused() {
         let field = |c: &DsConfig, w: u32| check_supported(c, w).unwrap_err().field;
         let base = tiny_config();
-        assert_eq!(field(&base, 1), "draft_width");
+        assert_eq!(field(&base, 5), "draft_width");
+        let mut c = base.clone();
+        c.drafter = None;
+        assert_eq!(field(&c, 1), "draft_width");
+        let s = check_supported(&base, 4).unwrap();
+        assert_eq!((s.draft_slots, s.drafter_blocks, s.open_cap()), (4, 3, 7));
+        assert_eq!(
+            (s.encoder_targets, s.decoder_targets),
+            (vec![2], vec![6, 7])
+        );
 
         let mut c = base.clone();
         c.layers[2].compress_ratio = 4;

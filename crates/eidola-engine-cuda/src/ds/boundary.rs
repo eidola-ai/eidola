@@ -10,11 +10,14 @@
 //!   and the collapse weights entering the split layer) for exactly the positions the
 //!   chain's bottom layer computes.
 //!
+//! Both are host memory for the length of a step and are zeroed when dropped.
+//!
 //! [`ToDecoder::check`] holds a value to that set, which is the one the CPU reference
 //! executor's `ToDecoder::check` enforces; [`StepTransfer`] is a step's crossing in the
 //! reference executor's order, for comparing the two.
 
 use eidola_engine::executor::Slot;
+use zeroize::Zeroize;
 
 use super::plan::StepPlan;
 use crate::{CudaError, Result};
@@ -53,13 +56,49 @@ pub struct ToDecoder {
     pub streams: Vec<u16>,
     /// `[rows, copies]`: the collapse weights the split layer applies.
     pub pre_mix: Vec<f32>,
+    /// Rows that also carry the drafter's taps: those the chain's top layer computes,
+    /// when the drafter has target layers before the split; else 0.
+    pub tap_rows: u32,
+    /// BF16 `[tap_rows, encoder target layers · dim]`: the means of the residual copies
+    /// entering the drafter's target layers on the encoder.
+    pub taps: Vec<u16>,
+}
+
+impl Drop for GatheredRows {
+    /// A crossing value leaves nothing in host memory.
+    fn drop(&mut self) {
+        self.codes.zeroize();
+        self.scales.zeroize();
+    }
+}
+
+impl Drop for ToDecoder {
+    /// A crossing value leaves nothing in host memory.
+    fn drop(&mut self) {
+        self.entries.zeroize();
+        self.streams.zeroize();
+        self.pre_mix.zeroize();
+        self.taps.zeroize();
+    }
 }
 
 impl ToDecoder {
     /// Refuses a value that is not exactly what `plan` declares: an entry for every
     /// position, in the plan's order, and a boundary row for each position the chain's
     /// bottom layer computes and no other.
-    pub fn check(&self, plan: &StepPlan, stream_width: usize, copies: usize) -> Result<()> {
+    pub fn check(
+        &self,
+        plan: &StepPlan,
+        stream_width: usize,
+        copies: usize,
+        tap_width: usize,
+    ) -> Result<()> {
+        let tap_rows = if tap_width > 0 { plan.tap_rows() } else { 0 };
+        if self.tap_rows != tap_rows || self.taps.len() != tap_rows as usize * tap_width {
+            return Err(CudaError::new(
+                "the crossing's drafter taps are not those of the rows the top layer computes",
+            ));
+        }
         let want: Vec<(Slot, u32)> = plan.items.iter().map(|it| (it.slot, it.pos)).collect();
         if self.positions != want {
             return Err(CudaError::new(
@@ -95,6 +134,10 @@ pub struct StepTransfer {
     pub bank_entry_bytes: usize,
     /// Encoder → decoder: boundary rows, as `(slot, position)`.
     pub boundary_rows: Vec<(Slot, u32)>,
+    /// Encoder → decoder: boundary rows that carried drafter taps.
+    pub taps: Vec<(Slot, u32)>,
+    /// Decoder → encoder: the drafted token ids, per drafting row's slot, in step order.
+    pub drafts: Vec<(Slot, Vec<u32>)>,
     /// Layer-positions the chain computed.
     pub chain_work: u64,
 }
@@ -127,6 +170,12 @@ impl StepTransfer {
                 .filter(|i| **i < to_decoder.rows as usize)
                 .map(at)
                 .collect(),
+            taps: order
+                .iter()
+                .filter(|i| **i < to_decoder.tap_rows as usize)
+                .map(at)
+                .collect(),
+            drafts: Vec::new(),
             chain_work: plan.chain_work(),
         }
     }
@@ -146,6 +195,8 @@ mod tests {
             rows,
             streams: vec![0; rows as usize * 8],
             pre_mix: vec![0.0; rows as usize * 2],
+            tap_rows: 0,
+            taps: Vec::new(),
         }
     }
 
@@ -157,19 +208,20 @@ mod tests {
             p: 9,
             sample: false,
             chain_start: 8,
+            drafts: 0,
         }];
         // Depth 2, window 3: the bottom layer from 6, the top from 8.
         let plan = StepPlan::new(&rows, 2, 3);
         assert_eq!(plan.boundary_rows(), 4);
         let good = crossing(&plan);
-        good.check(&plan, 8, 2).unwrap();
+        good.check(&plan, 8, 2, 0).unwrap();
 
         let mut extra = good.clone();
         extra.rows += 1;
         extra.streams.extend([0; 8]);
         extra.pre_mix.extend([0.0; 2]);
         assert!(
-            extra.check(&plan, 8, 2).is_err(),
+            extra.check(&plan, 8, 2, 0).is_err(),
             "a row the chain does not compute"
         );
 
@@ -177,13 +229,13 @@ mod tests {
         missing.positions.pop();
         missing.entries.truncate(27);
         assert!(
-            missing.check(&plan, 8, 2).is_err(),
+            missing.check(&plan, 8, 2, 0).is_err(),
             "a position without its entry"
         );
 
         let mut swapped = good.clone();
         swapped.positions.swap(0, 1);
-        assert!(swapped.check(&plan, 8, 2).is_err());
+        assert!(swapped.check(&plan, 8, 2, 0).is_err());
 
         let t = StepTransfer::of(
             &plan,
@@ -196,5 +248,15 @@ mod tests {
         assert_eq!(t.boundary_rows, (6..10).map(|p| (1, p)).collect::<Vec<_>>());
         assert_eq!(t.gathered, (0..10).map(|p| (1, p, 1)).collect::<Vec<_>>());
         assert_eq!((t.bank_entry_bytes, t.chain_work), (3, 6));
+
+        // With encoder-side target layers the rows the top layer computes carry taps.
+        let mut tapped = good.clone();
+        tapped.tap_rows = plan.tap_rows();
+        tapped.taps = vec![0; plan.tap_rows() as usize * 4];
+        tapped.check(&plan, 8, 2, 4).unwrap();
+        assert!(good.check(&plan, 8, 2, 4).is_err(), "taps missing");
+        assert!(tapped.check(&plan, 8, 2, 0).is_err(), "taps nobody reads");
+        let t = StepTransfer::of(&plan, &ToEncoder::default(), &tapped);
+        assert_eq!(t.taps, (8..10).map(|p| (1, p)).collect::<Vec<_>>());
     }
 }

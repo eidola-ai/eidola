@@ -17,8 +17,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use eidola_engine::executor::{Executor, ExecutorError, Maintenance, Slot, StepInput, StepOutput};
+use eidola_engine::sampling::Stream;
 use eidola_engine::spec::{
-    AttentionKind, Bucket, Coverage, KvGroupSpec, KvRole, ModelSpec, WindowChain,
+    AttentionKind, Bucket, Coverage, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK, WindowChain,
 };
 use eidola_engine_model::WeightSet;
 use eidola_engine_model::deepseek::DsConfig;
@@ -29,10 +30,10 @@ use super::abi::{
     ROT_ROTATE, STATUS_BAD_INDEX, STATUS_BAD_TOKEN,
 };
 use super::boundary::{GatheredRows, StepTransfer, ToDecoder, ToEncoder};
-use super::half::{CudaDevice, Device, SampleArgs};
+use super::half::{AcceptArgs, CudaDevice, Device, SampleArgs};
 use super::kv::{Cell, GroupGeometry, KvStore};
 use super::model::{BANK, Dst, HalfNet, LayerRun, MemoryBytes, WINDOW};
-use super::plan::{PlanRow, StepPlan, pool_plan, window_slots};
+use super::plan::{DraftPlan, PlanRow, StepPlan, pool_plan, window_slots};
 use super::support::{DsShape, check_supported};
 use super::weights::{Half, HalfWeights};
 use crate::module::KernelDir;
@@ -57,6 +58,15 @@ pub struct DsCudaExecutorConfig {
     /// The device ordinal of each half (encoder, decoder). The same ordinal twice puts
     /// both logical devices on one GPU.
     pub devices: [usize; 2],
+    /// Drafted tokens per speculative step, at most the drafter's slots; 0 disables
+    /// drafting and the drafter's KV group.
+    pub draft_width: u32,
+    /// Blocks per group of the host tier (page-locked host memory holding demoted
+    /// ciphertext), including the null block 0; 0 for no host tier.
+    pub host_blocks: u32,
+    /// Keep a position tag per KV entry on the host and refuse a step that reads KV no
+    /// step computed (`ds::kv`).
+    pub position_tags: bool,
     /// Testing aid: keep each step's [`StepTransfer`] and [`StepStats`].
     pub record: bool,
 }
@@ -68,8 +78,11 @@ pub struct StepStats {
     pub rows: u32,
     /// Layer-positions the chain computed.
     pub chain_work: u64,
+    /// Tokens produced.
     pub sampled: u32,
     pub maintenance_ms: f64,
+    /// The draft pass, its sampling and the read-back of the drafts.
+    pub draft_ms: f64,
     /// The decoder device's Engram gather and its crossing.
     pub gather_ms: f64,
     pub encoder_ms: f64,
@@ -89,6 +102,7 @@ pub struct DsCudaExecutor {
     decoder: HalfNet,
     record: bool,
     transfers: Vec<StepTransfer>,
+    draft_logits: Vec<(Slot, Vec<Vec<f32>>)>,
     stats: Vec<StepStats>,
     chain_work: u64,
     steps: u64,
@@ -120,7 +134,7 @@ fn model_spec(c: &DsConfig, shape: &DsShape, cfg: &DsCudaExecutorConfig) -> Resu
                 head_dim_qk: hd,
                 head_dim_v: hd,
                 num_blocks: cfg.num_blocks,
-                host_blocks: 0,
+                host_blocks: cfg.host_blocks,
                 ratio,
                 device,
                 coverage,
@@ -153,7 +167,7 @@ fn model_spec(c: &DsConfig, shape: &DsShape, cfg: &DsCudaExecutorConfig) -> Resu
                 Coverage::Chain,
             )?,
         ],
-        max_draft_tokens: 0,
+        max_draft_tokens: cfg.draft_width,
         num_state_slots: cfg.num_state_slots,
         buckets: cfg.buckets.clone(),
         window_chain: Some(WindowChain {
@@ -162,6 +176,20 @@ fn model_spec(c: &DsConfig, shape: &DsShape, cfg: &DsCudaExecutorConfig) -> Resu
         }),
         token_history: narrow(shape.history, "token history")?,
     };
+    let mut spec = spec;
+    if shape.drafting() {
+        // A drafting row reads the `window` positions before its own.
+        let mut drafter = group(
+            "drafter",
+            AttentionKind::Sliding { window: window + 1 },
+            shape.drafter_blocks,
+            1,
+            1,
+            Coverage::Chain,
+        )?;
+        drafter.role = KvRole::Drafter;
+        spec.kv_groups.push(drafter);
+    }
     spec.validate().map_err(CudaError::new)?;
     if !cfg.block_size.is_multiple_of(shape.ratio) {
         return Err(CudaError::new(
@@ -200,7 +228,7 @@ impl DsCudaExecutor {
     /// Configuration checks only: the shape, the spec and the block layouts, with no
     /// device. `new` runs exactly these first.
     pub fn preflight(c: &DsConfig, cfg: &DsCudaExecutorConfig) -> Result<(DsShape, ModelSpec)> {
-        let shape = check_supported(c, 0)?;
+        let shape = check_supported(c, cfg.draft_width)?;
         let spec = model_spec(c, &shape, cfg)?;
         if c.max_positions
             .is_some_and(|m| cfg.max_model_len as usize > m)
@@ -250,6 +278,30 @@ impl DsCudaExecutor {
         token_map: Option<Vec<u32>>,
         cfg: &DsCudaExecutorConfig,
     ) -> Result<DsCudaExecutor> {
+        Self::build(encoder, decoder, Some(store.as_ref()), c, token_map, cfg)
+    }
+
+    /// An executor laid out over two devices without a checkpoint: every allocation at
+    /// its size, no weight uploaded. With [`super::dry::DryDevice`] it answers what a
+    /// configuration puts on each device and whether its launches are accepted.
+    pub fn layout(
+        encoder: Box<dyn Device>,
+        decoder: Box<dyn Device>,
+        c: &DsConfig,
+        token_map: Option<Vec<u32>>,
+        cfg: &DsCudaExecutorConfig,
+    ) -> Result<DsCudaExecutor> {
+        Self::build(encoder, decoder, None, c, token_map, cfg)
+    }
+
+    fn build(
+        encoder: Box<dyn Device>,
+        decoder: Box<dyn Device>,
+        store: Option<&WeightSet>,
+        c: &DsConfig,
+        token_map: Option<Vec<u32>>,
+        cfg: &DsCudaExecutorConfig,
+    ) -> Result<DsCudaExecutor> {
         let (shape, spec) = Self::preflight(c, cfg)?;
         let hasher = match (&c.engram, token_map) {
             (Some(e), Some(map)) => Some(
@@ -263,28 +315,42 @@ impl DsCudaExecutor {
             }
             _ => None,
         };
-        let max_rows = cfg.buckets.iter().map(|b| b.max_tokens).max().unwrap_or(0);
-        let samples = cfg.buckets.iter().map(|b| b.max_seqs).max().unwrap_or(0);
-        // The open entry after any accepted length: the pooling ratio, the draft width
-        // (0) and one.
-        let cap = shape.ratio + 1;
+        let seqs = cfg.buckets.iter().map(|b| b.max_seqs).max().unwrap_or(0);
+        // A step's positions, or a draft pass's rows: every slot of every drafting row.
+        let pass = seqs * narrow::<u32, usize>(shape.draft_slots, "draft slots")?;
+        let max_rows = cfg
+            .buckets
+            .iter()
+            .map(|b| b.max_tokens)
+            .max()
+            .unwrap_or(0)
+            .max(pass);
+        // The head's rows: a sampling row's last host position and its drafts.
+        let samples = seqs * (cfg.draft_width + 1);
+        let cap = shape.open_cap();
         let mut halves = Vec::new();
         for (half, dev) in [(Half::Encoder, encoder), (Half::Decoder, decoder)] {
             let w = HalfWeights::load(
                 dev.as_ref(),
-                Some(store.as_ref()),
+                store,
                 c,
                 &shape,
                 half,
                 cfg.max_model_len,
                 true,
             )?;
-            let kv = KvStore::new(
+            let mut kv = KvStore::new(
                 dev.as_ref(),
                 geometry(c, &spec, half)?,
                 cfg.num_state_slots,
                 spec.max_blocks_per_seq(),
             )?;
+            if cfg.host_blocks > 0 {
+                kv.set_host_tier(dev.as_ref(), cfg.host_blocks)?;
+            }
+            if cfg.position_tags {
+                kv.enable_tags();
+            }
             halves.push(HalfNet::new(
                 half,
                 dev,
@@ -295,6 +361,7 @@ impl DsCudaExecutor {
                 cfg.max_model_len,
                 max_rows,
                 samples,
+                seqs,
                 cfg.sampleable_vocab_size,
                 cap,
             )?);
@@ -310,6 +377,7 @@ impl DsCudaExecutor {
             decoder,
             record: cfg.record,
             transfers: Vec::new(),
+            draft_logits: Vec::new(),
             stats: Vec::new(),
             chain_work: 0,
             steps: 0,
@@ -349,6 +417,12 @@ impl DsCudaExecutor {
     /// `record`).
     pub fn take_transfers(&mut self) -> Vec<StepTransfer> {
         std::mem::take(&mut self.transfers)
+    }
+
+    /// Per drafting row since the last call, in step order: its slot and each draft
+    /// slot's logits, given the token before it in the chain (with `record`).
+    pub fn take_draft_logits(&mut self) -> Vec<(Slot, Vec<Vec<f32>>)> {
+        std::mem::take(&mut self.draft_logits)
     }
 
     /// Each step's timings since the last call (with `record`).
@@ -404,10 +478,41 @@ impl DsCudaExecutor {
         n.kv.is_encrypted(g, block)
     }
 
+    /// A host-tier block's bytes.
+    pub fn host_block_bytes(&self, group: u32, host: u32) -> Result<Vec<u8>> {
+        let (n, g) = self.net(group);
+        n.kv.read_host_block(n.dev.as_ref(), g, host)
+    }
+
+    /// Whether a host-tier block holds ciphertext.
+    pub fn host_block_is_encrypted(&self, group: u32, host: u32) -> bool {
+        let (n, g) = self.net(group);
+        n.kv.host_is_encrypted(g, host)
+    }
+
+    /// Whether every scratch buffer of both halves (the step's part of the buffers that
+    /// also hold per-slot state) is zero.
+    pub fn scratch_is_zero(&self) -> Result<bool> {
+        Ok(self.encoder.scratch_is_zero()? && self.decoder.scratch_is_zero()?)
+    }
+
     /// Whether a slot's per-sequence model state (the pooled sources' open entries) is
     /// scrubbed.
     pub fn slot_state_is_zero(&self, slot: Slot) -> Result<bool> {
         self.encoder.state_is_zero(slot)
+    }
+
+    fn check_tokens(&self, tokens: &[u32]) -> Result<()> {
+        match tokens
+            .iter()
+            .find(|t| **t as usize >= self.c.vocab_size || self.c.image_token_id == Some(**t))
+        {
+            Some(t) => Err(CudaError::new(format!(
+                "token {t} cannot be embedded (vocabulary {}, image token {:?})",
+                self.c.vocab_size, self.c.image_token_id
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Refuses what this executor does not run, before any of the step takes effect.
@@ -419,12 +524,17 @@ impl DsCudaExecutor {
                 Maintenance::ResetSlot { .. } => continue,
                 Maintenance::Encrypt { group, key, .. }
                 | Maintenance::Decrypt { group, key, .. } => (group, Some(key)),
-                Maintenance::Demote { .. }
-                | Maintenance::Promote { .. }
-                | Maintenance::ZeroHost { .. } => {
-                    return Err(CudaError::new(format!(
-                        "unsupported maintenance {m:?}: this executor has no host tier"
-                    )));
+                Maintenance::Demote { group, host, .. }
+                | Maintenance::Promote { group, host, .. }
+                | Maintenance::ZeroHost { group, host } => {
+                    let blocks = self.encoder.kv.host_blocks();
+                    if host == NULL_BLOCK || host >= blocks {
+                        return Err(CudaError::new(format!(
+                            "maintenance {m:?} names a host block outside a host tier of \
+                             {blocks} blocks"
+                        )));
+                    }
+                    (group, None)
                 }
             };
             if group >= groups {
@@ -470,9 +580,18 @@ impl DsCudaExecutor {
                     let (n, g) = self.net_mut(group);
                     n.kv.crypt(n.dev.as_ref(), g, block, key, &nonce, encrypt)?;
                 }
-                Maintenance::Demote { .. }
-                | Maintenance::Promote { .. }
-                | Maintenance::ZeroHost { .. } => unreachable!("refused before the step"),
+                Maintenance::Demote { group, block, host } => {
+                    let (n, g) = self.net_mut(group);
+                    n.kv.demote(n.dev.as_ref(), g, block, host)?;
+                }
+                Maintenance::Promote { group, host, block } => {
+                    let (n, g) = self.net_mut(group);
+                    n.kv.promote(n.dev.as_ref(), g, host, block)?;
+                }
+                Maintenance::ZeroHost { group, host } => {
+                    let (n, g) = self.net_mut(group);
+                    n.kv.zero_host(g, host);
+                }
             }
         }
         for u in &step.table_updates {
@@ -481,6 +600,8 @@ impl DsCudaExecutor {
         }
         for n in [&mut self.encoder, &mut self.decoder] {
             n.kv.flush_tables(n.dev.as_ref())?;
+            // A host block is zero before the step returns.
+            n.kv.finish_host(n.dev.as_ref())?;
         }
         Ok(())
     }
@@ -503,7 +624,16 @@ impl DsCudaExecutor {
                 );
             }
             let k = if e.sample { e.num_drafts } else { 0 };
-            assert!(k == 0, "{k} drafts requested; the executor drafts 0");
+            assert!(
+                k <= self.shape.draft_width,
+                "{k} drafts requested; the executor drafts {}",
+                self.shape.draft_width
+            );
+            assert!(
+                e.context_len + e.num_tokens > 1 || k == 0,
+                "slot {}: {k} drafts requested at position 0",
+                e.slot
+            );
             let p = e.context_len + e.num_tokens - 1;
             let chain_start = *step
                 .aux
@@ -529,7 +659,13 @@ impl DsCudaExecutor {
                 p,
                 sample: e.sample,
                 chain_start,
+                drafts: k,
             });
+            assert!(
+                k == 0 || chain_start == e.context_len,
+                "slot {}: a drafting row runs every chain layer at every position",
+                e.slot
+            );
             known.push((history, tokens));
         }
         (rows, known)
@@ -607,7 +743,9 @@ impl DsCudaExecutor {
     /// The step's index arrays on one half: positions, bank visibility, table rows,
     /// the window targets of the first `writes` rows and the window slot lists of the
     /// first `queries` rows. Every read and write is checked against the tables here.
-    fn step_arrays(n: &HalfNet, plan: &StepPlan, writes: u32, queries: u32) -> Result<()> {
+    fn step_arrays(n: &mut HalfNet, plan: &StepPlan, writes: u32, queries: u32) -> Result<()> {
+        n.items = plan.items.iter().map(|it| (it.slot, it.pos)).collect();
+        let n = &*n;
         let dev = n.dev.as_ref();
         let ratio = n.kv.groups[BANK].geom.ratio;
         let items = &plan.items;
@@ -724,6 +862,10 @@ impl DsCudaExecutor {
                 emit: count,
                 window_layer: narrow(l, "layer")?,
                 bank_layer: spec.kv_source.map(source).transpose()?,
+                tap: match shape.encoder_targets.iter().position(|t| *t == l) {
+                    Some(at) => Some(narrow(at, "target layer")?),
+                    None => None,
+                },
                 build: match spec.is_kv_source {
                     true => Some((source(l)?, &pool)),
                     false => None,
@@ -836,6 +978,15 @@ impl DsCudaExecutor {
             .chunks_exact(d.mix_words as usize)
             .flat_map(|row| row[..d.copies as usize].iter().copied())
             .collect();
+        // The drafter's taps of the encoder's target layers, where its context is written.
+        let (mut tap_rows, mut taps) = (0, Vec::new());
+        if !shape.encoder_targets.is_empty() {
+            let (ds, draft) = n.drafting()?;
+            tap_rows = plan.tap_rows();
+            taps = ds
+                .hidden
+                .read(dev, 0, (tap_rows * draft.targets * d.dim) as usize)?;
+        }
         check_status(n.status()?)?;
         Ok(ToDecoder {
             positions: plan.items.iter().map(|it| (it.slot, it.pos)).collect(),
@@ -844,6 +995,8 @@ impl DsCudaExecutor {
             rows: boundary,
             streams,
             pre_mix,
+            tap_rows,
+            taps,
         })
     }
 
@@ -864,12 +1017,14 @@ impl DsCudaExecutor {
         let boundary = plan.boundary_rows();
 
         // The bank entries of every position, section by section.
+        let mut written = Vec::with_capacity(crossing.positions.len());
         {
             let dev = n.dev.as_ref();
             let gs = &n.kv.groups[BANK];
             let (entries, block_bytes) = (gs.geom.entries(), gs.geom.block_bytes());
             for (row, (slot, pos)) in crossing.positions.iter().enumerate() {
                 let target = n.kv.target(BANK, *slot, *pos);
+                written.push((target, *pos));
                 let block = (target / entries) as usize * block_bytes;
                 let cell = &crossing.entries[row * crossing.entry_bytes..][..crossing.entry_bytes];
                 let mut from = 0;
@@ -878,6 +1033,9 @@ impl DsCudaExecutor {
                     from += bytes;
                 }
             }
+        }
+        for (target, pos) in written {
+            n.kv.tag(BANK, 0, target, pos);
         }
         Self::step_arrays(n, plan, boundary, plan.emit_rows(0))?;
         {
@@ -891,6 +1049,22 @@ impl DsCudaExecutor {
                 row[..d.copies as usize].copy_from_slice(src);
             }
             n.s.mix_b.write(dev, 0, &pre)?;
+            // The encoder's taps: the first columns of each row's taps.
+            if crossing.tap_rows > 0 {
+                let (ds, draft) = n.drafting()?;
+                let (from, to) = (
+                    (draft.encoder_targets * d.dim) as usize,
+                    (draft.targets * d.dim) as usize,
+                );
+                let mut hidden = vec![0u16; crossing.tap_rows as usize * to];
+                for (row, src) in hidden
+                    .chunks_exact_mut(to)
+                    .zip(crossing.taps.chunks_exact(from))
+                {
+                    row[..from].copy_from_slice(src);
+                }
+                ds.hidden.write(dev, 0, &hidden)?;
+            }
         }
         for j in 0..shape.depth() {
             let l = shape.split + j;
@@ -900,9 +1074,28 @@ impl DsCudaExecutor {
                 window_layer: narrow(j, "chain layer")?,
                 bank_layer: c.layers[l].kv_source.map(|_| 0),
                 build: None,
+                tap: match shape.decoder_targets.iter().position(|t| *t == l) {
+                    Some(at) => Some(narrow(shape.encoder_targets.len() + at, "target layer")?),
+                    None => None,
+                },
             };
             n.layer(l, &run)?;
             tap(l, n)?;
+        }
+        // The drafter's context KV, wherever the top layer computed.
+        if shape.drafting() {
+            let rows = plan.tap_rows();
+            let group = n.kv.groups.len() - 1;
+            let targets: Vec<u32> = plan.items[..rows as usize]
+                .iter()
+                .map(|it| n.kv.target(group, it.slot, it.pos))
+                .collect();
+            let (ds, _) = n.drafting()?;
+            ds.targets.write(n.dev.as_ref(), 0, &targets)?;
+            n.drafter_context(rows)?;
+            for b in 0..shape.drafter_blocks {
+                n.tag_rows(group, narrow(b, "draft block")?, rows);
+            }
         }
 
         let top = plan.top_rows;
@@ -944,14 +1137,120 @@ impl DsCudaExecutor {
         Ok(top)
     }
 
-    /// The decoder: [`DsCudaExecutor::decode_half`], then the sampler. Returns each
-    /// sampling row's token and, when asked, its logits.
+    /// The draft pass of the step's drafting rows, on the decoder's device before the
+    /// forward, from context KV earlier steps wrote: the pass, then the slots sampled
+    /// left to right on the draft stream, each slot's logits conditioned on the token
+    /// before it through the Markov head (the previous slot's tokens are read on the
+    /// device). Returns each drafting row's drafts, read back for the encoder's device.
+    fn draft(&mut self, plan: &DraftPlan, step: &StepInput, last: &[u32]) -> Result<Vec<Vec<u32>>> {
+        let count = plan.count();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let n = &mut self.decoder;
+        let d = n.d.clone();
+        let (_, draft) = n.drafting()?;
+        let pass = count * plan.slots;
+        let group = n.kv.groups.len() - 1;
+        {
+            let (ds, _) = n.drafting()?;
+            let dev = n.dev.as_ref();
+            // Slot 0 takes the row's last host token, the others the noise token.
+            let mut tokens = last.to_vec();
+            tokens.resize(pass as usize, draft.noise_token);
+            let slots = plan.slot_lists(d.window, |slot, pos| n.kv.entry(group, slot, pos));
+            if n.kv.tagged() {
+                for row in &plan.rows {
+                    for b in 0..draft.blocks {
+                        n.check_window(group, b, row.1, row.2 - 1)?;
+                    }
+                }
+            }
+            let mut pre = vec![0.0f32; pass as usize * d.mix_words as usize];
+            for row in pre.chunks_exact_mut(d.mix_words as usize) {
+                row[0] = 1.0;
+            }
+            n.s.tokens.write(dev, 0, &tokens)?;
+            n.s.positions.write(dev, 0, &plan.positions())?;
+            n.s.mix_b.write(dev, 0, &pre)?;
+            n.s.status.write(dev, 0, &[0u32])?;
+            ds.slots.write(dev, 0, &slots)?;
+            ds.previous.write(dev, 0, last)?;
+        }
+        n.draft_pass(pass)?;
+        let sampleable = self.spec.sampleable_vocab_size;
+        let lane = |i: u32| (i * count) as usize;
+        let mut recorded: Vec<Vec<Vec<f32>>> = vec![Vec::new(); count as usize];
+        for i in 0..plan.width() {
+            let rows = plan.drafting(i);
+            let (ds, _) = n.drafting()?;
+            let previous = match i {
+                0 => ds.previous.addr,
+                _ => ds.tokens.at(lane(i - 1) * 4, 0),
+            };
+            n.draft_logits(rows, plan.row(i, 0), previous)?;
+            let (ds, _) = n.drafting()?;
+            let dev = n.dev.as_ref();
+            if self.record {
+                let all: Vec<f32> = ds.logits.read(dev, 0, (rows * d.vocab) as usize)?;
+                for (r, l) in all.chunks_exact(d.vocab as usize).enumerate() {
+                    recorded[r].push(l.to_vec());
+                }
+            }
+            let samples: Vec<SampleRow> = plan.rows[..rows as usize]
+                .iter()
+                .zip(0u32..)
+                .map(|(r, at)| SampleRow::new(&step.seqs[r.0 as usize].sampling, r.2 + 1 + i, at))
+                .collect();
+            // SAFETY: `rows` rows of one slot's logits; the slot's lane of the
+            // distributions and of the tokens.
+            unsafe {
+                dev.sample(&SampleArgs {
+                    logits: ds.logits.addr,
+                    logits_stride: d.vocab,
+                    logit_rows: rows,
+                    n: sampleable,
+                    rows: &samples,
+                    rows_dev: ds.rows.addr,
+                    probs: ds.probs.at(lane(i) * sampleable as usize * 8, 0),
+                    tokens: ds.tokens.at(lane(i) * 4, 0),
+                    status: n.s.status.addr,
+                    draw: Some(Stream::Draft),
+                })?;
+            }
+        }
+        let (ds, _) = n.drafting()?;
+        let tokens: Vec<u32> = ds.tokens.read(n.dev.as_ref(), 0, lane(plan.width()))?;
+        check_status(n.status()?)?;
+        if self.record {
+            let mut order: Vec<usize> = (0..plan.rows.len()).collect();
+            order.sort_by_key(|r| plan.rows[*r].0);
+            for r in order {
+                self.draft_logits
+                    .push((plan.rows[r].1, std::mem::take(&mut recorded[r])));
+            }
+        }
+        Ok(plan
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| (0..row.3).map(|i| tokens[lane(i) + r]).collect())
+            .collect())
+    }
+
+    /// The decoder: [`DsCudaExecutor::decode_half`], then the sampler and, for the
+    /// drafting rows, chain acceptance over the target's distributions at the drafted
+    /// positions and the conditionals the drafts were drawn from. Returns each row's
+    /// produced tokens and, when asked, the logits each was drawn from.
+    #[allow(clippy::type_complexity)]
     fn decode(
         &mut self,
         plan: &StepPlan,
+        dplan: &DraftPlan,
+        rows: &[PlanRow],
         step: &StepInput,
         crossing: &ToDecoder,
-    ) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
+    ) -> Result<(Vec<Vec<u32>>, Vec<Vec<Vec<f32>>>)> {
         let top = Self::decode_half(
             &mut self.decoder,
             &self.c,
@@ -960,44 +1259,132 @@ impl DsCudaExecutor {
             crossing,
             &mut Self::no_tap,
         )?;
+        let mut produced = vec![Vec::new(); rows.len()];
+        let mut logits = vec![Vec::new(); rows.len()];
         if top == 0 {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((produced, logits));
         }
         let n = &self.decoder;
         let (d, dev) = (&n.d, n.dev.as_ref());
-        let samples: Vec<SampleRow> = step
-            .seqs
-            .iter()
-            .zip(&plan.last_row)
-            .filter(|(e, _)| e.sample)
-            .map(|(e, row)| SampleRow::new(&e.sampling, e.context_len + e.num_tokens, *row))
+        let sampleable = self.spec.sampleable_vocab_size;
+        let logit_row = |row: usize, pos: u32| {
+            plan.row_of(u32::try_from(row).expect("rows of a step"), pos)
+                .expect("the head read every sampling position")
+        };
+        // Rows without drafts sample plainly.
+        let plain: Vec<usize> = (0..rows.len())
+            .filter(|i| rows[*i].sample && rows[*i].drafts == 0)
             .collect();
-        // SAFETY: the logits of `top` rows; the sampler's buffers hold a row per
-        // sampling row of the largest step.
+        let samples: Vec<SampleRow> = plain
+            .iter()
+            .map(|i| {
+                SampleRow::new(
+                    &step.seqs[*i].sampling,
+                    rows[*i].p + 1,
+                    logit_row(*i, rows[*i].p),
+                )
+            })
+            .collect();
+        // SAFETY: the logits of `top` rows; the sampler's buffers hold a row per head
+        // row of the largest step.
         unsafe {
             dev.sample(&SampleArgs {
                 logits: n.s.logits.addr,
                 logits_stride: d.vocab,
                 logit_rows: top,
-                n: self.spec.sampleable_vocab_size,
+                n: sampleable,
                 rows: &samples,
                 rows_dev: n.s.srows.addr,
                 probs: n.s.probs.addr,
                 tokens: n.s.stokens.addr,
                 status: n.s.status.addr,
+                draw: Some(Stream::Sample),
             })?;
         }
-        let tokens: Vec<u32> = n.s.stokens.read(dev, 0, samples.len())?;
-        check_status(n.status()?)?;
-        let mut logits = Vec::new();
-        if step.return_logits {
-            let all: Vec<f32> = n.s.logits.read(dev, 0, top as usize * d.vocab as usize)?;
-            for s in &samples {
-                let at = s.logit_row as usize * d.vocab as usize;
-                logits.push(all[at..at + d.vocab as usize].to_vec());
+        // Drafting rows: the target's distributions at `p ..= p + k`, then acceptance.
+        let count = dplan.count();
+        let stride = self.spec.max_draft_tokens + 1;
+        if count > 0 {
+            let (ds, _) = n.drafting()?;
+            let first = plain.len();
+            let (mut targets, mut target_row, mut accept) = (Vec::new(), Vec::new(), Vec::new());
+            for r in &dplan.rows {
+                let params = &step.seqs[r.0 as usize].sampling;
+                target_row.push(narrow::<u32, usize>(first + targets.len(), "target rows")?);
+                for pos in r.2..=r.2 + r.3 {
+                    targets.push(SampleRow::new(
+                        params,
+                        pos + 1,
+                        logit_row(r.0 as usize, pos),
+                    ));
+                }
+                accept.push(SampleRow::new(params, r.2 + 1, 0));
+            }
+            let draft_row: Vec<u32> = (0..count).collect();
+            let num_drafts: Vec<u32> = dplan.rows.iter().map(|r| r.3).collect();
+            ds.accept_rows.write(dev, 0, &accept)?;
+            ds.target_row.write(dev, 0, &target_row)?;
+            ds.draft_row.write(dev, 0, &draft_row)?;
+            ds.num_drafts.write(dev, 0, &num_drafts)?;
+            // SAFETY: as above, after the plain rows' distributions; the acceptance
+            // reads the rows just uploaded, the drafts where the draft pass left them.
+            unsafe {
+                dev.sample(&SampleArgs {
+                    logits: n.s.logits.addr,
+                    logits_stride: d.vocab,
+                    logit_rows: top,
+                    n: sampleable,
+                    rows: &targets,
+                    rows_dev: n.s.srows.at(first * 32, 0),
+                    probs: n.s.probs.at(first * sampleable as usize * 8, 0),
+                    tokens: n.s.stokens.at(first * 4, 0),
+                    status: n.s.status.addr,
+                    draw: None,
+                })?;
+                dev.accept(&AcceptArgs {
+                    target: n.s.probs.addr,
+                    draft: ds.probs.addr,
+                    n: sampleable,
+                    rows: ds.accept_rows.addr,
+                    target_row: ds.target_row.addr,
+                    draft_row: ds.draft_row.addr,
+                    draft_step: count,
+                    num_drafts: ds.num_drafts.addr,
+                    drafts: ds.tokens.addr,
+                    stride,
+                    scratch: ds.residual.addr,
+                    out: ds.out.addr,
+                    counts: ds.counts.addr,
+                    status: n.s.status.addr,
+                    num_rows: count,
+                })?;
+            }
+            let out: Vec<u32> = ds.out.read(dev, 0, (count * stride) as usize)?;
+            let counts: Vec<u32> = ds.counts.read(dev, 0, count as usize)?;
+            for (r, row) in dplan.rows.iter().enumerate() {
+                let got = counts[r] as usize;
+                if got == 0 || got > row.3 as usize + 1 {
+                    return Err(CudaError::new("chain acceptance produced no tokens"));
+                }
+                produced[row.0 as usize] = out[r * stride as usize..][..got].to_vec();
             }
         }
-        Ok((tokens, logits))
+        let tokens: Vec<u32> = n.s.stokens.read(dev, 0, plain.len())?;
+        check_status(n.status()?)?;
+        for (i, token) in plain.iter().zip(tokens) {
+            produced[*i] = vec![token];
+        }
+        if step.return_logits {
+            let all: Vec<f32> = n.s.logits.read(dev, 0, top as usize * d.vocab as usize)?;
+            for (i, tokens) in produced.iter().enumerate() {
+                for j in 0..tokens.len() {
+                    let at = logit_row(i, rows[i].p + u32::try_from(j).expect("a draft")) as usize
+                        * d.vocab as usize;
+                    logits[i].push(all[at..at + d.vocab as usize].to_vec());
+                }
+            }
+        }
+        Ok((produced, logits))
     }
 
     fn run(&mut self, step: &StepInput) -> Result<StepOutput> {
@@ -1040,6 +1427,27 @@ impl DsCudaExecutor {
         }
         self.had_rows = true;
 
+        // Drafting, on the decoder's device, before the forward.
+        let at = Instant::now();
+        let dplan = DraftPlan::new(&rows, narrow(self.shape.draft_slots, "draft slots")?);
+        let last: Vec<u32> = dplan
+            .rows
+            .iter()
+            .map(|r| {
+                *known[r.0 as usize]
+                    .1
+                    .last()
+                    .expect("a row has a host token")
+            })
+            .collect();
+        self.check_tokens(&last)?;
+        let drafts = self.draft(&dplan, step, &last)?;
+        let mut known = known;
+        for (r, tokens) in dplan.rows.iter().zip(&drafts) {
+            known[r.0 as usize].1.extend(tokens);
+        }
+        stats.draft_ms = ms(at);
+
         let depth = self.spec.window_chain.expect("a window chain");
         let plan = StepPlan::new(&rows, depth.depth, depth.window);
         let tokens: Vec<u32> = plan
@@ -1050,14 +1458,7 @@ impl DsCudaExecutor {
                 tokens[history + (it.pos - rows[it.row as usize].c) as usize]
             })
             .collect();
-        for &t in &tokens {
-            if t as usize >= self.c.vocab_size || self.c.image_token_id == Some(t) {
-                return Err(CudaError::new(format!(
-                    "token {t} cannot be embedded (vocabulary {}, image token {:?})",
-                    self.c.vocab_size, self.c.image_token_id
-                )));
-            }
-        }
+        self.check_tokens(&tokens)?;
         let ids = self.engram_ids(&plan, &rows, &known)?;
 
         let at = Instant::now();
@@ -1081,41 +1482,49 @@ impl DsCudaExecutor {
 
         let at = Instant::now();
         let d = &self.encoder.d;
-        crossing.check(&plan, (d.copies * d.dim) as usize, d.copies as usize)?;
+        crossing.check(
+            &plan,
+            (d.copies * d.dim) as usize,
+            d.copies as usize,
+            self.shape.encoder_targets.len() * d.dim as usize,
+        )?;
         stats.crossing_ms = ms(at);
 
         let at = Instant::now();
-        let (sampled, logits) = self.decode(&plan, step, &crossing)?;
+        let (produced, logits) = self.decode(&plan, &dplan, &rows, step, &crossing)?;
         stats.decoder_ms = ms(at);
 
-        let mut next = 0;
-        for (i, e) in step.seqs.iter().enumerate() {
-            if !e.sample {
-                if let Some(l) = out.logits.as_mut() {
-                    l.push(Vec::new());
-                }
-                continue;
-            }
-            let token = sampled[next];
-            if token >= self.spec.sampleable_vocab_size {
+        let mut sampled = 0;
+        for (i, (tokens, logits)) in produced.into_iter().zip(logits).enumerate() {
+            if let Some(&bad) = tokens
+                .iter()
+                .find(|t| **t >= self.spec.sampleable_vocab_size)
+            {
                 return Err(CudaError::new(format!(
-                    "sampled id {token} is not sampleable"
+                    "sampled id {bad} is not sampleable"
                 )));
             }
-            out.tokens[i * stride as usize] = token;
-            out.num_tokens[i] = 1;
+            sampled += tokens.len();
+            out.tokens[i * stride as usize..][..tokens.len()].copy_from_slice(&tokens);
+            out.num_tokens[i] = narrow(tokens.len(), "produced tokens")?;
             if let Some(l) = out.logits.as_mut() {
-                l.push(vec![logits[next].clone()]);
+                l.push(logits);
             }
-            next += 1;
         }
         self.chain_work += plan.chain_work();
         if self.record {
-            self.transfers
-                .push(StepTransfer::of(&plan, &to_encoder, &crossing));
+            let mut transfer = StepTransfer::of(&plan, &to_encoder, &crossing);
+            // In step order, as the reference executor lists them.
+            let mut order: Vec<usize> = (0..dplan.rows.len()).collect();
+            order.sort_by_key(|r| dplan.rows[*r].0);
+            transfer.drafts = order
+                .into_iter()
+                .map(|r| (dplan.rows[r].1, drafts[r].clone()))
+                .collect();
+            self.transfers.push(transfer);
             stats.rows = plan.rows();
             stats.chain_work = plan.chain_work();
-            stats.sampled = narrow(sampled.len(), "sampled rows")?;
+            stats.sampled = narrow(sampled, "sampled tokens")?;
             stats.total_ms = ms(started);
             self.stats.push(stats);
         }
@@ -1148,10 +1557,11 @@ impl Executor for DsCudaExecutor {
 }
 
 impl Drop for DsCudaExecutor {
-    /// Zeroes every pool, table, state and scratch buffer before the memory is freed:
+    /// Zeroes every pool, table, state and scratch buffer and the host tier before the
+    /// memory is freed:
     /// best effort, since on a failed device the writes fail too.
     fn drop(&mut self) {
-        for n in [&self.encoder, &self.decoder] {
+        for n in [&mut self.encoder, &mut self.decoder] {
             let _ = n.scrub_all();
         }
     }
@@ -1180,11 +1590,20 @@ mod tests {
             }],
             sampleable_vocab_size: 95,
             devices: [0, 0],
+            draft_width: 0,
+            host_blocks: 0,
+            position_tags: true,
             record: true,
         }
     }
 
     fn executor() -> DsCudaExecutor {
+        executor_with(|_| ())
+    }
+
+    fn executor_with(change: impl FnOnce(&mut DsCudaExecutorConfig)) -> DsCudaExecutor {
+        let mut cfg = config();
+        change(&mut cfg);
         let dir = fixture_dir();
         let store = Arc::new(WeightSet::open_dir(&dir).unwrap());
         let golden = WeightSet::open_files(&[dir.join("golden.safetensors")]).unwrap();
@@ -1198,7 +1617,7 @@ mod tests {
             &store,
             &c,
             Some(map),
-            &config(),
+            &cfg,
         )
         .unwrap()
     }
@@ -1291,42 +1710,206 @@ mod tests {
     }
 
     #[test]
-    fn the_host_tier_is_refused_before_the_step_takes_effect() {
-        let mut x = executor();
-        let mut s = first_row(&x, 1, 3, &[5, 6, 7]);
-        s.maintenance = vec![
-            Maintenance::Zero { group: 0, block: 2 },
-            Maintenance::Demote {
-                group: 0,
-                block: 2,
-                host: 1,
-            },
-        ];
-        let e = x.execute(&s).unwrap_err();
-        assert!(e.0.contains("no host tier"), "{e}");
-        for op in [
-            Maintenance::Promote {
-                group: 1,
-                host: 1,
-                block: 2,
-            },
-            Maintenance::ZeroHost { group: 1, host: 1 },
-        ] {
-            s.maintenance = vec![op];
-            assert!(x.execute(&s).unwrap_err().0.contains("no host tier"));
+    fn host_blocks_outside_the_tier_are_refused_before_the_step_takes_effect() {
+        for host_blocks in [0, 4] {
+            let mut x = executor_with(|c| c.host_blocks = host_blocks);
+            let mut s = first_row(&x, 1, 3, &[5, 6, 7]);
+            for op in [
+                Maintenance::Demote {
+                    group: 0,
+                    block: 2,
+                    host: host_blocks,
+                },
+                Maintenance::Promote {
+                    group: 1,
+                    host: 0,
+                    block: 2,
+                },
+                Maintenance::ZeroHost {
+                    group: 1,
+                    host: host_blocks + 1,
+                },
+            ] {
+                s.maintenance = vec![Maintenance::Zero { group: 0, block: 2 }, op];
+                let e = x.execute(&s).unwrap_err();
+                assert!(e.0.contains("outside a host tier"), "{e}");
+            }
+            // Nothing was mapped: the same rows now run from scratch.
+            let n = x.half(Half::Encoder);
+            assert!(
+                n.kv.read_table(n.dev.as_ref(), WINDOW, 1)
+                    .unwrap()
+                    .iter()
+                    .all(|w| *w == -1)
+            );
+            s.maintenance.clear();
+            let out = x.execute(&s).unwrap();
+            assert_eq!(out.num_tokens, vec![1]);
+            assert_eq!(x.take_transfers().len(), 1);
         }
-        // Nothing was mapped: the same rows now run from scratch.
-        let n = x.half(Half::Encoder);
-        assert!(
-            n.kv.read_table(n.dev.as_ref(), WINDOW, 1)
-                .unwrap()
-                .iter()
-                .all(|w| *w == -1)
-        );
-        s.maintenance.clear();
-        let out = x.execute(&s).unwrap();
-        assert_eq!(out.num_tokens, vec![1]);
-        assert_eq!(x.take_transfers().len(), 1);
+    }
+
+    /// A block goes to the host tier as the ciphertext it is, byte for byte, and comes
+    /// back into another block as the same plaintext; the host block's zero, listed in
+    /// the step that promotes it, lands after the copy.
+    #[test]
+    fn the_host_tier_round_trips_ciphertext() {
+        let mut x = executor_with(|c| c.host_blocks = 4);
+        x.execute(&first_row(&x, 1, 3, &[5, 6, 7])).unwrap();
+        let key = eidola_engine::secret::KvKey::from_bytes([7; 32]);
+        let nonce = eidola_engine::kv_cipher::KvNonce::from_words([1, 2, 3]);
+        for group in 0..4u32 {
+            let plain = x.block_bytes(group, 3).unwrap();
+            assert!(plain.iter().any(|b| *b != 0));
+            let mut down = step(&x);
+            down.kv_keys = vec![key.clone()];
+            down.maintenance = vec![
+                Maintenance::Encrypt {
+                    group,
+                    block: 3,
+                    key: 0,
+                    nonce,
+                },
+                Maintenance::Demote {
+                    group,
+                    block: 3,
+                    host: 2,
+                },
+                Maintenance::Zero { group, block: 3 },
+            ];
+            x.execute(&down).unwrap();
+            let held = x.host_block_bytes(group, 2).unwrap();
+            assert!(x.host_block_is_encrypted(group, 2));
+            assert!(x.block_is_zero(group, 3).unwrap());
+            let same = held.iter().zip(&plain).filter(|(a, b)| a == b).count();
+            assert!(
+                same * 10 < plain.len(),
+                "group {group}: the host holds plaintext"
+            );
+            assert!(
+                x.host_block_bytes(group, 1)
+                    .unwrap()
+                    .iter()
+                    .all(|b| *b == 0)
+            );
+
+            let mut up = step(&x);
+            up.kv_keys = vec![key.clone()];
+            up.maintenance = vec![
+                Maintenance::Promote {
+                    group,
+                    host: 2,
+                    block: 5,
+                },
+                Maintenance::ZeroHost { group, host: 2 },
+                Maintenance::Decrypt {
+                    group,
+                    block: 5,
+                    key: 0,
+                    nonce,
+                },
+            ];
+            x.execute(&up).unwrap();
+            assert_eq!(x.block_bytes(group, 5).unwrap(), plain, "group {group}");
+            assert!(!x.host_block_is_encrypted(group, 2));
+            assert!(
+                x.host_block_bytes(group, 2)
+                    .unwrap()
+                    .iter()
+                    .all(|b| *b == 0)
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "demote of a plaintext block")]
+    fn plaintext_never_reaches_the_host_tier() {
+        let mut x = executor_with(|c| c.host_blocks = 4);
+        x.execute(&first_row(&x, 1, 3, &[5, 6, 7])).unwrap();
+        let mut s = step(&x);
+        s.maintenance = vec![Maintenance::Demote {
+            group: 1,
+            block: 3,
+            host: 2,
+        }];
+        let _ = x.execute(&s);
+    }
+
+    /// The rows of `tokens` at `context ..` of slot 0, every group's first two blocks
+    /// mapped to blocks 1 and 2.
+    fn later_row(x: &DsCudaExecutor, context: u32, tokens: &[u32], chain_start: u32) -> StepInput {
+        let mut s = first_row(x, 0, 1, tokens);
+        s.table_updates.extend((0..4).map(|group| TableUpdate {
+            slot: 0,
+            group,
+            index: 1,
+            block: 2,
+        }));
+        s.seqs[0].context_len = context;
+        let n = u32::try_from(tokens.len()).unwrap();
+        s.positions = (context..context + n).collect();
+        s.aux.chain_start = vec![chain_start];
+        s
+    }
+
+    /// With position tags a step that reads KV no step computed is refused: a chain
+    /// layer's window before the layer's start, and a context whose blocks are mapped
+    /// and empty. Without them the same steps read whatever the blocks hold.
+    #[test]
+    fn a_read_of_kv_no_step_computed_is_refused() {
+        let tokens: Vec<u32> = (0..10).collect();
+        for tags in [true, false] {
+            // The top layer starts at 6 and the row samples at 9: its top-layer window
+            // reaches back to 0, which that layer does not compute.
+            let mut x = executor_with(|c| c.position_tags = tags);
+            let got = x.execute(&later_row(&x, 0, &tokens, 6));
+            match tags {
+                true => {
+                    let e = got.unwrap_err();
+                    assert!(e.0.contains("group 3 layer 3"), "{e}");
+                    assert!(e.0.contains("no step computed"), "{e}");
+                }
+                false => assert!(got.is_ok()),
+            }
+            // The whole chain from 0 is a context every layer computed.
+            let mut x = executor_with(|c| c.position_tags = tags);
+            x.execute(&later_row(&x, 0, &tokens, 0)).unwrap();
+            x.execute(&later_row(&x, 10, &[3], 10)).unwrap();
+
+            // A context nothing computed.
+            let mut x = executor_with(|c| c.position_tags = tags);
+            let got = x.execute(&later_row(&x, 10, &[3], 10));
+            assert_eq!(got.is_err(), tags);
+        }
+    }
+
+    /// A zeroed block's tags go with its bytes, and a copy carries them.
+    #[test]
+    fn tags_follow_zero_and_copy() {
+        let tokens: Vec<u32> = (0..10).collect();
+        let mut x = executor();
+        x.execute(&later_row(&x, 0, &tokens, 0)).unwrap();
+        // Every group's second block moves to block 7.
+        let mut s = later_row(&x, 10, &[3], 10);
+        s.maintenance = (0..4)
+            .map(|group| Maintenance::Copy {
+                group,
+                src: 2,
+                dst: 7,
+            })
+            .collect();
+        for u in s.table_updates.iter_mut().filter(|u| u.index == 1) {
+            u.block = 7;
+        }
+        x.execute(&s).unwrap();
+        // Zeroed, the first block no longer holds the context.
+        let mut s = later_row(&x, 11, &[4], 11);
+        for u in s.table_updates.iter_mut().filter(|u| u.index == 1) {
+            u.block = 7;
+        }
+        s.maintenance = vec![Maintenance::Zero { group: 3, block: 1 }];
+        let e = x.execute(&s).unwrap_err();
+        assert!(e.0.contains("no step computed"), "{e}");
     }
 
     #[test]
@@ -1358,28 +1941,53 @@ mod tests {
     }
 
     /// A slot's open entry is state the reset scrubs, and only that slot's; the first
-    /// rowless step after rows scrubs the scratch, once.
+    /// rowless step after rows scrubs every scratch buffer, the drafter's included, once.
     #[test]
     fn resets_and_idle_steps_scrub() {
-        let mut x = executor();
-        x.execute(&first_row(&x, 1, 3, &[5, 6, 7])).unwrap();
-        x.execute(&first_row(&x, 2, 4, &[9])).unwrap();
+        let mut x = executor_with(|c| c.draft_width = 4);
+        let mut first = first_row(&x, 1, 3, &[5, 6, 7]);
+        let drafter = |s: &mut StepInput, block| {
+            let slot = s.seqs[0].slot;
+            s.table_updates.push(TableUpdate {
+                slot,
+                group: 4,
+                index: 0,
+                block,
+            });
+        };
+        drafter(&mut first, 3);
+        x.execute(&first).unwrap();
+        // A drafting step, so the drafter's scratch holds a pass.
+        let mut next = first_row(&x, 1, 3, &[8]);
+        next.table_updates.clear();
+        next.seqs[0].context_len = 3;
+        next.seqs[0].num_drafts = 2;
+        next.positions = vec![3];
+        next.aux.chain_start = vec![3];
+        x.execute(&next).unwrap();
+        let mut other = first_row(&x, 2, 4, &[9]);
+        drafter(&mut other, 4);
+        x.execute(&other).unwrap();
         assert!(!x.slot_state_is_zero(1).unwrap());
         assert!(!x.slot_state_is_zero(2).unwrap());
         assert!(x.slot_state_is_zero(0).unwrap());
-        let scratch_is_zero = |x: &DsCudaExecutor| {
-            let n = x.half(Half::Decoder);
-            let bytes: Vec<u8> = n.s.x.read(n.dev.as_ref(), 0, n.s.x.bytes).unwrap();
-            bytes.iter().all(|b| *b == 0)
-        };
-        assert!(!scratch_is_zero(&x));
+        assert!(!x.scratch_is_zero().unwrap());
+        let (ds, _) = x.half(Half::Decoder).drafting().unwrap();
+        let pass: Vec<u8> = ds
+            .base
+            .read(x.half(Half::Decoder).dev.as_ref(), 0, ds.base.bytes)
+            .unwrap();
+        assert!(
+            pass.iter().any(|b| *b != 0),
+            "the draft pass left its logits"
+        );
 
         let mut idle = step(&x);
         idle.maintenance = vec![Maintenance::ResetSlot { slot: 1 }];
         x.execute(&idle).unwrap();
         assert!(x.slot_state_is_zero(1).unwrap());
         assert!(!x.slot_state_is_zero(2).unwrap(), "another slot's state");
-        assert!(scratch_is_zero(&x));
+        assert!(x.scratch_is_zero().unwrap());
         assert_eq!(x.idle_scrubs(), 1);
         x.execute(&step(&x)).unwrap();
         assert_eq!(x.idle_scrubs(), 1);
@@ -1391,5 +1999,157 @@ mod tests {
         x.execute(&zero).unwrap();
         assert!(x.block_is_zero(1, 3).unwrap());
         assert!(!x.block_is_zero(1, 4).unwrap());
+    }
+
+    /// The released configuration with five drafts, laid out with no checkpoint on two
+    /// devices of one B300's memory that only check their launches: both halves fit
+    /// (the decoder's with the drafter and its Engram table), and a prefill step and a
+    /// drafting step make only launches their wrappers accept. The dry device reads
+    /// back zeros, so the drafting step ends where it needs the acceptance's counts.
+    #[test]
+    fn the_released_model_drafts_within_one_device_a_half() {
+        use super::super::dry::DryDevice;
+        let c = super::super::support::tests::released_config();
+        let e = c.engram.clone().unwrap();
+        let map: Vec<u32> = (0..c.vocab_size)
+            .map(|i| u32::try_from(i % e.compressed_vocab).unwrap())
+            .collect();
+        let cfg = DsCudaExecutorConfig {
+            block_size: 32,
+            num_blocks: 4096,
+            num_state_slots: 16,
+            max_model_len: 4096,
+            buckets: vec![Bucket {
+                max_seqs: 16,
+                max_tokens: 256,
+            }],
+            sampleable_vocab_size: u32::try_from(c.vocab_size).unwrap(),
+            devices: [0, 1],
+            draft_width: 5,
+            host_blocks: 8192,
+            position_tags: true,
+            record: false,
+        };
+        let capacity = 275_040usize << 20;
+        let device = || -> Box<dyn Device> { Box::new(DryDevice::new(Some(capacity))) };
+        let mut x = DsCudaExecutor::layout(device(), device(), &c, Some(map), &cfg).unwrap();
+        assert_eq!(x.spec.kv_groups.len(), 5);
+        assert_eq!(x.spec.max_draft_tokens, 5);
+        let [enc, dec] = x.memory();
+        eprintln!("{enc:?}\n{dec:?}");
+        assert!(enc.total() < capacity as u64 && dec.total() < capacity as u64);
+        // The drafter's weights are on the decoder's device beside its checkpoint side.
+        assert!(dec.weights > 250_527_512_880 + 7_000_000_000);
+        assert!(x.decoder.kv.host_bytes() > 0);
+
+        let groups = 0..5u32;
+        let map = |slot: Slot, index: u32, block: u32| {
+            groups.clone().map(move |group| TableUpdate {
+                slot,
+                group,
+                index,
+                block,
+            })
+        };
+        let row = |slot, context: u32, n: u32, drafts| SeqEntry {
+            slot,
+            token_start: context,
+            num_tokens: n,
+            context_len: context,
+            num_drafts: drafts,
+            sample: true,
+            sampling: SamplingParams::greedy(),
+        };
+        // Two rows of 100 and 60 tokens.
+        let mut s = step(&x);
+        s.table_updates = (0..4)
+            .flat_map(|i| map(0, i, 1 + i))
+            .chain((0..2).flat_map(|i| map(1, i, 5 + i)))
+            .collect();
+        s.seqs = vec![row(0, 0, 100, 0), row(1, 0, 60, 0)];
+        s.seqs[1].token_start = 100;
+        s.token_ids = (0..160).collect();
+        s.positions = (0..100).chain(0..60).collect();
+        s.aux = StepAux {
+            chain_start: vec![0, 0],
+            history_ids: vec![0; 2 * x.spec.token_history as usize],
+        };
+        let out = x.execute(&s).unwrap();
+        assert_eq!(out.num_tokens, vec![1, 1]);
+
+        // Both draft, five and three tokens.
+        let mut s = step(&x);
+        s.seqs = vec![row(0, 100, 1, 5), row(1, 60, 1, 3)];
+        s.seqs[0].token_start = 0;
+        s.seqs[1].token_start = 1;
+        s.token_ids = vec![7, 8];
+        s.positions = vec![100, 60];
+        s.aux = StepAux {
+            chain_start: vec![100, 60],
+            history_ids: vec![0; 2 * x.spec.token_history as usize],
+        };
+        let e = x.execute(&s).unwrap_err();
+        assert!(e.0.contains("chain acceptance produced no tokens"), "{e}");
+    }
+
+    /// What dropping the executor runs leaves nothing but weights: every pool, table,
+    /// slot state, scratch buffer and host block is zero.
+    #[test]
+    fn the_drop_scrub_covers_every_allocation() {
+        let mut x = executor_with(|c| c.host_blocks = 4);
+        x.execute(&first_row(&x, 1, 3, &[5, 6, 7])).unwrap();
+        let mut down = step(&x);
+        down.kv_keys = vec![eidola_engine::secret::KvKey::from_bytes([7; 32])];
+        let nonce = eidola_engine::kv_cipher::KvNonce::from_words([1, 2, 3]);
+        down.maintenance = vec![
+            Maintenance::Encrypt {
+                group: 1,
+                block: 3,
+                key: 0,
+                nonce,
+            },
+            Maintenance::Demote {
+                group: 1,
+                block: 3,
+                host: 2,
+            },
+        ];
+        // Rows again, so the scratch holds a step when the scrub runs.
+        let mut s = first_row(&x, 2, 4, &[9]);
+        s.kv_keys = std::mem::take(&mut down.kv_keys);
+        s.maintenance = std::mem::take(&mut down.maintenance);
+        x.execute(&s).unwrap();
+        assert!(x.host_block_bytes(1, 2).unwrap().iter().any(|b| *b != 0));
+        for n in [&mut x.encoder, &mut x.decoder] {
+            n.scrub_all().unwrap();
+        }
+        assert!(x.scratch_is_zero().unwrap());
+        for group in 0..4 {
+            for block in 0..12 {
+                assert!(x.block_is_zero(group, block).unwrap());
+            }
+            for host in 1..4 {
+                assert!(
+                    x.host_block_bytes(group, host)
+                        .unwrap()
+                        .iter()
+                        .all(|b| *b == 0)
+                );
+            }
+        }
+        for n in [&x.encoder, &x.decoder] {
+            for b in n.buffers() {
+                let bytes: Vec<u8> = b.read(n.dev.as_ref(), 0, b.bytes).unwrap();
+                assert!(bytes.iter().all(|b| *b == 0), "{b:?}");
+            }
+            for g in 0..2 {
+                assert!(
+                    n.kv.read_table(n.dev.as_ref(), g, 1)
+                        .unwrap()
+                        .iter()
+                        .all(|w| *w == 0)
+                );
+            }
+        }
     }
 }

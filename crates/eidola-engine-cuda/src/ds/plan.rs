@@ -26,6 +26,8 @@ pub struct PlanRow {
     pub sample: bool,
     /// Where the chain's top layer starts.
     pub chain_start: u32,
+    /// Drafted positions after the last host token: `p + 1 ..= p + drafts`.
+    pub drafts: u32,
 }
 
 /// One position of a step.
@@ -67,7 +69,7 @@ impl StepPlan {
         let mut items = Vec::new();
         for (ri, r) in rows.iter().enumerate() {
             assert!(r.c <= r.p, "a row has at least one host token");
-            for pos in r.c..=r.p {
+            for pos in r.c..=r.p + r.drafts {
                 let computed = (0..depth)
                     .filter(|j| pos >= chain_layer_start(r.chain_start, depth, window, *j))
                     .count();
@@ -118,6 +120,11 @@ impl StepPlan {
     /// Every position: the encoder's rows.
     pub fn rows(&self) -> u32 {
         u32::try_from(self.items.len()).expect("positions of a step")
+    }
+
+    /// Rows the chain's top layer computes: where the drafter's context is written.
+    pub fn tap_rows(&self) -> u32 {
+        self.chain_rows.last().copied().unwrap_or(0)
     }
 
     /// Rows whose state crosses to the decoder: those the chain's bottom layer computes.
@@ -189,7 +196,7 @@ pub fn pool_plan(plan: &StepPlan, rows: &[PlanRow], cap: u32) -> PoolPlan {
             out.second.push(at);
             out.closes.push((it.slot, it.pos));
         }
-        if it.pos + cap > r.p {
+        if it.pos + cap > r.p + r.drafts {
             out.keep.push((at, it.slot, it.pos));
         }
     }
@@ -216,6 +223,91 @@ pub fn window_slots(
         }
     }
     out
+}
+
+/// The rows of a step that draft, in the draft pass's order: widest first, so the rows
+/// drafting slot `i` are a prefix, then step order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftPlan {
+    /// `(step row, slot, last host position, drafts)`.
+    pub rows: Vec<(u32, Slot, u32, u32)>,
+    /// Slots a pass computes.
+    pub slots: u32,
+}
+
+impl DraftPlan {
+    pub fn new(rows: &[PlanRow], slots: u32) -> DraftPlan {
+        let mut drafting: Vec<(u32, Slot, u32, u32)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.drafts > 0)
+            .map(|(i, r)| {
+                (
+                    u32::try_from(i).expect("rows of a step"),
+                    r.slot,
+                    r.p,
+                    r.drafts,
+                )
+            })
+            .collect();
+        drafting.sort_by_key(|r| (std::cmp::Reverse(r.3), r.0));
+        DraftPlan {
+            rows: drafting,
+            slots,
+        }
+    }
+
+    /// Drafting rows.
+    pub fn count(&self) -> u32 {
+        u32::try_from(self.rows.len()).expect("rows of a step")
+    }
+
+    /// The widest row's drafts.
+    pub fn width(&self) -> u32 {
+        self.rows.first().map_or(0, |r| r.3)
+    }
+
+    /// Rows that draft slot `i`: a prefix.
+    pub fn drafting(&self, i: u32) -> u32 {
+        u32::try_from(self.rows.iter().filter(|r| r.3 > i).count()).expect("rows of a step")
+    }
+
+    /// The pass's row of slot `i` of drafting row `r`: slot-major.
+    pub fn row(&self, i: u32, r: u32) -> u32 {
+        i * self.count() + r
+    }
+
+    /// The pass's positions: slot `i` of a row whose last host position is `p` stands
+    /// at `p + i`.
+    pub fn positions(&self) -> Vec<u32> {
+        (0..self.slots)
+            .flat_map(|i| self.rows.iter().map(move |r| r.2 + i))
+            .collect()
+    }
+
+    /// The pass's attention slot lists, `stride = window + slots` words a row: the
+    /// drafter's context at the positions before `p` in ring order (`ring_order` of
+    /// `p - 1`: slot `q` holds the newest position congruent to `q`), then every draft
+    /// slot of the row's sequence as an entry of the pass's own KV (its row index).
+    /// `entry` maps a slot and a position to its entry in the drafter's group.
+    pub fn slot_lists(&self, window: u32, entry: impl Fn(Slot, u32) -> u32) -> Vec<u32> {
+        let stride = (window + self.slots) as usize;
+        let mut out = vec![SLOT_EMPTY; self.rows.len() * self.slots as usize * stride];
+        for i in 0..self.slots {
+            for (r, row) in self.rows.iter().enumerate() {
+                let r32 = u32::try_from(r).expect("rows of a step");
+                let at = self.row(i, r32) as usize * stride;
+                let main = row.2 - 1;
+                for q in 0..window.min(main + 1) {
+                    out[at + q as usize] = entry(row.1, main - (main - q) % window);
+                }
+                for j in 0..self.slots {
+                    out[at + (window + j) as usize] = self.row(j, r32);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Rows the expert-major layout can need for `rows` positions routed to `active` of
@@ -275,7 +367,51 @@ mod tests {
             p,
             sample,
             chain_start,
+            drafts: 0,
         }
+    }
+
+    #[test]
+    fn a_draft_pass_is_slot_major_with_ring_ordered_context() {
+        let mut rows = vec![
+            row(4, 9, 9, true, 9),
+            row(2, 5, 5, true, 5),
+            row(7, 3, 3, false, 3),
+        ];
+        rows[0].drafts = 2;
+        rows[1].drafts = 3;
+        let plan = StepPlan::new(&rows, 2, 3);
+        // Drafted positions are the plan's, and the head reads them.
+        assert_eq!(plan.rows(), 3 + 2 + 3);
+        assert_eq!(plan.top_rows, 3 + 4);
+        let d = DraftPlan::new(&rows, 4);
+        // Widest first.
+        assert_eq!(d.rows, vec![(1, 2, 5, 3), (0, 4, 9, 2)]);
+        assert_eq!((d.count(), d.width()), (2, 3));
+        assert_eq!(
+            (0..4).map(|i| d.drafting(i)).collect::<Vec<_>>(),
+            [2, 2, 1, 0]
+        );
+        assert_eq!(d.positions(), vec![5, 9, 6, 10, 7, 11, 8, 12]);
+        let lists = d.slot_lists(3, |slot, pos| slot * 100 + pos);
+        let e = SLOT_EMPTY;
+        // Row (slot 0, drafting row 1): sequence 4 at p = 9, context 8, 7, 6 in ring
+        // order of 8 (slot q holds the newest position congruent to q mod 3).
+        assert_eq!(lists[7..14], [406, 407, 408, 1, 3, 5, 7]);
+        // Sequence 2 at p = 5: main position 4, ring 3, 4, 2.
+        assert_eq!(lists[..7], [203, 204, 202, 0, 2, 4, 6]);
+        // A short context leaves the ring's tail empty.
+        let short = DraftPlan::new(
+            &[PlanRow {
+                drafts: 1,
+                ..row(1, 2, 2, true, 2)
+            }],
+            2,
+        );
+        assert_eq!(
+            short.slot_lists(3, |_, pos| pos),
+            vec![0, 1, e, 0, 1, 0, 1, e, 0, 1]
+        );
     }
 
     /// A triangle: the top layer from `chain_start`, each layer below from `window - 1`
