@@ -73,11 +73,10 @@ pub const CHAT_FILES: [&str; 3] = [TOKENIZER_FILE, CHAT_TEMPLATE_FILE, GENERATIO
 /// `config.json`'s `model_type` for DeepSeek-V4.1.
 pub const DEEPSEEK_V4_1_MODEL_TYPE: &str = "deepseek_v41";
 
-/// The tensor holding DeepSeek-V4.1's Engram compressed-vocabulary map (one `int32` or
-/// `int64` per token id), read from the verified shards. The reference derives the map
-/// from the tokenizer at load time; that derivation is not implemented here, so a
-/// checkpoint with Engram layers is served only when its shards carry the map (the dev
-/// model's do), and refused otherwise.
+/// A tensor of DeepSeek-V4.1's Engram compressed-vocabulary map (one `int32` or `int64`
+/// per token id). The node derives the map from the tokenizer, as the reference does
+/// (`eidola_engine_chat::deepseek_v4_1::compressed_vocab`); shards that carry this tensor
+/// too must carry exactly the derived map, or the model is refused.
 pub const ENGRAM_TOKEN_MAP_TENSOR: &str = "engram.token_map";
 
 /// Why the model could not be loaded. Every message is authored here from file names and
@@ -316,7 +315,9 @@ impl LoadedModel {
                     )));
                 }
                 let model = match executor {
-                    ExecutorKind::Cpu => Some(Arc::new(load_deepseek(&store, config.clone())?)),
+                    ExecutorKind::Cpu => {
+                        Some(Arc::new(load_deepseek(&store, config.clone(), &tokenizer)?))
+                    }
                     #[cfg(feature = "cuda")]
                     ExecutorKind::Cuda => None,
                 };
@@ -489,28 +490,15 @@ fn architecture_of(config_json: &[u8]) -> Result<Architecture, ModelError> {
 }
 
 /// DeepSeek-V4.1's reference model over the verified shards, with its Engram map
-/// ([`ENGRAM_TOKEN_MAP_TENSOR`]) when the model has Engram layers. The vision tower's
-/// tensors are mapped with their shards but never read.
-fn load_deepseek(store: &Arc<WeightSet>, config: DsConfig) -> Result<DsModel, ModelError> {
+/// ([`engram_token_map`]) when the model has Engram layers. The vision tower's tensors are
+/// mapped with their shards but never read.
+fn load_deepseek(
+    store: &Arc<WeightSet>,
+    config: DsConfig,
+    tokenizer: &Tokenizer,
+) -> Result<DsModel, ModelError> {
     let token_map = if config.engram.is_some() {
-        let view = store.get(ENGRAM_TOKEN_MAP_TENSOR).map_err(|_| {
-            ModelError(format!(
-                "the model has Engram layers and its weights carry no {ENGRAM_TOKEN_MAP_TENSOR}; \
-                 deriving the compressed-vocabulary map from the tokenizer is not implemented"
-            ))
-        })?;
-        let ids = view
-            .to_i64(ENGRAM_TOKEN_MAP_TENSOR)
-            .map_err(|e| ModelError(format!("{ENGRAM_TOKEN_MAP_TENSOR}: {e}")))?;
-        Some(
-            ids.into_iter()
-                .map(|t| {
-                    u32::try_from(t).map_err(|_| {
-                        ModelError(format!("{ENGRAM_TOKEN_MAP_TENSOR}: an id is out of range"))
-                    })
-                })
-                .collect::<Result<Vec<u32>, _>>()?,
-        )
+        Some(engram_token_map(store, tokenizer)?)
     } else {
         None
     };
@@ -518,6 +506,41 @@ fn load_deepseek(store: &Arc<WeightSet>, config: DsConfig) -> Result<DsModel, Mo
         .map_err(|e| ModelError(format!("cannot load the weights: {e}")))?;
     DsModel::new(weights, token_map)
         .map_err(|e| ModelError(format!("cannot load the weights: {e}")))
+}
+
+/// The Engram compressed-vocabulary map: derived from the tokenizer, the reference's
+/// definition, and checked against [`ENGRAM_TOKEN_MAP_TENSOR`] when the shards carry one.
+/// The model crate checks its size against the config.
+fn engram_token_map(store: &WeightSet, tokenizer: &Tokenizer) -> Result<Vec<u32>, ModelError> {
+    let derived = eidola_engine_chat::deepseek_v4_1::compressed_vocab(tokenizer)
+        .map_err(|e| ModelError(format!("the Engram map: {e}")))?
+        .map;
+    let stored = match store.get(ENGRAM_TOKEN_MAP_TENSOR) {
+        Ok(view) => Some(
+            view.to_i64(ENGRAM_TOKEN_MAP_TENSOR)
+                .map_err(|e| ModelError(format!("{ENGRAM_TOKEN_MAP_TENSOR}: {e}")))?,
+        ),
+        Err(_) => None,
+    };
+    agreeing_token_map(derived, stored.as_deref())
+}
+
+/// `derived`, when the shards carry no map or carry exactly it.
+fn agreeing_token_map(derived: Vec<u32>, stored: Option<&[i64]>) -> Result<Vec<u32>, ModelError> {
+    match stored {
+        Some(stored)
+            if stored.len() != derived.len()
+                || stored
+                    .iter()
+                    .zip(&derived)
+                    .any(|(s, d)| *s != i64::from(*d)) =>
+        {
+            Err(ModelError(format!(
+                "the weights' {ENGRAM_TOKEN_MAP_TENSOR} is not the map the tokenizer derives"
+            )))
+        }
+        _ => Ok(derived),
+    }
 }
 
 /// The weights directory, resolved once. Every later check, listing and open goes through
@@ -642,6 +665,28 @@ fn utf8_name(name: &std::ffi::OsStr) -> Result<&str, ModelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stored_engram_map_must_be_the_derived_one() {
+        let derived = vec![0, 1, 0, 2];
+        assert_eq!(
+            agreeing_token_map(derived.clone(), None),
+            Ok(derived.clone())
+        );
+        assert_eq!(
+            agreeing_token_map(derived.clone(), Some(&[0, 1, 0, 2])),
+            Ok(derived.clone())
+        );
+        for stored in [
+            &[0, 1, 0, 1][..],
+            &[0, 1, 0],
+            &[0, 1, 0, 2, 0],
+            &[0, 1, 0, 2 + (1 << 32)],
+        ] {
+            let refused = agreeing_token_map(derived.clone(), Some(stored)).unwrap_err();
+            assert!(refused.0.contains(ENGRAM_TOKEN_MAP_TENSOR), "{refused}");
+        }
+    }
 
     #[test]
     fn manifest_is_sha256sum_layout_sorted_by_name() {
