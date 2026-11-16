@@ -23,6 +23,8 @@
 //!   entry alone and writes nothing.
 //! * **The cache doctrine** — a summary appearing changes only the trailing map
 //!   message; every conversation byte above it is untouched.
+//! * **Scheduling** — a post into a space with summaries off leaves no task
+//!   waiting out the debounce; with them on, the debounced pass is waiting.
 //! * **Emissions** — a committed summary emits `Change::Space` (the row in
 //!   `tests/bus.rs`'s exit-point table).
 //!
