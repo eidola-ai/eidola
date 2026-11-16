@@ -2,7 +2,7 @@ name: CLA Check
 
 on:
   pull_request:
-    branches: [main, next, engine]
+    branches: [main, next, engine, qwen38-27b]
 
 # Cancel superseded runs when a PR branch is updated.
 concurrency:

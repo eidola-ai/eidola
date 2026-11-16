@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - next
+      - qwen38-27b
 
 permissions:
   contents: read

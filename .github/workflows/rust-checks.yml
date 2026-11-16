@@ -21,12 +21,14 @@ on:
     branches:
       - next
       - main
+      - qwen38-27b
     tags:
       - "v*"
   pull_request:
     branches:
       - main
       - next
+      - qwen38-27b
 
 # Cancel superseded PR runs; let pushes to main and tag releases finish.
 concurrency:
@@ -47,8 +49,10 @@ jobs:
     # ceiling also protects the post-merge push run that SAVES the cache:
     # rust-cache saves in a post step, which a timeout cancellation skips — a
     # too-tight timeout there would leave every subsequent PR cold, timing out
-    # in a spiral.
-    timeout-minutes: 90
+    # in a spiral. The `qwen38-27b` integration branch carries a third
+    # engine architecture's test suites, and a cold run of the engine's
+    # suites has outlasted 90 minutes, so its runs get 150.
+    timeout-minutes: ${{ (github.ref == 'refs/heads/qwen38-27b' || github.base_ref == 'qwen38-27b') && 150 || 90 }}
     env:
       # Nothing here is debugged interactively, and full debuginfo for every
       # gpui-linked test binary overflows the runner's disk at link time.
@@ -279,8 +283,13 @@ jobs:
         # Save from pushes to the trunks: `next` (the active integration
         # branch — this is what warms feature PRs, which restore from their
         # base) and `main` (the default branch — the universal restore fallback
-        # and the promotion PR's base). PRs never save (github.ref is a PR ref),
-        # so there's no per-PR thrash. This job only runs tests; no artifact
+        # and the promotion PR's base). PRs into `next` and `main` never save
+        # (github.ref is a PR ref), so there's no per-PR thrash. The
+        # `qwen38-27b` integration branch saves from its own pushes
+        # (its merges), which warm every PR into it, and its PRs save too:
+        # they take many pushes, and a cache saved under a PR ref is restored
+        # only by that same PR's later runs. A cold run of the whole workspace
+        # can outlast the job's timeout. This job only runs tests; no artifact
         # from here is published.
         #
         # A failed job saves too. The key's environment half is the Rust
@@ -292,7 +301,7 @@ jobs:
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true' || steps.scope.outputs.markdown == 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/qwen38-27b' || github.base_ref == 'qwen38-27b' }}
           cache-on-failure: true
           # The pinned dev tools are their own workspace with their own
           # target directory; rust-cache keeps only the dependencies of the
