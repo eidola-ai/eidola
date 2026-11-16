@@ -40,7 +40,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::executor::{Executor, ExecutorError, SeqEntry, StepInput};
+use crate::executor::{Executor, ExecutorError, SeqEntry, StepAux, StepInput};
 use crate::kv::{CachePolicy, KvManager, Millis, PendingWork, Release};
 use crate::sampling::SamplingParams;
 use crate::secret::Lineage;
@@ -474,6 +474,7 @@ impl<E: Executor> Engine<E> {
                 token_ids: Vec::new(),
                 positions: Vec::new(),
                 return_logits: false,
+                aux: StepAux::default(),
             };
             self.exec.execute(&step)?;
             self.stats.steps += 1;
@@ -735,7 +736,13 @@ impl<E: Executor> Engine<E> {
             };
             (1, d)
         } else {
-            (pending.min(self.config.max_prefill_chunk), 0)
+            // With a window chain, a row ends by the next position that needs
+            // full-depth state, so one row has one triangle to run toward.
+            let to_target = self
+                .kv
+                .next_target(id)
+                .map_or(pending, |t| t + 1 - computed);
+            (pending.min(self.config.max_prefill_chunk).min(to_target), 0)
         };
         let cost = num_tokens + num_drafts;
         if cost > budget {
@@ -771,6 +778,8 @@ impl<E: Executor> Engine<E> {
     ) -> Result<Vec<Event>, ExecutorError> {
         let mut token_ids = Vec::new();
         let mut positions = Vec::new();
+        let mut aux = StepAux::default();
+        let history = self.spec.token_history as usize;
         for p in &mut planned {
             let seq = &self.seqs[&p.id];
             p.entry.token_start = token_ids.len() as u32;
@@ -778,6 +787,22 @@ impl<E: Executor> Engine<E> {
             let end = start + p.entry.num_tokens as usize;
             token_ids.extend_from_slice(&seq.tokens[start..end]);
             positions.extend(p.entry.context_len..p.entry.context_len + p.entry.num_tokens);
+            aux.history_ids
+                .extend(std::iter::repeat_n(0, history.saturating_sub(start)));
+            aux.history_ids
+                .extend_from_slice(&seq.tokens[start.saturating_sub(history)..start]);
+            if self.spec.window_chain.is_some() {
+                // The row's target: the retention point it is prefilling toward, or the
+                // sequence's last known token.
+                let last = seq.tokens.len() as u32 - 1;
+                let target = self.kv.next_target(p.id).map_or(last, |t| t.min(last));
+                aux.chain_start.push(self.kv.chain_row(
+                    p.id,
+                    p.entry.context_len,
+                    end as u32,
+                    target,
+                ));
+            }
         }
         let rows = planned.len() as u32;
         let query: u32 = planned
@@ -802,6 +827,7 @@ impl<E: Executor> Engine<E> {
             token_ids,
             positions,
             return_logits: false,
+            aux,
         };
         let out = self.exec.execute(&step)?;
         self.stats.steps += 1;

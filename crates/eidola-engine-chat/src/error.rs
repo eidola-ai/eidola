@@ -11,6 +11,8 @@ pub enum ChatError {
     InvalidArtifact(String),
     /// The request lies outside the accepted chat-input domain.
     InvalidInput(String),
+    /// The request carries content the model is not served with (an image).
+    UnsupportedContent(String),
     /// Template evaluation failed (Jinja raised an error).
     Template(String),
     /// A token id the tokenizer does not define (a padded logit row, or beyond the
@@ -28,6 +30,7 @@ impl std::fmt::Display for ChatError {
             }
             ChatError::InvalidArtifact(m) => write!(f, "invalid model artifact: {m}"),
             ChatError::InvalidInput(m) => write!(f, "invalid chat input: {m}"),
+            ChatError::UnsupportedContent(m) => write!(f, "unsupported content: {m}"),
             ChatError::Template(m) => write!(f, "chat template error: {m}"),
             ChatError::UnknownToken(id) => {
                 write!(f, "token id {id} is outside the tokenizer's vocabulary")

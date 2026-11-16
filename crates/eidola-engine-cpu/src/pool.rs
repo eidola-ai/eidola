@@ -69,7 +69,7 @@ pub(crate) struct Tag {
 /// # Safety
 ///
 /// All-zero bytes must be a valid `Self`.
-unsafe trait Zeroable: Copy {}
+pub(crate) unsafe trait Zeroable: Copy {}
 
 // SAFETY: zero bytes are `0.0`, `0` and a `Tag` of two zero words.
 unsafe impl Zeroable for f32 {}
@@ -81,7 +81,7 @@ unsafe impl Zeroable for Tag {}
 /// `len` values in an allocation of their own: page-aligned and whole pages long, zero when
 /// made, and zeroed (then unlocked) before it is freed. Since no other allocation shares its
 /// pages, locking or unlocking them touches nothing else.
-struct PageBuf<T: Zeroable> {
+pub(crate) struct PageBuf<T: Zeroable> {
     ptr: NonNull<T>,
     len: usize,
     /// The allocation; `None` for an empty buffer, which owns no memory.
@@ -95,7 +95,7 @@ unsafe impl<T: Zeroable + Send> Send for PageBuf<T> {}
 unsafe impl<T: Zeroable + Sync> Sync for PageBuf<T> {}
 
 impl<T: Zeroable> PageBuf<T> {
-    fn zeroed(len: usize) -> Self {
+    pub(crate) fn zeroed(len: usize) -> Self {
         let bytes = len
             .checked_mul(std::mem::size_of::<T>())
             .expect("a pool's size fits in usize");
@@ -134,7 +134,7 @@ impl<T: Zeroable> PageBuf<T> {
         }
     }
 
-    fn lock(&mut self) -> std::io::Result<()> {
+    pub(crate) fn lock(&mut self) -> std::io::Result<()> {
         if let Some(l) = self.layout {
             // SAFETY: exactly this buffer's allocation, whole pages no other allocation uses.
             unsafe { rustix::mm::mlock(self.ptr.as_ptr().cast(), l.size()) }?;
@@ -143,7 +143,7 @@ impl<T: Zeroable> PageBuf<T> {
         Ok(())
     }
 
-    fn unlock(&mut self) {
+    pub(crate) fn unlock(&mut self) {
         if let (true, Some(l)) = (std::mem::take(&mut self.locked), self.layout) {
             // SAFETY: exactly this buffer's allocation, locked by `lock`; its pages are its
             // own, so no other allocation's lock is released. An error leaves them locked

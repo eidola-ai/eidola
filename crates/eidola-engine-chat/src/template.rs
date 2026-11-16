@@ -78,7 +78,13 @@ pub struct Prompt {
 }
 
 impl Prompt {
-    /// The prompt text, byte-identical to `apply_chat_template`'s.
+    /// A prompt from its text and data spans (ascending, disjoint, non-empty,
+    /// on character boundaries).
+    pub(crate) fn from_parts(text: String, data: Vec<Range<usize>>) -> Prompt {
+        Prompt { text, data }
+    }
+
+    /// The prompt text, byte-identical to the reference rendering's.
     pub fn text(&self) -> &str {
         &self.text
     }

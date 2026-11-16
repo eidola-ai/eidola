@@ -15,6 +15,7 @@ pub mod attention;
 pub mod bf16;
 pub mod device;
 pub mod draft;
+pub mod ds;
 pub mod engine_ops;
 pub mod executor;
 pub mod gemm;

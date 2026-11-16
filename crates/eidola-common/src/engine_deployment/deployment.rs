@@ -19,10 +19,10 @@ use std::collections::BTreeMap;
 
 use super::{
     Architecture, CacheConfig, ExecutorSettings, GpuCc, MeasuredConfig, ModelPack, WeightsStorage,
-    artifact_data_bytes, check_container_gpu_access, check_cvm_image, check_env_names,
-    check_gpu_attestation, check_kernels_dir, check_resources, check_secrets, check_shim_paths,
-    check_vm_resources, check_weights_pack, env, is_safe_component, parse_cvm_version,
-    parse_measured,
+    artifact_data_bytes, check_container_gpu_access, check_cvm_image, check_device_resources,
+    check_env_names, check_gpu_attestation, check_kernels_dir, check_resources, check_secrets,
+    check_shim_paths, check_vm_resources, check_weights_pack, env, is_safe_component,
+    parse_cvm_version, parse_measured,
 };
 
 /// The image every engine deployment runs, pinned by digest.
@@ -355,26 +355,49 @@ pub fn check_deployment(
         .ok_or_else(|| format!("{at}: the weights pack has no artifact reference"))?;
     // The CUDA executor drafts with the architecture's MTP layers, one per
     // depth: no wider than the checkpoint ships.
-    let shape = side.architecture.shape();
-    if measured.sizing.draft_tokens > shape.mtp_layers {
+    let mtp_layers = side.architecture.mtp_layers();
+    if measured.sizing.draft_tokens > mtp_layers {
         return Err(format!(
-            "{at}: {} is {}, more than {}'s {} MTP layers",
+            "{at}: {} is {}, more than {}'s {mtp_layers} MTP layers",
             env::DRAFT_TOKENS,
             measured.sizing.draft_tokens,
             side.architecture,
-            shape.mtp_layers
         ));
     }
-    check_resources(
-        shape,
-        &measured.sizing,
-        &measured.cache,
-        &measured.executor,
-        measured.kv_host_bytes,
-        weights_bytes,
-        c.memory,
-        c.gpus.unwrap_or(0),
-    )
+    // One KV budget per device the architecture runs on: a one-device
+    // model's by the single-device rule, a split model's device by device.
+    match side.architecture.devices() {
+        [shape] => {
+            let budgets = measured.executor.kv_device_budgets().len();
+            if budgets != 1 {
+                return Err(format!(
+                    "{at}: {} names {budgets} budgets, but {} runs on one device",
+                    env::KV_DEVICE_BYTES,
+                    side.architecture
+                ));
+            }
+            check_resources(
+                shape,
+                &measured.sizing,
+                &measured.cache,
+                &measured.executor,
+                measured.kv_host_bytes,
+                weights_bytes,
+                c.memory,
+                c.gpus.unwrap_or(0),
+            )
+        }
+        devices => check_device_resources(
+            devices,
+            &measured.sizing,
+            &measured.cache,
+            &measured.executor,
+            measured.kv_host_bytes,
+            weights_bytes,
+            c.memory,
+            c.gpus.unwrap_or(0),
+        ),
+    }
     .map_err(|e| format!("{at}: {e}"))?;
 
     Ok(Deployment {
@@ -1052,5 +1075,173 @@ shim:
         extra["igvm"]["tdx_launch"]["rtmr4"] = zero.clone().into();
         let extra = serde_json::to_vec(&extra).unwrap();
         assert!(err(&cvm(&extra, "0.0.0-test+gpu"), &extra).contains("unknown field"));
+    }
+
+    const MIMO_CONFIG: &[u8] =
+        include_bytes!("../../../../deploy/engine/mimo-v2.6-flash/b300x1/tinfoil-config.yml");
+    const MIMO_SIDECAR: &[u8] =
+        include_bytes!("../../../../deploy/engine/mimo-v2.6-flash/b300x1/deployment.json");
+
+    /// The committed MiMo-V2.6-Flash deployment reads as it always has: one
+    /// device, its one KV budget, its pack and sidecar.
+    #[test]
+    fn the_committed_mimo_deployment_is_unchanged() {
+        let d = check_deployment("config", MIMO_CONFIG, "sidecar", MIMO_SIDECAR).unwrap();
+        let hash = "2a94a85c36b9d4d29ef733142091f88853fcce4d9f3ca4a1725dbfabab7f1dec";
+        assert_eq!(d.architecture, Architecture::MimoV26Flash);
+        assert_eq!(
+            d.cvm_version,
+            "0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f"
+        );
+        let m = &d.measured;
+        assert_eq!(
+            (m.model_id.as_str(), m.weights_sha256.as_str()),
+            (hash, hash)
+        );
+        assert_eq!(m.weights_dir, "/tinfoil/models/weights");
+        assert_eq!(m.weights_storage, WeightsStorage::VerifiedReadonly);
+        assert_eq!(
+            m.executor,
+            ExecutorSettings::Cuda {
+                kernels_dir: "/opt/eidola/kernels".into(),
+                kv_device_bytes: 85_899_345_920,
+                further_kv_device_bytes: Vec::new(),
+                graphs: super::super::CudaGraphs::On,
+                gpu_cc: GpuCc::Required,
+            }
+        );
+        assert_eq!(m.bind_addr, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(
+            m.sizing,
+            super::super::Sizing {
+                kv_block_size: 16,
+                max_model_len: 1 << 20,
+                max_seqs: 64,
+                max_batched_tokens: 8192,
+                max_prefill_chunk: 4096,
+                draft_tokens: 3,
+                max_requests: 64,
+            }
+        );
+        assert_eq!(
+            m.cache,
+            CacheConfig {
+                enabled: true,
+                idle_ttl_secs: 900,
+                max_age_secs: 7200
+            }
+        );
+        assert_eq!(m.kv_host_bytes, 64 << 30);
+        assert_eq!(d.weights_repo, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD");
+        assert_eq!(
+            d.weights_revision,
+            "2479e2d0029eca9a34cc7e7f55a121925f81908e"
+        );
+        assert_eq!(d.expected_gpus, Some(1));
+        let tdx = d.tdx.unwrap();
+        assert_eq!(
+            (tdx.release.as_str(), tdx.policy.as_str()),
+            ("platform-v0.1.11", "tdx-b300-prod")
+        );
+    }
+
+    /// The MiMo deployment's shape for DeepSeek-V4.1-Flash on two B300s: two
+    /// GPUs attested, a KV budget per device, the published text-only pack,
+    /// a `max_model_len` context and steps of `step` tokens.
+    fn deepseek_stepped(kv: &str, gpus: u64, max_model_len: u32, step: u32) -> (String, String) {
+        let config = std::str::from_utf8(MIMO_CONFIG)
+            .unwrap()
+            .replace(
+                "EIDOLA_ENGINE_MAX_BATCHED_TOKENS: \"8192\"",
+                &format!("EIDOLA_ENGINE_MAX_BATCHED_TOKENS: \"{step}\""),
+            )
+            .replace("gpus: 1\n", &format!("gpus: {gpus}\n"))
+            .replace("\"85899345920\"", &format!("\"{kv}\""))
+            .replace(
+                "EIDOLA_ENGINE_MAX_MODEL_LEN: \"1048576\"",
+                &format!("EIDOLA_ENGINE_MAX_MODEL_LEN: \"{max_model_len}\""),
+            )
+            .replace(
+                "XiaomiMiMo/MiMo-V2.6-Flash-MOPD@2479e2d0029eca9a34cc7e7f55a121925f81908e",
+                "deepseek-ai/DeepSeek-V4.1-Flash-1017@08c8657f02291e11b6f6b63e0e16014f8e748518",
+            )
+            .replace("_177765052416_", "_510300000000_");
+        let sidecar = std::str::from_utf8(MIMO_SIDECAR)
+            .unwrap()
+            .replace("MimoV26Flash", "DeepSeekV41Flash")
+            .replace(
+                "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+                "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            )
+            .replace(
+                "2479e2d0029eca9a34cc7e7f55a121925f81908e",
+                "08c8657f02291e11b6f6b63e0e16014f8e748518",
+            )
+            .replace(
+                "\"expected_gpus\": 1",
+                &format!("\"expected_gpus\": {gpus}"),
+            );
+        (config, sidecar)
+    }
+
+    /// [`deepseek_stepped`] at the MiMo deployment's 8,192-token steps.
+    fn deepseek_deployment(kv: &str, gpus: u64, max_model_len: u32) -> (String, String) {
+        deepseek_stepped(kv, gpus, max_model_len, 8192)
+    }
+
+    #[test]
+    fn a_deepseek_deployment_names_a_budget_per_device_and_fits_each() {
+        let check = |kv: &str, gpus: u64| {
+            let (config, sidecar) = deepseek_deployment(kv, gpus, 1 << 17);
+            check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
+        };
+        let d = check("16000000000,8000000000", 2).unwrap();
+        // The whole 2^20 window with three drafts at 8,192-token steps: the
+        // step's index scratch alone leaves device 1 no room, at any budget.
+        let whole = |kv: &str, step: u32| {
+            let (config, sidecar) = deepseek_stepped(kv, 2, 1 << 20, step);
+            check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
+        };
+        let err = whole("16000000000,1000000000", 8192).unwrap_err();
+        assert!(
+            err.contains("device 1:") && err.contains("device memory"),
+            "{err}"
+        );
+        // At 4,096-token steps it fits. In blocks of 16, device 1's least is
+        // 65,537 bank blocks of 5,696 bytes beside 2,625 window blocks of
+        // 194,304 (64 seats of four windows of nine blocks and one more, and a
+        // step's 256).
+        let least = 65_537 * 5_696 + 2_625 * 194_304;
+        assert_eq!(least, 883_346_752);
+        whole("16000000000,8000000000", 4096).unwrap();
+        whole(&format!("16000000000,{least}"), 4096).unwrap();
+        let err = whole(&format!("16000000000,{}", least - 1), 4096).unwrap_err();
+        assert!(
+            err.contains("device 1:") && err.contains("smallest"),
+            "{err}"
+        );
+        assert_eq!(d.architecture, Architecture::DeepSeekV41Flash);
+        assert_eq!(
+            d.measured.executor.kv_device_budgets(),
+            [16_000_000_000, 8_000_000_000]
+        );
+        assert_eq!(d.expected_gpus, Some(2));
+        // One budget, or three, is the wrong device count.
+        let err = check("16000000000", 2).unwrap_err();
+        assert!(err.contains("names 1 budgets"), "{err}");
+        let err = check("16000000000,8000000000,8000000000", 3).unwrap_err();
+        assert!(err.contains("names 3 budgets"), "{err}");
+        // One GPU for two devices.
+        let err = check("16000000000,8000000000", 1).unwrap_err();
+        assert!(err.contains("runs on 2 GPUs"), "{err}");
+        // Device 1 holds more weights than device 0, so less KV.
+        let err = check("16000000000,16000000000", 2).unwrap_err();
+        assert!(err.contains("device 1:"), "{err}");
+        // A MiMo deployment naming two budgets is refused too.
+        let two = std::str::from_utf8(MIMO_CONFIG)
+            .unwrap()
+            .replace("\"85899345920\"", "\"85899345920,85899345920\"");
+        let err = check_deployment("config", two.as_bytes(), "sidecar", MIMO_SIDECAR).unwrap_err();
+        assert!(err.contains("runs on one device"), "{err}");
     }
 }

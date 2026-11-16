@@ -37,12 +37,13 @@ use eidola_engine::engine::SchedulerConfig;
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::secret::SaltDeriver;
 use eidola_engine::spec::Bucket;
+use eidola_engine_cpu::deepseek::{DsCpuExecutor, DsCpuExecutorConfig};
 use eidola_engine_cpu::{CpuExecutor, CpuExecutorConfig, MtpHidden};
 use tokio::sync::oneshot;
 
 use crate::config::{Config, ExecutorConfig};
 use crate::http::AppState;
-use crate::model::LoadedModel;
+use crate::model::{LoadedModel, Served};
 use crate::worker::{Admission, EngineHandle};
 
 /// How often an idle engine sweeps the prefix cache for expired entries.
@@ -262,6 +263,100 @@ fn cpu_host_blocks(
     Ok(blocks as u32)
 }
 
+/// Refuses unless `EIDOLA_ENGINE_KV_DEVICE_BYTES` names one budget for each device the
+/// served architecture runs on (`eidola_common::architecture::Architecture::devices`):
+/// the node opens exactly the devices its configuration names, device `d` on GPU `d`.
+pub fn check_device_budgets(
+    architecture: eidola_common::architecture::Architecture,
+    budgets: usize,
+) -> Result<(), BootError> {
+    let devices = architecture.devices().len();
+    if budgets == devices {
+        Ok(())
+    } else {
+        Err(BootError(format!(
+            "{} names {budgets} device budgets; {architecture} runs on {devices}",
+            config::env::KV_DEVICE_BYTES
+        )))
+    }
+}
+
+/// The engine core's scheduler configuration for `sizing` and `cache` over `model`: the
+/// node's, whichever executor runs it.
+pub fn scheduler_config(
+    sizing: &config::Sizing,
+    cache: &config::CacheConfig,
+    model: &LoadedModel,
+) -> SchedulerConfig {
+    SchedulerConfig {
+        max_batched_tokens: sizing.max_batched_tokens,
+        max_seqs: sizing.max_seqs,
+        max_prefill_chunk: sizing.max_prefill_chunk,
+        eos_token_ids: model.tokenizer().eos_token_ids().to_vec(),
+        speculative: sizing.draft_tokens > 0,
+        cache: CachePolicy {
+            enabled: cache.enabled,
+            idle_ttl_ms: cache.idle_ttl_secs * 1000,
+            max_age_ms: cache.max_age_secs * 1000,
+        },
+        sweep_interval_ms: SWEEP_INTERVAL.as_millis() as u64,
+    }
+}
+
+/// The DeepSeek-V4.1 CPU executor's configuration: one captured shape, as for MiMo; every
+/// group `kv_blocks` blocks. Refuses what the executor would panic on: a block size the
+/// pooling ratios do not divide, or more drafts than the drafter's slots (or any, without
+/// a drafter). A host tier is not offered for this executor.
+pub fn deepseek_cpu_config(
+    ds: &eidola_engine_model::deepseek::DsConfig,
+    sizing: &config::Sizing,
+    kv_blocks: u32,
+    kv_host_bytes: u64,
+    sampleable_vocab_size: u32,
+) -> Result<DsCpuExecutorConfig, BootError> {
+    if let Some(ratio) = ds
+        .layers
+        .iter()
+        .map(|l| l.compress_ratio as u32)
+        .find(|&r| r > 1 && !sizing.kv_block_size.is_multiple_of(r))
+    {
+        return Err(BootError(format!(
+            "{} ({}) must be a multiple of the model's pooling ratio {ratio}",
+            config::env::KV_BLOCK_SIZE,
+            sizing.kv_block_size
+        )));
+    }
+    let slots = ds.drafter.as_ref().map_or(0, |d| d.slots as u32);
+    if sizing.draft_tokens > slots {
+        return Err(BootError(format!(
+            "{} ({}) exceeds the model's {slots} draft slots",
+            config::env::DRAFT_TOKENS,
+            sizing.draft_tokens
+        )));
+    }
+    if kv_host_bytes > 0 {
+        return Err(BootError(format!(
+            "{} must be 0: the DeepSeek-V4.1 cpu executor takes no host tier",
+            config::env::KV_HOST_BYTES
+        )));
+    }
+    Ok(DsCpuExecutorConfig {
+        block_size: sizing.kv_block_size,
+        num_blocks: kv_blocks,
+        window_blocks: kv_blocks,
+        host_blocks: 0,
+        num_state_slots: sizing.max_seqs,
+        max_model_len: sizing.max_model_len,
+        buckets: vec![Bucket {
+            max_seqs: sizing.max_seqs,
+            max_tokens: sizing.max_batched_tokens,
+        }],
+        draft_width: sizing.draft_tokens,
+        sampleable_vocab_size,
+        record: false,
+    })
+}
+
 /// Starts the node over an already verified model. Refuses unless the model's verified
 /// weights hash is the one `config` expects.
 pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError> {
@@ -276,7 +371,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         ));
     }
     let sizing = config.sizing;
-    let max_positions = u32::try_from(model.config().max_position_embeddings).unwrap_or(u32::MAX);
+    let max_positions = model.max_positions();
     if sizing.max_model_len > max_positions {
         return Err(BootError(format!(
             "{} ({}) exceeds the model's max_position_embeddings ({max_positions})",
@@ -284,24 +379,88 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
             sizing.max_model_len
         )));
     }
-    let sampleable_vocab_size = model.tokenizer().vocab_size() as u32;
-    let scheduler = SchedulerConfig {
-        max_batched_tokens: sizing.max_batched_tokens,
-        max_seqs: sizing.max_seqs,
-        max_prefill_chunk: sizing.max_prefill_chunk,
-        eos_token_ids: model.tokenizer().eos_token_ids().to_vec(),
-        speculative: sizing.draft_tokens > 0,
-        cache: CachePolicy {
-            enabled: config.cache.enabled,
-            idle_ttl_ms: config.cache.idle_ttl_secs * 1000,
-            max_age_ms: config.cache.max_age_secs * 1000,
-        },
-        sweep_interval_ms: SWEEP_INTERVAL.as_millis() as u64,
-    };
+    let sampleable_vocab_size = model.sampleable_vocab_size();
+    let scheduler = scheduler_config(&sizing, &config.cache, &model);
 
     let (stopped_tx, stopped_rx) = oneshot::channel();
-    let (engine, device) = match &config.executor {
-        ExecutorConfig::Cpu { kv_blocks } => {
+    let (engine, device) = match (&config.executor, model.served()) {
+        (
+            ExecutorConfig::Cpu { kv_blocks },
+            Served::DeepSeek {
+                config: ds,
+                model: reference,
+                ..
+            },
+        ) => {
+            let reference = reference.clone().ok_or_else(|| {
+                BootError("the loaded model has no reference weights for the cpu executor".into())
+            })?;
+            let exec_config = deepseek_cpu_config(
+                ds,
+                &sizing,
+                *kv_blocks,
+                config.kv_host_bytes,
+                sampleable_vocab_size,
+            )?;
+            let engine = worker::spawn(
+                move || {
+                    // The executor panics on a shape it does not run; the checks above
+                    // refuse every configuration the node can be given that would.
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        DsCpuExecutor::new(reference, exec_config)
+                    }))
+                    .map_err(|_| "the DeepSeek-V4.1 executor refused this model".to_string())
+                },
+                scheduler,
+                SWEEP_INTERVAL,
+                stopped_tx,
+            );
+            (engine, None)
+        }
+        // DeepSeek-V4.1 on two GPUs, device `d` on GPU `d`. Never a fallback: a refusal
+        // here ends the boot.
+        #[cfg(feature = "cuda")]
+        (
+            ExecutorConfig::Cuda {
+                kernels_dir,
+                kv_device_bytes,
+                further_kv_device_bytes,
+                graphs,
+                gpu_cc,
+            },
+            Served::DeepSeek { .. },
+        ) => {
+            check_device_budgets(model.architecture(), 1 + further_kv_device_bytes.len())?;
+            let budgets = [*kv_device_bytes, further_kv_device_bytes[0]];
+            let prepared = cuda::prepare_deepseek(
+                &model,
+                &sizing,
+                &config.cache,
+                kernels_dir,
+                budgets,
+                config.kv_host_bytes,
+                *graphs,
+                *gpu_cc,
+            )?;
+            let report = prepared.report();
+            let c = prepared.config();
+            tracing::info!(
+                devices = ?c.devices,
+                bank_kv_blocks = c.num_blocks,
+                window_kv_blocks = c.window_blocks,
+                host_kv_blocks = c.host_blocks,
+                draft_tokens = c.draft_width,
+                "loading the model onto the devices"
+            );
+            let engine = worker::spawn(
+                move || prepared.build(),
+                scheduler,
+                SWEEP_INTERVAL,
+                stopped_tx,
+            );
+            (engine, Some(report))
+        }
+        (ExecutorConfig::Cpu { kv_blocks }, Served::Mimo { .. }) => {
             let reference = model.reference().cloned().ok_or_else(|| {
                 BootError("the loaded model has no reference weights for the cpu executor".into())
             })?;
@@ -342,12 +501,17 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         }
         // Never a fallback: a refusal here ends the boot.
         #[cfg(feature = "cuda")]
-        ExecutorConfig::Cuda {
-            kernels_dir,
-            kv_device_bytes,
-            graphs,
-            gpu_cc,
-        } => {
+        (
+            ExecutorConfig::Cuda {
+                kernels_dir,
+                kv_device_bytes,
+                further_kv_device_bytes,
+                graphs,
+                gpu_cc,
+            },
+            Served::Mimo { .. },
+        ) => {
+            check_device_budgets(model.architecture(), 1 + further_kv_device_bytes.len())?;
             let prepared = cuda::prepare(
                 &model,
                 &sizing,
@@ -409,4 +573,24 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         weights_hash,
         engine_stopped: stopped_rx,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eidola_common::architecture::Architecture;
+
+    #[test]
+    fn a_node_names_one_budget_per_device() {
+        assert!(check_device_budgets(Architecture::MimoV26Flash, 1).is_ok());
+        assert!(check_device_budgets(Architecture::DeepSeekV41Flash, 2).is_ok());
+        for (arch, n) in [
+            (Architecture::MimoV26Flash, 2),
+            (Architecture::DeepSeekV41Flash, 1),
+            (Architecture::DeepSeekV41Flash, 3),
+        ] {
+            let e = check_device_budgets(arch, n).unwrap_err();
+            assert!(e.0.contains("device budgets"), "{e}");
+        }
+    }
 }

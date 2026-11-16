@@ -10,7 +10,7 @@ pub fn bf16_to_f32(bits: u16) -> f32 {
 
 /// OCP FP8 E4M3 ("e4m3fn"): bias 7, no infinities, `S.1111.111` is NaN,
 /// largest finite magnitude 448.
-pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
+pub const fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     FP8_E4M3_TABLE[bits as usize]
 }
 

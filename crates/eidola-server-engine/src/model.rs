@@ -3,13 +3,21 @@
 //!
 //! # The weights hash
 //!
-//! A node's weights hash identifies every file it reads from the weights directory:
+//! A node's weights hash identifies every covered file the weights directory holds, and
+//! so every file it reads from it:
 //!
 //! * every `*.safetensors` file in the directory (the shards);
 //! * `config.json`, and `model.safetensors.index.json` when present (the model crate's
 //!   semantic files, which decide how the shards are read);
-//! * `tokenizer.json`, `chat_template.jinja` and `generation_config.json` (the chat
-//!   artifacts, which decide the prompt, the EOS ids and the default sampling).
+//! * `tokenizer.json`, `chat_template.jinja` and `generation_config.json` when present
+//!   (the chat artifacts, which decide the prompt, the EOS ids and the default sampling).
+//!
+//! The names are `eidola_common::weights_manifest`'s, the same for every architecture;
+//! which of them must be present is the served architecture's
+//! (`weights_manifest::required_files`): MiMo-V2.6 reads all three chat artifacts, while
+//! DeepSeek-V4.1 encodes its prompt with a compiled-in encoder and reads its EOS id from
+//! `config.json`, so it needs only the tokenizer (and reads `generation_config.json` when
+//! there is one). A covered file the node does not read is hashed all the same.
 //!
 //! The **manifest** is one line per file, `<sha256 hex, lowercase>  <file name>\n` (two
 //! spaces, as `sha256sum` prints), sorted by file name in byte order. The weights hash is
@@ -33,18 +41,26 @@
 //! and parsed from the bytes that were hashed. The hash is checked **before** any weight
 //! is dequantised or copied to a device.
 //!
-//! What is loaded depends on the executor: the CPU executor runs the f32 reference model,
-//! dequantised here; the CUDA executor copies the checkpoint to the device as stored, from
-//! the same verified mapping ([`LoadedModel::store`]), so no reference model is built.
+//! The architecture is `config.json`'s `model_type`, read after the hash is checked:
+//! `deepseek_v41` is DeepSeek-V4.1-Flash, and anything else is read as MiMo-V2.6, whose
+//! configuration parser refuses what it is not.
+//!
+//! What is loaded depends on the executor: the CPU executor runs the reference model,
+//! built here (MiMo's dequantised to f32; DeepSeek's from the model crate's DeepSeek
+//! loader); the CUDA executor copies the checkpoint to the device as stored, from the
+//! same verified mapping ([`LoadedModel::store`]), so no reference model is built.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use eidola_common::architecture::Architecture;
+use eidola_common::weights_manifest;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine_chat::template::CHAT_TEMPLATE_FILE;
-use eidola_engine_chat::tokenizer::{GENERATION_CONFIG_FILE, TOKENIZER_FILE};
-use eidola_engine_chat::{ChatTemplate, MimoTokenizer};
+use eidola_engine_chat::tokenizer::{CONFIG_FILE, GENERATION_CONFIG_FILE, TOKENIZER_FILE};
+use eidola_engine_chat::{ChatFormat, ChatTemplate, MimoTokenizer, Tokenizer};
+use eidola_engine_model::deepseek::{DsConfig, DsLoadOptions, DsModel, DsWeights};
 use eidola_engine_model::safetensors::{SEMANTIC_FILES, WeightSet};
 use eidola_engine_model::{LoadOptions, ModelConfig, ModelWeights, ReferenceModel};
 use sha2::{Digest, Sha256};
@@ -53,6 +69,15 @@ use crate::config::{ExecutorKind, WeightsStorage};
 
 /// The chat artifacts the weights hash covers besides the model crate's files.
 pub const CHAT_FILES: [&str; 3] = [TOKENIZER_FILE, CHAT_TEMPLATE_FILE, GENERATION_CONFIG_FILE];
+
+/// `config.json`'s `model_type` for DeepSeek-V4.1.
+pub const DEEPSEEK_V4_1_MODEL_TYPE: &str = "deepseek_v41";
+
+/// A tensor of DeepSeek-V4.1's Engram compressed-vocabulary map (one `int32` or `int64`
+/// per token id). The node derives the map from the tokenizer, as the reference does
+/// (`eidola_engine_chat::deepseek_v4_1::compressed_vocab`); shards that carry this tensor
+/// too must carry exactly the derived map, or the model is refused.
+pub const ENGRAM_TOKEN_MAP_TENSOR: &str = "engram.token_map";
 
 /// Why the model could not be loaded. Every message is authored here from file names and
 /// fixed text; none carries request data (there is none at boot).
@@ -106,6 +131,14 @@ pub struct GenerationDefaults {
 }
 
 impl GenerationDefaults {
+    /// The defaults without a `generation_config.json`: temperature and `top_p` 1.0, no
+    /// `top_k`.
+    pub const NONE: GenerationDefaults = GenerationDefaults {
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: 0,
+    };
+
     fn parse(bytes: &[u8]) -> Result<Self, ModelError> {
         let bad = |m: &str| ModelError(format!("{GENERATION_CONFIG_FILE}: {m}"));
         let v: serde_json::Value =
@@ -137,6 +170,28 @@ impl GenerationDefaults {
     }
 }
 
+/// What the node serves, per architecture.
+// One value per process: the variants' sizes do not matter.
+#[allow(clippy::large_enum_variant)]
+pub enum Served {
+    /// MiMo-V2.6-Flash: its configuration, the f32 reference model (CPU executor only)
+    /// and the model's chat template.
+    Mimo {
+        config: ModelConfig,
+        reference: Option<Arc<ReferenceModel>>,
+        template: ChatTemplate,
+    },
+    /// DeepSeek-V4.1-Flash, text only: its configuration, the Engram compressed-vocabulary
+    /// map when the model has Engram layers (`engram_token_map`, for either executor), and
+    /// the reference model (CPU executor only). The prompt encoder is compiled into the
+    /// chat crate.
+    DeepSeek {
+        config: DsConfig,
+        token_map: Option<Vec<u32>>,
+        model: Option<Arc<DsModel>>,
+    },
+}
+
 /// The model this node serves, verified against its expected weights hash and loaded.
 ///
 /// Only [`LoadedModel::load`] constructs one, and it checks the hash first, so holding a
@@ -144,13 +199,11 @@ impl GenerationDefaults {
 pub struct LoadedModel {
     weights_hash: String,
     storage: WeightsStorage,
-    config: ModelConfig,
+    architecture: Architecture,
+    served: Served,
     /// The verified shards, memory-mapped.
     store: Arc<WeightSet>,
-    /// The f32 reference model, loaded for the CPU executor only.
-    reference: Option<Arc<ReferenceModel>>,
-    tokenizer: MimoTokenizer,
-    template: ChatTemplate,
+    tokenizer: Tokenizer,
     defaults: GenerationDefaults,
 }
 
@@ -209,11 +262,16 @@ impl LoadedModel {
             ));
         }
         let mut manifest = store.sha256_manifest();
-        if !manifest.contains_key("config.json") {
+        if !manifest.contains_key(CONFIG_FILE) {
             return Err(ModelError("config.json is missing".into()));
         }
+        // Every chat artifact the directory holds is hashed (and read once, from the
+        // bytes hashed); which of them the architecture needs is checked after the hash.
         let mut chat: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
         for name in CHAT_FILES {
+            if !inventory.others.iter().any(|n| n == name) {
+                continue;
+            }
             let path = dir.join(name);
             let bytes = std::fs::read(&path)
                 .map_err(|e| ModelError(format!("cannot read {name}: {}", e.kind())))?;
@@ -227,45 +285,115 @@ impl LoadedModel {
             )));
         }
 
-        let config = store
-            .model_config()
-            .map_err(|e| ModelError(format!("config.json: {e}")))?;
-        let store = Arc::new(store);
-        let reference = match executor {
-            ExecutorKind::Cpu => {
-                let weights =
-                    ModelWeights::load(store.clone(), config.clone(), &LoadOptions::default())
-                        .map_err(|e| ModelError(format!("cannot load the weights: {e}")))?;
-                Some(Arc::new(ReferenceModel::new(weights)))
+        let config_bytes = store
+            .semantic_file(CONFIG_FILE)
+            .expect("hashed above")
+            .to_vec();
+        let architecture = architecture_of(&config_bytes)?;
+        for name in weights_manifest::required_files(architecture) {
+            if !manifest.contains_key(*name) {
+                return Err(ModelError(format!("{name} is missing")));
             }
-            #[cfg(feature = "cuda")]
-            ExecutorKind::Cuda => None,
-        };
-
-        let tokenizer =
-            MimoTokenizer::from_bytes(&chat[TOKENIZER_FILE], &chat[GENERATION_CONFIG_FILE])
-                .map_err(|e| ModelError(e.to_string()))?;
-        let template_source = String::from_utf8(chat.remove(CHAT_TEMPLATE_FILE).expect("read"))
-            .map_err(|_| ModelError(format!("{CHAT_TEMPLATE_FILE} is not UTF-8")))?;
-        let template =
-            ChatTemplate::from_source(template_source).map_err(|e| ModelError(e.to_string()))?;
-        let defaults = GenerationDefaults::parse(&chat[GENERATION_CONFIG_FILE])?;
-
-        let vocab = tokenizer.vocab_size();
-        if vocab > config.vocab_size {
-            return Err(ModelError(format!(
-                "the tokenizer defines {vocab} ids but the model's head has only {} rows",
-                config.vocab_size
-            )));
         }
+        let store = Arc::new(store);
+        let (served, tokenizer, defaults) = match architecture {
+            Architecture::DeepSeekV41Flash => {
+                let config = eidola_engine_model::deepseek::config_of(&store)
+                    .map_err(|e| ModelError(format!("config.json: {e}")))?;
+                let tokenizer = Tokenizer::for_format(
+                    ChatFormat::DeepSeekV4_1,
+                    &chat[TOKENIZER_FILE],
+                    &config_bytes,
+                )
+                .map_err(|e| ModelError(e.to_string()))?;
+                let defaults = match chat.get(GENERATION_CONFIG_FILE) {
+                    Some(bytes) => GenerationDefaults::parse(bytes)?,
+                    None => GenerationDefaults::NONE,
+                };
+                if tokenizer.vocab_size() > config.vocab_size {
+                    return Err(ModelError(format!(
+                        "the tokenizer defines {} ids but the model's head has only {} rows",
+                        tokenizer.vocab_size(),
+                        config.vocab_size
+                    )));
+                }
+                let token_map = if config.engram.is_some() {
+                    Some(engram_token_map(&store, &tokenizer)?)
+                } else {
+                    None
+                };
+                let model = match executor {
+                    ExecutorKind::Cpu => Some(Arc::new(load_deepseek(
+                        &store,
+                        config.clone(),
+                        token_map.clone(),
+                    )?)),
+                    #[cfg(feature = "cuda")]
+                    ExecutorKind::Cuda => None,
+                };
+                (
+                    Served::DeepSeek {
+                        config,
+                        token_map,
+                        model,
+                    },
+                    tokenizer,
+                    defaults,
+                )
+            }
+            _ => {
+                let config = store
+                    .model_config()
+                    .map_err(|e| ModelError(format!("config.json: {e}")))?;
+                let reference = match executor {
+                    ExecutorKind::Cpu => {
+                        let weights = ModelWeights::load(
+                            store.clone(),
+                            config.clone(),
+                            &LoadOptions::default(),
+                        )
+                        .map_err(|e| ModelError(format!("cannot load the weights: {e}")))?;
+                        Some(Arc::new(ReferenceModel::new(weights)))
+                    }
+                    #[cfg(feature = "cuda")]
+                    ExecutorKind::Cuda => None,
+                };
+
+                let tokenizer =
+                    MimoTokenizer::from_bytes(&chat[TOKENIZER_FILE], &chat[GENERATION_CONFIG_FILE])
+                        .map_err(|e| ModelError(e.to_string()))?;
+                let template_source =
+                    String::from_utf8(chat.remove(CHAT_TEMPLATE_FILE).expect("required"))
+                        .map_err(|_| ModelError(format!("{CHAT_TEMPLATE_FILE} is not UTF-8")))?;
+                let template = ChatTemplate::from_source(template_source)
+                    .map_err(|e| ModelError(e.to_string()))?;
+                let defaults = GenerationDefaults::parse(&chat[GENERATION_CONFIG_FILE])?;
+
+                let vocab = tokenizer.vocab_size();
+                if vocab > config.vocab_size {
+                    return Err(ModelError(format!(
+                        "the tokenizer defines {vocab} ids but the model's head has only {} rows",
+                        config.vocab_size
+                    )));
+                }
+                (
+                    Served::Mimo {
+                        config,
+                        reference,
+                        template,
+                    },
+                    tokenizer,
+                    defaults,
+                )
+            }
+        };
         Ok(LoadedModel {
             weights_hash: actual,
             storage,
-            config,
+            architecture,
+            served,
             store,
-            reference,
             tokenizer,
-            template,
             defaults,
         })
     }
@@ -280,9 +408,56 @@ impl LoadedModel {
         self.storage
     }
 
-    /// The model's configuration (`config.json`, verified).
+    /// The architecture served, from the verified `config.json`.
+    pub fn architecture(&self) -> Architecture {
+        self.architecture
+    }
+
+    /// What is served, per architecture.
+    pub fn served(&self) -> &Served {
+        &self.served
+    }
+
+    /// The chat format of the architecture served.
+    pub fn format(&self) -> ChatFormat {
+        match self.served {
+            Served::Mimo { .. } => ChatFormat::MimoV2_6,
+            Served::DeepSeek { .. } => ChatFormat::DeepSeekV4_1,
+        }
+    }
+
+    /// The longest sequence the model's positions allow (`max_position_embeddings`).
+    pub fn max_positions(&self) -> u32 {
+        let n = match &self.served {
+            Served::Mimo { config, .. } => config.max_position_embeddings,
+            Served::DeepSeek { config, .. } => config.max_positions.unwrap_or(usize::MAX),
+        };
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// The token ids the model may emit (the engine's `sampleable_vocab_size`): the
+    /// tokenizer's ids, and for DeepSeek-V4.1 only those below its image token, which the
+    /// text model cannot embed (the ids from it on are the vision tower's).
+    pub fn sampleable_vocab_size(&self) -> u32 {
+        let vocab = self.tokenizer.vocab_size() as u32;
+        match &self.served {
+            Served::Mimo { .. } => vocab,
+            Served::DeepSeek { config, .. } => {
+                config.image_token_id.map_or(vocab, |i| i.min(vocab))
+            }
+        }
+    }
+
+    /// MiMo-V2.6's configuration (`config.json`, verified).
+    ///
+    /// # Panics
+    ///
+    /// For another architecture; read [`LoadedModel::served`] for those.
     pub fn config(&self) -> &ModelConfig {
-        &self.config
+        match &self.served {
+            Served::Mimo { config, .. } => config,
+            Served::DeepSeek { .. } => panic!("a DeepSeek-V4.1 model has no MiMo configuration"),
+        }
     }
 
     /// The verified shards, memory-mapped: the bytes the weights hash covers.
@@ -290,21 +465,94 @@ impl LoadedModel {
         &self.store
     }
 
-    /// The f32 reference model (weights and numerics), when loaded for the CPU executor.
+    /// MiMo-V2.6's f32 reference model (weights and numerics), when loaded for the CPU
+    /// executor; `None` otherwise.
     pub fn reference(&self) -> Option<&Arc<ReferenceModel>> {
-        self.reference.as_ref()
+        match &self.served {
+            Served::Mimo { reference, .. } => reference.as_ref(),
+            Served::DeepSeek { .. } => None,
+        }
     }
 
     pub fn tokenizer(&self) -> &MimoTokenizer {
         &self.tokenizer
     }
 
+    /// MiMo-V2.6's chat template.
+    ///
+    /// # Panics
+    ///
+    /// For another architecture (DeepSeek-V4.1's prompt encoder is compiled in).
     pub fn template(&self) -> &ChatTemplate {
-        &self.template
+        match &self.served {
+            Served::Mimo { template, .. } => template,
+            Served::DeepSeek { .. } => panic!("a DeepSeek-V4.1 model has no chat template"),
+        }
     }
 
     pub fn defaults(&self) -> GenerationDefaults {
         self.defaults
+    }
+}
+
+/// The architecture `config.json` describes, by its `model_type` (module docs).
+fn architecture_of(config_json: &[u8]) -> Result<Architecture, ModelError> {
+    let v: serde_json::Value = serde_json::from_slice(config_json)
+        .map_err(|_| ModelError("config.json is not valid JSON".into()))?;
+    Ok(
+        match v.get("model_type").and_then(serde_json::Value::as_str) {
+            Some(DEEPSEEK_V4_1_MODEL_TYPE) => Architecture::DeepSeekV41Flash,
+            _ => Architecture::MimoV26Flash,
+        },
+    )
+}
+
+/// DeepSeek-V4.1's reference model over the verified shards, with its Engram map
+/// ([`engram_token_map`]) when the model has Engram layers. The vision tower's tensors are
+/// mapped with their shards but never read.
+fn load_deepseek(
+    store: &Arc<WeightSet>,
+    config: DsConfig,
+    token_map: Option<Vec<u32>>,
+) -> Result<DsModel, ModelError> {
+    let weights = DsWeights::load(store.clone(), config, &DsLoadOptions::default())
+        .map_err(|e| ModelError(format!("cannot load the weights: {e}")))?;
+    DsModel::new(weights, token_map)
+        .map_err(|e| ModelError(format!("cannot load the weights: {e}")))
+}
+
+/// The Engram compressed-vocabulary map: derived from the tokenizer, the reference's
+/// definition, and checked against [`ENGRAM_TOKEN_MAP_TENSOR`] when the shards carry one.
+/// The model crate checks its size against the config.
+fn engram_token_map(store: &WeightSet, tokenizer: &Tokenizer) -> Result<Vec<u32>, ModelError> {
+    let derived = eidola_engine_chat::deepseek_v4_1::compressed_vocab(tokenizer)
+        .map_err(|e| ModelError(format!("the Engram map: {e}")))?
+        .map;
+    let stored = match store.get(ENGRAM_TOKEN_MAP_TENSOR) {
+        Ok(view) => Some(
+            view.to_i64(ENGRAM_TOKEN_MAP_TENSOR)
+                .map_err(|e| ModelError(format!("{ENGRAM_TOKEN_MAP_TENSOR}: {e}")))?,
+        ),
+        Err(_) => None,
+    };
+    agreeing_token_map(derived, stored.as_deref())
+}
+
+/// `derived`, when the shards carry no map or carry exactly it.
+fn agreeing_token_map(derived: Vec<u32>, stored: Option<&[i64]>) -> Result<Vec<u32>, ModelError> {
+    match stored {
+        Some(stored)
+            if stored.len() != derived.len()
+                || stored
+                    .iter()
+                    .zip(&derived)
+                    .any(|(s, d)| *s != i64::from(*d)) =>
+        {
+            Err(ModelError(format!(
+                "the weights' {ENGRAM_TOKEN_MAP_TENSOR} is not the map the tokenizer derives"
+            )))
+        }
+        _ => Ok(derived),
     }
 }
 
@@ -432,6 +680,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_stored_engram_map_must_be_the_derived_one() {
+        let derived = vec![0, 1, 0, 2];
+        assert_eq!(
+            agreeing_token_map(derived.clone(), None),
+            Ok(derived.clone())
+        );
+        assert_eq!(
+            agreeing_token_map(derived.clone(), Some(&[0, 1, 0, 2])),
+            Ok(derived.clone())
+        );
+        for stored in [
+            &[0, 1, 0, 1][..],
+            &[0, 1, 0],
+            &[0, 1, 0, 2, 0],
+            &[0, 1, 0, 2 + (1 << 32)],
+        ] {
+            let refused = agreeing_token_map(derived.clone(), Some(stored)).unwrap_err();
+            assert!(refused.0.contains(ENGRAM_TOKEN_MAP_TENSOR), "{refused}");
+        }
+    }
+
+    #[test]
     fn manifest_is_sha256sum_layout_sorted_by_name() {
         let mut m = BTreeMap::new();
         m.insert("b.safetensors".to_string(), "AB".repeat(32));
@@ -458,7 +728,7 @@ mod tests {
     /// chat artifacts, the shard index optional, every other covered file a shard.
     #[test]
     fn the_hashed_files_are_the_catalogs() {
-        use eidola_common::weights_manifest::{OPTIONAL_FILES, REQUIRED_FILES};
+        use eidola_common::weights_manifest::{COVERED_FILES, OPTIONAL_FILES, REQUIRED_FILES};
         let mut node: Vec<&str> = SEMANTIC_FILES
             .iter()
             .chain(CHAT_FILES.iter())
@@ -472,7 +742,26 @@ mod tests {
             .collect();
         shared.sort_unstable();
         assert_eq!(node, shared);
+        let mut covered = COVERED_FILES.to_vec();
+        covered.sort_unstable();
+        assert_eq!(node, covered);
         assert_eq!(OPTIONAL_FILES, ["model.safetensors.index.json"]);
+    }
+
+    #[test]
+    fn the_architecture_is_the_configs_model_type() {
+        assert_eq!(
+            architecture_of(br#"{"model_type": "deepseek_v41"}"#).unwrap(),
+            Architecture::DeepSeekV41Flash
+        );
+        for other in [
+            &br#"{"model_type": "mimo_v2"}"#[..],
+            b"{}",
+            br#"{"model_type": 5}"#,
+        ] {
+            assert_eq!(architecture_of(other).unwrap(), Architecture::MimoV26Flash);
+        }
+        assert!(architecture_of(b"{").is_err());
     }
 
     /// Only names the offline `sha256sum` procedure reproduces byte for byte.

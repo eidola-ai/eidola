@@ -85,10 +85,35 @@ pub fn check(state: &CcState) -> Result<(), String> {
     }
 }
 
+/// Whether a node whose model runs on `needed` devices (device `d` on GPU `d`) may open
+/// them: the system state is the production one ([`check`]), and NVML reports at least
+/// `needed` GPUs (`reported`, `nvmlDeviceGetCount_v2`), so every GPU it opens is one the
+/// driver counts under that state. A GPU NVML does not report cannot have been reported
+/// in confidential-computing mode, so a shortfall is refused before any device opens.
+/// The CC state is system-wide, so one state covers every device. The one-device
+/// executor's boot runs [`check`] alone; a multi-device executor runs this, over
+/// [`query_devices`].
+pub fn check_devices(state: &CcState, reported: u32, needed: u32) -> Result<(), String> {
+    check(state)?;
+    if needed == 0 || reported < needed {
+        return Err(format!(
+            "the model runs on {needed} GPUs, and the driver reports {reported}"
+        ));
+    }
+    Ok(())
+}
+
 /// Queries the driver through NVML (`cuda` feature).
 #[cfg(feature = "cuda")]
 pub fn query() -> Result<CcState, String> {
-    nvml::query()
+    nvml::query(false).map(|(state, _)| state)
+}
+
+/// Queries the driver through NVML (`cuda` feature): the system state, and how many GPUs
+/// it reports (`nvmlDeviceGetCount_v2`), for [`check_devices`].
+#[cfg(feature = "cuda")]
+pub fn query_devices() -> Result<(CcState, u32), String> {
+    nvml::query(true).map(|(state, count)| (state, count.expect("asked for")))
 }
 
 #[cfg(feature = "cuda")]
@@ -121,8 +146,10 @@ mod nvml {
     type ErrorString = unsafe extern "C" fn(c_int) -> *const c_char;
     type GetState = unsafe extern "C" fn(*mut SystemState) -> c_int;
     type GetReadyState = unsafe extern "C" fn(*mut c_uint) -> c_int;
+    type GetCount = unsafe extern "C" fn(*mut c_uint) -> c_int;
 
-    pub(super) fn query() -> Result<CcState, String> {
+    /// The system state and, with `count`, the GPUs NVML reports.
+    pub(super) fn query(count: bool) -> Result<(CcState, Option<u32>), String> {
         // SAFETY: loading the driver's NVML runs its initialisers; it is the vendor's
         // library for this purpose, loaded by its documented soname.
         let lib = unsafe { libloading::Library::new(LIBRARY) }
@@ -142,6 +169,15 @@ mod nvml {
                 *lib.get::<GetReadyState>("nvmlSystemGetConfComputeGpusReadyState")
                     .map_err(|_| sym("nvmlSystemGetConfComputeGpusReadyState"))?,
             )
+        };
+        // SAFETY: resolved with the signature `nvml.h` declares for it.
+        let get_count = if count {
+            Some(unsafe {
+                *lib.get::<GetCount>("nvmlDeviceGetCount_v2")
+                    .map_err(|_| format!("{LIBRARY} has no nvmlDeviceGetCount_v2"))?
+            })
+        } else {
+            None
         };
         let failed = |call: &str, code: c_int| {
             // SAFETY: `nvmlErrorString` returns a static, NUL-terminated string for any
@@ -164,12 +200,16 @@ mod nvml {
         }
         let mut state = SystemState::default();
         let mut ready: c_uint = 0;
+        let mut devices: c_uint = 0;
         // SAFETY: NVML is initialised, and each pointer is to a live value of the type the
         // function fills.
         let result = unsafe {
             match get_state(&mut state) {
                 SUCCESS => match get_ready(&mut ready) {
-                    SUCCESS => Ok(()),
+                    SUCCESS => match get_count.map_or(SUCCESS, |f| f(&mut devices)) {
+                        SUCCESS => Ok(()),
+                        code => Err(failed("nvmlDeviceGetCount_v2", code)),
+                    },
                     code => Err(failed("nvmlSystemGetConfComputeGpusReadyState", code)),
                 },
                 code => Err(failed("nvmlSystemGetConfComputeState", code)),
@@ -178,12 +218,15 @@ mod nvml {
         // SAFETY: balances the successful `nvmlInit_v2` above.
         unsafe { shutdown() };
         result?;
-        Ok(CcState {
-            environment: state.environment,
-            cc_feature: state.cc_feature,
-            devtools_mode: state.dev_tools_mode,
-            ready_state: ready,
-        })
+        Ok((
+            CcState {
+                environment: state.environment,
+                cc_feature: state.cc_feature,
+                devtools_mode: state.dev_tools_mode,
+                ready_state: ready,
+            },
+            count.then_some(devices),
+        ))
     }
 }
 
@@ -257,6 +300,29 @@ mod tests {
             let err = check(&state).unwrap_err();
             assert!(err.contains(needle), "{state:?}: {err}");
         }
+    }
+
+    /// A model on several devices needs that many GPUs reported, each under the one
+    /// production state; the state is checked first.
+    #[test]
+    fn every_device_a_model_runs_on_is_reported() {
+        let ok = CcState::REQUIRED;
+        assert_eq!(check_devices(&ok, 1, 1), Ok(()));
+        assert_eq!(check_devices(&ok, 2, 2), Ok(()));
+        assert_eq!(check_devices(&ok, 8, 2), Ok(()));
+        let e = check_devices(&ok, 1, 2).unwrap_err();
+        assert!(
+            e.contains("runs on 2 GPUs, and the driver reports 1"),
+            "{e}"
+        );
+        assert!(check_devices(&ok, 0, 1).is_err());
+        assert!(check_devices(&ok, 2, 0).is_err());
+        let off = CcState {
+            cc_feature: 0,
+            ..ok
+        };
+        let e = check_devices(&off, 2, 2).unwrap_err();
+        assert!(e.starts_with("confidential computing"), "{e}");
     }
 
     /// With every field off, the refusal names the feature first.

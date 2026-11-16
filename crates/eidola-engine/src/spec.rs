@@ -39,6 +39,31 @@ pub enum KvRole {
     Drafter,
 }
 
+/// Which positions of a group hold valid KV.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coverage {
+    /// Every computed position: each block depends only on the tokens it covers and those
+    /// before it, so a full block is final and shareable.
+    All,
+    /// Only the positions the window chain computed ([`WindowChain`], and the row rule in
+    /// [`crate::executor`]): a block's contents depend on which rows ran how deep, so it
+    /// is never shared as a sealed block. The host caches such a group only as the windows
+    /// attached at retained hit points, where it is valid at every layer.
+    Chain,
+}
+
+/// A stack of sliding-window layers in which each layer's window keys at a position are a
+/// function of the layer below's output there, run only where its results can matter. The
+/// layers are those of the target group with [`Coverage::Chain`]; the row rule that says
+/// which layer computes which position is in [`crate::executor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowChain {
+    /// Layers in the chain, bottom first.
+    pub depth: u32,
+    /// Each layer's window: visible positions, including the query's own.
+    pub window: u32,
+}
+
 /// One KV group: a set of layers that share a block table and a physical block pool.
 ///
 /// All layers of a group have the same attention kind and KV shape, so one physical block
@@ -66,6 +91,26 @@ pub struct KvGroupSpec {
     /// entries demoted from `num_blocks` (the host tier), including a reserved null
     /// block 0; 0 when there is no host tier. Every group has a host tier or none does.
     pub host_blocks: u32,
+    /// Positions per entry (1: one entry per position). A block holds
+    /// `block_size / ratio` entries; entry `j` is pooled from positions
+    /// `ratio * j ..= ratio * j + ratio - 1`, is written when the last of them is
+    /// computed, and is visible to a query at `q` once `q` has reached that position.
+    /// `ratio` divides the block size, so no entry straddles a block. Only
+    /// full-attention groups pool.
+    pub ratio: u32,
+    /// The logical device holding this group's pool (0 for a single-device model). The
+    /// host only accounts memory by it; what crosses between devices is the executor's.
+    pub device: u32,
+    /// Which positions hold valid KV.
+    pub coverage: Coverage,
+}
+
+impl KvGroupSpec {
+    /// Entries of this group visible to a query at `q`, from the group's first:
+    /// full attention sees every completed entry.
+    pub fn visible_entries(&self, q: u32) -> u32 {
+        (q + 1) / self.ratio
+    }
 }
 
 /// A captured step shape: the executor can run any batch with at most `max_seqs`
@@ -111,6 +156,14 @@ pub struct ModelSpec {
     /// the scheduler plans against. Trade-off shapes (more sequences but fewer tokens)
     /// are refused by [`ModelSpec::validate`]: with them, no single bucket bounds a step.
     pub buckets: Vec<Bucket>,
+    /// The window chain, for a model whose upper layers run only where needed; `None`
+    /// for a model that runs every layer at every position.
+    pub window_chain: Option<WindowChain>,
+    /// Token ids before a row's first host token the executor needs beside KV (a
+    /// lookup addressed by the current token and the ones before it); 0 for none. The
+    /// host passes them with every row ([`crate::executor::StepAux::history_ids`]), so
+    /// no slot holds them.
+    pub token_history: u32,
 }
 
 /// Reserved physical block id in every group: never allocated and never written, so it
@@ -140,6 +193,41 @@ impl ModelSpec {
             "a logit row has vocab_size entries"
         );
         Logits::new(row, self.sampleable_vocab_size)
+    }
+
+    /// How far behind a target the chain's top layer starts: the widest window among
+    /// the [`Coverage::Chain`] groups, less the query's own position. 0 without a chain.
+    pub fn chain_top(&self) -> u32 {
+        self.kv_groups
+            .iter()
+            .filter(|g| g.coverage == Coverage::Chain)
+            .filter_map(|g| match g.attention {
+                AttentionKind::Sliding { window } => Some(window - 1),
+                AttentionKind::Full => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// How far behind a target the chain's bottom layer starts:
+    /// `chain_top + (depth - 1) * (window - 1)`. 0 without a chain.
+    pub fn chain_reach(&self) -> u32 {
+        match self.window_chain {
+            Some(c) => self.chain_top() + (c.depth - 1) * (c.window - 1),
+            None => 0,
+        }
+    }
+
+    /// The first position chain layer `layer` (0 = bottom) computes in a row whose top
+    /// layer starts at `chain_start` (the row rule of [`crate::executor`]).
+    pub fn chain_layer_start(&self, chain_start: u32, layer: u32) -> u32 {
+        let c = self.window_chain.expect("a model with a window chain");
+        chain_start.saturating_sub((c.depth - 1 - layer) * (c.window - 1))
+    }
+
+    /// Logical devices the groups name.
+    pub fn num_devices(&self) -> u32 {
+        self.kv_groups.iter().map(|g| g.device).max().unwrap_or(0) + 1
     }
 
     /// Whether the executor keeps a host tier for idle prefix-cache entries.
@@ -184,6 +272,48 @@ impl ModelSpec {
                 && window == 0
             {
                 return Err(format!("group {} has a zero window", g.name));
+            }
+            if g.ratio == 0 || !self.block_size.is_multiple_of(g.ratio) {
+                return Err(format!(
+                    "group {}: ratio {} must divide the block size {}",
+                    g.name, g.ratio, self.block_size
+                ));
+            }
+            if g.ratio != 1 && g.attention != AttentionKind::Full {
+                return Err(format!("group {}: only full attention pools", g.name));
+            }
+            if g.coverage == Coverage::Chain && g.attention == AttentionKind::Full {
+                return Err(format!(
+                    "group {}: a chain-covered group is a sliding window",
+                    g.name
+                ));
+            }
+        }
+        let chained = |role| {
+            self.kv_groups
+                .iter()
+                .filter(move |g| g.coverage == Coverage::Chain && g.role == role)
+        };
+        match self.window_chain {
+            None => {
+                if self.kv_groups.iter().any(|g| g.coverage == Coverage::Chain) {
+                    return Err("a chain-covered group needs a window chain".into());
+                }
+            }
+            Some(c) => {
+                if c.depth == 0 || c.window == 0 {
+                    return Err("the window chain needs a depth and a window".into());
+                }
+                let mut targets = chained(KvRole::Target);
+                let (Some(g), None) = (targets.next(), targets.next()) else {
+                    return Err("the window chain is exactly one chain-covered target group".into());
+                };
+                if g.attention != (AttentionKind::Sliding { window: c.window }) {
+                    return Err(format!(
+                        "group {} must slide by the chain's window {}",
+                        g.name, c.window
+                    ));
+                }
             }
         }
         let tiered = self.kv_groups.iter().filter(|g| g.host_blocks > 0).count();

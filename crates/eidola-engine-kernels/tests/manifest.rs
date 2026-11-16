@@ -174,6 +174,55 @@ fn sass_uses_the_intended_tensor_core_path() {
     }
 }
 
+/// A profile that turns contraction off is held to it: every cubin built under
+/// one records its floating-point operations, its PTX holds no fused
+/// multiply-add and no multiply, add or subtract left for ptxas to fuse, and
+/// no other cubin carries the record. The numerics probe without division is
+/// what shows ptxas fuses none itself: hundreds of rounded operations (the
+/// exponential's Horner steps, the pinned dots, the rotations) and not one
+/// fused multiply-add in its SASS; the full probe's are its divisions'.
+#[test]
+fn exact_profiles_fuse_no_multiply_add() {
+    let manifest = Manifest::embedded();
+    let mut exact = 0;
+    for cubin in &manifest.kernels {
+        let flags = &manifest.compile.profiles[&cubin.profile].flags;
+        let unfused = flags.iter().any(|f| f == "--fmad=false");
+        assert!(
+            !flags.iter().any(|f| f.contains("fast")) || !unfused,
+            "{}: a profile without contraction takes no fast-math flag",
+            cubin.profile
+        );
+        let Some(ops) = &cubin.float_ops else {
+            assert!(!unfused, "{} {}: no float_ops", cubin.name, cubin.arch);
+            continue;
+        };
+        assert!(unfused, "{} {}", cubin.name, cubin.arch);
+        assert_eq!(ops.ptx_fma, 0, "{} {}", cubin.name, cubin.arch);
+        assert_eq!(ops.ptx_unrounded, 0, "{} {}", cubin.name, cubin.arch);
+        exact += 1;
+    }
+    assert!(exact > 0);
+    assert_eq!(
+        manifest.compile.profiles["exact"].flags,
+        ["-std=c++17", "-O3", "--fmad=false"]
+    );
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        let nodiv = manifest.cubin("ds_probe_nodiv", arch).expect("probe");
+        let ops = nodiv.float_ops.as_ref().expect("float_ops");
+        assert!(ops.ptx_rounded > 500, "{arch}: {}", ops.ptx_rounded);
+        assert_eq!(ops.sass_fma, 0, "{arch}");
+        assert!(nodiv.mma_sass.is_empty(), "{arch}");
+        let full = manifest.cubin("ds_probe", arch).expect("probe");
+        assert!(
+            full.float_ops.as_ref().expect("float_ops").sass_fma > 0,
+            "{arch}"
+        );
+        assert_eq!(full.entries[0].symbol, "eidola_ds_probe");
+        assert_eq!(nodiv.entries[0].symbol, "eidola_ds_probe_nodiv");
+    }
+}
+
 /// Every kernel entry is bound to exactly one launch-contract record and every
 /// record to exactly one entry; entries we wrote ourselves keep their unmangled
 /// names and `<entry>_meta` records; mangled entries are bound by the aliases
@@ -307,5 +356,105 @@ fn no_third_party_sampling_kernels() {
                 cubin.arch
             );
         }
+    }
+}
+
+/// The DeepSeek scalar kernels: the images that neither divide nor take a
+/// square root hold rounded operations and not one fused multiply-add in
+/// their SASS (`exact_profiles_fuse_no_multiply_add` holds every image's PTX);
+/// the image of the dividing kernels holds only its divisions' expansions.
+/// Each image has exactly its entries.
+#[test]
+fn ds_scalar_kernels_fuse_nothing() {
+    let manifest = Manifest::embedded();
+    let images: [(&str, bool, &[&str]); 4] = [
+        (
+            "ds_ops",
+            false,
+            &[
+                "eidola_ds_collapse",
+                "eidola_ds_combine",
+                "eidola_ds_embed",
+                "eidola_ds_engram_gather",
+                "eidola_ds_expand",
+                "eidola_ds_linear",
+                "eidola_ds_place",
+                "eidola_ds_place_count",
+                "eidola_ds_place_rows",
+                "eidola_ds_quant_fp8",
+                "eidola_ds_rot_quant",
+            ],
+        ),
+        (
+            "ds_ops_div",
+            true,
+            &[
+                "eidola_ds_engram_inject",
+                "eidola_ds_mhc_mix",
+                "eidola_ds_pool",
+                "eidola_ds_rms_norm",
+                "eidola_ds_rot_quant_e4m3",
+                "eidola_ds_route",
+                "eidola_ds_stream_mean",
+                "eidola_ds_swiglu",
+            ],
+        ),
+        (
+            "ds_reference",
+            false,
+            &[
+                "eidola_ds_grouped_dot",
+                "eidola_ds_reference_lin4",
+                "eidola_ds_reference_lin8",
+            ],
+        ),
+        ("ds_head", false, &["eidola_ds_head"]),
+    ];
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        for (name, divides, entries) in images {
+            let cubin = manifest
+                .cubin(name, arch)
+                .unwrap_or_else(|| panic!("no cubin {name} {arch}"));
+            assert_eq!(cubin.profile, "exact", "{name}");
+            let ops = cubin.float_ops.as_ref().expect("float_ops");
+            assert!(ops.ptx_rounded > 0, "{name} {arch}");
+            assert_eq!(ops.sass_fma > 0, divides, "{name} {arch}: {}", ops.sass_fma);
+            assert!(cubin.mma_sass.is_empty(), "{name} {arch}");
+            let mut symbols: Vec<&str> = cubin.entries.iter().map(|e| e.symbol.as_str()).collect();
+            symbols.sort_unstable();
+            assert_eq!(symbols, entries, "{name} {arch}");
+        }
+    }
+}
+
+/// DeepSeek's tensor-core GEMMs (`ds_gemm_tc`): warp-level MMAs (`HMMA`, F16
+/// operands: these parts have no warp-level FP8 MMA, and the kernels convert
+/// their FP8 and FP4 codes exactly) and no tcgen05; built without contraction
+/// and dividing nothing, so their SASS holds no fused multiply-add at all (the
+/// block accumulation `acc + (dot · scale) · scale` is three rounded
+/// operations, as the reference's). The image has exactly its entries.
+#[test]
+fn ds_gemm_tc_runs_on_tensor_cores_and_fuses_nothing() {
+    let manifest = Manifest::embedded();
+    let mut want = vec!["eidola_ds_gemm_probe".to_owned()];
+    for product in ["lin4", "lin8"] {
+        for form in ["banded", "tolerance"] {
+            for tile in ["s8", "t32", "t8"] {
+                want.push(format!("eidola_ds_{product}_{form}_{tile}"));
+            }
+        }
+    }
+    want.sort_unstable();
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        let cubin = manifest.cubin("ds_gemm_tc", arch).expect("ds_gemm_tc");
+        assert_eq!(cubin.profile, "exact");
+        assert!(mma(manifest, "ds_gemm_tc", arch, "HMMA") > 0, "{arch}");
+        assert_eq!(mma(manifest, "ds_gemm_tc", arch, "UTC"), 0, "{arch}");
+        let ops = cubin.float_ops.as_ref().expect("float_ops");
+        assert!(ops.ptx_rounded > 0, "{arch}");
+        assert_eq!(ops.sass_fma, 0, "{arch}");
+        let mut symbols: Vec<String> = cubin.entries.iter().map(|e| e.symbol.clone()).collect();
+        symbols.sort_unstable();
+        assert_eq!(symbols, want, "{arch}");
     }
 }

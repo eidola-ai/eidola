@@ -154,6 +154,7 @@ fn step_of(seqs: Vec<SeqEntry>, tokens: Vec<u32>, updates: Vec<TableUpdate>) -> 
         token_ids: tokens,
         positions,
         return_logits: true,
+        aux: Default::default(),
     }
 }
 

@@ -57,6 +57,13 @@
 //! in-use entry past its max age is detached (no further hits); its blocks are freed and
 //! zeroed when the last sequence using them releases.
 //!
+//! When nothing unreferenced is left to evict and a sliding-window group still has no
+//! free block, an idle window block is taken back from the entry holding it, even one a
+//! running sequence's chain keeps (`KvManager::strip_window`): a sequence never reads
+//! the windows of points behind its own. So the window blocks a group cannot give back
+//! are exactly those running sequences map, and a sliding pool need only hold every
+//! running sequence's live window and a step's new blocks, not whole sequences.
+//!
 //! Sequences admitted with `retain = false` (no client cache key; a fresh random salt)
 //! still seal blocks, so a preempted sequence can resume from its own KV, but every entry
 //! they created is purged when they finish.
@@ -131,7 +138,7 @@ use crate::executor::{Maintenance, Slot, TableUpdate};
 use crate::hash::{BlockHash, extend_chain};
 use crate::kv_cipher::KvNonce;
 use crate::secret::{KvKey, Lineage};
-use crate::spec::{AttentionKind, ModelSpec, NULL_BLOCK};
+use crate::spec::{AttentionKind, Coverage, ModelSpec, NULL_BLOCK};
 
 /// Milliseconds on a monotonic clock supplied by the caller.
 pub type Millis = u64;
@@ -286,6 +293,15 @@ struct Entry {
     /// The key the entry is indexed under in the host tier's per-group sets, while it is
     /// unreferenced.
     tier_key: Option<Millis>,
+    /// Per group, for a chain-covered block the entry holds: the position from which the
+    /// block is valid at every chain layer.
+    valid_from: Vec<u32>,
+    /// Per group, for a chain-covered block the entry holds: the attachment its nonce is
+    /// derived from (unique in the manager's life); 0 where the entry holds none.
+    attachment: Vec<u64>,
+    /// Transient protections ([`KvManager::protect`]) on the entry: while non-zero, no
+    /// window block is taken from it to make room ([`KvManager::strip_window`]).
+    shield: u32,
 }
 
 impl Entry {
@@ -311,6 +327,18 @@ struct SeqKv {
     /// `(entry, group, block)`, while it runs (so [`KvManager::unpin`] can take them back).
     attached: Vec<(EntryId, usize, u32)>,
     slide_cursor: Vec<u32>,
+    /// With a window chain: the position from which every chain layer's KV is valid up
+    /// to `computed` (equal to `computed` when none is).
+    deep_from: u32,
+}
+
+/// The window chain's two distances, in positions behind a target.
+#[derive(Clone, Copy, Debug)]
+struct Chain {
+    /// Where the top layer starts.
+    top: u32,
+    /// Where the bottom layer starts.
+    reach: u32,
 }
 
 /// The paged KV manager. See the module documentation.
@@ -318,6 +346,10 @@ struct SeqKv {
 pub struct KvManager {
     block_size: u32,
     attention: Vec<AttentionKind>,
+    coverage: Vec<Coverage>,
+    chain: Option<Chain>,
+    /// The next attachment number; never reused.
+    next_attachment: u64,
     policy: CachePolicy,
     pools: Vec<Pool>,
     entries: HashMap<EntryId, Entry>,
@@ -342,6 +374,8 @@ pub struct KvManager {
     pending_promote: BTreeMap<(u32, u32), u32>,
     pending_host_zero: BTreeSet<(u32, u32)>,
     tier: TierStats,
+    /// Window blocks taken from referenced entries to make room.
+    stripped_windows: u64,
 }
 
 impl KvManager {
@@ -350,6 +384,12 @@ impl KvManager {
         Self {
             block_size: spec.block_size,
             attention: spec.kv_groups.iter().map(|g| g.attention).collect(),
+            coverage: spec.kv_groups.iter().map(|g| g.coverage).collect(),
+            chain: spec.window_chain.map(|_| Chain {
+                top: spec.chain_top(),
+                reach: spec.chain_reach(),
+            }),
+            next_attachment: 1,
             policy,
             pools: spec
                 .kv_groups
@@ -381,6 +421,7 @@ impl KvManager {
             pending_promote: BTreeMap::new(),
             pending_host_zero: BTreeSet::new(),
             tier: TierStats::default(),
+            stripped_windows: 0,
         }
     }
 
@@ -392,6 +433,12 @@ impl KvManager {
     /// Host-tier counters.
     pub fn tier_stats(&self) -> TierStats {
         self.tier
+    }
+
+    /// Window blocks taken from entries that running sequences' chains keep, because no
+    /// unreferenced entry was left to evict or demote ([`KvManager::strip_window`]).
+    pub fn stripped_windows(&self) -> u64 {
+        self.stripped_windows
     }
 
     /// The cache policy in force.
@@ -527,6 +574,7 @@ impl KvManager {
             points: Vec::new(),
             attached: Vec::new(),
             slide_cursor: vec![0; groups],
+            deep_from: 0,
         };
 
         if self.policy.enabled {
@@ -583,6 +631,8 @@ impl KvManager {
             seq.entries = chain;
             seq.hashes = hashes;
             seq.computed = m * bs;
+            // A hit supplies every chain layer's window before its boundary.
+            seq.deep_from = self.chain.map_or(0, |c| (m * bs).saturating_sub(c.top));
             for g in 0..groups {
                 seq.slide_cursor[g] = self.attention[g].first_visible(m * bs) / bs;
             }
@@ -750,12 +800,53 @@ impl KvManager {
                 continue;
             }
             entry.blocks[g] = NULL_BLOCK;
+            entry.valid_from[g] = 0;
+            entry.attachment[g] = 0;
             self.pools[g].holder[b as usize] = NO_ENTRY;
             freed |= self.pools[g].refs[b as usize] == 1;
             self.decref(g, b);
             self.settle(g, b, None);
         }
         freed
+    }
+
+    /// The next position at which `id` needs full-depth chain state for a retention point
+    /// it has yet to seal (the last position before the point's boundary), if any. A
+    /// prefill row never extends past it.
+    pub fn next_target(&self, id: SeqId) -> Option<u32> {
+        self.chain?;
+        let p = *self.seqs[&id].points.first()?;
+        Some(p * self.block_size - 1)
+    }
+
+    /// Plans the window chain for the row computing `[context_len, end)` of `id` on the
+    /// way to `target` (the first position at or after `end - 1` that needs full-depth
+    /// state), and records that the row runs: returns where the chain's top layer starts
+    /// (`context_len` without a chain).
+    ///
+    /// The top layer must be valid on the `top` positions before a target and each layer
+    /// below `window - 1` further back, so a triangle starts `target - top` at the top.
+    /// When that is at or before the row, every layer runs all of it. So does a row whose
+    /// chain state is valid at full depth before it and whose bottom layer has to start
+    /// by now anyway: the gap to the target is then shorter than a triangle, and running
+    /// it whole keeps the state continuous.
+    pub fn chain_row(&mut self, id: SeqId, context_len: u32, end: u32, target: u32) -> u32 {
+        let Some(c) = self.chain else {
+            return context_len;
+        };
+        let seq = self.seqs.get_mut(&id).expect("live sequence");
+        assert_eq!(seq.computed, context_len, "a row starts at the computed KV");
+        assert!(
+            context_len < end && end - 1 <= target,
+            "a row ends by its target"
+        );
+        let top_start = target.saturating_sub(c.top);
+        let valid = seq.deep_from <= context_len.saturating_sub(c.top);
+        if top_start <= context_len || (valid && target.saturating_sub(c.reach) <= context_len) {
+            return context_len;
+        }
+        seq.deep_from = top_start.min(end);
+        top_start
     }
 
     /// Records that positions `[0, computed)` of `id` hold valid KV after a step: releases
@@ -771,6 +862,7 @@ impl KvManager {
             "commit past allocation"
         );
         seq.computed = computed;
+        seq.deep_from = seq.deep_from.min(computed);
 
         // Rollback: blocks that start at or after `computed` hold only rejected positions.
         let keep = computed.div_ceil(bs) as usize;
@@ -934,6 +1026,21 @@ impl KvManager {
                 }
             }
         }
+        out
+    }
+
+    /// Chain-covered blocks held by cache entries on the device, as
+    /// `(group, block, attachment)` (testing).
+    pub fn chain_attachments(&self) -> Vec<(u32, u32, u64)> {
+        let mut out = Vec::new();
+        for e in self.entries.values() {
+            for (g, &b) in e.blocks.iter().enumerate() {
+                if b != NULL_BLOCK && e.attachment[g] != 0 {
+                    out.push((g as u32, b, e.attachment[g]));
+                }
+            }
+        }
+        out.sort_unstable();
         out
     }
 
@@ -1154,6 +1261,17 @@ impl KvManager {
                 assert_eq!(self.entries[c].parent, Some(*id));
             }
             assert_eq!(e.blocks.len(), self.attention.len(), "entry group count");
+            for (g, cov) in self.coverage.iter().enumerate() {
+                assert_eq!(
+                    e.attachment[g] != 0,
+                    *cov == Coverage::Chain && e.holds(g),
+                    "entry attachment disagrees with its chain-covered block"
+                );
+                assert!(
+                    e.attachment[g] < self.next_attachment,
+                    "attachment not minted"
+                );
+            }
             for (g, kind) in self.attention.iter().enumerate() {
                 if *kind == AttentionKind::Full {
                     assert!(e.holds(g), "entry lacks a full-attention block");
@@ -1173,6 +1291,18 @@ impl KvManager {
                 .filter(|e| e.lru_key.is_some())
                 .count()
         );
+        let mut attachments = BTreeSet::new();
+        for e in self.entries.values() {
+            for &a in e.attachment.iter().filter(|&&a| a != 0) {
+                assert!(attachments.insert(a), "attachment {a} held twice");
+            }
+        }
+        for s in self.seqs.values() {
+            assert!(
+                s.deep_from <= s.computed,
+                "chain valid past the computed KV"
+            );
+        }
         let used_slots: Vec<Slot> = self.seqs.values().map(|s| s.slot).collect();
         for s in &used_slots {
             assert!(!self.free_slots.contains(s), "slot both used and free");
@@ -1338,7 +1468,13 @@ impl KvManager {
             holder, NO_ENTRY,
             "group {g}: block {b} changes encryption with no entry holding it"
         );
-        let nonce = self.entries[&holder].hash.kv_nonce(g as u32);
+        let e = &self.entries[&holder];
+        let nonce = match self.coverage[g] {
+            Coverage::All => e.hash.kv_nonce(g as u32),
+            // The bytes depend on the rows the attaching sequence ran, not on the hash
+            // alone: each attachment has its own nonce.
+            Coverage::Chain => e.hash.kv_nonce_attached(g as u32, e.attachment[g]),
+        };
         let key = match self.pending_keys.iter().position(|k| k.ct_eq(key)) {
             Some(i) => i as u32,
             None => {
@@ -1367,7 +1503,7 @@ impl KvManager {
             } else {
                 self.evict_one()
             };
-            if !reclaimed {
+            if !reclaimed && !self.strip_window(g) {
                 return None;
             }
         }
@@ -1421,8 +1557,9 @@ impl KvManager {
                 continue;
             }
             let lo = att.first_visible(m * bs) / bs;
-            for &eid in &chain[lo as usize..m as usize] {
-                if !self.entries[&eid].holds(g) {
+            for idx in lo..m {
+                let e = &self.entries[&chain[idx as usize]];
+                if !e.holds(g) || e.valid_from[g] > self.window_floor(m, idx) {
                     return false;
                 }
             }
@@ -1430,18 +1567,37 @@ impl KvManager {
         true
     }
 
+    /// The first position of block `idx` that a hit at boundary `point` reads at full
+    /// chain depth: a chain-covered block serves the hit only if it is valid from there.
+    fn window_floor(&self, point: u32, idx: u32) -> u32 {
+        let bs = self.block_size;
+        let top = self.chain.map_or(0, |c| c.top);
+        (point * bs).saturating_sub(top).max(idx * bs)
+    }
+
     /// Attaches `seq`'s sliding-window blocks covering the window before boundary `point`
     /// to the entries sealed there, where an entry has none yet. Returns what it attached.
+    ///
+    /// With a window chain the point is attached only if the sequence's chain is valid at
+    /// every layer on that window, and then in every sliding group: a retained point
+    /// carries all of its windows or none. A chain-covered block an entry already holds
+    /// that is not valid far enough back for this point is replaced by the sequence's.
     fn attach_window(&mut self, seq: &SeqKv, point: u32) -> Vec<(EntryId, usize, u32)> {
         let mut attached = Vec::new();
         if point == 0 || point > seq.entries.len() as u32 {
             return attached;
         }
         let bs = self.block_size;
+        if let Some(c) = self.chain
+            && seq.deep_from > (point * bs).saturating_sub(c.top)
+        {
+            return attached;
+        }
         for g in 0..self.pools.len() {
             if self.attention[g] == AttentionKind::Full {
                 continue;
             }
+            let chained = self.coverage[g] == Coverage::Chain;
             let lo = self.attention[g].first_visible(point * bs) / bs;
             for idx in lo..point {
                 let eid = seq.entries[idx as usize];
@@ -1451,19 +1607,56 @@ impl KvManager {
                 if b == NULL_BLOCK {
                     continue;
                 }
-                if let Some(entry) = self.entries.get_mut(&eid)
-                    && !entry.holds(g)
-                {
-                    entry.blocks[g] = b;
-                    let pool = &mut self.pools[g];
-                    debug_assert_eq!(pool.holder[b as usize], NO_ENTRY);
-                    pool.holder[b as usize] = eid;
-                    pool.refs[b as usize] += 1;
-                    attached.push((eid, g, b));
+                let Some(entry) = self.entries.get(&eid) else {
+                    continue;
+                };
+                if entry.holds(g) {
+                    if !chained
+                        || entry.blocks[g] == b
+                        || entry.valid_from[g] <= self.window_floor(point, idx)
+                    {
+                        continue;
+                    }
+                    self.detach_block(eid, g);
                 }
+                let attachment = if chained {
+                    self.next_attachment += 1;
+                    self.next_attachment - 1
+                } else {
+                    0
+                };
+                let entry = self.entries.get_mut(&eid).expect("entry exists");
+                entry.blocks[g] = b;
+                if chained {
+                    entry.valid_from[g] = seq.deep_from;
+                    entry.attachment[g] = attachment;
+                }
+                let pool = &mut self.pools[g];
+                debug_assert_eq!(pool.holder[b as usize], NO_ENTRY);
+                pool.holder[b as usize] = eid;
+                pool.refs[b as usize] += 1;
+                attached.push((eid, g, b));
             }
         }
         attached
+    }
+
+    /// Takes group `g`'s block away from a referenced entry, wherever it is: a device
+    /// block is freed and zeroed once no sequence maps it, a host block at once.
+    fn detach_block(&mut self, eid: EntryId, g: usize) {
+        let entry = self.entries.get_mut(&eid).expect("entry exists");
+        let b = std::mem::replace(&mut entry.blocks[g], NULL_BLOCK);
+        let h = std::mem::replace(&mut entry.host[g], NULL_BLOCK);
+        entry.valid_from[g] = 0;
+        entry.attachment[g] = 0;
+        if b != NULL_BLOCK {
+            self.pools[g].holder[b as usize] = NO_ENTRY;
+            self.decref(g, b);
+            self.settle(g, b, None);
+        }
+        if h != NULL_BLOCK {
+            self.free_host(g, h, false);
+        }
     }
 
     fn is_hit_point(&self, eid: EntryId) -> bool {
@@ -1559,13 +1752,48 @@ impl KvManager {
         })
     }
 
+    /// Takes one idle device block of sliding group `g` from the entry that holds it, for
+    /// an allocation that nothing unreferenced is left to make room for: the least
+    /// recently used entry holding a block of `g` that no sequence maps, whether or not a
+    /// running sequence's chain passes through it (such an entry cannot be evicted, and a
+    /// sequence never reads the windows of retained points behind its own window). The
+    /// entry stays; the point whose window the block completed is no longer a hit. A
+    /// full-attention block is never taken (every entry holds its own), nor one of an
+    /// entry an admission is promoting into ([`KvManager::protect`]).
+    ///
+    /// So the window blocks a sliding group cannot give back are exactly those running
+    /// sequences map: each sequence's live window, at most `ceil((window - 1) / B) + 1`
+    /// blocks between steps, and what a step's rows add.
+    fn strip_window(&mut self, g: usize) -> bool {
+        if self.attention[g] == AttentionKind::Full {
+            return false;
+        }
+        let pool = &self.pools[g];
+        let victim = (1..pool.refs.len())
+            .filter(|&b| pool.idle(b as u32) && !pool.landing[b])
+            .map(|b| {
+                let eid = pool.holder[b];
+                (self.entries[&eid].last_used, eid, b as u32)
+            })
+            .filter(|&(_, eid, _)| self.entries[&eid].shield == 0)
+            .min();
+        let Some((_, eid, _)) = victim else {
+            return false;
+        };
+        self.detach_block(eid, g);
+        self.lru_refresh(eid);
+        self.stripped_windows += 1;
+        true
+    }
+
     /// Counts a transient user on `eid` and every ancestor, so nothing an eviction,
-    /// demotion or host drop does meanwhile removes them.
+    /// demotion, host drop or window strip does meanwhile removes them or their blocks.
     fn protect(&mut self, eid: EntryId) {
         let mut cur = Some(eid);
         while let Some(id) = cur {
             let e = self.entries.get_mut(&id).expect("protected entry exists");
             e.users += 1;
+            e.shield += 1;
             cur = e.parent;
             self.lru_refresh(id);
         }
@@ -1577,6 +1805,7 @@ impl KvManager {
         while let Some(id) = cur {
             let e = self.entries.get_mut(&id).expect("protected entry exists");
             e.users -= 1;
+            e.shield -= 1;
             cur = e.parent;
             self.lru_refresh(id);
         }
@@ -1793,6 +2022,9 @@ impl KvManager {
                 last_used: now,
                 lru_key: None,
                 tier_key: None,
+                valid_from: vec![0; groups],
+                attachment: vec![0; groups],
+                shield: 0,
             },
         );
         self.map.insert(h, eid);
@@ -1852,6 +2084,178 @@ mod tests {
         assert_eq!(zeroed.iter().filter(|z| z.0 == 2).count(), 2);
         assert!(tables.iter().all(|t| t.block == NULL_BLOCK && t.index < 2));
         kv.check_invariants();
+    }
+
+    /// Block 4, a chain of 3 layers of window 3 under a drafter window of 4: the top layer
+    /// starts 3 before a target and the bottom one 7. A prompt whose last token is within
+    /// the bottom layer's reach of the start is run whole, so the windows before its
+    /// first boundary are valid at every layer and a preemption retains them; started as
+    /// a triangle, the top layer would begin at position 3 and they would not be.
+    #[test]
+    fn a_gap_shorter_than_a_triangle_is_run_whole() {
+        use crate::mock::deepseek_like_spec;
+        let spec = deepseek_like_spec(32, 4, 2, 3, 3, 64, 4, 0);
+        let tokens: Vec<u32> = (0..8).collect();
+        let mut kv = KvManager::new(&spec, CachePolicy::default());
+        kv.admit(1, salt(), false, &tokens[..7], 7, 0);
+        assert!(kv.allocate(1, 7));
+        assert_eq!(kv.chain_row(1, 0, 7, 6), 0);
+        kv.commit(1, 7, &tokens, 0);
+        kv.release(1, Release::Preempt, 0);
+        kv.check_invariants();
+        assert_eq!(kv.lookup(&salt(), &tokens, 0), 4);
+
+        // A target past the reach starts a triangle instead: its top layer at 7, so a
+        // first chunk of 6 leaves no chain layer whole before boundary 4, and a
+        // preemption there retains no point.
+        let tokens: Vec<u32> = (100..111).collect();
+        kv.admit(2, lineage(3), false, &tokens, 11, 0);
+        assert!(kv.allocate(2, 6));
+        assert_eq!(kv.chain_row(2, 0, 6, 10), 7);
+        kv.commit(2, 6, &tokens, 0);
+        kv.release(2, Release::Preempt, 0);
+        kv.check_invariants();
+        assert_eq!(kv.lookup(&lineage(3), &tokens, 0), 0);
+    }
+
+    /// `spec` with its sliding groups' pools set to `blocks`, the null block among them.
+    fn small_windows(mut spec: ModelSpec, blocks: u32) -> ModelSpec {
+        for g in &mut spec.kv_groups {
+            if g.attention != AttentionKind::Full {
+                g.num_blocks = blocks;
+            }
+        }
+        spec
+    }
+
+    /// A window block taken back from an entry a running sequence's chain keeps is freed
+    /// as any other block is: its zero is queued (and the seam runs maintenance before the
+    /// table update that hands it on, and before any forward writes it), the encryption
+    /// its idleness had queued is dropped, no crypt of it is queued under the old entry's
+    /// key, the entry holds it no more (so no later hit or promotion maps, decrypts or
+    /// demotes it), and its next owner maps it as a fresh block. With and without a host
+    /// tier.
+    #[test]
+    fn a_stripped_window_is_zeroed_and_leaves_its_entry() {
+        // Block 4, windows 3: a point's window is one block. Three allocatable blocks in
+        // each sliding group.
+        let base = small_windows(mimo_like_spec(32, 4, 3, 3, 64, 4, 0), 4);
+        for spec in [base.clone(), crate::mock::with_host_tier(base, 16)] {
+            let mut kv = KvManager::new(&spec, CachePolicy::default());
+            let first: Vec<u32> = (0..9).collect();
+            kv.admit(1, salt(), true, &first, 9, 0);
+            assert!(kv.allocate(1, 9));
+            kv.commit(1, 9, &first, 0);
+            kv.release(1, Release::Finish, 0);
+            kv.take_pending();
+            // The regeneration and continuation point (boundary 8) holds one block per
+            // sliding group: block 1's window.
+            let held: Vec<(u32, u32)> =
+                kv.cache_blocks().into_iter().filter(|b| b.0 != 0).collect();
+            assert_eq!(held.len(), 2, "{held:?}");
+
+            // A continuation hits there, maps the window, and slides past it: the window
+            // is idle again, held by an entry on the running chain.
+            let mut cont = first[..8].to_vec();
+            cont.extend(100..112);
+            assert_eq!(kv.admit(2, salt(), true, &cont, 20, 0), Some(8));
+            // The step that decrypts the hit's window runs.
+            kv.take_pending();
+            assert!(kv.allocate(2, 12));
+            kv.commit(2, 12, &cont, 0);
+            for &(g, b) in &held {
+                assert!(kv.idle_blocks().contains(&(g, b)));
+                assert_eq!(kv.pending_crypts().get(&(g, b)), Some(&true));
+            }
+            // Two more blocks each, one free: nothing unreferenced to evict, so the
+            // idle window is taken back.
+            assert!(kv.allocate(2, 20));
+            assert_eq!(kv.stripped_windows(), 2);
+            kv.check_invariants();
+            let PendingWork {
+                maintenance,
+                table_updates,
+                ..
+            } = kv.take_pending();
+            for &(g, b) in &held {
+                let zero = maintenance.iter().any(|m| {
+                    matches!(*m, Maintenance::Zero { group, block } if (group, block) == (g, b))
+                });
+                assert!(zero, "group {g}: stripped block {b} not zeroed");
+                let crypt = maintenance.iter().any(|m| match *m {
+                    Maintenance::Encrypt { group, block, .. }
+                    | Maintenance::Decrypt { group, block, .. } => (group, block) == (g, b),
+                    _ => false,
+                });
+                assert!(!crypt, "group {g}: stripped block {b} still under a crypt");
+                assert!(!maintenance.iter().any(|m| matches!(
+                    *m,
+                    Maintenance::Demote { group, block, .. } if (group, block) == (g, b)
+                )));
+                // Handed to the running sequence, after the maintenance that zeroes it.
+                assert!(
+                    table_updates
+                        .iter()
+                        .any(|t| (t.group, t.block) == (g, b) && t.slot == kv.slot(2)),
+                    "group {g}: block {b} not reused"
+                );
+                assert!(!kv.cache_blocks().contains(&(g, b)));
+                assert!(!kv.idle_blocks().contains(&(g, b)));
+            }
+            // The point it completed is no hit any more: nothing will map, decrypt or
+            // promote that block for the old entry.
+            assert_eq!(kv.lookup(&salt(), &first, 0), 0);
+            kv.release(2, Release::Finish, 0);
+            kv.take_pending();
+            kv.check_invariants();
+        }
+    }
+
+    /// An admission promoting a demoted window back for its hit protects its chain: with
+    /// the sliding pools full and nothing unreferenced left, the idle window blocks of
+    /// that chain (which the hit is about to map) are never taken back to make room for
+    /// the promotion. The hit shortens instead, and the chain keeps its blocks.
+    #[test]
+    fn a_promoting_admission_never_strips_its_own_chain() {
+        // Block 4, windows 6: boundary 8's window is blocks 0 and 1, two entries.
+        let spec = crate::mock::with_host_tier(
+            small_windows(mimo_like_spec(32, 4, 6, 6, 64, 4, 0), 4),
+            16,
+        );
+        let mut kv = KvManager::new(&spec, CachePolicy::default());
+        let first: Vec<u32> = (0..9).collect();
+        kv.admit(1, salt(), true, &first, 9, 0);
+        assert!(kv.allocate(1, 9));
+        kv.commit(1, 9, &first, 0);
+        kv.release(1, Release::Finish, 0);
+        kv.take_pending();
+        assert_eq!(kv.lookup(&salt(), &first, 0), 8);
+        // Another lineage's sequence takes the last free window block and one more: the
+        // least recently used entry, block 0's, is demoted whole.
+        let other: Vec<u32> = (200..205).collect();
+        kv.admit(2, lineage(3), true, &other, 5, 0);
+        assert!(kv.allocate(2, 8));
+        assert_eq!(kv.tier_stats().demoted_entries, 1);
+        kv.take_pending();
+        let on_device: Vec<(u32, u32)> =
+            kv.cache_blocks().into_iter().filter(|b| b.0 != 0).collect();
+        assert_eq!(on_device.len(), 2, "{on_device:?}");
+        assert_eq!(kv.free_blocks(1), 0);
+
+        // The regeneration hits at 8: block 0's windows must come back from the host, the
+        // sliding pools are full, and the only idle window blocks are block 1's, the
+        // hit's own. They stay; the hit cannot be promoted and shortens to nothing.
+        assert_eq!(kv.admit(3, salt(), true, &first, 9, 0), Some(0));
+        assert_eq!(kv.stripped_windows(), 0);
+        for b in &on_device {
+            assert!(kv.cache_blocks().contains(b), "{b:?} taken from the chain");
+        }
+        kv.check_invariants();
+        kv.release(3, Release::Finish, 0);
+        kv.release(2, Release::Finish, 0);
+        kv.take_pending();
+        kv.check_invariants();
+        assert_eq!(kv.lookup(&salt(), &first, 0), 8);
     }
 
     #[test]

@@ -1,0 +1,9 @@
+# Every f32 through each one-argument function.
+x bf16_round = 40f41cec5ebf212
+x round_e4m3 = f9c7c26949c525de
+x round_e2m1 = 4977ab8809aacb47
+x exp32 = 4ccc7cddaea06b26
+x sigmoid32 = 2a7b4461b1fd6978
+x silu32 = 388e329cd386503c
+x softplus32 = c64c0edca813ad3b
+x rsqrt32 = bf1e74cd84d697cc

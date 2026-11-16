@@ -1,7 +1,9 @@
 //! From a validated request to engine tokens, and from engine tokens to OpenAI output.
 //!
-//! In: the chat crate renders the prompt with the model's own template (byte-exact),
-//! tokenizes it (request data never as a control token), and the request becomes an engine [`Request`] with checked
+//! In: the chat crate renders the prompt in the served model's format (MiMo-V2.6: the
+//! model's own template; DeepSeek-V4.1: the compiled-in encoder; byte-exact to the
+//! reference either way), tokenizes it (request data never as a control token), and the
+//! request becomes an engine [`Request`] with checked
 //! [`SamplingParams`] and a [`CacheScope`]: the client's key turned into its lineage (the
 //! engine salt and the idle-KV key, by the per-boot HMAC) and dropped, or
 //! [`CacheScope::Private`] without one.
@@ -13,18 +15,21 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use eidola_common::engine_protocol::ContinueField;
 use eidola_common::engine_protocol::DeclaredPrefixRefusal;
 use eidola_engine::engine::{CacheScope, FinishReason as EngineFinish, Request, RequestId};
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::secret::SaltDeriver;
+use eidola_engine_chat::deepseek_v4_1::{self, EncodeOptions};
+use eidola_engine_chat::json::Json;
 use eidola_engine_chat::{
     ChatDelta, ChatInput, Detokenizer, FinishReason, OutputConfig, OutputParser, PrefixedCallIds,
-    RenderOptions, StopCause, ToolSchemas,
+    Prompt, RenderOptions, StopCause, ToolSchemas,
 };
 
 use crate::api::ValidRequest;
 use crate::error::ApiError;
-use crate::model::LoadedModel;
+use crate::model::{LoadedModel, Served};
 
 /// The engine request for `req`, plus what the output side needs.
 pub struct Prepared {
@@ -78,27 +83,12 @@ pub fn prepare(
     };
     drop(cache_key);
 
-    let schemas = if parse_tools {
-        tools.as_ref().map(ToolSchemas::from_tools)
-    } else {
-        None
+    let (prompt, output) = match model.served() {
+        Served::Mimo { template, .. } => {
+            render_mimo(template, messages, tools, parse_tools, continuation)?
+        }
+        Served::DeepSeek { .. } => render_deepseek(messages, tools, parse_tools, continuation)?,
     };
-    let mut input = ChatInput { messages, tools };
-    input
-        .normalize_tool_call_arguments()
-        .map_err(|e| ApiError::invalid(e.to_string()))?;
-    // A continuation's prompt ends inside the final message, at the field it continues,
-    // and its output is parsed from there; otherwise the prompt opens a new turn.
-    let continuing = continuation.map(|field| field.field());
-    let options = RenderOptions {
-        add_generation_prompt: continuing.is_none(),
-        enable_thinking: None,
-        continue_final_message: continuing,
-    };
-    let prompt = model
-        .template()
-        .render_prompt(&input, options)
-        .map_err(|e| ApiError::invalid(e.to_string()))?;
     // Only the template's own text becomes control tokens: one spelled by the
     // request's data is encoded as the text it is.
     let tokens = model
@@ -137,11 +127,94 @@ pub fn prepare(
             required_cached_tokens: cached_prefix.map_or(0, |p| p.cached_tokens),
         },
         prompt_tokens,
-        output: OutputConfig::new(options.enable_thinking, schemas).continuing_in(continuing),
+        output,
         stop,
         window_bound,
         declared: cached_prefix.is_some(),
     })
+}
+
+/// MiMo-V2.6: the model's template over the request, history tool-call arguments
+/// normalized first; a continuation's prompt ends inside the final message, at the field
+/// it continues, and its output is parsed from there.
+fn render_mimo(
+    template: &eidola_engine_chat::ChatTemplate,
+    messages: Json,
+    tools: Option<Json>,
+    parse_tools: bool,
+    continuation: Option<ContinueField>,
+) -> Result<(Prompt, OutputConfig), ApiError> {
+    let schemas = if parse_tools {
+        tools.as_ref().map(ToolSchemas::from_tools)
+    } else {
+        None
+    };
+    let mut input = ChatInput { messages, tools };
+    input
+        .normalize_tool_call_arguments()
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
+    let continuing = continuation.map(|field| field.field());
+    let options = RenderOptions {
+        add_generation_prompt: continuing.is_none(),
+        enable_thinking: None,
+        continue_final_message: continuing,
+    };
+    let prompt = template
+        .render_prompt(&input, options)
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
+    let output = OutputConfig::new(options.enable_thinking, schemas).continuing_in(continuing);
+    Ok((prompt, output))
+}
+
+/// The DeepSeek-V4.1 encoder's options for a request: the format's request defaults
+/// (`EncodeOptions::from_request`), since the node's request subset carries neither a
+/// thinking switch nor a `reasoning_effort`: thinking on, effort `high`.
+pub fn deepseek_options() -> EncodeOptions {
+    EncodeOptions::from_request(None, None).expect("the defaults are valid")
+}
+
+/// DeepSeek-V4.1: the compiled-in encoder over the request (the request's tools on its
+/// system message, history tool-call arguments as sent), opening a new assistant turn.
+/// The format has no continuation (its answers are never continuable), so one is
+/// refused, and a request whose last message the format does not answer (an assistant
+/// message) is refused rather than encoded without a generation header.
+fn render_deepseek(
+    messages: Json,
+    tools: Option<Json>,
+    parse_tools: bool,
+    continuation: Option<ContinueField>,
+) -> Result<(Prompt, OutputConfig), ApiError> {
+    if continuation.is_some() {
+        return Err(ApiError::invalid(
+            "this model's format cannot continue a message: its answers are never continuable",
+        ));
+    }
+    let invalid = |e: eidola_engine_chat::ChatError| ApiError::invalid(e.to_string());
+    let schemas = match (&tools, parse_tools) {
+        (Some(tools), true) => Some(deepseek_v4_1::tool_schemas(tools).map_err(invalid)?),
+        _ => None,
+    };
+    let options = deepseek_options();
+    let input = ChatInput { messages, tools };
+    let prompt = deepseek_v4_1::encode(&input, options).map_err(invalid)?;
+    let header = [
+        deepseek_v4_1::ASSISTANT_TOKEN,
+        if options.thinking {
+            deepseek_v4_1::THINK_START
+        } else {
+            deepseek_v4_1::THINK_END
+        },
+    ]
+    .concat();
+    if !prompt.text().ends_with(&header) {
+        return Err(ApiError::invalid(
+            "this model answers a user, tool or system message: the last message must be one",
+        ));
+    }
+    Ok((
+        prompt,
+        OutputConfig::deepseek_v4_1(options.thinking, schemas),
+    ))
 }
 
 fn random_seed() -> u64 {

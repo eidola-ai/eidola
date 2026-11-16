@@ -460,6 +460,7 @@ fn logprobs(
                     token_ids: p[start as usize..(start + chunk) as usize].to_vec(),
                     positions: (start..start + chunk).collect(),
                     return_logits: false,
+                    aux: Default::default(),
                 };
                 ex.execute(&step).unwrap();
                 let all = ex.take_all_logits().unwrap();

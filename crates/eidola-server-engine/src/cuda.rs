@@ -1,10 +1,11 @@
-//! The CUDA executor's part of boot (`cuda` feature): every refusal that needs no device,
-//! the KV block counts derived from the configured device memory, opening the device, and
-//! the executor's construction on the engine thread.
+//! The CUDA executors' part of boot (`cuda` feature): every refusal that needs no device,
+//! the KV block counts derived from the configured device memory, opening the devices,
+//! and the executor's construction on the engine thread.
 //!
-//! The executor supports exactly MiMo-V2.6-Flash's configuration on one GPU
-//! (`eidola-engine-cuda`'s `check_supported` and `check_device`), and the node never
-//! narrows or widens that: it hands the executor the configuration and returns the
+//! [`prepare`] is MiMo-V2.6-Flash's executor on one GPU (`eidola-engine-cuda`'s
+//! `check_supported` and `check_device`); [`prepare_deepseek`] is DeepSeek-V4.1's on two,
+//! device `d` on GPU `d` (`eidola_engine_cuda::ds`). The node never narrows or widens
+//! what an executor supports: it hands the executor the configuration and returns the
 //! executor's own refusal. Nothing here changes a number the model computes; it only
 //! sizes and constructs.
 
@@ -12,16 +13,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec};
+use eidola_engine_cuda::ds::weights::Half;
+use eidola_engine_cuda::ds::{DsCudaExecutor, DsCudaExecutorConfig};
 use eidola_engine_cuda::kv::{GroupGeometry, KvLayout};
 use eidola_engine_cuda::{
     CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, KernelDir, KvBlocks, MtpHidden,
 };
+use eidola_engine_model::deepseek::DsConfig;
 use eidola_engine_model::safetensors::WeightSet;
 
 use crate::BootError;
 use crate::config::{CacheConfig, GpuCc, Sizing, env};
 use crate::http::DeviceReport;
-use crate::model::LoadedModel;
+use crate::model::{LoadedModel, Served};
 
 /// The device the node runs on. A node serves one model on one GPU; which physical GPU
 /// that is is the deployment's choice (`CUDA_VISIBLE_DEVICES`, or the one device a
@@ -365,9 +369,369 @@ pub fn prepare(
     })
 }
 
+/// The GPU of each of the DeepSeek-V4.1 executor's devices (encoder, decoder): device `d`
+/// on GPU `d`. Which physical GPUs those are is the deployment's choice, as for
+/// [`DEVICE_ORDINAL`].
+pub const DEEPSEEK_DEVICES: [usize; 2] = [0, 1];
+
+/// Bytes of one block of every KV group on `half`'s device together, banks (full
+/// attention) and windows (sliding) apart: the executor's own block layouts
+/// (`eidola_engine_cuda::ds::executor::geometry`, each group's block one image padded to
+/// 16 bytes).
+fn deepseek_half_block_bytes(
+    ds: &DsConfig,
+    spec: &ModelSpec,
+    half: Half,
+) -> Result<DsBlockBytes, BootError> {
+    let groups = eidola_engine_cuda::ds::executor::geometry(ds, spec, half)
+        .map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
+    let overflow = || BootError(format!("{} overflows the KV sizing", env::KV_DEVICE_BYTES));
+    let mut bytes = DsBlockBytes::default();
+    for g in groups {
+        let b = u64::try_from(g.block_bytes()).map_err(|_| overflow())?;
+        let sum = match spec.kv_groups[g.global as usize].attention {
+            AttentionKind::Full => &mut bytes.bank,
+            AttentionKind::Sliding { .. } => &mut bytes.window,
+        };
+        *sum = sum.checked_add(b).ok_or_else(overflow)?;
+    }
+    Ok(bytes)
+}
+
+/// Bytes of one block of a device's bank groups together, and of its window groups.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DsBlockBytes {
+    bank: u64,
+    window: u64,
+}
+
+impl DsBlockBytes {
+    fn total(self) -> u64 {
+        self.bank.saturating_add(self.window)
+    }
+}
+
+/// The DeepSeek-V4.1 executor's block counts: every bank group (full attention: the
+/// encoder's pooled bank, the decoder's per-position bank) holds `bank` blocks, every
+/// window group (the encoder's, the decoder's and the drafter's sliding windows) `window`,
+/// each the null block among them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DsKvBlocks {
+    pub bank: u32,
+    pub window: u32,
+}
+
+/// The DeepSeek-V4.1 executor's block counts from the two device budgets (`budgets`,
+/// device order), sized as MiMo's sliding pools are ([`derive_kv_blocks`]). With `B` the
+/// block size, `W` the model's window (the widest window less the query's own: the
+/// drafter's context), `R = ceil(W / B) + 1` and `P` = 3 retention points with the
+/// prefix cache (else 0):
+///
+/// * every **window** group gets `1 + MAX_SEQS × ((1 + P) × R + 1) +
+///   ceil(MAX_BATCHED_TOKENS / B)` blocks: the null block; per seat its live window and
+///   the block after it, and `P` retained windows; and the positions one step adds. The
+///   serving core takes idle windows back from entries running chains keep before an
+///   allocation fails, so the blocks a window group cannot give back are those running
+///   sequences map, at most `MAX_SEQS × (R + 1) + ceil(MAX_BATCHED_TOKENS / B)`: a window
+///   allocation never fails, and the banks bound concurrency and context;
+/// * every **bank** group gets what the tighter device leaves,
+///   `min_d floor((budgets[d] − window × V_d) / K_d)`, `V_d` and `K_d` the bytes of one
+///   block of every window group and every bank group on device `d`, and must hold one
+///   `MAX_MODEL_LEN` sequence and the null block (`ceil(MAX_MODEL_LEN / B) + 1`); it
+///   stops at the tables' `i32` range.
+///
+/// The executor captures no graph, so no pool holds a pad block. Measured values only,
+/// never the device. The least accepted budgets are
+/// `eidola_common::engine_deployment::cuda_kv_min_bytes` of each device's shape, kept
+/// equal by a test here.
+pub fn derive_deepseek_kv_blocks(
+    ds: &DsConfig,
+    spec: &ModelSpec,
+    budgets: [u64; 2],
+    sizing: &Sizing,
+    cache: &CacheConfig,
+) -> Result<DsKvBlocks, BootError> {
+    let b = u64::from(sizing.kv_block_size);
+    let overflow = || BootError(format!("{} overflows the KV sizing", env::KV_DEVICE_BYTES));
+    let points = if cache.enabled { RETENTION_POINTS } else { 0 };
+    let window_blocks = (ds.attention.window as u64).div_ceil(b) + 1;
+    let window = (1 + points)
+        .checked_mul(window_blocks)
+        .and_then(|x| x.checked_add(1))
+        .and_then(|x| x.checked_mul(u64::from(sizing.max_seqs)))
+        .and_then(|x| x.checked_add(1 + u64::from(sizing.max_batched_tokens).div_ceil(b)))
+        .filter(|&x| x <= i32::MAX as u64)
+        .ok_or_else(overflow)?;
+    let needed = u64::from(sizing.max_model_len).div_ceil(b) + 1;
+    let mut bank = i32::MAX as u64;
+    for (d, (half, budget)) in [Half::Encoder, Half::Decoder]
+        .into_iter()
+        .zip(budgets)
+        .enumerate()
+    {
+        let per_block = deepseek_half_block_bytes(ds, spec, half)?;
+        let windows = window.checked_mul(per_block.window).ok_or_else(overflow)?;
+        let rest = budget.checked_sub(windows).ok_or_else(|| {
+            BootError(format!(
+                "{} ({budget}, device {d}) cannot hold the window KV ({window} blocks of {} \
+                 bytes for {} sequences)",
+                env::KV_DEVICE_BYTES,
+                per_block.window,
+                sizing.max_seqs
+            ))
+        })?;
+        let fits = rest / per_block.bank.max(1);
+        if fits < needed {
+            return Err(BootError(format!(
+                "{} ({budget}, device {d}) leaves {fits} bank KV blocks of {} bytes beside the \
+                 window KV, fewer than the {needed} one {} sequence needs",
+                env::KV_DEVICE_BYTES,
+                per_block.bank,
+                env::MAX_MODEL_LEN
+            )));
+        }
+        bank = bank.min(fits);
+    }
+    Ok(DsKvBlocks {
+        bank: u32::try_from(bank).expect("capped at i32::MAX"),
+        window: u32::try_from(window).expect("capped at i32::MAX"),
+    })
+}
+
+/// The DeepSeek-V4.1 executor's host-tier block count from `kv_host_bytes`: one count for
+/// every group of both devices (each group's tier holds that many block images), so it is
+/// `floor(kv_host_bytes / (S_0 + S_1))` (`S_d` as in [`derive_deepseek_kv_blocks`]) and the
+/// tier's bytes never exceed the budget. 0 is no tier; a budget under two blocks (the null
+/// block and one more) is refused.
+pub fn derive_deepseek_host_blocks(
+    ds: &DsConfig,
+    spec: &ModelSpec,
+    kv_host_bytes: u64,
+) -> Result<u32, BootError> {
+    if kv_host_bytes == 0 {
+        return Ok(0);
+    }
+    let per_block = deepseek_half_block_bytes(ds, spec, Half::Encoder)?
+        .total()
+        .saturating_add(deepseek_half_block_bytes(ds, spec, Half::Decoder)?.total())
+        .max(1);
+    let blocks = kv_host_bytes / per_block;
+    if blocks < 2 {
+        return Err(BootError(format!(
+            "{} ({kv_host_bytes}) holds fewer than two host blocks of {per_block} bytes (every \
+             KV group of both devices)",
+            env::KV_HOST_BYTES
+        )));
+    }
+    Ok(u32::try_from(blocks.min(i32::MAX as u64)).expect("capped"))
+}
+
+/// The DeepSeek-V4.1 CUDA executor's configuration from the node's measured one, with no
+/// device: one step shape (`MAX_SEQS` × `MAX_BATCHED_TOKENS`), as on the CPU executor; the
+/// block counts from the two device budgets ([`derive_deepseek_kv_blocks`]) and the host
+/// tier's from `kv_host_bytes` ([`derive_deepseek_host_blocks`]); `DRAFT_TOKENS` drafts;
+/// devices [`DEEPSEEK_DEVICES`]. The executor's own preflight runs before the derivation
+/// (the model, the draft width against the drafter's slots, the block size against the
+/// pooling ratio, the step shape) and again over the derived counts. `graphs` must be
+/// `off`: this executor captures no decode graphs.
+pub fn deepseek_config(
+    ds: &DsConfig,
+    sizing: &Sizing,
+    cache: &CacheConfig,
+    kv_device_bytes: [u64; 2],
+    kv_host_bytes: u64,
+    graphs: CudaGraphs,
+    sampleable_vocab_size: u32,
+) -> Result<DsCudaExecutorConfig, BootError> {
+    if graphs == CudaGraphs::On {
+        return Err(BootError(format!(
+            "{} must be off: the DeepSeek-V4.1 cuda executor captures no decode graphs",
+            env::CUDA_GRAPHS
+        )));
+    }
+    let refused = |e: eidola_engine_cuda::CudaError| {
+        BootError(format!("the engine refused its configuration: {e}"))
+    };
+    let mut config = DsCudaExecutorConfig {
+        block_size: sizing.kv_block_size,
+        num_blocks: 2,
+        window_blocks: 2,
+        num_state_slots: sizing.max_seqs,
+        max_model_len: sizing.max_model_len,
+        buckets: vec![Bucket {
+            max_seqs: sizing.max_seqs,
+            max_tokens: sizing.max_batched_tokens,
+        }],
+        sampleable_vocab_size,
+        devices: DEEPSEEK_DEVICES,
+        draft_width: sizing.draft_tokens,
+        host_blocks: 0,
+        position_tags: false,
+        record: false,
+        gemm: eidola_engine_cuda::ds::gemm::GemmForm::Exact,
+    };
+    let (_, spec) = DsCudaExecutor::preflight(ds, &config).map_err(refused)?;
+    let blocks = derive_deepseek_kv_blocks(ds, &spec, kv_device_bytes, sizing, cache)?;
+    config.num_blocks = blocks.bank;
+    config.window_blocks = blocks.window;
+    config.host_blocks = derive_deepseek_host_blocks(ds, &spec, kv_host_bytes)?;
+    DsCudaExecutor::preflight(ds, &config).map_err(refused)?;
+    Ok(config)
+}
+
+/// Everything checked and both devices open: what the engine thread builds the
+/// DeepSeek-V4.1 executor from.
+pub struct DsPrepared {
+    /// The two GPUs, held open (their primary contexts retained) until the executor has
+    /// opened its own streams on them.
+    gpus: [Gpu; 2],
+    kernels_dir: PathBuf,
+    store: Arc<WeightSet>,
+    ds: DsConfig,
+    token_map: Option<Vec<u32>>,
+    config: DsCudaExecutorConfig,
+    report: DeviceReport,
+}
+
+impl DsPrepared {
+    /// Device 0's, for `/v1/engine/info`.
+    pub fn report(&self) -> DeviceReport {
+        self.report.clone()
+    }
+
+    /// The executor's configuration, as derived.
+    pub fn config(&self) -> &DsCudaExecutorConfig {
+        &self.config
+    }
+
+    /// Builds the executor: on each device the kernel images (each checked against the
+    /// compiled-in manifest), then the weights and every pool. Runs on the engine thread.
+    pub fn build(self) -> Result<DsCudaExecutor, String> {
+        let exec = DsCudaExecutor::new(
+            &KernelDir::new(self.kernels_dir),
+            &self.store,
+            &self.ds,
+            self.token_map,
+            &self.config,
+        )
+        .map_err(|e| e.to_string());
+        drop(self.gpus);
+        exec
+    }
+}
+
+/// DeepSeek-V4.1's refusals that need no device, in order ([`deepseek_config`]: graphs
+/// off, the executor's preflight, the block counts from both budgets and the host tier's),
+/// then, with `gpu_cc` required, the GPUs' confidential-computing state and their count
+/// (`crate::gpu_cc::check_devices`: at least as many GPUs reported as devices), then each
+/// device `d` on GPU `d`, whose budget must be less than its memory. Nothing is allocated
+/// on a device here.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_deepseek(
+    model: &LoadedModel,
+    sizing: &Sizing,
+    cache: &CacheConfig,
+    kernels_dir: &Path,
+    kv_device_bytes: [u64; 2],
+    kv_host_bytes: u64,
+    graphs: CudaGraphs,
+    gpu_cc: GpuCc,
+) -> Result<DsPrepared, BootError> {
+    let Served::DeepSeek {
+        config: ds,
+        token_map,
+        ..
+    } = model.served()
+    else {
+        return Err(BootError("the loaded model is not DeepSeek-V4.1".into()));
+    };
+    let config = deepseek_config(
+        ds,
+        sizing,
+        cache,
+        kv_device_bytes,
+        kv_host_bytes,
+        graphs,
+        model.sampleable_vocab_size(),
+    )?;
+
+    // No device is opened, and nothing reaches one, until the driver reports the GPUs in
+    // confidential-computing mode, accepting work, and at least one per device.
+    let devices = DEEPSEEK_DEVICES.len() as u32;
+    match gpu_cc {
+        GpuCc::Required => crate::gpu_cc::query_devices()
+            .and_then(|(state, reported)| crate::gpu_cc::check_devices(&state, reported, devices))
+            .map_err(|e| {
+                BootError(format!(
+                    "{} is required, but the driver does not report {devices} GPUs in \
+                     production confidential-computing mode: {e}",
+                    env::GPU_CC
+                ))
+            })?,
+        GpuCc::NotRequired => tracing::warn!(
+            "{} is not-required: the GPUs' confidential-computing mode is not checked \
+             (development only; no gateway pins this configuration)",
+            env::GPU_CC
+        ),
+    }
+
+    let refused = |e: eidola_engine_cuda::CudaError| {
+        BootError(format!("the engine refused its configuration: {e}"))
+    };
+    let mut opened = Vec::with_capacity(DEEPSEEK_DEVICES.len());
+    for (d, (ordinal, budget)) in DEEPSEEK_DEVICES
+        .into_iter()
+        .zip(kv_device_bytes)
+        .enumerate()
+    {
+        let gpu = Gpu::open(ordinal).map_err(refused)?;
+        let info = gpu.info();
+        let total = info.total_mem_bytes as u64;
+        if budget >= total {
+            return Err(BootError(format!(
+                "{} ({budget}, device {d}) is not less than its GPU's memory ({total} bytes)",
+                env::KV_DEVICE_BYTES
+            )));
+        }
+        let (major, minor) = info.compute_capability;
+        tracing::info!(
+            device = d,
+            gpu = ordinal,
+            name = %info.name,
+            compute_capability = %format!("{major}.{minor}"),
+            memory_bytes = total,
+            "opened the GPU"
+        );
+        opened.push(gpu);
+    }
+    let gpus: [Gpu; 2] = match opened.try_into() {
+        Ok(gpus) => gpus,
+        Err(_) => unreachable!("one GPU per device"),
+    };
+    let info = gpus[0].info();
+    let (major, minor) = info.compute_capability;
+    let report = DeviceReport {
+        name: info.name.clone(),
+        compute_capability: format!("{major}.{minor}"),
+        image: gpus[0].image_arch().map(|a| a.as_str()),
+        sm_count: info.sm_count,
+        memory_bytes: info.total_mem_bytes as u64,
+    };
+    Ok(DsPrepared {
+        gpus,
+        kernels_dir: kernels_dir.to_path_buf(),
+        store: model.store().clone(),
+        ds: ds.clone(),
+        token_map: token_map.clone(),
+        config,
+        report,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eidola_common::architecture::{Shape, UniformKvGroup};
     use eidola_engine::spec::KvRole;
 
     fn group(attention: AttentionKind, layers: u32, heads: u32) -> KvGroupSpec {
@@ -381,6 +745,9 @@ mod tests {
             head_dim_v: 128,
             num_blocks: 2,
             host_blocks: 0,
+            ratio: 1,
+            device: 0,
+            coverage: eidola_engine::spec::Coverage::All,
         }
     }
 
@@ -415,6 +782,8 @@ mod tests {
                 max_seqs: 8,
                 max_tokens: 512,
             }],
+            window_chain: None,
+            token_history: 0,
         }
     }
 
@@ -692,5 +1061,516 @@ mod tests {
     fn global_blocks_stop_at_the_tables_index_range() {
         let blocks = derive_kv_blocks(&flash(), 4096, u64::MAX, &sizing(), &cache(true)).unwrap();
         assert_eq!(blocks.global, i32::MAX as u32);
+    }
+
+    /// The model crate's tiny DeepSeek-V4.1 configuration (pooling ratio 2, a drafter).
+    fn deepseek_tiny() -> DsConfig {
+        DsConfig::from_file(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../eidola-engine-model/tests/fixtures/deepseek_tiny/config.json"),
+        )
+        .unwrap()
+    }
+
+    /// The released DeepSeek-V4.1-Flash configuration (the chat crate's copy of its
+    /// `config.json`).
+    fn deepseek_released() -> DsConfig {
+        DsConfig::from_file(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../eidola-engine-chat/tests/fixtures/deepseek_v4_1/config.json"),
+        )
+        .unwrap()
+    }
+
+    fn ds_sizing(draft_tokens: u32) -> Sizing {
+        Sizing {
+            max_model_len: 64,
+            max_seqs: 2,
+            max_batched_tokens: 32,
+            max_prefill_chunk: 32,
+            draft_tokens,
+            ..sizing()
+        }
+    }
+
+    /// The executor's spec under `sizing`, and the bytes of one block of every group on
+    /// each device, banks and windows apart, summed from the executor's own block layouts.
+    fn ds_spec(ds: &DsConfig, sizing: &Sizing) -> (ModelSpec, [DsBlockBytes; 2]) {
+        let config = deepseek_config(
+            ds,
+            sizing,
+            &cache(true),
+            [u64::MAX; 2],
+            0,
+            CudaGraphs::Off,
+            90,
+        )
+        .unwrap();
+        let (_, spec) = DsCudaExecutor::preflight(ds, &config).unwrap();
+        let per = |half| {
+            let mut bytes = DsBlockBytes::default();
+            for g in eidola_engine_cuda::ds::executor::geometry(ds, &spec, half).unwrap() {
+                match spec.kv_groups[g.global as usize].attention {
+                    AttentionKind::Full => bytes.bank += g.block_bytes() as u64,
+                    AttentionKind::Sliding { .. } => bytes.window += g.block_bytes() as u64,
+                }
+            }
+            bytes
+        };
+        let per_block = [per(Half::Encoder), per(Half::Decoder)];
+        (spec, per_block)
+    }
+
+    /// The dev model's KV groups in the shared contract's terms (the model crate's tiny
+    /// configuration: a 32-wide entry, 35-byte bank entries and 33-byte window entries;
+    /// one pooled source at ratio 2 and four window layers on device 0; one bank layer,
+    /// four window layers and the drafter's three on device 1).
+    const DEV_GROUPS: [&[UniformKvGroup]; 2] = [
+        &[
+            UniformKvGroup {
+                layers: 1,
+                ratio: 2,
+                entry_bytes: 35,
+                window: false,
+                drafter: false,
+            },
+            UniformKvGroup {
+                layers: 4,
+                ratio: 1,
+                entry_bytes: 33,
+                window: true,
+                drafter: false,
+            },
+        ],
+        &[
+            UniformKvGroup {
+                layers: 1,
+                ratio: 1,
+                entry_bytes: 35,
+                window: false,
+                drafter: false,
+            },
+            UniformKvGroup {
+                layers: 4,
+                ratio: 1,
+                entry_bytes: 33,
+                window: true,
+                drafter: false,
+            },
+            UniformKvGroup {
+                layers: 3,
+                ratio: 1,
+                entry_bytes: 33,
+                window: true,
+                drafter: true,
+            },
+        ],
+    ];
+
+    /// The gateway's build holds a pinned DeepSeek-V4.1 deployment's per-device budgets
+    /// to `cuda_kv_min_bytes` and its host tier to the devices' `cuda_kv_host_min_bytes`
+    /// summed. Over the released configuration (the shared `DEEPSEEK_V41_FLASH` shapes)
+    /// and the dev model's (`DEV_GROUPS`, window 48), across block sizes, context lengths,
+    /// seats, step sizes, the cache switch and every draft width a deployment can set: the
+    /// shared block bytes are the executor's, bank and window alike, the shared window
+    /// count is the derivation's, the derivation accepts exactly the shared minimum on
+    /// each device (one `MAX_MODEL_LEN` sequence of banks) and refuses one byte below on
+    /// either, and likewise the host tier.
+    #[test]
+    fn the_shared_deepseek_minimums_are_the_derivations() {
+        use eidola_common::architecture::DEEPSEEK_V41_FLASH;
+        use eidola_common::engine_deployment::{
+            cuda_kv_host_min_bytes, cuda_kv_min_bytes, uniform_kv_bank_block_bytes,
+            uniform_kv_window_block_bytes, uniform_kv_window_blocks,
+        };
+        let dev = DEV_GROUPS.map(|groups| Shape {
+            uniform_kv_groups: groups,
+            sliding_window: 48,
+            ..DEEPSEEK_V41_FLASH[0]
+        });
+        let cases = [
+            (
+                deepseek_released(),
+                DEEPSEEK_V41_FLASH,
+                vec![4096, 131_072, 1 << 20],
+            ),
+            (deepseek_tiny(), dev, vec![64, 1000, 1024]),
+        ];
+        for (ds, shapes, lengths) in cases {
+            for block in [2u32, 16, 64, 256] {
+                for &len in &lengths {
+                    for (seats, step) in [(2, 32), (64, 8192)] {
+                        for (enabled, draft) in [(true, 0), (true, 1), (false, 2), (true, 3)] {
+                            let sizing = Sizing {
+                                kv_block_size: block,
+                                max_model_len: len,
+                                max_seqs: seats,
+                                max_batched_tokens: step,
+                                max_prefill_chunk: step,
+                                ..ds_sizing(draft)
+                            };
+                            let cache = cache(enabled);
+                            let at = (block, len, seats, step, enabled, draft);
+                            let (spec, per_block) = ds_spec(&ds, &sizing);
+                            for (s, bytes) in shapes.iter().zip(per_block) {
+                                assert_eq!(
+                                    (
+                                        uniform_kv_bank_block_bytes(s, &sizing),
+                                        uniform_kv_window_block_bytes(s, &sizing)
+                                    ),
+                                    (bytes.bank, bytes.window),
+                                    "{at:?}"
+                                );
+                            }
+                            let min = shapes.map(|s| cuda_kv_min_bytes(&s, &sizing, &cache));
+                            let needed = len.div_ceil(block) + 1;
+                            let blocks =
+                                derive_deepseek_kv_blocks(&ds, &spec, min, &sizing, &cache)
+                                    .unwrap_or_else(|e| panic!("{at:?}: {e}"));
+                            assert_eq!(blocks.bank, needed, "{at:?}");
+                            for s in &shapes {
+                                assert_eq!(
+                                    u64::from(blocks.window),
+                                    uniform_kv_window_blocks(s, &sizing, &cache),
+                                    "{at:?}"
+                                );
+                            }
+                            for short in [[min[0] - 1, min[1]], [min[0], min[1] - 1]] {
+                                assert!(
+                                    derive_deepseek_kv_blocks(&ds, &spec, short, &sizing, &cache)
+                                        .is_err(),
+                                    "{at:?}"
+                                );
+                            }
+                            let host: u64 = shapes
+                                .iter()
+                                .zip(min)
+                                .map(|(s, b)| cuda_kv_host_min_bytes(s, &sizing, &cache, b))
+                                .sum();
+                            assert_eq!(
+                                derive_deepseek_host_blocks(&ds, &spec, host).unwrap(),
+                                2,
+                                "{at:?}"
+                            );
+                            assert!(
+                                derive_deepseek_host_blocks(&ds, &spec, host - 1).is_err(),
+                                "{at:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The window count is the documented rule: with block 16 and window 48, `R` = 4, so
+    /// two seats and a 32-token step take `1 + 2 × (4 × 4 + 1) + 2` = 37 blocks with the
+    /// cache and `1 + 2 × 5 + 2` = 13 without; the bank count is what the tighter device
+    /// leaves beside them, each budget charged its own device's groups, the drafter's
+    /// windows on the decoder's device.
+    #[test]
+    fn deepseek_blocks_are_what_the_tighter_device_leaves_beside_the_windows() {
+        let ds = deepseek_tiny();
+        for (enabled, window) in [(true, 37u64), (false, 13)] {
+            for k in [0u32, 2] {
+                let s = ds_sizing(k);
+                let (spec, [e, d]) = ds_spec(&ds, &s);
+                assert!(e.bank > 0 && e.window > 0 && d.bank > 0 && d.window > 0);
+                for (b0, b1) in [(100, 300), (300, 100), (200, 200)] {
+                    let budgets = [
+                        window * e.window + b0 * e.bank + 7,
+                        window * d.window + b1 * d.bank,
+                    ];
+                    let n = derive_deepseek_kv_blocks(&ds, &spec, budgets, &s, &cache(enabled))
+                        .unwrap();
+                    assert_eq!(u64::from(n.window), window, "k {k}");
+                    assert_eq!(u64::from(n.bank), b0.min(b1), "k {k}");
+                }
+            }
+        }
+        // Drafting adds the drafter's window group to the decoder's device only.
+        let (_, [e0, d0]) = ds_spec(&ds, &ds_sizing(0));
+        let (spec, [e2, d2]) = ds_spec(&ds, &ds_sizing(2));
+        assert_eq!(e0, e2);
+        assert_eq!(d0.bank, d2.bank);
+        assert!(d2.window > d0.window, "{d2:?} vs {d0:?}");
+        assert_eq!(spec.kv_groups.len(), 5);
+    }
+
+    /// Each device must hold the windows and, beside them, one `MAX_MODEL_LEN` sequence of
+    /// banks and the null block; the bank count stops at the tables' `i32` range.
+    #[test]
+    fn deepseek_blocks_hold_one_sequence_and_stop_at_the_index_range() {
+        let ds = deepseek_tiny();
+        let s = ds_sizing(0);
+        let (spec, [e, d]) = ds_spec(&ds, &s);
+        let c = cache(true);
+        let window = 37;
+        // 64 positions in blocks of 16, and the null block.
+        let needed = 64 / 16 + 1;
+        let at = |n: u64| {
+            [
+                window * e.window + n * e.bank,
+                window * d.window + n * d.bank,
+            ]
+        };
+        let blocks = derive_deepseek_kv_blocks(&ds, &spec, at(needed), &s, &c).unwrap();
+        assert_eq!((blocks.bank, blocks.window), (needed as u32, window as u32));
+        let [b0, b1] = at(needed);
+        for (budgets, device) in [([b0 - 1, b1], "device 0"), ([b0, b1 - 1], "device 1")] {
+            let e = derive_deepseek_kv_blocks(&ds, &spec, budgets, &s, &c).unwrap_err();
+            assert!(e.0.contains(env::KV_DEVICE_BYTES), "{e}");
+            assert!(e.0.contains(env::MAX_MODEL_LEN), "{e}");
+            assert!(e.0.contains(device), "{e}");
+        }
+        // Not even the windows fit.
+        let e =
+            derive_deepseek_kv_blocks(&ds, &spec, [b0, window * d.window - 1], &s, &c).unwrap_err();
+        assert!(e.0.contains("window KV") && e.0.contains("device 1"), "{e}");
+        let blocks = derive_deepseek_kv_blocks(&ds, &spec, [u64::MAX, u64::MAX], &s, &c).unwrap();
+        assert_eq!(blocks.bank, i32::MAX as u32);
+    }
+
+    /// The released configuration laid out with no checkpoint, every allocation at its
+    /// size, on dry devices; `budgets` the KV budgets, the counts the node derives.
+    fn released_layout(
+        sizing: &Sizing,
+        budgets: [u64; 2],
+        capacity: Option<u64>,
+    ) -> Result<DsCudaExecutor, String> {
+        use eidola_engine_cuda::ds::dry::DryDevice;
+        let ds = deepseek_released();
+        let e = ds.engram.clone().unwrap();
+        let map: Vec<u32> = (0..ds.vocab_size)
+            .map(|i| u32::try_from(i % e.compressed_vocab).unwrap())
+            .collect();
+        let config = deepseek_config(
+            &ds,
+            sizing,
+            &cache(true),
+            budgets,
+            0,
+            CudaGraphs::Off,
+            129_264,
+        )
+        .map_err(|e| e.0)?;
+        let device = || -> Box<dyn eidola_engine_cuda::ds::half::Device> {
+            Box::new(DryDevice::new(
+                capacity.map(|c| usize::try_from(c).unwrap()),
+            ))
+        };
+        DsCudaExecutor::layout(device(), device(), &ds, Some(map), &config)
+            .map_err(|e| e.to_string())
+    }
+
+    fn released_sizing(len: u32, seats: u32, step: u32, draft: u32) -> Sizing {
+        Sizing {
+            kv_block_size: 256,
+            max_model_len: len,
+            max_seqs: seats,
+            max_batched_tokens: step,
+            max_prefill_chunk: step.min(4096),
+            draft_tokens: draft,
+            max_requests: 64,
+        }
+    }
+
+    /// The gateway's build bounds each device's step scratch by
+    /// `engine_deployment::step_scratch_bytes` of the released shapes
+    /// (`DEEPSEEK_V41_FLASH`'s `step_scratch`). Across contexts, step sizes (below and
+    /// above a draft pass's rows), seats and draft widths, laid out by the executor
+    /// itself: the indexer's scores and candidate mask, the part that grows with step
+    /// tokens times the context, are exactly `step_scratch_rows × index_scratch_row_bytes`
+    /// on each device; the whole scratch and open entries are at most the shared count
+    /// and at least that less its `fixed_bytes`; the block tables are within the shared
+    /// term; and the weights the executor loads (its RoPE tables among them) are within
+    /// `device_weights_bytes` and the shared RoPE term.
+    #[test]
+    fn the_shared_step_scratch_is_the_executors() {
+        use eidola_common::architecture::DEEPSEEK_V41_FLASH;
+        use eidola_common::engine_deployment::{
+            device_weights_bytes, index_scratch_row_bytes, step_scratch_bytes, step_scratch_rows,
+        };
+        for len in [4096u32, 1 << 20] {
+            for step in [320u32, 8192] {
+                for seats in [16u32, 64] {
+                    for draft in [0u32, 1, 3] {
+                        let sizing = released_sizing(len, seats, step, draft);
+                        let at = (len, step, seats, draft);
+                        let x = released_layout(&sizing, [1 << 32; 2], None)
+                            .unwrap_or_else(|e| panic!("{at:?}: {e}"));
+                        for ((half, shape), m) in [Half::Encoder, Half::Decoder]
+                            .into_iter()
+                            .zip(&DEEPSEEK_V41_FLASH)
+                            .zip(x.memory())
+                        {
+                            let n = x.half(half);
+                            let index = (n.s.scores.bytes + n.s.mask.bytes) as u64;
+                            assert_eq!(
+                                step_scratch_rows(shape, &sizing)
+                                    * index_scratch_row_bytes(shape, &sizing),
+                                index,
+                                "{at:?} {half:?}"
+                            );
+                            let shared = step_scratch_bytes(shape, &sizing);
+                            let fixed = shape.step_scratch.unwrap().fixed_bytes;
+                            let held = m.scratch + m.state;
+                            assert!(
+                                held <= shared && shared - held <= fixed,
+                                "{at:?} {half:?}: {held} against {shared}"
+                            );
+                            let blocks = u64::from(len.div_ceil(256));
+                            let groups = eidola_common::engine_deployment::kv_groups(draft);
+                            assert!(m.tables <= u64::from(seats) * blocks * groups * 4);
+                            let rope = u64::from(len) * shape.rope_device_bytes_per_position;
+                            assert!(
+                                m.weights <= device_weights_bytes(shape, &sizing).unwrap() + rope,
+                                "{at:?} {half:?}: weights {}",
+                                m.weights
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A gateway never pins a DeepSeek-V4.1 deployment the node cannot lay out. At its
+    /// whole 2^20-position window, with each device's budget the most the shared check
+    /// accepts (`check_device_resources`: the budget, `device_weights_bytes` and
+    /// `cuda_device_reserve_bytes` exactly a B300's memory; one byte more is refused),
+    /// the node derives the counts and the executor lays both devices out, every
+    /// allocation at its size, within a B300's memory less the reserve's fixed 4 GiB
+    /// (the driver's context and the kernel modules, which a dry device does not hold):
+    /// undrafted at 8,192-token steps and drafting three at 4,096. Drafting three at
+    /// 8,192, which the shared check refuses at any budget, does not lay out even with
+    /// the least KV.
+    #[test]
+    fn the_released_model_lays_out_wherever_the_shared_check_admits_it() {
+        use eidola_common::architecture::DEEPSEEK_V41_FLASH;
+        use eidola_common::engine_deployment::{
+            DEVICE_FIXED_RESERVE_BYTES, SUPPORTED_GPU_MEMORY_BYTES, cuda_device_reserve_bytes,
+            cuda_kv_min_bytes, device_weights_bytes,
+        };
+        let capacity = SUPPORTED_GPU_MEMORY_BYTES - DEVICE_FIXED_RESERVE_BYTES;
+        let room = |sizing: &Sizing| {
+            DEEPSEEK_V41_FLASH.map(|d| {
+                (SUPPORTED_GPU_MEMORY_BYTES as i128)
+                    - device_weights_bytes(&d, sizing).unwrap() as i128
+                    - cuda_device_reserve_bytes(&d, sizing) as i128
+            })
+        };
+        for (draft, step) in [(0, 8192), (3, 4096)] {
+            let sizing = released_sizing(1 << 20, 64, step, draft);
+            let budgets = room(&sizing).map(|r| u64::try_from(r).unwrap());
+            let x = released_layout(&sizing, budgets, Some(capacity))
+                .unwrap_or_else(|e| panic!("drafts {draft}: {e}"));
+            for (d, m) in x.memory().iter().enumerate() {
+                assert!(m.kv <= budgets[d], "device {d}");
+                eprintln!(
+                    "drafts {draft}, step {step}, device {d}: budget {}, {} bytes to spare",
+                    budgets[d],
+                    capacity - m.total()
+                );
+            }
+        }
+        let crowded = released_sizing(1 << 20, 64, 8192, 3);
+        assert!(room(&crowded)[1] < 0);
+        let least = DEEPSEEK_V41_FLASH.map(|d| cuda_kv_min_bytes(&d, &crowded, &cache(true)));
+        let e = released_layout(&crowded, least, Some(capacity))
+            .err()
+            .unwrap();
+        assert!(e.contains("out of device memory"), "{e}");
+    }
+
+    /// The host tier: one count for every group of both devices, its bytes within the
+    /// budget; 0 is none; under two blocks refused.
+    #[test]
+    fn deepseek_host_blocks_fit_their_budget() {
+        let ds = deepseek_tiny();
+        let s = ds_sizing(2);
+        let (spec, [e, d]) = ds_spec(&ds, &s);
+        let all = e.total() + d.total();
+        assert_eq!(derive_deepseek_host_blocks(&ds, &spec, 0).unwrap(), 0);
+        for budget in [2 * all, 2 * all + 1, 1000 * all - 1] {
+            let n = derive_deepseek_host_blocks(&ds, &spec, budget).unwrap();
+            assert_eq!(u64::from(n), budget / all);
+            assert!(u64::from(n) * all <= budget);
+        }
+        let e = derive_deepseek_host_blocks(&ds, &spec, 2 * all - 1).unwrap_err();
+        assert!(e.0.contains(env::KV_HOST_BYTES), "{e}");
+    }
+
+    /// Graphs are refused (the executor captures none); the executor's own preflight
+    /// refuses a draft width past the drafter's slots and a block size the pooling ratio
+    /// does not divide; the derived configuration is the node's sizing.
+    #[test]
+    fn the_deepseek_configuration_is_the_nodes() {
+        let ds = deepseek_tiny();
+        let c = cache(true);
+        let e = deepseek_config(&ds, &ds_sizing(0), &c, [1 << 30; 2], 0, CudaGraphs::On, 90)
+            .unwrap_err();
+        assert!(e.0.contains(env::CUDA_GRAPHS), "{e}");
+        assert!(e.0.contains("no decode graphs"), "{e}");
+        let slots = ds.drafter.as_ref().unwrap().slots as u32;
+        let e = deepseek_config(
+            &ds,
+            &ds_sizing(slots + 1),
+            &c,
+            [1 << 30; 2],
+            0,
+            CudaGraphs::Off,
+            90,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("draft_width"), "{e}");
+        let odd = Sizing {
+            kv_block_size: 5,
+            ..ds_sizing(0)
+        };
+        let e = deepseek_config(&ds, &odd, &c, [1 << 30; 2], 0, CudaGraphs::Off, 90).unwrap_err();
+        assert!(e.0.contains("ratio 2 must divide the block size"), "{e}");
+
+        let s = ds_sizing(2);
+        let budgets = [1 << 24, 1 << 23];
+        let config = deepseek_config(&ds, &s, &c, budgets, 1 << 22, CudaGraphs::Off, 90).unwrap();
+        let (spec, [e0, e1]) = ds_spec(&ds, &s);
+        let blocks = derive_deepseek_kv_blocks(&ds, &spec, budgets, &s, &c).unwrap();
+        assert_eq!(
+            (config.num_blocks, config.window_blocks),
+            (blocks.bank, blocks.window)
+        );
+        // The executor's spec carries them: banks one count, windows the other.
+        let (_, derived) = DsCudaExecutor::preflight(&ds, &config).unwrap();
+        for g in &derived.kv_groups {
+            let want = match g.attention {
+                AttentionKind::Full => blocks.bank,
+                AttentionKind::Sliding { .. } => blocks.window,
+            };
+            assert_eq!(g.num_blocks, want, "{}", g.name);
+        }
+        assert_eq!(
+            u64::from(config.host_blocks),
+            (1u64 << 22) / (e0.total() + e1.total())
+        );
+        assert_eq!(config.devices, DEEPSEEK_DEVICES);
+        assert_eq!(
+            (
+                config.block_size,
+                config.num_state_slots,
+                config.max_model_len,
+                config.draft_width
+            ),
+            (16, 2, 64, 2)
+        );
+        assert_eq!(
+            config.buckets,
+            vec![Bucket {
+                max_seqs: 2,
+                max_tokens: 32
+            }]
+        );
+        assert_eq!(config.sampleable_vocab_size, 90);
+        assert!(!config.position_tags && !config.record);
     }
 }

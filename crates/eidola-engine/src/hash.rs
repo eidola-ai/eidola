@@ -18,6 +18,9 @@ const DOMAIN: &[u8] = b"eidola/kv-block/v1";
 /// Domain label of the nonce an idle block is encrypted under.
 const NONCE_DOMAIN: &[u8] = b"eidola/kv-nonce/v1";
 
+/// Domain label of the nonce of a block whose bytes are not a function of its hash.
+const ATTACHED_NONCE_DOMAIN: &[u8] = b"eidola/kv-nonce-attached/v1";
+
 /// A block hash. It is an opaque but stable linkage tag for a (salt, prefix) pair: two
 /// equal hashes mean "same salt and same tokens up to here", and nothing about the tokens
 /// can be recovered from it. `Debug` is redacted, it has no `Display`, serialization or
@@ -59,6 +62,23 @@ impl BlockHash {
         h.update(NONCE_DOMAIN);
         h.update(self.0);
         h.update(group.to_le_bytes());
+        let d = h.finalize();
+        let mut n = [0u8; 12];
+        n.copy_from_slice(&d[..12]);
+        KvNonce::from_bytes(n)
+    }
+
+    /// The nonce of a block whose bytes depend on more than the tokens it covers (a
+    /// group with [`crate::spec::Coverage::Chain`]), for one attachment to a cache entry:
+    /// `SHA-256("eidola/kv-nonce-attached/v1" ‖ hash ‖ group:u32le ‖ attachment:u64le)`,
+    /// its first 12 bytes. `attachment` is unique in the process, so no two attachments
+    /// share a nonce, and a block is immutable while attached.
+    pub fn kv_nonce_attached(&self, group: u32, attachment: u64) -> KvNonce {
+        let mut h = Sha256::new();
+        h.update(ATTACHED_NONCE_DOMAIN);
+        h.update(self.0);
+        h.update(group.to_le_bytes());
+        h.update(attachment.to_le_bytes());
         let d = h.finalize();
         let mut n = [0u8; 12];
         n.copy_from_slice(&d[..12]);

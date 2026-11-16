@@ -119,6 +119,29 @@ pub struct Cubin {
     /// Count of tensor-core instructions in the SASS, by opcode family
     /// (`UTC*` is tcgen05, `HMMA` is `mma.sync`).
     pub mma_sass: BTreeMap<String, u64>,
+    /// For a source built without multiply-add contraction (`--fmad=false`
+    /// among its flags), what its PTX and SASS show of it.
+    #[serde(default)]
+    pub float_ops: Option<FloatOps>,
+}
+
+/// The floating-point multiply-adds of a translation unit built without
+/// contraction. Its PTX shows contraction directly: a fused operation is an
+/// `fma` instruction, and a multiply, add or subtract ptxas may still fuse is
+/// one without a rounding mode. Its SASS does not: a division, a reciprocal
+/// and a square root each expand into fused multiply-adds of their own.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FloatOps {
+    /// `fma` instructions in the PTX.
+    pub ptx_fma: u64,
+    /// Floating-point `mul` / `add` / `sub` in the PTX without a rounding mode.
+    pub ptx_unrounded: u64,
+    /// The same with one (`.rn`): what the source's arithmetic compiled to.
+    pub ptx_rounded: u64,
+    /// `FFMA` / `DFMA` in the SASS: with no `fma` in the PTX, all of them
+    /// belong to division, reciprocal and square-root expansions.
+    pub sass_fma: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

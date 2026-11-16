@@ -307,10 +307,15 @@ fn without_a_utility_model_the_map_stays_structural() {
     });
 }
 
-/// The runtime's live tasks after a bare post into `space`, against the count
-/// before it: `true` once it is back down within `within`.
-fn post_leaves_no_task(core: &AppCore, space: &str, reply_to: &str, within: Duration) -> bool {
-    let before = core.runtime().metrics().num_alive_tasks();
+/// After a bare post into `space`: whether its summary trigger is still waiting
+/// out the debounce once `settle` has passed. The trigger's stamp is per space,
+/// so other tasks starting or ending meanwhile cannot change the answer.
+fn post_leaves_pending_trigger(
+    core: &AppCore,
+    space: &str,
+    reply_to: &str,
+    settle: Duration,
+) -> bool {
     core.runtime()
         .block_on(core.post_reply(
             "One more thought.".into(),
@@ -318,22 +323,20 @@ fn post_leaves_no_task(core: &AppCore, space: &str, reply_to: &str, within: Dura
             Some(reply_to.to_string()),
         ))
         .expect("post");
-    let deadline = Instant::now() + within;
-    loop {
-        if core.runtime().metrics().num_alive_tasks() <= before {
-            return true;
-        }
-        if Instant::now() >= deadline {
+    let deadline = Instant::now() + settle;
+    while Instant::now() < deadline {
+        if !core.test_summary_trigger_pending(space) {
             return false;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    core.test_summary_trigger_pending(space)
 }
 
 /// A space with summaries off has no pass to debounce, so a post into it leaves
-/// no task waiting out the debounce — the runtime is idle again well within it.
-/// With a utility model set, the same post does leave the debounced pass
-/// waiting, which is what shows this test can see the task at all.
+/// no trigger waiting: its stamp is gone as soon as the router model is read,
+/// well within the debounce. With a utility model set, the same post leaves its
+/// trigger waiting, which is what shows this test can see the trigger at all.
 #[test]
 fn a_post_with_summaries_off_schedules_no_pass() {
     run(|| {
@@ -345,13 +348,13 @@ fn a_post_with_summaries_off_schedules_no_pass() {
         with_account(&core);
         let fx = branched_space(&core);
         assert!(
-            post_leaves_no_task(&core, &fx.space, &fx.branch_tail, Duration::from_secs(5)),
-            "summaries are off, yet a task outlived the post"
+            !post_leaves_pending_trigger(&core, &fx.space, &fx.branch_tail, Duration::from_secs(5)),
+            "summaries are off, yet the post left its trigger waiting"
         );
 
         use_utility_model(&core, &mock, &fx.space, chat_harness::ROUTER_MODEL);
         assert!(
-            !post_leaves_no_task(&core, &fx.space, &fx.branch_tail, Duration::from_secs(1)),
+            post_leaves_pending_trigger(&core, &fx.space, &fx.branch_tail, Duration::from_secs(1)),
             "summaries are on, so the post leaves its debounced pass waiting"
         );
     });
