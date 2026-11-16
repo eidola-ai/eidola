@@ -53,7 +53,7 @@ Step 2's ordering is enforced rather than remembered. The `signing-identity` job
 
 "The previous release" means one thing everywhere — the templates `attest` renders from, the `previous_release` it records, and the CI pin both sides check: the highest release version below the tag among the tags in its history, by semantic-version precedence (`crates/release-tool/src/previous.rs`, mirrored by the guard script). Tags that are not `vMAJOR.MINOR.PATCH[-PRE]` releases are ignored wherever they sit, and of several tags on one commit the highest counts.
 
-**Currently mid-rotation:** clients built from this tree pin `https://github.com/eidola-ai/eidola/.github/workflows/sign-release.yml@refs/tags/v*`, a workflow that only signs, so nothing else a release job runs can mint the identity. The release that carries the pin is still signed by `tinfoil-build.yml`, which the release before it pins. Step 3 is moving the `signing-identity` and `sign` jobs into a top-level `sign-release.yml` (triggered by `v*` tags, never `workflow_call`) once that release is out.
+The pin today is `https://github.com/eidola-ai/eidola/.github/workflows/sign-release.yml@refs/tags/v*`, a workflow that only signs, so nothing else a release runs can mint the identity. A signing workflow stays top-level, triggered by `v*` tags and never by `workflow_call`, because Fulcio's SAN names a reusable workflow's own file whoever calls it.
 
 ### Changing attestation templates
 

@@ -1,6 +1,6 @@
 # Tag-triggered release pipeline.
 #
-# Three responsibilities, each in jobs holding only what it needs:
+# Two responsibilities, each in jobs holding only what it needs:
 #
 # 1. **The gateway enclave, cross-checked** (`cross-check`). The gateway
 #    runs on the platform provider's IGVM launch model: `tinfoil-config.yml`
@@ -14,29 +14,14 @@
 #    That runs a binary of the provider's, so the job holds a read-only
 #    token and no OIDC token.
 #
-# 2. **The GitHub release** (`release`), created with the config and the
-#    release manifest it names. Tinfoil's closed-source deployment system
-#    requires this workflow's file to be named `tinfoil-build.yml` — do not
-#    rename.
+# 2. **The GitHub release** (`release`, then `publish-assets`), created with
+#    the config and the release manifest it names, and then the measured
+#    files. Tinfoil's closed-source deployment system requires this
+#    workflow's file to be named `tinfoil-build.yml` — do not rename.
 #
-# 3. **Eidola release signing** (`signing-identity`, `sign`,
-#    `attach-signature`). `cosign sign-blob` signs `artifact-manifest.json`
-#    keyless under the workflow's Fulcio OIDC identity, the one clients pin
-#    (`expected_ci_identity_pattern` in `releases/trust/trust-constants.json`).
-#    Fulcio derives that identity from the workflow *file*, so every step of
-#    a job holding `id-token: write` can mint it: the signing job runs a
-#    checkout and cosign and nothing else, and no other job holds the
-#    permission. Before it runs, `signing-identity` refuses a signature the
-#    previous release's clients would reject (`scripts/check-signing-identity.sh`).
-#    The bundle and the manifest are attached to the release by a job with
-#    no OIDC token. The release is **not** marked latest here — the
-#    engineer's release-tool does that after their human attestation has
-#    been signed and uploaded.
-#
-# Clients built from this tree pin `sign-release.yml`, a workflow of its own
-# that signing moves to once a release carrying that pin is out
-# (releases/README.md → Rotating the CI signing workflow). Until then the
-# release before this one pins this file, so this file signs.
+# Nothing here signs, and no job here holds `id-token: write`. Clients pin
+# the identity of `sign-release.yml`, which waits for this workflow's
+# release and signs `artifact-manifest.json`.
 
 name: Tinfoil Build
 
@@ -208,97 +193,6 @@ jobs:
             "$RUNNER_TEMP/tinfoil-config.sha256" \
             "$RUNNER_TEMP"/tinfoil-inference-v*-manifest.json
 
-  signing-identity:
-    name: Check the previous release's clients accept this signer
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read # check out the tree and every release tag
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0 # every release tag, to read the previous release's pin
-
-      - name: Check this workflow against the previous release's pin
-        env:
-          TAG: ${{ github.ref_name }}
-        # The identity the `sign` job's token will carry: Fulcio's SAN for a
-        # top-level workflow is its own ref.
-        run: ./scripts/check-signing-identity.sh "$GITHUB_SERVER_URL/$GITHUB_WORKFLOW_REF" "$TAG"
-
-  sign:
-    name: Sign artifact-manifest.json
-    # Not before the enclave it records has been cross-checked, and not
-    # under an identity the previous release's clients would refuse.
-    needs: [cross-check, signing-identity]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read # check out the tagged tree
-      id-token: write # mint the OIDC token cosign signs with
-    outputs:
-      bundle: ${{ steps.sign.outputs.bundle }}
-
-    # Every step here can mint the pinned identity. Keep it to these.
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
-
-      - name: Sign artifact-manifest.json (Fulcio keyless via OIDC)
-        id: sign
-        run: |
-          set -euo pipefail
-          # Produces a Sigstore bundle binding the workflow's Fulcio OIDC
-          # identity to sha256(artifact-manifest.json), with a Rekor
-          # inclusion proof embedded. Clients pin both the OIDC issuer and
-          # the workflow path; any cert SAN that doesn't match is rejected
-          # on verification.
-          cosign sign-blob \
-            artifact-manifest.json \
-            --bundle "$RUNNER_TEMP/artifact-manifest.json.sigstore" \
-            --yes
-          test -s "$RUNNER_TEMP/artifact-manifest.json.sigstore"
-          # Handed to `attach-signature` as an output, so attaching needs no
-          # artifact store and this job runs no action past cosign.
-          echo "bundle=$(base64 -w0 "$RUNNER_TEMP/artifact-manifest.json.sigstore")" >> "$GITHUB_OUTPUT"
-
-  attach-signature:
-    name: Attach the signed manifest to the release
-    needs: [release, sign]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: write # attach assets to the tag's release
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Upload the signed manifest to the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-          BUNDLE: ${{ needs.sign.outputs.bundle }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$BUNDLE" | base64 -d > artifact-manifest.json.sigstore
-          test -s artifact-manifest.json.sigstore
-          gh release upload "$TAG" \
-            artifact-manifest.json \
-            artifact-manifest.json.sigstore \
-            --clobber \
-            --repo "$GITHUB_REPOSITORY"
-
   # ── Attach the measured files themselves ─────────────────────────────────
   # The signed manifest records a hash for every artifact and
   # docs/verification.md promises that hash is checkable with nothing but
@@ -314,12 +208,12 @@ jobs:
   # may be uploaded; a mismatch, a missing file, or an artifact class no one
   # decided about fails this job before `gh release upload` runs. The
   # release itself already exists at that point (the manifest and its
-  # Sigstore bundle are attached above), so a failure here is loud and
-  # re-runnable rather than a half-created release — and `--clobber` makes
-  # the re-run idempotent.
+  # Sigstore bundle are attached by `sign-release.yml`), so a failure here
+  # is loud and re-runnable rather than a half-created release — and
+  # `--clobber` makes the re-run idempotent.
   publish-assets:
     name: Attach verified release assets
-    needs: attach-signature
+    needs: release
     runs-on: ubuntu-24.04
     # This job spends nearly all of its time waiting for `artifacts.yml`,
     # whose Nix builds are slow from a cold cache and, on a tag,
