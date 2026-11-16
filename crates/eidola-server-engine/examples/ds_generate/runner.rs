@@ -22,6 +22,7 @@ use std::time::Instant;
 use eidola_engine::engine::Engine;
 use eidola_engine::secret::SaltDeriver;
 use eidola_engine_chat::ChatDelta;
+use eidola_engine_chat::json::{self, BigInt, Json, ObjectBuilder};
 use eidola_engine_cpu::deepseek::DsCpuExecutor;
 use eidola_server_engine::config::{CacheConfig, ExecutorKind, Sizing, WeightsStorage};
 use eidola_server_engine::model::{LoadedModel, Served};
@@ -53,12 +54,16 @@ pub struct RunConfig {
     pub min_available_bytes: u64,
 }
 
-/// One chat request: OpenAI messages, optionally one or more tools.
+/// One chat request: OpenAI messages, optionally one or more tools, with every object's
+/// keys in the order the prompts file gives them. The format renders a tool's schema as
+/// the JSON text it was sent, so the key order is part of the prompt: a request built
+/// through `serde_json::Value` (whose maps sort their keys) would be another prompt than
+/// the one a client sending the file's text gets from the node.
 #[derive(Clone, Debug)]
 pub struct PromptSpec {
     pub name: String,
-    pub messages: Value,
-    pub tools: Option<Value>,
+    pub messages: Json,
+    pub tools: Option<Json>,
     /// Also run at draft width 0 and compare the greedy tokens.
     pub check_width0: bool,
 }
@@ -66,12 +71,14 @@ pub struct PromptSpec {
 impl PromptSpec {
     /// A prompts file: a JSON array of `{"name", "messages", "tools"?, "check_width0"?}`.
     pub fn parse_file(bytes: &[u8]) -> Result<Vec<PromptSpec>, String> {
-        let v: Value = serde_json::from_slice(bytes).map_err(|e| format!("prompts: {e}"))?;
+        let text = std::str::from_utf8(bytes).map_err(|e| format!("prompts: {e}"))?;
+        let v = json::parse(text).map_err(|e| format!("prompts: {e}"))?;
         let items = v.as_array().ok_or("prompts: not a JSON array")?;
         let mut out = Vec::new();
         for item in items {
-            let name = item["name"]
-                .as_str()
+            let name = item
+                .get("name")
+                .and_then(Json::as_str)
                 .ok_or("prompts: an entry has no name")?;
             if name.is_empty()
                 || !name
@@ -83,9 +90,10 @@ impl PromptSpec {
             if out.iter().any(|p: &PromptSpec| p.name == name) {
                 return Err(format!("prompts: {name} appears twice"));
             }
-            if let Some(key) = item.as_object().and_then(|o| {
-                o.keys()
-                    .find(|k| !["name", "messages", "tools", "check_width0"].contains(&k.as_str()))
+            if let Some((key, _)) = item.as_object().and_then(|o| {
+                o.iter().find(|(k, _)| {
+                    !["name", "messages", "tools", "check_width0"].contains(&k.as_str())
+                })
             }) {
                 return Err(format!("prompts: {name}: unknown key {key}"));
             }
@@ -93,11 +101,11 @@ impl PromptSpec {
                 name: name.to_string(),
                 messages: item
                     .get("messages")
-                    .filter(|m| m.is_array())
+                    .filter(|m| m.as_array().is_some())
                     .cloned()
                     .ok_or_else(|| format!("prompts: {name} has no messages array"))?,
                 tools: item.get("tools").cloned(),
-                check_width0: item["check_width0"].as_bool().unwrap_or(false),
+                check_width0: item.get("check_width0") == Some(&Json::Bool(true)),
             });
         }
         if out.is_empty() {
@@ -106,21 +114,26 @@ impl PromptSpec {
         Ok(out)
     }
 
-    /// The request body the node would be sent: greedy, a stream with usage, as the
-    /// gateway forwards one.
-    fn body(&self, max_new_tokens: u32) -> Value {
-        let mut body = json!({
-            "model": MODEL_ID,
-            "messages": self.messages,
-            "max_completion_tokens": max_new_tokens,
-            "temperature": 0.0,
-            "stream": true,
-            "stream_options": {"include_usage": true},
-        });
+    /// The request body the node would be sent, as its text: greedy, a stream with usage,
+    /// as the gateway forwards one, the messages and tools as the prompts file gives them.
+    fn body(&self, max_new_tokens: u32) -> String {
+        let mut body = ObjectBuilder::default();
+        let mut put = |key: &str, value: Json| body.insert(key.to_string(), value);
+        put("model", Json::Str(MODEL_ID.to_string()));
+        put("messages", self.messages.clone());
+        put(
+            "max_completion_tokens",
+            BigInt::from_digits(false, &max_new_tokens.to_string()).into(),
+        );
+        put("temperature", Json::Float(0.0));
+        put("stream", Json::Bool(true));
+        let mut usage = ObjectBuilder::default();
+        usage.insert("include_usage".to_string(), Json::Bool(true));
+        put("stream_options", usage.finish());
         if let Some(tools) = &self.tools {
-            body["tools"] = tools.clone();
+            put("tools", tools.clone());
         }
-        body
+        json::dumps_default(&body.finish())
     }
 }
 
@@ -397,7 +410,7 @@ fn build_identity() -> Result<String, String> {
 fn fingerprint(cfg: &RunConfig, build: &str, spec: &PromptSpec, width: u32) -> String {
     use sha2::{Digest, Sha256};
     let inputs = json!({
-        "runner": 1,
+        "runner": 2,
         "weights_sha256": cfg.weights_sha256,
         "build": build,
         "request": spec.body(cfg.max_new_tokens),
@@ -490,7 +503,7 @@ fn prepare(
     spec: &PromptSpec,
     max_new: u32,
 ) -> Result<Prepared, String> {
-    let body = serde_json::to_vec(&spec.body(max_new)).expect("JSON");
+    let body = spec.body(max_new).into_bytes();
     let refused = |e: eidola_server_engine::error::ApiError| {
         format!("{}: refused: {}", spec.name, e.to_body())
     };
@@ -739,8 +752,8 @@ fn run_task(
         })).collect::<Vec<_>>(),
         "token_ids": tokens,
         "prompt_text": prompt_text,
-        "messages": task.spec.messages,
-        "tools": task.spec.tools,
+        "messages": task.spec.messages.to_serde(),
+        "tools": task.spec.tools.as_ref().and_then(Json::to_serde),
         "wall_secs": started.elapsed().as_secs_f64(),
         "prefill": {
             "steps": prefill_steps,

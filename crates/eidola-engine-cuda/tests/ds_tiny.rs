@@ -1,5 +1,6 @@
 //! The DeepSeek-V4.1 executor on a GPU: the committed tiny fixture and its wide-window
-//! configuration through the real engine, both logical devices on device 0, every step
+//! configuration through the real engine, both logical devices on device 0 (or the
+//! encoder's on one GPU and the decoder's on another: `EIDOLA_DS_TINY_DEVICES=0,1`), every step
 //! held equal to the CPU reference executor's (`ds_common`): tokens, logits bit for
 //! bit, pool bytes block for block, the crossing, and with drafts on every draft slot's
 //! logits and the drafted tokens. Skipped (after saying why) without a device or
@@ -24,8 +25,27 @@ use ds_common::*;
 use eidola_engine_cuda::ds::half::{CudaDevice, Device};
 use eidola_engine_cuda::{Gpu, KernelDir};
 
-/// Runs `scenarios` over the fixture and its wide-window configuration on device 0 and
-/// writes their summary to `file`.
+/// The encoder's and the decoder's GPU: `EIDOLA_DS_TINY_DEVICES` (`e,d`), else both 0.
+fn devices() -> [usize; 2] {
+    match std::env::var("EIDOLA_DS_TINY_DEVICES") {
+        Ok(v) if !v.is_empty() => {
+            let d: Vec<usize> = v
+                .split(',')
+                .map(|d| {
+                    d.trim()
+                        .parse()
+                        .expect("EIDOLA_DS_TINY_DEVICES: two ordinals")
+                })
+                .collect();
+            assert_eq!(d.len(), 2, "EIDOLA_DS_TINY_DEVICES: two ordinals");
+            [d[0], d[1]]
+        }
+        _ => [0, 0],
+    }
+}
+
+/// Runs `scenarios` over the fixture and its wide-window configuration on the devices
+/// of [`devices`] and writes their summary to `file`.
 fn on_device(file: &str, drafting: bool, scenarios: impl Fn(&mut Run<'_>, bool)) {
     let Some(dir) = std::env::var_os("EIDOLA_ENGINE_KERNELS_DIR") else {
         eprintln!("skipping: EIDOLA_ENGINE_KERNELS_DIR is not set");
@@ -35,10 +55,23 @@ fn on_device(file: &str, drafting: bool, scenarios: impl Fn(&mut Run<'_>, bool))
         eprintln!("skipping: no CUDA device");
         return;
     }
-    let info = Gpu::open(0).expect("open device 0").info().clone();
-    eprintln!("{} (driver {})", info.name, info.driver_version);
+    let ordinals = devices();
+    let info = Gpu::open(ordinals[0])
+        .expect("open the encoder's device")
+        .info()
+        .clone();
+    eprintln!(
+        "{} (driver {}), halves on {ordinals:?}",
+        info.name, info.driver_version
+    );
+    // Every executor opens its encoder's half first, then its decoder's.
+    let opened = std::cell::Cell::new(0usize);
     let device = || -> Box<dyn Device> {
-        Box::new(CudaDevice::open(0, &KernelDir::new(dir.clone())).expect("open a half"))
+        let n = opened.get();
+        opened.set(n + 1);
+        Box::new(
+            CudaDevice::open(ordinals[n % 2], &KernelDir::new(dir.clone())).expect("open a half"),
+        )
     };
     let mut outcomes = Vec::new();
     for wide in [false, true] {
