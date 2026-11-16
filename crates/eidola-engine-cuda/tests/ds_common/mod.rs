@@ -252,6 +252,8 @@ pub struct Drafting {
     pub host_blocks: u32,
     /// Longest sequence.
     pub max_model_len: u32,
+    /// Blocks per window group, when not the banks' count.
+    pub window_blocks: Option<u32>,
 }
 
 impl Default for Drafting {
@@ -262,6 +264,7 @@ impl Default for Drafting {
             markov: true,
             host_blocks: 0,
             max_model_len: 1024,
+            window_blocks: None,
         }
     }
 }
@@ -359,6 +362,7 @@ impl Paired {
         let cfg = DsCudaExecutorConfig {
             block_size: 8,
             num_blocks: blocks,
+            window_blocks: how.window_blocks.unwrap_or(blocks),
             num_state_slots: 16,
             max_model_len: how.max_model_len,
             buckets: buckets(),
@@ -409,6 +413,7 @@ impl Paired {
             DsCpuExecutorConfig {
                 block_size: cfg.block_size,
                 num_blocks: blocks,
+                window_blocks: how.window_blocks.unwrap_or(blocks),
                 host_blocks: how.host_blocks,
                 num_state_slots: cfg.num_state_slots,
                 max_model_len: cfg.max_model_len,
@@ -1041,6 +1046,56 @@ impl Run<'_> {
             "a preempted sequence resumed into a triangle"
         );
         self.record("preemption", at, done);
+    }
+
+    /// Window pools sized apart from the banks (512 bank blocks; block 8 and window 48,
+    /// so a live window is at most seven blocks): one conversation of 700-position
+    /// prompts through 38 window blocks, the node's rule for one seat and a 64-token step,
+    /// resuming at its continuation and regeneration points with no preemption; then six
+    /// concurrent sequences whose windows do not fit 17 window blocks at once, which the
+    /// window pools preempt as any pool does.
+    pub fn window_pools(&mut self) {
+        let at = Instant::now();
+        let g = SamplingParams::greedy();
+        let windowed = |run: &Self, window_blocks, sched| {
+            let how = Drafting {
+                width: run.width,
+                window_blocks: Some(window_blocks),
+                ..Drafting::default()
+            };
+            Harness::drafting(run.model, run.device, 512, sched, how)
+        };
+        let mut long = windowed(self, 38, chunked(64));
+        let mut rng = TestRng(60);
+        let prompt = rng.tokens(700);
+        assert_eq!(long.run_one(1, &prompt, g, 40, keyed(1)), 0);
+        let mut cont = prompt.clone();
+        cont.extend(&long.outputs[&1]);
+        cont.extend(rng.tokens(150));
+        // 700 + 40 - 1 positions entered KV: the last sealed boundary is 736.
+        assert_eq!(long.run_one(2, &cont, g, 40, keyed(1)), 736);
+        assert_eq!(long.run_one(3, &prompt, g, 40, keyed(1)), 696);
+        for id in 1..=3 {
+            assert_eq!(long.finished[&id], FinishReason::Length, "request {id}");
+        }
+        assert_eq!(long.eng.stats().preemptions, 0);
+
+        let mut pressed = windowed(self, 17, chunked(11));
+        for id in 0..6 {
+            let prompt = rng.var_tokens(150, 100);
+            let key = keyed(u8::try_from(id).unwrap());
+            pressed.submit(request(id, prompt, params(id), 24, key));
+        }
+        pressed.run();
+        pressed.flush();
+        assert!(
+            pressed.eng.stats().preemptions > 0,
+            "the window pools must force preemption"
+        );
+        for id in 0..6 {
+            assert_eq!(pressed.finished[&id], FinishReason::Length, "request {id}");
+        }
+        self.record("window_pools", at, vec![long, pressed]);
     }
 
     /// Under KV pressure a lone sequence sheds its prefill chunk and its retention, and
@@ -1677,6 +1732,7 @@ pub fn all_scenarios(run: &mut Run<'_>, wide: bool) {
     run.hits();
     run.cancelled_mid_triangle();
     run.preemption();
+    run.window_pools();
     run.shedding();
     run.batch_invariance();
     run.randomized(0..3);

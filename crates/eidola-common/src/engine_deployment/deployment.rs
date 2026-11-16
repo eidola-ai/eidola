@@ -1163,8 +1163,7 @@ shim:
 
     /// The MiMo deployment's shape for DeepSeek-V4.1-Flash on two B300s: two
     /// GPUs attested, a KV budget per device, the published text-only pack,
-    /// and a `max_model_len` context (MiMo's whole 2^20 window does not fit
-    /// DeepSeek-V4.1's device 1: `deepseek_does_not_fit_two_b300s_at_its_whole_window`).
+    /// and a `max_model_len` context.
     fn deepseek_deployment(kv: &str, gpus: u64, max_model_len: u32) -> (String, String) {
         let config = std::str::from_utf8(MIMO_CONFIG)
             .unwrap()
@@ -1204,18 +1203,19 @@ shim:
             check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
         };
         let d = check("16000000000,8000000000", 2).unwrap();
-        // The whole 2^20 window: device 1's least KV (every group one whole
-        // sequence) is past what its GPU has left.
-        let (config, sidecar) = deepseek_deployment("16000000000,13107400000", 2, 1 << 20);
-        let err = check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
-            .unwrap_err();
-        assert!(
-            err.contains("device 1:") && err.contains("device memory"),
-            "{err}"
-        );
-        let (config, sidecar) = deepseek_deployment("16000000000,13107399999", 2, 1 << 20);
-        let err = check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
-            .unwrap_err();
+        // The whole 2^20 window fits as well. In blocks of 16, device 1's least
+        // is 65,537 bank blocks of 5,696 bytes beside 2,881 window blocks of
+        // 194,304 (64 seats of four windows of nine blocks and one more, and a
+        // step's 512).
+        let whole = |kv: &str| {
+            let (config, sidecar) = deepseek_deployment(kv, 2, 1 << 20);
+            check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
+        };
+        let least = 65_537 * 5_696 + 2_881 * 194_304;
+        assert_eq!(least, 933_088_576);
+        whole("16000000000,8000000000").unwrap();
+        whole(&format!("16000000000,{least}")).unwrap();
+        let err = whole(&format!("16000000000,{}", least - 1)).unwrap_err();
         assert!(
             err.contains("device 1:") && err.contains("smallest"),
             "{err}"

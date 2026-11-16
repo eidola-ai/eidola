@@ -170,10 +170,12 @@ impl Run {
         let block_size = BLOCK;
         let positions = n32(tokens.len()).next_multiple_of(block_size);
         let again = again.min(tokens.len());
+        // The sequence's blocks, the null block, and the invariance pass's.
+        let blocks = positions / block_size + 2 + 2 * n32(again).div_ceil(block_size);
         let cfg = DsCudaExecutorConfig {
             block_size,
-            // The sequence's blocks, the null block, and the invariance pass's.
-            num_blocks: positions / block_size + 2 + 2 * n32(again).div_ceil(block_size),
+            num_blocks: blocks,
+            window_blocks: blocks,
             num_state_slots: SLOTS,
             max_model_len: positions,
             buckets: vec![Bucket {

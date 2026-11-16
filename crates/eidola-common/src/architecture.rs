@@ -170,15 +170,17 @@ pub struct Shape {
     /// whose weights are bounded by the whole pack
     /// (`engine_deployment::artifact_data_bytes`).
     pub weights_bytes: Option<u64>,
-    /// For an executor that gives every KV group of every device one block
-    /// count (DeepSeek-V4.1's), this device's groups, in the executor's
-    /// block layout; empty for one that sizes each group's pool by its own
-    /// rule (MiMo-V2.6's), whose bounds read the per-position fields above.
+    /// For an executor that gives every bank group of every device one block
+    /// count and every window group another (DeepSeek-V4.1's), this device's
+    /// groups, in the executor's block layout; empty for one that sizes each
+    /// group's pool by its own rule (MiMo-V2.6's), whose bounds read the
+    /// per-position fields above.
     pub uniform_kv_groups: &'static [UniformKvGroup],
 }
 
-/// One KV group of an executor whose groups all hold the same number of
-/// blocks (`Shape::uniform_kv_groups`). A block of it is `layers` layers of
+/// One KV group of an executor whose bank groups all hold one number of
+/// blocks and whose window groups all hold another
+/// (`Shape::uniform_kv_groups`). A block of it is `layers` layers of
 /// `KV_BLOCK_SIZE / ratio` entries of `entry_bytes` each, padded to 16 bytes
 /// (`eidola-engine-cuda`'s `ds::kv::GroupGeometry::block_bytes`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +191,11 @@ pub struct UniformKvGroup {
     pub ratio: u64,
     /// Bytes of one entry of one layer.
     pub entry_bytes: u64,
+    /// A sliding-window group, whose pool holds running sequences' live
+    /// windows and the windows retained at hit points
+    /// (`engine_deployment::uniform_kv_window_blocks`); otherwise a bank
+    /// (full attention), whose pool holds whole sequences.
+    pub window: bool,
     /// The drafter's group: present only when drafting (`DRAFT_TOKENS` > 0),
     /// and the same size at every draft width.
     pub drafter: bool,
@@ -295,12 +302,14 @@ pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
                 layers: 3,
                 ratio: 2,
                 entry_bytes: DS_GLOBAL_CELL,
+                window: false,
                 drafter: false,
             },
             UniformKvGroup {
                 layers: DS_LAYERS_PER_DEVICE,
                 ratio: 1,
                 entry_bytes: DS_WINDOW_CELL,
+                window: true,
                 drafter: false,
             },
         ],
@@ -336,18 +345,21 @@ pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
                 layers: 1,
                 ratio: 1,
                 entry_bytes: DS_GLOBAL_CELL,
+                window: false,
                 drafter: false,
             },
             UniformKvGroup {
                 layers: DS_LAYERS_PER_DEVICE,
                 ratio: 1,
                 entry_bytes: DS_WINDOW_CELL,
+                window: true,
                 drafter: false,
             },
             UniformKvGroup {
                 layers: 3,
                 ratio: 1,
                 entry_bytes: DS_WINDOW_CELL,
+                window: true,
                 drafter: true,
             },
         ],

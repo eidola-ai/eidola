@@ -343,6 +343,7 @@ pub fn deepseek_cpu_config(
     Ok(DsCpuExecutorConfig {
         block_size: sizing.kv_block_size,
         num_blocks: kv_blocks,
+        window_blocks: kv_blocks,
         host_blocks: 0,
         num_state_slots: sizing.max_seqs,
         max_model_len: sizing.max_model_len,
@@ -434,6 +435,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
             let prepared = cuda::prepare_deepseek(
                 &model,
                 &sizing,
+                &config.cache,
                 kernels_dir,
                 budgets,
                 config.kv_host_bytes,
@@ -444,7 +446,8 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
             let c = prepared.config();
             tracing::info!(
                 devices = ?c.devices,
-                kv_blocks = c.num_blocks,
+                bank_kv_blocks = c.num_blocks,
+                window_kv_blocks = c.window_blocks,
                 host_kv_blocks = c.host_blocks,
                 draft_tokens = c.draft_width,
                 "loading the model onto the devices"

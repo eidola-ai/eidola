@@ -61,6 +61,11 @@ fn preemption_and_resume() {
 }
 
 #[test]
+fn window_pools_smaller_than_the_banks() {
+    run(false, |r| r.window_pools());
+}
+
+#[test]
 fn kv_pressure_sheds_before_it_ends_a_sequence() {
     run(false, |r| r.shedding());
 }
