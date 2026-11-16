@@ -3040,6 +3040,7 @@ dependencies = [
  "eidola-engine-cpu",
  "eidola-engine-kernels",
  "eidola-engine-model",
+ "flate2",
  "libloading 0.8.9",
  "rustix 1.1.6",
  "serde_json",
