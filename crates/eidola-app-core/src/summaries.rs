@@ -83,7 +83,9 @@
 //! emitted; `prepare_turn` only ever *reads* whatever is already stored. Two things keep a burst cheap: a **trailing debounce**
 //! per space (a later trigger supersedes an earlier one, so an exchange —
 //! post, then the answer it draws — costs one pass, not two), and a gate that
-//! runs one pass at a time with the cache re-read inside it. A pass with
+//! runs one pass at a time with the cache re-read inside it. A space with
+//! summaries off waits out no debounce: the trigger reads the router model
+//! first and ends there. A pass with
 //! nothing stale makes no HTTP call and does not even start an engine: the
 //! freshness check happens before the route is opened.
 
@@ -260,6 +262,18 @@ impl Inner {
             .expect("summary trigger lock poisoned")
             .insert(space_id.clone(), stamp);
         tokio::spawn(async move {
+            // A space with summaries off (no router model, the default) has
+            // no pass to wait for, so it holds no task through the debounce.
+            if !inner.summaries_enabled(&space_id).await {
+                let mut triggers = inner
+                    .summary_triggers
+                    .lock()
+                    .expect("summary trigger lock poisoned");
+                if triggers.get(&space_id) == Some(&stamp) {
+                    triggers.remove(&space_id);
+                }
+                return;
+            }
             tokio::time::sleep(DEBOUNCE).await;
             {
                 let mut triggers = inner
@@ -286,6 +300,15 @@ impl Inner {
                 );
             }
         });
+    }
+
+    /// Whether the space has summaries on: a router model is set. An
+    /// unreachable database answers "on", leaving the pass to report it.
+    async fn summaries_enabled(&self, space_id: &str) -> bool {
+        let Ok(conn) = self.db_conn().await else {
+            return true;
+        };
+        !matches!(db::space_router_model(&conn, space_id).await, Ok(None))
     }
 
     /// One summary pass over a space: generate a summary for every branch whose
