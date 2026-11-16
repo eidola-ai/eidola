@@ -30,7 +30,12 @@ RUN printf '%s\n' \
       'cores = 4' \
       >> /etc/nix/nix.conf
 
-COPY crates/eidola-engine-kernels/ /src/
+# What the expression reads (its own files and `csrc/`, the inputs the
+# manifest lists) and the manifest it is held to; not the crate's Rust code,
+# so an edit there does not rebuild the kernels.
+COPY crates/eidola-engine-kernels/csrc/ /src/csrc/
+COPY crates/eidola-engine-kernels/nix/ /src/nix/
+COPY crates/eidola-engine-kernels/kernels.manifest.json /src/
 
 # ── eval ───────────────────────────────────────────────────────────────────────
 # Not part of the image. `scripts/check-oci-stub-workspace.sh` builds this
