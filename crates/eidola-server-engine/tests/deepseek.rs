@@ -76,6 +76,7 @@ fn direct_greedy(prompt: Vec<u32>, max_tokens: u32) -> (Vec<u32>, FinishReason) 
         DsCpuExecutorConfig {
             block_size: 16,
             num_blocks: 256,
+            window_blocks: 256,
             host_blocks: 0,
             num_state_slots: 4,
             max_model_len: 1024,

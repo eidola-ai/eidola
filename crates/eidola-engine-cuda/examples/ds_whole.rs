@@ -130,6 +130,7 @@ impl Compare {
         let cfg = DsCudaExecutorConfig {
             block_size: BLOCK,
             num_blocks: positions / BLOCK + 2,
+            window_blocks: positions / BLOCK + 2,
             num_state_slots: SLOTS,
             max_model_len: positions,
             buckets: vec![Bucket {
@@ -767,6 +768,7 @@ fn generation_config(
         block_size: block,
         // The sequence twice over, the null block, and a little room.
         num_blocks: 2 * (max_model_len / block) + 8,
+        window_blocks: 2 * (max_model_len / block) + 8,
         num_state_slots: 2,
         max_model_len,
         buckets: vec![Bucket {

@@ -48,8 +48,11 @@ use crate::{CudaError, Result, narrow};
 pub struct DsCudaExecutorConfig {
     /// Positions per KV block (every group); a multiple of the pooling ratio.
     pub block_size: u32,
-    /// Physical blocks per group, including the null block 0.
+    /// Physical blocks per bank group (full attention), including the null block 0.
     pub num_blocks: u32,
+    /// Physical blocks per window group (sliding: the encoder's, the decoder's and the
+    /// drafter's windows), including the null block 0.
+    pub window_blocks: u32,
     /// Per-sequence state rows.
     pub num_state_slots: u32,
     /// Longest sequence.
@@ -140,7 +143,10 @@ fn model_spec(c: &DsConfig, shape: &DsShape, cfg: &DsCudaExecutorConfig) -> Resu
                 num_kv_heads: 1,
                 head_dim_qk: hd,
                 head_dim_v: hd,
-                num_blocks: cfg.num_blocks,
+                num_blocks: match attention {
+                    AttentionKind::Full => cfg.num_blocks,
+                    AttentionKind::Sliding { .. } => cfg.window_blocks,
+                },
                 host_blocks: cfg.host_blocks,
                 ratio,
                 device,
@@ -1619,6 +1625,7 @@ mod tests {
         DsCudaExecutorConfig {
             block_size: 8,
             num_blocks: 12,
+            window_blocks: 12,
             num_state_slots: 4,
             max_model_len: 64,
             buckets: vec![Bucket {
@@ -2055,6 +2062,7 @@ mod tests {
         let cfg = DsCudaExecutorConfig {
             block_size: 32,
             num_blocks: 4096,
+            window_blocks: 4096,
             num_state_slots: 16,
             max_model_len: 4096,
             buckets: vec![Bucket {

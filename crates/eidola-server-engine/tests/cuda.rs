@@ -423,8 +423,8 @@ fn deepseek_checks_the_weights_hash_before_the_executor() {
     }
 }
 
-/// Before the devices: a device budget that cannot hold one `MAX_MODEL_LEN` sequence
-/// (either device's), a host tier under two blocks, and what the executor's preflight
+/// Before the devices: a device budget that cannot hold every seat's windows and one
+/// `MAX_MODEL_LEN` sequence of banks (either device's), a host tier under two blocks, and what the executor's preflight
 /// refuses (a block size the pooling ratio does not divide). A draft width past the
 /// cuda cap never parses.
 #[test]
@@ -437,9 +437,7 @@ fn deepseek_budgets_are_refused_before_the_devices() {
         map.insert(env::KV_DEVICE_BYTES, budgets);
         let err = boot_err(&map);
         assert!(
-            err.contains(env::KV_DEVICE_BYTES)
-                && err.contains(env::MAX_MODEL_LEN)
-                && err.contains(device),
+            err.contains(env::KV_DEVICE_BYTES) && err.contains("window KV") && err.contains(device),
             "{err}"
         );
         assert!(!err.contains(NO_DEVICE), "{err}");
@@ -570,6 +568,7 @@ fn the_nodes_deepseek_configuration_computes_what_the_cpu_executor_does() {
         DsCpuExecutorConfig {
             block_size: 16,
             num_blocks: 256,
+            window_blocks: 256,
             host_blocks: 0,
             num_state_slots: 4,
             max_model_len: 1024,
@@ -601,6 +600,7 @@ fn the_nodes_deepseek_configuration_computes_what_the_cpu_executor_does() {
         let exec_config = eidola_server_engine::cuda::deepseek_config(
             ds,
             &config.sizing,
+            &config.cache,
             [*kv_device_bytes, further_kv_device_bytes[0]],
             config.kv_host_bytes,
             *graphs,

@@ -406,6 +406,127 @@ fn kv_pressure_drops_drafts_before_finishing() {
     }
 }
 
+/// `spec` with every sliding group's pool set to `blocks` (the null block included) and
+/// the full-attention pools left as they are.
+fn with_window_blocks(mut spec: ModelSpec, blocks: u32) -> ModelSpec {
+    for g in &mut spec.kv_groups {
+        if g.attention != AttentionKind::Full {
+            g.num_blocks = blocks;
+        }
+    }
+    spec
+}
+
+/// A conversation continued turn after turn leaves a retained point at every turn's
+/// regeneration and continuation boundaries, all on the chain the next turn runs, and no
+/// entry on a running sequence's chain can be evicted. Window pools far smaller than
+/// those points still serve it: the windows behind the running turn's own are taken back
+/// from their entries (`KvManager::stripped_windows`), every turn runs to its length with
+/// the reference's tokens, and each still resumes from the turn before. MiMo's shape
+/// (no chain) and DeepSeek-V4.1's alike, with and without a host tier (where a hit's
+/// promotions may need window blocks, and never take its own).
+#[test]
+fn window_pools_smaller_than_a_conversations_points_serve_it() {
+    let g = SamplingParams::greedy();
+    let shapes = [
+        chain_spec(1024),
+        eidola_engine::mock::mimo_like_spec(32, 4, 6, 10, 1024, 32, 3),
+    ];
+    for (spec, host, spec_on) in shapes
+        .iter()
+        .flat_map(|s| [(s, 0, false), (s, 0, true), (s, 32, false), (s, 32, true)])
+    {
+        // Five allocatable blocks: one window, the block being written, and drafts.
+        let mut spec = with_window_blocks(spec.clone(), 6);
+        if host > 0 {
+            spec = with_host_tier(spec, host);
+        }
+        let mut h = Harness::new(spec, chunked(8, spec_on), MockConfig::default());
+        let mut rng = TestRng(40);
+        let mut prompt = rng.tokens(9, 32);
+        for id in 0..40 {
+            let cached = run_checked(&mut h, id, &prompt, g, 4, keyed(1));
+            assert_eq!(h.finished[&id], FinishReason::Length, "turn {id}");
+            if id > 0 {
+                assert!(cached > 0, "turn {id} resumes from the one before");
+            }
+            prompt.extend(&h.outputs[&id]);
+            prompt.extend(rng.tokens(5, 32));
+        }
+        assert!(h.eng.kv().stripped_windows() > 0);
+        assert_eq!(h.eng.stats().preemptions, 0);
+    }
+}
+
+/// Window pools of `1 + S × (R + 1) + ceil(T / B)` blocks (`S` seats, `R =
+/// ceil(w / B) + 1` for the widest window less one `w`, `T` the step's tokens): many
+/// concurrent keyed sequences, each far longer than its window, and their continuations,
+/// never wait on a window block, while full-attention pools hold every sequence whole.
+/// Below it, window pressure preempts (and sheds) as any pool's does, and every output is
+/// still the reference's.
+#[test]
+fn window_pools_at_the_bound_never_preempt() {
+    let bs = 4u32;
+    let seats = 16u32;
+    let step = 256u32;
+    // The drafter's window less one, 4, is the widest: two blocks.
+    let r = 4u32.div_ceil(bs) + 1;
+    let bound = 1 + seats * (r + 1) + step.div_ceil(bs);
+    for (windows, preempts) in [(bound, false), (1 + 3 * r, true)] {
+        for spec_on in [false, true] {
+            let spec = with_window_blocks(chain_spec(16384), windows);
+            let mut sched = chunked(step, spec_on);
+            sched.max_seqs = seats;
+            let mut h = Harness::new(spec, sched, MockConfig::default());
+            let mut rng = TestRng(41);
+            let mut cases = Vec::new();
+            for id in 0..seats as u64 {
+                let prompt = rng.var_tokens(60, 100, 32);
+                h.submit(request(id, prompt.clone(), params(id), 20, keyed(id as u8)));
+                cases.push((id, prompt, params(id)));
+            }
+            h.run();
+            for (id, prompt, p) in &mut cases {
+                assert_eq!(h.finished[id], FinishReason::Length, "request {id}");
+                if !spec_on || p.is_greedy() {
+                    assert_eq!(
+                        h.outputs[id],
+                        h.expected(prompt, p, 20, &[]),
+                        "request {id}"
+                    );
+                }
+                prompt.extend(&h.outputs[id]);
+                prompt.extend(rng.tokens(30, 32));
+                *id += 100;
+                h.submit(request(
+                    *id,
+                    prompt.clone(),
+                    *p,
+                    20,
+                    keyed((*id - 100) as u8),
+                ));
+            }
+            h.run();
+            for (id, prompt, p) in &cases {
+                assert_eq!(h.finished[id], FinishReason::Length, "request {id}");
+                if spec_on && !p.is_greedy() {
+                    continue;
+                }
+                assert_eq!(
+                    h.outputs[id],
+                    h.expected(prompt, p, 20, &[]),
+                    "request {id}"
+                );
+            }
+            assert_eq!(
+                h.eng.stats().preemptions > 0,
+                preempts,
+                "windows {windows}, speculative {spec_on}"
+            );
+        }
+    }
+}
+
 /// Greedy speculation with five-slot block drafts never changes a token, at every
 /// agreement rate and wherever the first drafting row falls (a chunk of one makes it the
 /// prompt's own last token, whose drafter context reaches furthest back).

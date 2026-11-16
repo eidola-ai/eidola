@@ -1028,6 +1028,7 @@ mod tests {
         let cfg = DsCudaExecutorConfig {
             block_size: 32,
             num_blocks: 1024,
+            window_blocks: 1024,
             num_state_slots: 4,
             max_model_len: 4096,
             buckets: vec![Bucket {

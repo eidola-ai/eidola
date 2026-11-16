@@ -156,6 +156,7 @@ fn released_decode_rows_equal_the_dense_forward() {
         let cfg = DsCpuExecutorConfig {
             block_size: 16,
             num_blocks: 64,
+            window_blocks: 64,
             host_blocks: 0,
             num_state_slots: 2,
             max_model_len: 1024,
@@ -329,6 +330,7 @@ fn released_chat_decode_rows_equal_the_dense_forward() {
         let cfg = DsCpuExecutorConfig {
             block_size: 16,
             num_blocks: 56,
+            window_blocks: 56,
             host_blocks: 0,
             num_state_slots: 1,
             max_model_len: 192,
@@ -435,6 +437,7 @@ fn follow(model: Arc<DsModel>, tokens: &[u32], prompt: usize, steps: usize, samp
     let cfg = DsCpuExecutorConfig {
         block_size: 16,
         num_blocks: 56,
+        window_blocks: 56,
         host_blocks: 0,
         num_state_slots: 1,
         max_model_len: 192,
