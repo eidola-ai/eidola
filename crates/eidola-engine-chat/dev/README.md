@@ -23,3 +23,23 @@ The revision is recorded in each fixture file's `meta`, with the SHA-256 of `enc
 After changing the script's dependencies, refresh the lock with `uv lock --script dev/deepseek_gen_fixtures.py`.
 
 The generator executes the reference code it is pointed at: run it only on a checkout you trust.
+
+## Qwen3.8
+
+Two generators, run with `uv` like the DeepSeek one, each with its dependencies pinned in its header and its lock file. Both read a directory holding the non-weight files of [`Qwen/Qwen3.8-27B-FP8`](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) (Apache-2.0) at the revision to pin: `chat_template.jinja`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json` and `config.json`.
+
+- `qwen_gen_template_fixtures.py` renders every case with `transformers.apply_chat_template` and encodes with the reference `tokenizers`, and writes `tests/fixtures/qwen/template_cases.json`, `template_token_ids.json` and copies of the template, generation config and tokenizer (gzip with a zero timestamp). The revision and the template's and tokenizer's SHA-256 are recorded in `meta`; a new revision whose files differ also needs their hashes pinned (`src/qwen/template.rs`, `src/tokenizer.rs`).
+
+  ```sh
+  uv run --script dev/qwen_gen_template_fixtures.py \
+      --model-dir <dir> --revision <commit sha>
+  ```
+
+- `qwen_gen_vllm_fixtures.py` records what vLLM's Qwen3 output parser (`vllm/parser/qwen3.py` on its parser engine, which serves both `--reasoning-parser qwen3` and `--tool-call-parser qwen3_coder`) reads from outputs the template renders and from truncated and malformed ones, and writes `tests/fixtures/qwen/vllm_parser_cases.json`. It runs those files from a vLLM checkout you supply, with the few serving-layer modules they import replaced by stand-ins, and records the commit and each file's SHA-256.
+
+  ```sh
+  uv run --script dev/qwen_gen_vllm_fixtures.py \
+      --vllm-src <vllm checkout> --vllm-commit <commit sha> --model-dir <dir>
+  ```
+
+Both execute code they are pointed at (the template, vLLM's parser): run them only on files you trust. Refresh a lock with `uv lock --script <script>` after changing its dependencies.

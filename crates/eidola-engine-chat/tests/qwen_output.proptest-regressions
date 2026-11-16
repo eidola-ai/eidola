@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 54f5996570e78cd271e9549e856e768efcffe154a036a99810326f4b768463b4 # shrinks to reasoning = "", content = "", arguments = [Object([("s", Str(""))])], thinking = false
