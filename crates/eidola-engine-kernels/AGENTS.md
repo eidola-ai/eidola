@@ -354,6 +354,7 @@ The kernel bytes are a function of the inputs listed in the manifest: the source
   - `NIX_CFLAGS_COMPILE`
   - the hardening variables
 - **`-DNDEBUG` everywhere.** Device `assert` would embed `__FILE__` strings.
+- **Pin addresses whose placement varied by builder architecture.** The split GEMM block computes each lane's row addresses and its shared-memory pointers once and passes them through an empty `asm volatile` (`split_rows` in `ds_gemm_tc.cuh`, `split_pass` in `ds_gemm_tc.cu`). Without it the x86_64 and aarch64 builds of the same toolkit placed those computations differently among the loads (the PTX of two entries differed, and the cubins by 224 bytes), while builds on one architecture were identical. The control experiment is removing the barriers and building with `--platform linux/amd64 --verify` against an aarch64 manifest.
 
 Each rule has a control experiment: build with the rule broken, from two directories, and compare. Keep that discipline when changing flags.
 
