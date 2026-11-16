@@ -29,7 +29,7 @@
 //! |---|---|---|
 //! | `EIDOLA_DS_WHOLE_PHASES` | of `compare`, `generate`, in order | both |
 //! | `EIDOLA_DS_WHOLE_RECORDED` | the `deepseek_halves` output directory (`compare`) | |
-//! | `EIDOLA_DS_WHOLE_OUT` | recordings and `ds_whole.json` | `deepseek_whole` in the working directory |
+//! | `EIDOLA_DS_WHOLE_OUT` | recordings and `ds_whole.json` | `ds_whole` in the working directory |
 //! | `EIDOLA_DS_WHOLE_HOST` | `read` (each expert read once into host memory) or `mapped` | `read` |
 //! | `EIDOLA_DS_WHOLE_THREADS` | threads reading the experts | the machine's |
 //! | `EIDOLA_DS_WHOLE_RESERVE_GB` | device memory left free beside the caches | 4 |

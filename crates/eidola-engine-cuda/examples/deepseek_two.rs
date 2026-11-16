@@ -50,7 +50,7 @@
 //! | Variable | Meaning | Default |
 //! |---|---|---|
 //! | `EIDOLA_DS_TWO_PHASES` | of `tokens`, `compare`, `score`, `generate`, `bench` | all five |
-//! | `EIDOLA_DS_TWO_OUT` | results | `deepseek_two` in the working directory |
+//! | `EIDOLA_DS_TWO_OUT` | results | `ds_two` in the working directory |
 //! | `EIDOLA_DS_TWO_TEXTS` | the health texts (`tokens`) | |
 //! | `EIDOLA_DS_TWO_RECORDED` | the `deepseek_halves` output (`compare`) | |
 //! | `EIDOLA_DS_TWO_CPU` | a `deepseek_generate` output on the CPU (`generate`) | none |

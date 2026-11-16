@@ -32,7 +32,7 @@
 //! | `EIDOLA_DS_HALVES_INVARIANCE` | positions the invariance pass repeats; 0 for none | twice the chunk |
 //! | `EIDOLA_DS_HALVES_PHASES` | of `encoder`, `decoder`, `reference`, in order | all three |
 //! | `EIDOLA_DS_HALVES_GOLDEN` | a safetensors file holding `tokens` and `engram.token_map` | `<checkpoint>/golden/reference-pinned.safetensors`, else the first `reference-*.safetensors` there |
-//! | `EIDOLA_DS_HALVES_OUT` | recordings and `ds_halves.json` | `deepseek_halves` in the working directory |
+//! | `EIDOLA_DS_HALVES_OUT` | recordings and `ds_halves.json` | `ds_halves` in the working directory |
 //!
 //! Before a device phase the same phases run over a device with no memory (`deepseek::dry`),
 //! so anything arithmetic can refuse is refused before a half is loaded. Each phase

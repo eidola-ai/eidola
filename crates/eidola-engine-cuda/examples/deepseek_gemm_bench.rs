@@ -91,7 +91,7 @@ struct Args {
 fn parse() -> Args {
     let a: Vec<String> = std::env::args().collect();
     let Some(kernels) = a.get(1).cloned() else {
-        eprintln!("usage: ds_gemm_bench <kernels_dir> [options]; see the module docs");
+        eprintln!("usage: deepseek_gemm_bench <kernels_dir> [options]; see the module docs");
         std::process::exit(2);
     };
     let mut args = Args {
