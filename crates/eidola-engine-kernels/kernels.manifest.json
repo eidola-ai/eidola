@@ -135,11 +135,11 @@
     },
     {
       "path": "csrc/ds_gemm_tc.cu",
-      "sha256": "4eb593f313376153f318cf8f6617366d8fe7be0f8c33f660656690b10de627cd"
+      "sha256": "42e662dc020c39089659c6258b01b230683fc7cc049e8afd3b1111885569a953"
     },
     {
       "path": "csrc/ds_gemm_tc.cuh",
-      "sha256": "8fd24fb2c8782947c40f3d9e6f5fb00f23d8da741789384afedd225352d4300e"
+      "sha256": "90dcb801face4660c161959908bbb07b3837d7fcc3b1280df72d646b61da746e"
     },
     {
       "path": "csrc/ds_head.cu",
@@ -582,8 +582,8 @@
       "source": "csrc/ds_gemm_tc.cu",
       "profile": "exact",
       "file": "cubin/ds_gemm_tc.sm_100a.cubin",
-      "sha256": "94f99f32415f27ecb0df90ac81190a8692b2ae625dc2d0fc6189768e5c57daff",
-      "size": 748504,
+      "sha256": "11e1e92145229936b6c7cde20bcbb93627356a63a60a315ad19c82075c0bfa36",
+      "size": 709064,
       "entries": [
         {
           "symbol": "eidola_ds_gemm_probe",
@@ -667,12 +667,12 @@
         "eidola_ds_lin8_tolerance_t8_meta"
       ],
       "mma_sass": {
-        "HMMA": 804
+        "HMMA": 772
       },
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 10784,
+        "ptx_rounded": 10282,
         "sass_fma": 0
       }
     },
@@ -682,8 +682,8 @@
       "source": "csrc/ds_gemm_tc.cu",
       "profile": "exact",
       "file": "cubin/ds_gemm_tc.sm_100f.cubin",
-      "sha256": "55cdae8fba47e6051f2f44d351b75de30bd8a2aef0e0e20914767122adaf5644",
-      "size": 748504,
+      "sha256": "0d79ecfee80e5f40d7c9b81e1d5706b93a8cce5b7db46499fbeec494bad152cc",
+      "size": 709064,
       "entries": [
         {
           "symbol": "eidola_ds_gemm_probe",
@@ -767,12 +767,12 @@
         "eidola_ds_lin8_tolerance_t8_meta"
       ],
       "mma_sass": {
-        "HMMA": 804
+        "HMMA": 772
       },
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 10784,
+        "ptx_rounded": 10282,
         "sass_fma": 0
       }
     },
@@ -782,8 +782,8 @@
       "source": "csrc/ds_gemm_tc.cu",
       "profile": "exact",
       "file": "cubin/ds_gemm_tc.sm_103a.cubin",
-      "sha256": "e163e4504e223d3554ed894e04d0362f9e6505ac86898983902baf0cd33e85a3",
-      "size": 749080,
+      "sha256": "69811db49bdc27f938e96e67a229828ec4747aa0983f9af5eacbbf79995d5242",
+      "size": 709640,
       "entries": [
         {
           "symbol": "eidola_ds_gemm_probe",
@@ -867,12 +867,12 @@
         "eidola_ds_lin8_tolerance_t8_meta"
       ],
       "mma_sass": {
-        "HMMA": 804
+        "HMMA": 772
       },
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 10784,
+        "ptx_rounded": 10282,
         "sass_fma": 0
       }
     },
@@ -2715,8 +2715,8 @@
     {
       "name": "ds_gemm_tc",
       "file": "fatbin/ds_gemm_tc.fatbin",
-      "sha256": "903baf5ae5ea7118c52839b642617ad3ba8086449a2156cf63d655d58a8e3d60",
-      "size": 1497816,
+      "sha256": "5ad40c41ca539a8e15f666ea6b6db0f37795df2c549d3728b05f48d6fa65f44c",
+      "size": 1418936,
       "archs": [
         "sm_100a",
         "sm_103a"
