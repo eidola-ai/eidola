@@ -14,6 +14,7 @@ Eidola is a privacy-preserving AI chat system: an OpenAI-compatible gateway and 
 | Notepad (a markdown file editor on Eidola's writing surface) | `crates/eidola-notepad/AGENTS.md` |
 | CLI (commands, systemd service doctrine) | `crates/eidola-cli/AGENTS.md` |
 | Inference engine (serving core, executor seam, prefix cache) | `crates/eidola-engine/AGENTS.md` (+ `eidola-engine-model`, `eidola-engine-chat`, `eidola-engine-cpu`, `eidola-engine-kernels`, `eidola-engine-cuda`) |
+| Each model architecture (state, code across crates, outstanding work) | `crates/eidola-engine/architectures/` |
 | Inference node server (gateway-facing API, weights hash, node contract) | `crates/eidola-server-engine/AGENTS.md` |
 | Attestation verification (per-handshake flow, threat model) | `crates/tinfoil-verifier/AGENTS.md` |
 | Enclave measurement (the measurement flow) | `crates/measure-enclave/AGENTS.md` |
