@@ -21,7 +21,7 @@ Generated into the client at compile time by `crates/eidola-app-core/build.rs`, 
 | `EXPECTED_CI_ISSUER` | `releases/trust/trust-constants.json` | OIDC issuer (`https://token.actions.githubusercontent.com`) |
 | `SUPPORTED_RELEASE_SCHEMA_VERSIONS` | `releases/trust/trust-constants.json` | Integer `schema_version` values of `release.json` this client will parse |
 | `SUPPORTED_ATTESTATION_SCHEMA_VERSIONS` | `releases/trust/trust-constants.json` | Integer `schema_version` values of `attestation.json` this client will parse |
-| `UPDATE_DISCOVERY_URL` | `releases/trust/trust-constants.json` | Where to look for the next release (GitHub releases API) |
+| `UPDATE_RELEASES_URL` | `releases/trust/trust-constants.json` | Where to look for the next release (the repository's GitHub releases; not a trust decision, since whatever is found there is verified against everything else in this table) |
 | `ATTESTATION_TEMPLATES_JSON` | `releases/schema/attestation-templates.json` | Pinned claim templates the verifier re-renders during equality checks |
 | `SIGSTORE_TRUSTED_ROOT_JSON` | `releases/trust/sigstore-trusted-root.json` | Pinned Sigstore tlog / Fulcio / CT log keys with validity windows |
 

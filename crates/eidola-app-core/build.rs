@@ -131,7 +131,12 @@ fn main() {
 
     let expected_ci_identity_pattern = get_str(&trust_constants, "expected_ci_identity_pattern");
     let expected_ci_issuer = get_str(&trust_constants, "expected_ci_issuer");
-    let update_discovery_url = get_str(&trust_constants, "update_discovery_url");
+    let update_releases_url = get_str(&trust_constants, "update_releases_url");
+    if !update_releases_url.starts_with("https://") || update_releases_url.ends_with('/') {
+        panic!(
+            "update_releases_url must be an https URL with no trailing slash: {update_releases_url:?}"
+        );
+    }
 
     let trusted_attestant_fingerprints =
         get_str_array(&trust_constants, "trusted_attestant_fingerprints");
@@ -165,7 +170,7 @@ fn main() {
         expected_ci_identity_pattern,
     );
     push_str_const(&mut out, "EXPECTED_CI_ISSUER", expected_ci_issuer);
-    push_str_const(&mut out, "UPDATE_DISCOVERY_URL", update_discovery_url);
+    push_str_const(&mut out, "UPDATE_RELEASES_URL", update_releases_url);
 
     push_str_slice_const(
         &mut out,

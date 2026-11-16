@@ -212,9 +212,10 @@ pub struct Config {
     pub account_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain_separator: Option<String>,
-    /// Base URL of an alternate update feed (a GitHub-releases-API-shaped
-    /// server), for dev/test fixture servers. Same `*_override` pattern as
-    /// `base_url`: the resolved endpoint comes from [`Config::update_feed_url`],
+    /// An alternate releases location, for dev/test fixture servers: a URL
+    /// that serves `<url>/latest/download/release.json` the way a GitHub
+    /// repository's releases do. Same `*_override` pattern as `base_url`:
+    /// the resolved location comes from [`Config::update_releases_url`],
     /// which falls back to the trust-root pin.
     #[serde(
         rename = "update_feed",
@@ -335,16 +336,16 @@ impl Config {
             .filter(|s| !s.is_empty())
     }
 
-    /// The full URL of the latest-release endpoint the update checker
-    /// polls: `<update_feed override>/releases/latest` when the override is
-    /// set, otherwise the trust-root pin (`UPDATE_DISCOVERY_URL`, the
-    /// GitHub `releases/latest` API). The override is a *base* URL so a
-    /// dev/test fixture server mounts the same `/releases/latest` path the
-    /// real API serves.
-    pub fn update_feed_url(&self) -> String {
+    /// The releases location the update checker reads: the `update_feed`
+    /// override when set, otherwise the trust-root pin
+    /// (`UPDATE_RELEASES_URL`, the repository's GitHub releases). Never
+    /// ends in `/`. Where releases are found is not a trust decision —
+    /// whatever is found there is verified against the embedded trust root
+    /// all the same (`crate::updater`).
+    pub fn update_releases_url(&self) -> String {
         match self.update_feed_override.as_deref() {
-            Some(base) => format!("{}/releases/latest", base.trim_end_matches('/')),
-            None => crate::trust_root::UPDATE_DISCOVERY_URL.to_string(),
+            Some(base) => base.trim_end_matches('/').to_string(),
+            None => crate::trust_root::UPDATE_RELEASES_URL.to_string(),
         }
     }
 
@@ -829,21 +830,18 @@ mod tests {
     }
 
     #[test]
-    fn update_feed_url_resolves_override_and_pin() {
+    fn update_releases_url_resolves_override_and_pin() {
         let cfg = Config::default();
         assert_eq!(
-            cfg.update_feed_url(),
-            crate::trust_root::UPDATE_DISCOVERY_URL
+            cfg.update_releases_url(),
+            crate::trust_root::UPDATE_RELEASES_URL
         );
 
         let cfg = Config {
             update_feed_override: Some("http://127.0.0.1:9999/".into()),
             ..Config::default()
         };
-        assert_eq!(
-            cfg.update_feed_url(),
-            "http://127.0.0.1:9999/releases/latest"
-        );
+        assert_eq!(cfg.update_releases_url(), "http://127.0.0.1:9999");
     }
 
     #[test]

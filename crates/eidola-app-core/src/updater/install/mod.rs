@@ -508,14 +508,11 @@ async fn fetch(fetcher: &Fetcher, file: &RemoteFile, label: &str) -> Result<Vec<
         .await
         .map_err(|e| InstallError::Download {
             label: label.to_string(),
-            // The fetch layer strips URLs from error text (`AppError`'s
-            // `request_error_text`), so this passes the message through
+            // The fetch layer strips URLs from error text
+            // (`request_error_text`), so this passes the message through
             // rather than reformatting it: a redirect can leave a
             // credential in a URL, and a standing failure is rendered.
-            reason: match e {
-                AppError::Update { message } => message,
-                other => other.to_string(),
-            },
+            reason: e.message().to_string(),
         })
 }
 
