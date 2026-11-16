@@ -15,7 +15,7 @@ variable "TAGS" {
 # Empty (the default, and what local builds use) disables the cache entirely;
 # CI sets it for non-release builds and leaves it empty for v* release tags so
 # the attested artifacts compile clean. The dev and ci-* variant of each image
-# share one ref per image (eidola-buildcache:{server,cli,postgres,engine-kernels,server-engine}), so the
+# share one ref per image (eidola-buildcache:{server,cli,cli-arm64,postgres,engine-kernels,server-engine}), so the
 # promotion PR (which builds the dev targets) warms the post-merge push to main
 # (which builds the ci-* targets). See .github/workflows/artifacts.yml.
 variable "CACHE_REGISTRY" {
@@ -57,6 +57,11 @@ target "_cache_server" {
 target "_cache_cli" {
   cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:cli"] : []
   cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:cli,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+}
+
+target "_cache_cli_arm64" {
+  cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:cli-arm64"] : []
+  cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:cli-arm64,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
 }
 
 target "_cache_postgres" {
@@ -107,6 +112,22 @@ target "cli" {
   context    = "."
   dockerfile = "oci/eidola-cli/Containerfile"
   tags       = ["eidola-cli:dev"]
+}
+
+# The static CLI for 64-bit ARM Linux, cross-compiled on an x86-64 builder
+# (every build stage of its Containerfile runs on linux/amd64; only the final,
+# empty image is linux/arm64). Not published and not a manifest row: the
+# image exists to carry its one file, which scripts/artifact-manifest.sh
+# extract-cli --arch arm64 takes out of it and records from manifest schema 5
+# as `eidola-cli-linux-static-arm64`. The `cli` target, and the `eidola-cli`
+# row that records it, stay a linux/amd64 image. Never pushed, so it has no
+# `ci-` variant.
+target "cli-arm64" {
+  inherits   = ["_common", "_cache_cli_arm64"]
+  platforms  = ["linux/arm64"]
+  context    = "."
+  dockerfile = "oci/eidola-cli-arm64/Containerfile"
+  tags       = ["eidola-cli-arm64:dev"]
 }
 
 # Operational image, runnable as receiver, worker or private support CLI.
