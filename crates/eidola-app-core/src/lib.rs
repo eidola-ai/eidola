@@ -2796,11 +2796,11 @@ impl Inner {
             .update_checks_started
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        let feed_url = self.load_config().update_feed_url();
+        let releases_url = self.load_config().update_releases_url();
 
         let outcome = match updater::build_http_client() {
             Ok(client) => {
-                let ctx = updates::CheckContext::new(feed_url, env!("CARGO_PKG_VERSION"));
+                let ctx = updates::CheckContext::new(releases_url, env!("CARGO_PKG_VERSION"));
                 updates::check_outcome(&client, &ctx).await
             }
             Err(e) => updates::CheckOutcome::Settled(updates::UpdateCheckResult::CheckFailed {
@@ -12264,7 +12264,7 @@ impl AppCore {
         self.runtime.spawn(async move {
             loop {
                 let _ = inner.run_update_check().await;
-                tokio::time::sleep(updates::POLL_INTERVAL).await;
+                tokio::time::sleep(updates::next_poll_delay(&mut OsRng)).await;
             }
         });
     }

@@ -1,55 +1,57 @@
 //! Update *notification* flow — "a verified newer release exists; here's
 //! the door to it."
 //!
-//! This module answers one question on launch and every ~6 hours: **is
-//! there a newer release of Eidola, and can this binary prove it's real?**
-//! It never downloads or installs anything — v1's ceiling is "verified
-//! update available → open the release page in the browser." (The full
-//! self-update *install* pipeline — `release.json`, human attestations,
-//! template equality — lives in [`crate::updater`] and remains the path a
-//! future in-app install will take.)
+//! This module answers one question at launch and about once an hour after:
+//! **is there a newer release of Eidola, and can this binary prove it's
+//! real?** It never downloads or installs anything; installing is
+//! [`crate::updater`]'s job.
 //!
-//! ## Source of truth
+//! ## What "verified" means here
 //!
-//! Only the GitHub release **marked `latest`** counts. That marker is
-//! applied by the release officer's tooling *after* the human attestation
-//! is signed and uploaded (see `.github/workflows/tinfoil-build.yml` — CI
-//! deliberately does not mark its release `latest`), so it is the
-//! human-attested signal. A `v*` release that exists but isn't `latest` is
-//! simply not an update yet. The GitHub `releases/latest` API endpoint
-//! returns exactly the release carrying that marker (drafts and
-//! prereleases never qualify), and returns 404 when no release carries it
-//! — which this module maps to "up to date", not an error.
+//! Exactly what it means to the installer. A release is announced only after
+//! [`crate::updater::verify_release`] accepts it: CI's signature over
+//! `artifact-manifest.json`, under the pinned workflow identity and bound to
+//! this release's tag, **and** at least `MIN_HUMAN_ATTESTATIONS` independent
+//! human attestations, each signed by a pinned attestant key, logged in
+//! Rekor, re-rendered character for character from the pinned templates, and
+//! naming the sha256 of that same manifest. A release that passes CI's
+//! check alone is `Unverifiable`. CI is one party that can be compromised,
+//! and the attestation exists for that case (`docs/releases.md`).
 //!
-//! Per release, CI publishes two assets exactly for this verifier:
-//! `artifact-manifest.json` and `artifact-manifest.json.sigstore` (a
-//! `cosign sign-blob` Sigstore bundle, Fulcio keyless under the
-//! `tinfoil-build.yml` workflow's OIDC identity).
+//! All of it is anchored in the trust root compiled into this build
+//! ([`crate::trust_root`]): the Sigstore roots, the CI identity and issuer,
+//! the attestant keys, the threshold, the templates, and the schemas this
+//! build reads. No trust anchor is fetched from the network.
 //!
-//! ## Verification anchor
+//! ## Where releases are found
 //!
-//! All verification is anchored **exclusively** in the embedded trust root
-//! ([`crate::trust_root`]): the pinned Sigstore `TrustedRoot` snapshot
-//! (Fulcio CAs + Rekor keys), the pinned CI identity pattern + OIDC
-//! issuer, and the schema versions this build was built against. No trust
-//! anchor is ever fetched from the network. The cryptographic work is
-//! [`crate::updater::ci_sigstore::verify_ci_signature_with`] — full Fulcio
-//! chain walk, identity match, ECDSA signature over the manifest hash,
-//! Rekor SET + Merkle inclusion proof.
+//! `<releases>/latest/download/release.json`, where `<releases>` is the
+//! trust root's `UPDATE_RELEASES_URL` (or the `update_feed` override in
+//! dev). That is the `release.json` of the GitHub release marked `latest`.
+//! The marker is a pointer, not evidence. Anyone who can edit the release
+//! listing can move it, and that changes only *which* release goes through
+//! the checks above. A 404 means nothing is marked latest, or the latest
+//! release has no `release.json`. Neither is an update, and no client
+//! check can tell either one from a withheld release.
 //!
-//! On top of the bundle verification, the Fulcio cert's SAN identity is
-//! required to end in `@refs/tags/<tag>` for the *same tag* the release
-//! claims — so an authentic old manifest can't be replayed under a newer
-//! tag to fake an update.
+//! These are GitHub's download redirects, not its REST API. The API allows
+//! sixty unauthenticated requests an hour per address, shared by every
+//! client behind one NAT. The redirects have no such limit.
+//!
+//! **The version is read before anything is verified**
+//! ([`crate::updater::gate_release`]). A release that is not newer is not
+//! judged at all, so a current release this build cannot parse never turns
+//! into a warning just by being current. Once a release claims to be newer,
+//! every failure to verify it is a security state.
 //!
 //! ## Failure-mode matrix (product decisions — encoded in [`UpdateCheckResult`])
 //!
 //! | State | Meaning | Behavior |
 //! |---|---|---|
-//! | [`UpdateCheckResult::CheckFailed`] | Network/API failure — not a security signal | Quiet. "Couldn't check (offline?)" in the Updates window; retry next cycle. Never alarms. A standing `Unverifiable`/`ClaimsChanged` state is **not** overwritten by a later `CheckFailed` (see [`UpdateState::absorb`]). |
+//! | [`UpdateCheckResult::CheckFailed`] | Nothing could be fetched (offline, a server error, a rate limit), or the `release.json` found was unreadable before it claimed any version — not a security signal | Quiet. "Couldn't check (offline?)" in the Updates window; retry next cycle. Never alarms. A standing `Unverifiable`/`ClaimsChanged` state is **not** overwritten by a later `CheckFailed` (see [`UpdateState::absorb`]). |
 //! | [`UpdateCheckResult::UpToDate`] | No newer `latest` release | Includes "no release is marked latest" (HTTP 404) and "latest is older/equal". |
-//! | [`UpdateCheckResult::UpdateAvailable`] | `latest` verifies, version > ours | "Eidola vX.Y.Z is available — cryptographically verified." One action: open the release page. |
-//! | [`UpdateCheckResult::Unverifiable`] | `latest` fails cryptographic verification (missing/bad bundle, wrong identity, manifest hash mismatch, tag binding mismatch) | **Possible fake / channel compromise.** Hard, visible security state — never silent, never offers the artifact. `reason` states exactly what failed. Persists until a later check finds a verifiable `latest`. |
+//! | [`UpdateCheckResult::UpdateAvailable`] | `latest` is newer and passes every check `crate::updater::verify_release` makes | "Eidola vX.Y.Z is available", with who attested it. One action: open the release page. |
+//! | [`UpdateCheckResult::Unverifiable`] | A newer `latest` fails verification: a missing or bad signature, the wrong identity, CI's identity bound to another tag, a missing, untrusted, malformed or unbound human attestation, too few of them, or an index that does not hold to its schema or continue from the installed commit | **Possible fake / channel compromise.** Hard, visible security state — never silent, never offers the artifact. `reason` states exactly what failed. Persists until a later check finds a verifiable `latest`. |
 //! | [`UpdateCheckResult::ClaimsChanged`] | Verifies cryptographically, but the attested claims differ structurally from what this build expects | **Authentic, but the threat model changed.** Surfaces a side-by-side of expected vs attested claims; default NOT trusted. An explicit "treat as update" action ([`crate::AppCore::accept_changed_claims`]) records the user's choice. |
 //!
 //! ## Expected claims — the concrete set
@@ -127,11 +129,10 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 use crate::trust_root;
-use crate::updater::ci_sigstore;
+use crate::updater;
 
 /// `artifact-manifest.json` `schema_version` values this build can parse
 /// structurally. Distinct from `trust_root::SUPPORTED_RELEASE_SCHEMA_VERSIONS`
@@ -273,8 +274,23 @@ const RETIRING_ARTIFACTS: &[(u64, ArtifactRows)] = &[
     (CLI_ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4),
 ];
 
-/// How often the background poll re-checks while the app is running.
-pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+/// How often, on average, the background poll re-checks while the app is
+/// running.
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The wait before the next background check: [`POLL_INTERVAL`], moved by up
+/// to a quarter of it either way, drawn fresh each time.
+///
+/// Every request to the releases host reveals that an Eidola client is
+/// running at an address. A fixed hour would also let that host line the
+/// requests up into a launch time and a run length per address. Drawn
+/// waits don't, and the jitter keeps clients that start together from
+/// staying in step.
+pub fn next_poll_delay(rng: &mut impl rand_core::RngCore) -> std::time::Duration {
+    let base = POLL_INTERVAL.as_millis() as u64;
+    let spread = base / 2;
+    std::time::Duration::from_millis(base - spread / 2 + rng.next_u64() % (spread + 1))
+}
 
 // ---------------------------------------------------------------------------
 // Result types — the typed mirror of the failure-mode matrix
@@ -314,8 +330,9 @@ pub enum UpdateCheckResult {
     CheckFailed { message: String },
 }
 
-/// A release whose `artifact-manifest.json` Sigstore bundle verified
-/// against the embedded trust root.
+/// A release that passed every check [`crate::updater::verify_release`]
+/// makes — CI's signature bound to its tag, and the human attestations the
+/// embedded policy requires.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedRelease {
     /// Semver, without the leading `v`.
@@ -323,13 +340,22 @@ pub struct VerifiedRelease {
     /// The git tag (e.g. `v0.0.9`), cross-checked against the Fulcio
     /// cert's `@refs/tags/…` identity suffix.
     pub tag: String,
-    /// The GitHub release page — the only artifact-adjacent link v1 offers.
+    /// The commit the release was built from, as its attestations name it.
+    #[serde(default)]
+    pub git_commit: String,
+    /// The release page, derived from the releases location and the tag.
     pub release_url: Option<String>,
+    /// When the release says it was cut (`release.json`'s `released_at`).
     pub published_at: Option<String>,
-    /// The Fulcio cert SAN identity the bundle verified under.
+    /// The Fulcio cert SAN identity CI's manifest signature verified under.
     pub ci_identity: String,
-    /// Rekor transparency-log index, for independent lookup.
+    /// Rekor transparency-log index of CI's manifest signature, for
+    /// independent lookup.
     pub rekor_log_index: u64,
+    /// Every human attestation that verified, in the order the release
+    /// lists them.
+    #[serde(default)]
+    pub attestants: Vec<ReleaseAttestant>,
     /// Hex sha256 of the verified manifest bytes — the durable handle an
     /// accepted claims-change is recorded against.
     pub manifest_sha256: String,
@@ -337,6 +363,17 @@ pub struct VerifiedRelease {
     /// the user explicitly chose "treat as update" for this exact
     /// manifest (matched by version + manifest hash).
     pub claims_accepted: bool,
+}
+
+/// Who attested a release, as their verified attestation states it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseAttestant {
+    /// The attestant's name, from the signed preamble.
+    pub name: String,
+    /// The jurisdiction whose perjury laws they signed under.
+    pub jurisdiction: String,
+    /// Rekor log index of their signature, for independent lookup.
+    pub rekor_log_index: u64,
 }
 
 /// One structural claim — `key` identifies it, `value` describes its
@@ -451,15 +488,14 @@ pub fn save_state(data_dir: &Path, state: &UpdateState) -> Result<(), AppError> 
 /// rows (the crypto still runs for real — only the pins move).
 #[derive(Debug, Clone)]
 pub struct CheckContext {
-    /// Full URL of the latest-release endpoint (GitHub `releases/latest`
-    /// shape). Resolved from `Config::update_feed_url()`.
-    pub feed_url: String,
+    /// The releases location (`<url>/latest/download/release.json` is the
+    /// latest release's index). Resolved from
+    /// `Config::update_releases_url()`.
+    pub releases_url: String,
     /// The running binary's semver.
     pub installed_version: String,
-    /// Fulcio SAN identity glob the bundle must match.
-    pub ci_identity_pattern: String,
-    /// OIDC issuer the Fulcio cert must record.
-    pub ci_issuer: String,
+    /// The trust pins every check runs against.
+    pub pins: updater::ReleasePins,
     /// The expected structural claim set (see module docs).
     pub expected_claims: Vec<Claim>,
 }
@@ -526,46 +562,24 @@ pub fn classify(outcome: CheckOutcome, accepted: Option<&AcceptedClaims>) -> Upd
 impl CheckContext {
     /// Production context: every pin from the embedded trust root, claims
     /// from [`expected_claims`].
-    pub fn new(feed_url: impl Into<String>, installed_version: impl Into<String>) -> Self {
+    pub fn new(releases_url: impl Into<String>, installed_version: impl Into<String>) -> Self {
         Self {
-            feed_url: feed_url.into(),
+            releases_url: releases_url.into(),
             installed_version: installed_version.into(),
-            ci_identity_pattern: trust_root::EXPECTED_CI_IDENTITY_PATTERN.to_string(),
-            ci_issuer: trust_root::EXPECTED_CI_ISSUER.to_string(),
+            pins: updater::ReleasePins::embedded(),
             expected_claims: expected_claims(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// GitHub releases/latest — minimal subset we consume
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct GhLatestRelease {
-    tag_name: String,
-    #[serde(default)]
-    html_url: Option<String>,
-    #[serde(default)]
-    published_at: Option<String>,
-    #[serde(default)]
-    assets: Vec<GhAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-// ---------------------------------------------------------------------------
 // The check
 // ---------------------------------------------------------------------------
 
-/// Run one update check. Infallible by design: every failure mode maps to
-/// an [`UpdateCheckResult`] variant per the matrix in the module docs.
 /// Run one check and classify it against `accepted` — [`check_outcome`] and
 /// [`classify`] in one step, for a caller with nothing to reconcile against.
+/// Infallible by design: every failure mode maps to an
+/// [`UpdateCheckResult`] variant per the matrix in the module docs.
 ///
 /// A caller that persists state should use the two halves instead and take
 /// the acceptance from the state it is about to write, since anything read
@@ -580,136 +594,97 @@ pub async fn check_for_update(
 }
 
 pub async fn check_outcome(client: &reqwest::Client, ctx: &CheckContext) -> CheckOutcome {
+    let settled = CheckOutcome::Settled;
+    let fetcher = updater::Fetcher::Network(client.clone());
+
     // ── discover: the release marked `latest` ───────────────────────────
-    let release = match fetch_latest_release(client, &ctx.feed_url).await {
-        Ok(Some(r)) => r,
-        // 404: no release is marked `latest` (the human-attested marker
-        // hasn't been applied to anything). Not an update, not an error.
+    let release_json = match fetcher.fetch_latest_release_json(&ctx.releases_url).await {
+        Ok(Some(bytes)) => bytes,
         Ok(None) => {
-            return CheckOutcome::Settled(UpdateCheckResult::UpToDate {
+            return settled(UpdateCheckResult::UpToDate {
                 latest_version: None,
             });
         }
-        Err(message) => return CheckOutcome::Settled(UpdateCheckResult::CheckFailed { message }),
-    };
-
-    // ── version gate: compare semver against the `latest` tag ───────────
-    let tag = release.tag_name.clone();
-    let version_str = tag.strip_prefix('v').unwrap_or(&tag).to_string();
-    let latest = match semver::Version::parse(&version_str) {
-        Ok(v) => v,
+        // Discovery reached nothing it could read, so nothing claimed an
+        // update. A body over the bound is the one `Rejected` discovery can
+        // produce, and it carries no version either.
         Err(e) => {
-            // A malformed tag is a feed anomaly, not a crypto verdict —
-            // we never reached any signed material.
-            return CheckOutcome::Settled(UpdateCheckResult::CheckFailed {
-                message: format!("latest release tag `{tag}` is not semver: {e}"),
+            return settled(UpdateCheckResult::CheckFailed {
+                message: e.message().to_string(),
             });
         }
     };
-    let installed = match semver::Version::parse(&ctx.installed_version) {
-        Ok(v) => v,
-        Err(e) => {
-            return CheckOutcome::Settled(UpdateCheckResult::CheckFailed {
-                message: format!(
-                    "installed version `{}` is not semver: {e}",
-                    ctx.installed_version
-                ),
+
+    // ── version gate, then the index's own shape ────────────────────────
+    // Continuity is not checked here: no build knows the commit it was
+    // released from (`docs/gaps.md` → First-install downgrade).
+    let release = match updater::gate_release(&release_json, &ctx.installed_version, None) {
+        Ok(updater::ReleaseGate::Newer(release)) => *release,
+        Ok(updater::ReleaseGate::NotNewer { version }) => {
+            return settled(UpdateCheckResult::UpToDate {
+                latest_version: Some(version),
             });
         }
-    };
-    if latest <= installed {
-        return CheckOutcome::Settled(UpdateCheckResult::UpToDate {
-            latest_version: Some(version_str),
-        });
-    }
-
-    // From here on, a newer `latest` exists — every failure is a security
-    // state, never silence.
-    let unverifiable = |reason: String| {
-        CheckOutcome::Settled(UpdateCheckResult::Unverifiable {
-            version: version_str.clone(),
-            tag: tag.clone(),
+        Err(updater::GateError {
+            newer_version: None,
             reason,
-        })
-    };
-
-    // ── fetch the two verifier assets ────────────────────────────────────
-    let manifest_bytes = match fetch_listed_asset(client, &release, "artifact-manifest.json").await
-    {
-        Ok(bytes) => bytes,
-        Err(FetchAssetError::Security(reason)) => return unverifiable(reason),
-        Err(FetchAssetError::Transient(message)) => {
-            return CheckOutcome::Settled(UpdateCheckResult::CheckFailed { message });
+        }) => return settled(UpdateCheckResult::CheckFailed { message: reason }),
+        Err(updater::GateError {
+            newer_version: Some(version),
+            reason,
+        }) => {
+            return settled(UpdateCheckResult::Unverifiable {
+                tag: format!("v{version}"),
+                version,
+                reason,
+            });
         }
     };
-    let bundle_bytes =
-        match fetch_listed_asset(client, &release, "artifact-manifest.json.sigstore").await {
-            Ok(bytes) => bytes,
-            Err(FetchAssetError::Security(reason)) => return unverifiable(reason),
-            Err(FetchAssetError::Transient(message)) => {
-                return CheckOutcome::Settled(UpdateCheckResult::CheckFailed { message });
-            }
-        };
 
-    // ── cryptographic verification, anchored in the embedded trust root ─
-    let trust = match crate::updater::trust::load() {
-        Ok(t) => t,
-        Err(e) => {
-            // The embedded trust root failing to parse is a build defect,
-            // but surfacing it as Unverifiable keeps it loud.
-            return unverifiable(format!("embedded Sigstore trust root failed to load: {e}"));
+    // From here on, a newer release has been claimed — every failure to
+    // verify it is a security state, and only an unreachable file is not.
+    let evidence = match updater::verify_release(&fetcher, &release, &ctx.pins).await {
+        Ok(evidence) => evidence,
+        Err(updater::ReleaseCheckError::Unreachable(message)) => {
+            return settled(UpdateCheckResult::CheckFailed { message });
+        }
+        Err(updater::ReleaseCheckError::Rejected(reason)) => {
+            return settled(UpdateCheckResult::Unverifiable {
+                version: release.version.clone(),
+                tag: release.git_tag.clone(),
+                reason,
+            });
         }
     };
-    let verified = match ci_sigstore::verify_ci_signature_with(
-        &manifest_bytes,
-        &bundle_bytes,
-        &trust,
-        &ctx.ci_identity_pattern,
-        &ctx.ci_issuer,
-    ) {
-        Ok(v) => v,
-        Err(e) => return unverifiable(e.to_string()),
-    };
-
-    // ── tag binding: the identity must be for *this* tag ────────────────
-    // The Fulcio SAN ends in `@refs/tags/<tag>`; requiring it to equal the
-    // release's tag prevents replaying an authentic older manifest under a
-    // newer tag to fabricate an "update".
-    match verified.ci_identity.rsplit_once("@refs/tags/") {
-        Some((_, signed_tag)) if signed_tag == tag => {}
-        Some((_, signed_tag)) => {
-            return unverifiable(format!(
-                "the manifest signature is from the pinned release identity, but for tag \
-                 `{signed_tag}`, not this release's tag `{tag}` — an authentic file appears \
-                 to have been replayed under a different release"
-            ));
-        }
-        None => {
-            return unverifiable(format!(
-                "the signing identity `{}` is not bound to a release tag (`@refs/tags/…`)",
-                verified.ci_identity
-            ));
-        }
-    }
-
-    let manifest_sha256 = hex(&Sha256::digest(&manifest_bytes));
 
     // ── claims: structural comparison against the expected set ──────────
-    let manifest_value: serde_json::Value = match serde_json::from_slice(&manifest_bytes) {
-        Ok(v) => v,
-        Err(_) => serde_json::Value::Null,
-    };
+    let manifest_value: serde_json::Value =
+        serde_json::from_slice(&evidence.manifest_bytes).unwrap_or(serde_json::Value::Null);
     let attested = attested_claims(&manifest_value);
     let deltas = compare_claims(&ctx.expected_claims, &attested);
 
+    let summary = evidence.summary;
     let release = VerifiedRelease {
-        version: version_str.clone(),
-        tag: tag.clone(),
-        release_url: release.html_url.clone(),
-        published_at: release.published_at.clone(),
-        ci_identity: verified.ci_identity,
-        rekor_log_index: verified.rekor_log_index,
-        manifest_sha256,
+        release_url: Some(updater::release_page_url(
+            &ctx.releases_url,
+            &summary.git_tag,
+        )),
+        version: summary.version,
+        tag: summary.git_tag,
+        git_commit: summary.git_commit,
+        published_at: Some(summary.released_at),
+        ci_identity: evidence.ci_identity,
+        rekor_log_index: evidence.ci_rekor_log_index,
+        attestants: summary
+            .attestations
+            .iter()
+            .map(|a| ReleaseAttestant {
+                name: a.attestant_name.clone(),
+                jurisdiction: a.jurisdiction.clone(),
+                rekor_log_index: a.rekor_log_index,
+            })
+            .collect(),
+        manifest_sha256: evidence.manifest_sha256,
         // Not yet knowable here: acceptance is a fact about persisted state,
         // and this function is the half that must not read it. `classify`
         // fills it in.
@@ -724,86 +699,6 @@ pub async fn check_outcome(client: &reqwest::Client, ctx: &CheckContext) -> Chec
             deltas,
         },
     }
-}
-
-/// Fetch and parse the latest-release endpoint. `Ok(None)` = HTTP 404 (no
-/// release marked latest). `Err` = transient network/API failure message.
-async fn fetch_latest_release(
-    client: &reqwest::Client,
-    feed_url: &str,
-) -> Result<Option<GhLatestRelease>, String> {
-    let resp = client
-        .get(feed_url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| format!("GET {feed_url}: {e}"))?;
-    let status = resp.status();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("reading latest-release response: {e}"))?;
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !status.is_success() {
-        return Err(format!("GET {feed_url} → HTTP {status}"));
-    }
-    let release: GhLatestRelease =
-        serde_json::from_slice(&bytes).map_err(|e| format!("parsing latest-release JSON: {e}"))?;
-    Ok(Some(release))
-}
-
-enum FetchAssetError {
-    /// The release should have this file but doesn't (absent from the
-    /// listing, or listed but 404) — a security state for a newer release.
-    Security(String),
-    /// Transport-level or server-side trouble — quiet retry.
-    Transient(String),
-}
-
-async fn fetch_listed_asset(
-    client: &reqwest::Client,
-    release: &GhLatestRelease,
-    name: &str,
-) -> Result<Vec<u8>, FetchAssetError> {
-    let Some(asset) = release.assets.iter().find(|a| a.name == name) else {
-        return Err(FetchAssetError::Security(format!(
-            "the release has no `{name}` asset — the verification material this client \
-             requires is missing"
-        )));
-    };
-    let resp = client
-        .get(&asset.browser_download_url)
-        .header("Accept", "application/octet-stream")
-        .send()
-        .await
-        .map_err(|e| FetchAssetError::Transient(format!("GET {name}: {e}")))?;
-    let status = resp.status();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| FetchAssetError::Transient(format!("reading {name}: {e}")))?;
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(FetchAssetError::Security(format!(
-            "the release lists `{name}` but the file is gone (HTTP 404)"
-        )));
-    }
-    if !status.is_success() {
-        return Err(FetchAssetError::Transient(format!(
-            "{name} returned HTTP {status}"
-        )));
-    }
-    Ok(bytes.to_vec())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,6 +1240,40 @@ pub fn compare_claims(expected: &[Claim], attested: &[Claim]) -> Vec<ClaimDelta>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An RNG that always draws the same word, so the delay's arithmetic can
+    /// be read at its ends.
+    struct Fixed(u64);
+
+    impl rand_core::RngCore for Fixed {
+        fn next_u32(&mut self) -> u32 {
+            self.0 as u32
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            dest.fill(0);
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            dest.fill(0);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_poll_delay_stays_within_a_quarter_of_the_interval() {
+        let interval = POLL_INTERVAL.as_millis() as u64;
+        let spread = interval / 2;
+        let shortest = next_poll_delay(&mut Fixed(0)).as_millis() as u64;
+        let longest = next_poll_delay(&mut Fixed(spread)).as_millis() as u64;
+        assert_eq!(shortest, interval - interval / 4);
+        assert_eq!(longest, interval + interval / 4);
+        for word in [1, spread / 2, spread + 1, u64::MAX] {
+            let ms = next_poll_delay(&mut Fixed(word)).as_millis() as u64;
+            assert!((shortest..=longest).contains(&ms), "{word} drew {ms}ms");
+        }
+    }
 
     fn current_manifest() -> serde_json::Value {
         serde_json::json!({
@@ -2325,10 +2254,12 @@ mod tests {
         let release = VerifiedRelease {
             version: "9.9.9".into(),
             tag: "v9.9.9".into(),
+            git_commit: "c".repeat(40),
             release_url: None,
             published_at: None,
             ci_identity: "x".into(),
             rekor_log_index: 1,
+            attestants: vec![],
             manifest_sha256: "ab".repeat(32),
             claims_accepted: false,
         };

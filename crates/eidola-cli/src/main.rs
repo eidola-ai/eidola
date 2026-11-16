@@ -2095,7 +2095,7 @@ fn print_update_check(
         }
         UpdateCheckResult::UpdateAvailable { release } => {
             println!(
-                "Eidola v{} is available — cryptographically verified.",
+                "Eidola v{} is available — verified against this build's trust root.",
                 release.version
             );
             if release.claims_accepted {
@@ -2104,13 +2104,18 @@ fn print_update_check(
                      to treat it as an update)"
                 );
             }
-            println!("  signed by: {}", release.ci_identity);
+            for attestant in &release.attestants {
+                println!(
+                    "  attested by: {} ({}) — https://search.sigstore.dev/?logIndex={}",
+                    attestant.name, attestant.jurisdiction, attestant.rekor_log_index
+                );
+            }
             println!(
-                "  rekor:     https://search.sigstore.dev/?logIndex={}",
-                release.rekor_log_index
+                "  built by:    {} — https://search.sigstore.dev/?logIndex={}",
+                release.ci_identity, release.rekor_log_index
             );
             if let Some(url) = &release.release_url {
-                println!("  release:   {url}");
+                println!("  release:     {url}");
             }
         }
         UpdateCheckResult::Unverifiable {

@@ -1342,6 +1342,7 @@ mod driver {
                             release: VerifiedRelease {
                                 version: "0.2.0".into(),
                                 tag: "v0.2.0".into(),
+                                git_commit: "0123456789abcdef0123456789abcdef01234567".into(),
                                 release_url: Some(
                                     "https://github.com/eidola-ai/eidola/releases/tag/v0.2.0"
                                         .into(),
@@ -1349,6 +1350,11 @@ mod driver {
                                 published_at: Some("2026-06-01T12:00:00Z".into()),
                                 ci_identity: "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v0.2.0".into(),
                                 rekor_log_index: 168_338_903,
+                                attestants: vec![eidola_app_core::updates::ReleaseAttestant {
+                                    name: "Ada Example".into(),
+                                    jurisdiction: "the State of California, United States".into(),
+                                    rekor_log_index: 168_338_904,
+                                }],
                                 manifest_sha256: "ab".repeat(32),
                                 claims_accepted: false,
                             },

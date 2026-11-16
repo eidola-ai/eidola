@@ -1,24 +1,45 @@
-//! Self-update verifier — fetches `release.json` from the embedded
-//! `UPDATE_DISCOVERY_URL`, validates every signed artifact it references
-//! against the embedded trust root, and surfaces the attestation prose to
-//! the user for approval before swapping the running binary.
+//! Self-update verifier — fetches the latest `release.json` from the
+//! releases location pinned in the trust root (`UPDATE_RELEASES_URL`),
+//! validates every signed artifact it references against the embedded trust
+//! root, and surfaces the attestation prose to the user for approval before
+//! swapping the running binary.
 //!
 //! ## Pipeline
 //!
 //! ```text
-//!   discover    → fetch release.json from GitHub releases API   [step 4b]
-//!   schema      → release.json.schema_version supported          [step 4b]
-//!   continuity  → release.version > installed; previous matches  [step 4b]
-//!   fetch       → download artifact-manifest.json + both bundles + each attestation
-//!   verify-ci   → tinfoil-rs sigstore verification               [step 4c]
-//!   verify-human→ cosign-signed hashedrekord (PKIX SPKI in body) per attestation [step 4d]
-//!   templates   → render each template; require character-exact match [step 4e]
-//!   cross-check → resolved substitution values match release.x.y paths [step 4e]
-//!   policy      → ≥ trust_root::MIN_HUMAN_ATTESTATIONS human attestations verified [step 4e]
-//!   manifest    → fetch artifact-manifest.json artifacts; verify each hash [step 4e]
+//!   discover    → GET <releases>/latest/download/release.json (404 = nothing marked latest)
+//!   version     → release.version > installed, read before anything else
+//!   schema      → release.json.schema_version supported, shape held to it
+//!   continuity  → previous_release matches the installed commit, when one is known
+//!   fetch       → artifact-manifest.json + its bundle + each attestation + its bundle
+//!   verify-ci   → Fulcio chain, pinned identity, Rekor; identity bound to this release's tag
+//!   verify-human→ cosign-signed hashedrekord (PKIX SPKI in body) per attestation
+//!   templates   → render each template; require character-exact match
+//!   cross-check → resolved substitution values match release.x.y paths
+//!   bind        → every attestation names the sha256 of the manifest fetched
+//!   policy      → ≥ MIN_HUMAN_ATTESTATIONS independent attestations verified
 //!   present     → return ReleaseSummary to the UI for user approval
-//!   install     → (step 5, deferred) download + swap the new binary
+//!   install     → `install::stage` downloads and hashes; promotion is separate
 //! ```
+//!
+//! [`verify_release`] is the stages from `fetch` to `policy`, and it is the
+//! only definition of "this release is real" in the client: the update
+//! notification (`crate::updates`) and the install path both run it, so a
+//! release can never be announced on less evidence than installing it
+//! requires.
+//!
+//! **Where the latest release is found is not a trust decision.** The
+//! `latest` marker, the URLs in `release.json`, and `release.json` itself are
+//! all unsigned, and anyone who can edit the release listing can change
+//! them. What they can do with that is limited to pointing at a different
+//! release, which then has to pass every stage above, or pointing at
+//! nothing. Withholding an update is the one thing a discovery channel can
+//! always do, and no client-side check can tell a withheld release from no
+//! release.
+//!
+//! Discovery uses GitHub's download redirects rather than its REST API:
+//! the API allows sixty unauthenticated requests an hour per address, which
+//! every client behind one NAT shares, and the redirects carry no such limit.
 //!
 //! The minimum-attestation threshold lives in the *embedded* trust root
 //! ([`trust_root::MIN_HUMAN_ATTESTATIONS`]), **not** in `release.json` —
@@ -28,7 +49,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use serde::Deserialize;
 use sha2::Digest;
 
 use crate::error::AppError;
@@ -80,14 +100,27 @@ impl Fetcher {
         Fetcher::Fixtures(dir.into())
     }
 
-    /// Fetch `release.json` itself. In `Network` mode this hits the GitHub
-    /// releases API at `trust_root::UPDATE_DISCOVERY_URL`. In `Fixtures`
-    /// mode it reads `<dir>/release.json` directly — the GitHub releases
-    /// lookup is the one stage the fixtures path bypasses.
-    async fn fetch_release_json(&self) -> Result<Vec<u8>, AppError> {
-        match self {
-            Fetcher::Network(client) => fetch_release_json_network(client).await,
+    /// Fetch the `release.json` of the release marked latest under
+    /// `releases_url` (`<releases_url>/latest/download/release.json`).
+    /// `Ok(None)` when there is none to fetch: GitHub answers 404 both when
+    /// nothing is marked latest and when the release marked latest has no
+    /// `release.json`, and neither is an update. In `Fixtures` mode it reads
+    /// `<dir>/release.json`, and a missing file is likewise `None`.
+    pub async fn fetch_latest_release_json(
+        &self,
+        releases_url: &str,
+    ) -> Result<Option<Vec<u8>>, ReleaseCheckError> {
+        let result = match self {
+            Fetcher::Network(client) => {
+                let url = latest_release_json_url(releases_url);
+                fetch_url_network(client, &url, "release.json", MAX_DOCUMENT_BYTES).await
+            }
             Fetcher::Fixtures(dir) => read_fixture(dir, "release.json"),
+        };
+        match result {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(FetchFailure::Missing(_)) => Ok(None),
+            Err(other) => Err(other.into()),
         }
     }
 
@@ -96,7 +129,7 @@ impl Fetcher {
     /// Bounded at [`MAX_DOCUMENT_BYTES`]: every URL reached this way comes
     /// out of `release.json`, which is unsigned and therefore chosen by
     /// whoever served it.
-    async fn fetch_url(&self, url: &str, label: &str) -> Result<Vec<u8>, AppError> {
+    async fn fetch_url(&self, url: &str, label: &str) -> Result<Vec<u8>, ReleaseCheckError> {
         self.fetch_url_bounded(url, label, MAX_DOCUMENT_BYTES).await
     }
 
@@ -107,17 +140,165 @@ impl Fetcher {
         url: &str,
         label: &str,
         max_bytes: u64,
-    ) -> Result<Vec<u8>, AppError> {
-        match self {
+    ) -> Result<Vec<u8>, ReleaseCheckError> {
+        let result = match self {
             Fetcher::Network(client) => fetch_url_network(client, url, label, max_bytes).await,
-            Fetcher::Fixtures(dir) => {
-                let name = url_to_filename(url).ok_or_else(|| AppError::Update {
-                    message: format!(
-                        "fixtures mode: could not extract filename from URL `{url}` (for {label})"
-                    ),
-                })?;
-                read_fixture(dir, &name)
-            }
+            Fetcher::Fixtures(dir) => match url_to_filename(url) {
+                Some(name) => read_fixture(dir, &name),
+                None => Err(FetchFailure::Refused(format!(
+                    "fixtures mode: could not extract filename from URL `{url}` (for {label})"
+                ))),
+            },
+        };
+        result.map_err(ReleaseCheckError::from)
+    }
+}
+
+/// Where the `release.json` of the release marked latest is downloaded
+/// from, under a releases location.
+pub fn latest_release_json_url(releases_url: &str) -> String {
+    format!(
+        "{}/latest/download/release.json",
+        releases_url.trim_end_matches('/')
+    )
+}
+
+/// The human-readable page for one release tag, under a releases location.
+pub fn release_page_url(releases_url: &str, tag: &str) -> String {
+    format!("{}/tag/{tag}", releases_url.trim_end_matches('/'))
+}
+
+/// Why a release could not be read or could not be believed.
+///
+/// The two are different facts and a caller has to be able to tell them
+/// apart. A release that could not be *reached* says nothing about whether
+/// it is real: the network was down, a server failed, a rate limit applied,
+/// and the right response is to try again later without alarm. A release
+/// whose bytes arrived and failed a check, or that names a file which is not
+/// there, is evidence: either the release is broken or someone has
+/// tampered with it, and a client that has been told an update exists must
+/// say so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseCheckError {
+    /// The bytes could not be fetched. Not a security signal.
+    Unreachable(String),
+    /// The bytes were fetched, or were missing where the release said they
+    /// would be, and the release does not verify.
+    Rejected(String),
+}
+
+impl ReleaseCheckError {
+    pub fn message(&self) -> &str {
+        match self {
+            ReleaseCheckError::Unreachable(m) | ReleaseCheckError::Rejected(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for ReleaseCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<ReleaseCheckError> for AppError {
+    fn from(e: ReleaseCheckError) -> Self {
+        AppError::Update {
+            message: e.message().to_string(),
+        }
+    }
+}
+
+/// Every verification stage reports through `AppError::Update`, and every
+/// one of them is a judgement about bytes that arrived. Only the fetch layer
+/// can say a failure was the network's, and it says so through
+/// [`FetchFailure`] instead of this conversion.
+impl From<AppError> for ReleaseCheckError {
+    fn from(e: AppError) -> Self {
+        match e {
+            AppError::Update { message } => ReleaseCheckError::Rejected(message),
+            other => ReleaseCheckError::Rejected(other.to_string()),
+        }
+    }
+}
+
+/// How one fetch failed, before a caller decides what that means.
+///
+/// `Missing` is kept apart from `Unreachable` because the two callers read it
+/// differently: for discovery, a missing `release.json` means nothing is
+/// marked latest; for a file a release names, a missing file is a release
+/// that does not hold together.
+#[derive(Debug)]
+pub(crate) enum FetchFailure {
+    /// Transport failure, a timeout, or a status that says the server could
+    /// not answer (a 5xx, a rate limit, an authorization wall).
+    Unreachable(String),
+    /// The server answered that there is no such file (404 or 410).
+    Missing(String),
+    /// The server answered with something this will not read: a body over
+    /// the bound, or a request that could not be formed.
+    Refused(String),
+}
+
+impl FetchFailure {
+    fn message(&self) -> &str {
+        match self {
+            FetchFailure::Unreachable(m) | FetchFailure::Missing(m) | FetchFailure::Refused(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for FetchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<FetchFailure> for ReleaseCheckError {
+    fn from(f: FetchFailure) -> Self {
+        match f {
+            FetchFailure::Unreachable(m) => ReleaseCheckError::Unreachable(m),
+            FetchFailure::Missing(m) | FetchFailure::Refused(m) => ReleaseCheckError::Rejected(m),
+        }
+    }
+}
+
+impl From<FetchFailure> for AppError {
+    fn from(f: FetchFailure) -> Self {
+        AppError::Update {
+            message: f.message().to_string(),
+        }
+    }
+}
+
+/// The trust pins one verification runs against.
+///
+/// Production uses [`ReleasePins::embedded`], every value from the trust
+/// root compiled into this build. The struct exists so tests can move a pin
+/// and watch the real cryptography refuse — the verification code is the
+/// same either way, and nothing outside a test constructs anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasePins {
+    /// Fulcio SAN identity glob CI's manifest signature must match.
+    pub ci_identity_pattern: String,
+    /// OIDC issuer the Fulcio certificate must record.
+    pub ci_issuer: String,
+    /// `sha256(SPKI DER)` of every key whose attestation counts.
+    pub trusted_attestant_fingerprints: Vec<String>,
+    /// How many independent attestations a release needs.
+    pub min_human_attestations: u32,
+}
+
+impl ReleasePins {
+    pub fn embedded() -> Self {
+        Self {
+            ci_identity_pattern: trust_root::EXPECTED_CI_IDENTITY_PATTERN.to_string(),
+            ci_issuer: trust_root::EXPECTED_CI_ISSUER.to_string(),
+            trusted_attestant_fingerprints: trust_root::TRUSTED_ATTESTANT_FINGERPRINTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            min_human_attestations: trust_root::MIN_HUMAN_ATTESTATIONS,
         }
     }
 }
@@ -134,10 +315,15 @@ fn url_to_filename(url: &str) -> Option<String> {
     }
 }
 
-fn read_fixture(dir: &Path, name: &str) -> Result<Vec<u8>, AppError> {
+fn read_fixture(dir: &Path, name: &str) -> Result<Vec<u8>, FetchFailure> {
     let path = dir.join(name);
-    std::fs::read(&path).map_err(|e| AppError::Update {
-        message: format!("reading fixture {}: {e}", path.display()),
+    std::fs::read(&path).map_err(|e| {
+        let message = format!("reading fixture {}: {e}", path.display());
+        if e.kind() == std::io::ErrorKind::NotFound {
+            FetchFailure::Missing(message)
+        } else {
+            FetchFailure::Unreachable(message)
+        }
     })
 }
 
@@ -174,23 +360,6 @@ impl Tracer {
         let ms = self.start.elapsed().as_millis();
         eprintln!("[{:>5}ms] {}: {}", ms, stage, msg.as_ref());
     }
-}
-
-// ---------------------------------------------------------------------------
-// GitHub releases API — minimal subset we consume
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct GhRelease {
-    #[allow(dead_code)]
-    tag_name: String,
-    assets: Vec<GhReleaseAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhReleaseAsset {
-    name: String,
-    browser_download_url: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -281,16 +450,16 @@ pub struct VerifiedClaim {
 }
 
 // ---------------------------------------------------------------------------
-// Entry point — partially implemented (steps 4b through 4f flesh this out)
+// Entry points
 // ---------------------------------------------------------------------------
 
 /// Fetch the latest release index, run the verification pipeline, and
 /// return a [`ReleaseSummary`] ready for the UI to display.
 ///
-/// Returns `Ok(None)` if no update is available (the latest release matches
-/// or is older than the currently-installed version). Returns `Err` if the
-/// latest release fails any pipeline stage — the UI surfaces the error and
-/// the installed version stays put.
+/// Returns `Ok(None)` if no update is available (nothing is marked latest,
+/// or the latest release matches or is older than the installed version).
+/// Returns `Err` if the latest release fails any pipeline stage — the UI
+/// surfaces the error and the installed version stays put.
 ///
 /// Production callers should use this entry point — it constructs the
 /// default network `Fetcher` and emits no diagnostics. The dev loop uses
@@ -324,27 +493,29 @@ pub async fn check_for_update_with(
 
     // ── discover ─────────────────────────────────────────────────────────
     tracer.log("discover", "reading release.json");
-    let release_json_bytes = fetcher.fetch_release_json().await?;
+    let Some(release_json_bytes) = fetcher
+        .fetch_latest_release_json(trust_root::UPDATE_RELEASES_URL)
+        .await?
+    else {
+        tracer.log("discover", "no release is marked latest; no update");
+        return Ok(None);
+    };
     tracer.log(
         "discover",
         format!("release.json ({} bytes)", release_json_bytes.len()),
     );
 
-    // ── schema + continuity ─────────────────────────────────────────────
-    let release = match parse_and_gate_release(
-        &release_json_bytes,
-        installed_version,
-        installed_git_commit,
-    ) {
-        Ok(r) => r,
-        Err(NoUpdateOrError::NoUpdate) => {
+    // ── version, schema, continuity ──────────────────────────────────────
+    let release = match gate_release(&release_json_bytes, installed_version, installed_git_commit) {
+        Ok(ReleaseGate::Newer(release)) => *release,
+        Ok(ReleaseGate::NotNewer { version }) => {
             tracer.log(
-                "schema",
-                format!("installed version {installed_version} is current; no update"),
+                "version",
+                format!("latest is {version}; installed {installed_version} is current"),
             );
             return Ok(None);
         }
-        Err(NoUpdateOrError::Error(e)) => return Err(e),
+        Err(e) => return Err(AppError::Update { message: e.reason }),
     };
     tracer.log(
         "schema",
@@ -362,9 +533,143 @@ pub async fn check_for_update_with(
             ),
         ),
         (None, None) => tracer.log("continuity", "first install; no prior commit to anchor"),
-        (None, Some(_)) => { /* parse_and_gate_release already returned Err */ }
+        (None, Some(_)) => { /* gate_release already refused */ }
     }
 
+    let evidence =
+        verify_release_traced(fetcher, &release, &ReleasePins::embedded(), &tracer).await?;
+    tracer.log("present", format!("release {} verified", release.version));
+    Ok(Some(evidence.summary))
+}
+
+/// What reading a `release.json` against the installed version found,
+/// before any signed material is fetched.
+#[derive(Debug)]
+pub enum ReleaseGate {
+    /// The release is not newer than the one installed. Nothing about it is
+    /// checked: a client has no business judging a release it would not
+    /// install, and a release this build cannot parse (a schema from after
+    /// it) must not turn into a warning merely by being current.
+    NotNewer { version: String },
+    /// A newer release whose index parsed, holds to the schema it declares,
+    /// names the tag its version implies, and continues from the installed
+    /// commit when one is known. Its signed material is still unchecked.
+    Newer(Box<ReleaseIndex>),
+}
+
+/// Why a `release.json` could not be gated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateError {
+    /// The version the document claims, when it was readable and newer than
+    /// the installed one. `None` means the document never got that far, and
+    /// so never claimed an update.
+    pub newer_version: Option<String>,
+    pub reason: String,
+}
+
+/// Read a `release.json` against the installed version.
+///
+/// **The version is read first, and alone.** Whether a release is newer is
+/// the only question worth asking of a release that is not, so the
+/// document's own schema, shape and continuity are checked only once it
+/// claims to be an update. From that point every refusal names the version,
+/// because a document that claims an update and does not hold together is
+/// the thing a client must surface.
+pub fn gate_release(
+    release_json_bytes: &[u8],
+    installed_version: &str,
+    installed_git_commit: Option<&str>,
+) -> Result<ReleaseGate, GateError> {
+    let unreadable = |reason: String| GateError {
+        newer_version: None,
+        reason,
+    };
+
+    let value: serde_json::Value = serde_json::from_slice(release_json_bytes)
+        .map_err(|e| unreadable(format!("release.json failed to parse: {e}")))?;
+    let version = value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| unreadable("release.json has no string `version`".to_string()))?
+        .to_string();
+
+    match compare_versions(&version, installed_version) {
+        Ok(VersionCompare::OlderOrEqual) => return Ok(ReleaseGate::NotNewer { version }),
+        Ok(VersionCompare::Newer) => {}
+        Err(e) => return Err(unreadable(update_message(e))),
+    }
+
+    let refuse = |reason: String| GateError {
+        newer_version: Some(version.clone()),
+        reason,
+    };
+
+    let release: ReleaseIndex = serde_json::from_value(value)
+        .map_err(|e| refuse(format!("release.json failed to parse: {e}")))?;
+
+    if !trust_root::SUPPORTED_RELEASE_SCHEMA_VERSIONS.contains(&release.schema_version) {
+        return Err(refuse(format!(
+            "release.json schema_version `{}` is not in the supported set {:?} \
+             — this client cannot parse the release safely; install a newer client.",
+            release.schema_version,
+            trust_root::SUPPORTED_RELEASE_SCHEMA_VERSIONS,
+        )));
+    }
+    check_schema_shape(&release).map_err(|e| refuse(update_message(e)))?;
+
+    // The tag is what CI's signing identity is bound to, so the version a
+    // client is told about and the tag it checks must be one fact.
+    let expected_tag = format!("v{}", release.version);
+    if release.git_tag != expected_tag {
+        return Err(refuse(format!(
+            "release.json names version `{}` but tag `{}`; a release's tag is `{expected_tag}`",
+            release.version, release.git_tag
+        )));
+    }
+
+    check_continuity(&release, installed_git_commit).map_err(|e| refuse(update_message(e)))?;
+
+    Ok(ReleaseGate::Newer(Box::new(release)))
+}
+
+/// What a release that verified is made of: the summary a person approves,
+/// and the signed manifest that every artifact hash comes from.
+#[derive(Debug, Clone)]
+pub struct ReleaseEvidence {
+    pub summary: ReleaseSummary,
+    /// The CI-signed `artifact-manifest.json`, exactly as fetched.
+    pub manifest_bytes: Vec<u8>,
+    /// Lowercase hex sha256 of `manifest_bytes`, which every counted
+    /// attestation names.
+    pub manifest_sha256: String,
+    /// The Fulcio SAN identity CI's signature verified under, bound to this
+    /// release's tag.
+    pub ci_identity: String,
+    /// Rekor log index of CI's manifest signature.
+    pub ci_rekor_log_index: u64,
+}
+
+/// Verify a gated release: CI's signature over the manifest, bound to the
+/// release's tag, and at least `pins.min_human_attestations` independent
+/// human attestations over that same manifest.
+///
+/// This is the whole of what makes a release real to this client. Both the
+/// update notification and the install path call it, and neither adds a
+/// shortcut around it.
+pub async fn verify_release(
+    fetcher: &Fetcher,
+    release: &ReleaseIndex,
+    pins: &ReleasePins,
+) -> Result<ReleaseEvidence, ReleaseCheckError> {
+    verify_release_traced(fetcher, release, pins, &Tracer::new(false)).await
+}
+
+async fn verify_release_traced(
+    fetcher: &Fetcher,
+    release: &ReleaseIndex,
+    pins: &ReleasePins,
+    tracer: &Tracer,
+) -> Result<ReleaseEvidence, ReleaseCheckError> {
     let trust = trust::load()?;
     tracer.log("trust", "embedded Sigstore trust root loaded");
 
@@ -408,8 +713,41 @@ pub async fn check_for_update_with(
         "verify-ci",
         "verifying Fulcio chain + Rekor SET + inclusion",
     );
-    let _verified_ci = ci_sigstore::verify_ci_signature(&manifest_bytes, &bundle_bytes, &trust)?;
-    tracer.log("verify-ci", "ok");
+    let verified_ci = ci_sigstore::verify_ci_signature_with(
+        &manifest_bytes,
+        &bundle_bytes,
+        &trust,
+        &pins.ci_identity_pattern,
+        &pins.ci_issuer,
+    )?;
+
+    // The Fulcio SAN ends in `@refs/tags/<tag>`. Requiring that tag to be
+    // this release's stops an authentic manifest from an older release
+    // being offered under a newer one.
+    match verified_ci.ci_identity.rsplit_once("@refs/tags/") {
+        Some((_, signed_tag)) if signed_tag == release.git_tag => {}
+        Some((_, signed_tag)) => {
+            return Err(ReleaseCheckError::Rejected(format!(
+                "the manifest signature is from the pinned release identity, but for tag \
+                 `{signed_tag}`, not this release's tag `{}` — an authentic file appears \
+                 to have been replayed under a different release",
+                release.git_tag
+            )));
+        }
+        None => {
+            return Err(ReleaseCheckError::Rejected(format!(
+                "the signing identity `{}` is not bound to a release tag (`@refs/tags/…`)",
+                verified_ci.ci_identity
+            )));
+        }
+    }
+    tracer.log(
+        "verify-ci",
+        format!(
+            "ok ({}, bound to {})",
+            verified_ci.ci_identity, release.git_tag
+        ),
+    );
 
     let manifest_sha256_hex = human_attestation::hex_encode(&sha2::Sha256::digest(&manifest_bytes));
 
@@ -440,24 +778,23 @@ pub async fn check_for_update_with(
                 human.attestant_id
             ),
         );
-        let verified = human_attestation::verify_human_attestation(
+        let verified = human_attestation::verify_human_attestation_with(
             &attestation_bytes,
             &bundle_bytes,
-            &release,
+            release,
             &trust,
+            &pins.trusted_attestant_fingerprints,
         )?;
         // The attestant_id in release.json must match what the
         // attestation prose says — defends against a release manifest
         // listing one attestant_id but pointing to a different person's
         // signed prose.
         if verified.attestant_id != human.attestant_id {
-            return Err(AppError::Update {
-                message: format!(
-                    "release.human_attestations[].attestant_id `{}` ≠ attestation prose \
-                     attestant.id `{}`",
-                    human.attestant_id, verified.attestant_id
-                ),
-            });
+            return Err(ReleaseCheckError::Rejected(format!(
+                "release.human_attestations[].attestant_id `{}` ≠ attestation prose \
+                 attestant.id `{}`",
+                human.attestant_id, verified.attestant_id
+            )));
         }
         // The attestant swears to a specific manifest hash inside the
         // signed prose; bind it to the manifest actually fetched and
@@ -468,13 +805,11 @@ pub async fn check_for_update_with(
             .artifact_manifest_sha256
             .eq_ignore_ascii_case(&manifest_sha256_hex)
         {
-            return Err(AppError::Update {
-                message: format!(
-                    "attestation `{}` attests artifact-manifest.json sha256 `{}`, but the \
-                     fetched manifest hashes to `{}`",
-                    verified.attestant_id, verified.artifact_manifest_sha256, manifest_sha256_hex
-                ),
-            });
+            return Err(ReleaseCheckError::Rejected(format!(
+                "attestation `{}` attests artifact-manifest.json sha256 `{}`, but the \
+                 fetched manifest hashes to `{}`",
+                verified.attestant_id, verified.artifact_manifest_sha256, manifest_sha256_hex
+            )));
         }
         tracer.log(
             "verify-human",
@@ -494,13 +829,11 @@ pub async fn check_for_update_with(
     let mut seen_fingerprints = std::collections::HashSet::new();
     for att in &verified_attestations {
         if !seen_fingerprints.insert(att.fingerprint_hex.to_ascii_lowercase()) {
-            return Err(AppError::Update {
-                message: format!(
-                    "release lists multiple attestations signed by the same key \
-                     (fingerprint sha256:{}); attestations must be independent",
-                    att.fingerprint_hex
-                ),
-            });
+            return Err(ReleaseCheckError::Rejected(format!(
+                "release lists multiple attestations signed by the same key \
+                 (fingerprint sha256:{}); attestations must be independent",
+                att.fingerprint_hex
+            )));
         }
     }
 
@@ -508,21 +841,19 @@ pub async fn check_for_update_with(
     // threshold is pinned in the *embedded* trust root rather than in
     // `release.json` so an adversary who controls the index can't lower
     // the bar — see module docs and `docs/trust-root.md`.
-    if (verified_attestations.len() as u32) < trust_root::MIN_HUMAN_ATTESTATIONS {
-        return Err(AppError::Update {
-            message: format!(
-                "release verified only {} human attestation(s); embedded policy requires ≥{}",
-                verified_attestations.len(),
-                trust_root::MIN_HUMAN_ATTESTATIONS,
-            ),
-        });
+    if (verified_attestations.len() as u32) < pins.min_human_attestations {
+        return Err(ReleaseCheckError::Rejected(format!(
+            "release verified only {} human attestation(s); embedded policy requires ≥{}",
+            verified_attestations.len(),
+            pins.min_human_attestations,
+        )));
     }
     tracer.log(
         "policy",
         format!(
             "{} attestation(s) verified (>= {} required)",
             verified_attestations.len(),
-            trust_root::MIN_HUMAN_ATTESTATIONS
+            pins.min_human_attestations
         ),
     );
 
@@ -530,74 +861,56 @@ pub async fn check_for_update_with(
     // [`install::stage`]'s job, not this function's: it hashes each
     // downloaded artifact against what the manifest here declares, and
     // the natural place to do that is where the bytes are being fetched
-    // anyway. This function stops at a verified `ReleaseSummary` because
-    // the user approves a release *before* anything is downloaded.
-    //
-    // What is still missing is the wiring between the two — building an
-    // [`install::InstallPlan`] from this summary plus the manifest — and
-    // it waits on the attestation carrying the envelope's hash and the
-    // identity to expect. See `docs/gaps.md`.
+    // anyway. This function stops at verified evidence because the user
+    // approves a release *before* anything is downloaded.
 
-    tracer.log("present", format!("release {} verified", release.version));
-
-    Ok(Some(ReleaseSummary {
-        version: release.version,
-        git_commit: release.git_commit,
-        git_tag: release.git_tag,
-        released_at: release.released_at,
-        previous_release: release.previous_release,
-        attestations: verified_attestations,
-    }))
+    Ok(ReleaseEvidence {
+        summary: ReleaseSummary {
+            version: release.version.clone(),
+            git_commit: release.git_commit.clone(),
+            git_tag: release.git_tag.clone(),
+            released_at: release.released_at.clone(),
+            previous_release: release.previous_release.clone(),
+            attestations: verified_attestations,
+        },
+        manifest_bytes,
+        manifest_sha256: manifest_sha256_hex,
+        ci_identity: verified_ci.ci_identity,
+        ci_rekor_log_index: verified_ci.rekor_log_index,
+    })
 }
 
-/// Outcome wrapper for the discover→continuity stages: either we have a
-/// parsed `ReleaseIndex` to feed to the crypto stages, or we hit the "no
-/// newer release" signal (collapses to `Ok(None)` upstream), or we hit a
-/// hard failure.
+/// The text of an `AppError` from one of the gate's checks, without the
+/// variant's own prefix.
+fn update_message(e: AppError) -> String {
+    match e {
+        AppError::Update { message } => message,
+        other => other.to_string(),
+    }
+}
+
+/// The gate's answer in the shape the unit tests below read: a release to
+/// verify, "no update", or a refusal.
+#[cfg(test)]
 #[derive(Debug)]
 enum NoUpdateOrError {
     NoUpdate,
     Error(AppError),
 }
 
-impl From<AppError> for NoUpdateOrError {
-    fn from(e: AppError) -> Self {
-        NoUpdateOrError::Error(e)
-    }
-}
-
+#[cfg(test)]
 fn parse_and_gate_release(
     release_json_bytes: &[u8],
     installed_version: &str,
     installed_git_commit: Option<&str>,
 ) -> Result<ReleaseIndex, NoUpdateOrError> {
-    let release: ReleaseIndex = serde_json::from_slice(release_json_bytes).map_err(|e| {
-        NoUpdateOrError::Error(AppError::Update {
-            message: format!("release.json failed to parse: {e}"),
-        })
-    })?;
-
-    if !trust_root::SUPPORTED_RELEASE_SCHEMA_VERSIONS.contains(&release.schema_version) {
-        return Err(NoUpdateOrError::Error(AppError::Update {
-            message: format!(
-                "release.json schema_version `{}` is not in the supported set {:?} \
-                 — this client cannot parse the release safely; install a newer client.",
-                release.schema_version,
-                trust_root::SUPPORTED_RELEASE_SCHEMA_VERSIONS,
-            ),
-        }));
+    match gate_release(release_json_bytes, installed_version, installed_git_commit) {
+        Ok(ReleaseGate::Newer(release)) => Ok(*release),
+        Ok(ReleaseGate::NotNewer { .. }) => Err(NoUpdateOrError::NoUpdate),
+        Err(e) => Err(NoUpdateOrError::Error(AppError::Update {
+            message: e.reason,
+        })),
     }
-
-    check_schema_shape(&release)?;
-
-    match compare_versions(&release.version, installed_version)? {
-        VersionCompare::OlderOrEqual => return Err(NoUpdateOrError::NoUpdate),
-        VersionCompare::Newer => {}
-    }
-
-    check_continuity(&release, installed_git_commit)?;
-
-    Ok(release)
 }
 
 /// The schema a release document *declares* is the shape it is held to.
@@ -610,10 +923,10 @@ fn parse_and_gate_release(
 /// carrying the new fields, or declares the new one and omits what it
 /// promises, is not a shape either release ever produced. Tolerating
 /// either would make the version number decorative.
-fn check_schema_shape(release: &ReleaseIndex) -> Result<(), NoUpdateOrError> {
+fn check_schema_shape(release: &ReleaseIndex) -> Result<(), AppError> {
     const ARTIFACT_INDEX_SINCE: u32 = 2;
 
-    let refuse = |message: String| NoUpdateOrError::Error(AppError::Update { message });
+    let refuse = |message: String| AppError::Update { message };
 
     if release.schema_version < ARTIFACT_INDEX_SINCE {
         if release.artifacts.is_some() {
@@ -649,16 +962,12 @@ enum VersionCompare {
     OlderOrEqual,
 }
 
-fn compare_versions(latest: &str, installed: &str) -> Result<VersionCompare, NoUpdateOrError> {
-    let latest_v = semver::Version::parse(latest).map_err(|e| {
-        NoUpdateOrError::Error(AppError::Update {
-            message: format!("release.json `version` is not valid semver ({latest}): {e}"),
-        })
+fn compare_versions(latest: &str, installed: &str) -> Result<VersionCompare, AppError> {
+    let latest_v = semver::Version::parse(latest).map_err(|e| AppError::Update {
+        message: format!("release.json `version` is not valid semver ({latest}): {e}"),
     })?;
-    let installed_v = semver::Version::parse(installed).map_err(|e| {
-        NoUpdateOrError::Error(AppError::Update {
-            message: format!("installed version is not valid semver ({installed}): {e}"),
-        })
+    let installed_v = semver::Version::parse(installed).map_err(|e| AppError::Update {
+        message: format!("installed version is not valid semver ({installed}): {e}"),
     })?;
     Ok(if latest_v > installed_v {
         VersionCompare::Newer
@@ -670,7 +979,7 @@ fn compare_versions(latest: &str, installed: &str) -> Result<VersionCompare, NoU
 fn check_continuity(
     release: &ReleaseIndex,
     installed_git_commit: Option<&str>,
-) -> Result<(), NoUpdateOrError> {
+) -> Result<(), AppError> {
     // First install (no prior commit) bypasses continuity. There's no
     // installed state to anchor against, so we trust the release purely
     // on the cryptographic verification stages (and the user's review of
@@ -680,12 +989,12 @@ fn check_continuity(
     };
 
     let Some(prev) = release.previous_release.as_ref() else {
-        return Err(NoUpdateOrError::Error(AppError::Update {
+        return Err(AppError::Update {
             message: format!(
                 "client has installed git_commit `{installed}` but the new release.json \
                  declares no `previous_release` — cannot verify continuity"
             ),
-        }));
+        });
     };
 
     // Strict equality. v1 doesn't attempt fast-forward / multi-hop
@@ -693,7 +1002,7 @@ fn check_continuity(
     // and the simpler "must update through each release in order" model is
     // sufficient until the cadence makes it painful.
     if !prev.git_commit.eq_ignore_ascii_case(installed) {
-        return Err(NoUpdateOrError::Error(AppError::Update {
+        return Err(AppError::Update {
             message: format!(
                 "continuity failure: new release.previous_release.git_commit is `{}`, \
                  but the installed git_commit is `{}`. The new release is not a direct \
@@ -701,47 +1010,10 @@ fn check_continuity(
                  someone served a forked release.json.",
                 prev.git_commit, installed
             ),
-        }));
+        });
     }
 
     Ok(())
-}
-
-/// Fetch the latest `release.json` asset from the GitHub releases API.
-async fn fetch_release_json_network(client: &reqwest::Client) -> Result<Vec<u8>, AppError> {
-    // Same bounds as every other fetch. This URL is pinned in the trust
-    // root rather than taken from an index, but the *response* is still
-    // someone else's, and a discovery endpoint that stalls or answers with
-    // gigabytes should not be the one unbounded read left in the pipeline.
-    let body_bytes = fetch_url_network_with(
-        client,
-        trust_root::UPDATE_DISCOVERY_URL,
-        "application/vnd.github+json",
-        "the release feed",
-        MAX_DOCUMENT_BYTES,
-        FETCH_STALL_TIMEOUT,
-    )
-    .await?;
-    let gh: GhRelease = serde_json::from_slice(&body_bytes).map_err(|e| AppError::Update {
-        message: format!("parsing GitHub release JSON: {e}"),
-    })?;
-
-    let asset = gh
-        .assets
-        .iter()
-        .find(|a| a.name == "release.json")
-        .ok_or_else(|| AppError::Update {
-            message: "latest GitHub release has no `release.json` asset — incomplete release"
-                .to_string(),
-        })?;
-
-    fetch_url_network(
-        client,
-        &asset.browser_download_url,
-        "release.json",
-        MAX_DOCUMENT_BYTES,
-    )
-    .await
 }
 
 /// Fetch a single URL's body bytes. Errors carry the file label so the
@@ -800,7 +1072,7 @@ async fn fetch_url_network(
     url: &str,
     label: &str,
     max_bytes: u64,
-) -> Result<Vec<u8>, AppError> {
+) -> Result<Vec<u8>, FetchFailure> {
     fetch_url_network_with(
         client,
         url,
@@ -821,7 +1093,7 @@ async fn fetch_url_network_with(
     label: &str,
     max_bytes: u64,
     stall: std::time::Duration,
-) -> Result<Vec<u8>, AppError> {
+) -> Result<Vec<u8>, FetchFailure> {
     use futures_util::StreamExt;
 
     // Connecting is bounded on the client and each body read is bounded
@@ -832,13 +1104,19 @@ async fn fetch_url_network_with(
     // container that is still arriving.
     let resp =
         match tokio::time::timeout(stall, client.get(url).header("Accept", accept).send()).await {
-            Ok(sent) => sent.map_err(|e| AppError::Update {
-                message: format!("GET {label}: {}", crate::error::request_error_text(e)),
+            Ok(sent) => sent.map_err(|e| {
+                let malformed = e.is_builder();
+                let message = format!("GET {label}: {}", crate::error::request_error_text(e));
+                if malformed {
+                    FetchFailure::Refused(message)
+                } else {
+                    FetchFailure::Unreachable(message)
+                }
             })?,
             Err(_) => {
-                return Err(AppError::Update {
-                    message: format!("{label} sent no response headers within {stall:?}"),
-                });
+                return Err(FetchFailure::Unreachable(format!(
+                    "{label} sent no response headers within {stall:?}"
+                )));
             }
         };
     let status = resp.status();
@@ -846,11 +1124,9 @@ async fn fetch_url_network_with(
     if let Some(claimed) = resp.content_length()
         && claimed > max_bytes
     {
-        return Err(AppError::Update {
-            message: format!(
-                "{label} is {claimed} bytes, more than the {max_bytes} this will read"
-            ),
-        });
+        return Err(FetchFailure::Refused(format!(
+            "{label} is {claimed} bytes, more than the {max_bytes} this will read"
+        )));
     }
 
     let mut bytes: Vec<u8> = Vec::new();
@@ -864,30 +1140,38 @@ async fn fetch_url_network_with(
         let next = match tokio::time::timeout(stall, stream.next()).await {
             Ok(next) => next,
             Err(_) => {
-                return Err(AppError::Update {
-                    message: format!("{label} stopped sending for {:?}", stall),
-                });
+                return Err(FetchFailure::Unreachable(format!(
+                    "{label} stopped sending for {stall:?}"
+                )));
             }
         };
         let Some(chunk) = next else { break };
-        let chunk = chunk.map_err(|e| AppError::Update {
-            message: format!(
+        let chunk = chunk.map_err(|e| {
+            FetchFailure::Unreachable(format!(
                 "reading {label} body: {}",
                 crate::error::request_error_text(e)
-            ),
+            ))
         })?;
         if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
-            return Err(AppError::Update {
-                message: format!("{label} is larger than the {max_bytes} bytes this will read"),
-            });
+            return Err(FetchFailure::Refused(format!(
+                "{label} is larger than the {max_bytes} bytes this will read"
+            )));
         }
         bytes.extend_from_slice(&chunk);
     }
 
     if !status.is_success() {
-        return Err(AppError::Update {
-            message: format!("{label} returned HTTP {} ({})", status, excerpt(&bytes)),
-        });
+        let message = format!("{label} returned HTTP {} ({})", status, excerpt(&bytes));
+        // A 404 or 410 is the server answering that the file is not there.
+        // Anything else is the server failing to answer — an outage, a rate
+        // limit, a wall in front of it — which says nothing about the file.
+        return Err(
+            if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+                FetchFailure::Missing(message)
+            } else {
+                FetchFailure::Unreachable(message)
+            },
+        );
     }
     Ok(bytes)
 }
