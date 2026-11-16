@@ -38,7 +38,7 @@ use eidola_engine::kv::CachePolicy;
 use eidola_engine::secret::SaltDeriver;
 use eidola_engine::spec::Bucket;
 use eidola_engine_cpu::deepseek::{DsCpuExecutor, DsCpuExecutorConfig};
-use eidola_engine_cpu::{CpuExecutor, CpuExecutorConfig, MtpHidden};
+use eidola_engine_cpu::mimo::{CpuExecutor, CpuExecutorConfig, MtpHidden};
 use tokio::sync::oneshot;
 
 use crate::config::{Config, ExecutorConfig};
@@ -245,7 +245,7 @@ pub fn boot_with_swap_list(config: Config, swaps: &std::path::Path) -> Result<No
 /// group together as the budget holds (one count for every group, as its pools have; the
 /// null block among them). 0 is none; a budget under two blocks is refused.
 fn cpu_host_blocks(
-    model: &Arc<eidola_engine_model::ReferenceModel>,
+    model: &Arc<eidola_engine_model::mimo::ReferenceModel>,
     cfg: &CpuExecutorConfig,
     kv_host_bytes: u64,
 ) -> Result<u32, BootError> {

@@ -13,7 +13,8 @@ mod common;
 
 use common::*;
 use eidola_engine::engine::FinishReason as EngineFinish;
-use eidola_engine_chat::{ChatInput, OutputConfig, RenderOptions};
+use eidola_engine_chat::mimo::RenderOptions;
+use eidola_engine_chat::{ChatInput, OutputConfig};
 use eidola_server_engine::pipeline::Decoder;
 use serde_json::json;
 

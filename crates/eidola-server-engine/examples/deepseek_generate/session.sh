@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One CPU session generating from a DeepSeek-V4.1 checkpoint with the node's own path
-# (`ds_generate`, beside this script; doctrine in crates/eidola-server-engine/AGENTS.md).
+# (`deepseek_generate`, beside this script; doctrine in crates/eidola-server-engine/AGENTS.md).
 #
 #   CHECKPOINT=<dir> session.sh [step ...]      steps: setup hash build generate summary
 #                                               (none given: all of them, in that order)
@@ -18,7 +18,7 @@
 #   EIDOLA_DSGEN_WEIGHTS_SHA256  the checkpoint's weights hash; when unset, `hash`
 #                computes it once with the offline procedure and caches it in
 #                $OUT/weights.sha256
-#   EIDOLA_DSGEN_*  the runner's other settings (examples/ds_generate/main.rs):
+#   EIDOLA_DSGEN_*  the runner's other settings (examples/deepseek_generate/main.rs):
 #                MAX_NEW_TOKENS (96), DRAFT_WIDTH (the drafter's 5), TIME_LIMIT_HOURS
 #                (12), PREFILL_CHUNK (512), MIN_AVAILABLE_GB (64), PROMPTS
 set -euo pipefail
@@ -90,7 +90,7 @@ hash_weights() {
 
 build() {
     cd "$ROOT"
-    cargo build --release --locked -p eidola-server-engine --example ds_generate
+    cargo build --release --locked -p eidola-server-engine --example deepseek_generate
 }
 
 generate() {
@@ -99,12 +99,12 @@ generate() {
     EIDOLA_DSGEN_WEIGHTS_DIR="$CHECKPOINT" \
         EIDOLA_DSGEN_WEIGHTS_SHA256="$(cat "$OUT/weights.sha256")" \
         EIDOLA_DSGEN_OUT="$OUT/run" \
-        "$ROOT/target/release/examples/ds_generate" || status=$?
+        "$ROOT/target/release/examples/deepseek_generate" || status=$?
     case "$status" in
         0) ;;
         2) die "greedy tokens differ between draft widths (results in $OUT/run/summary.json)" ;;
         3) die "refused: the estimate exceeds EIDOLA_DSGEN_TIME_LIMIT_HOURS (see the log; finished requests are kept)" ;;
-        *) die "ds_generate exited with $status" ;;
+        *) die "deepseek_generate exited with $status" ;;
     esac
 }
 

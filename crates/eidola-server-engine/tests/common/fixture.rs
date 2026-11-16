@@ -63,7 +63,7 @@ pub const FINGERPRINT_FILE: &str = ".fixture-fingerprint";
 /// Every input file of the DeepSeek-V4.1 derivation.
 fn deepseek_input_files() -> Vec<PathBuf> {
     let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/deepseek_tiny");
-    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures/deepseek_v4_1");
+    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures/deepseek");
     vec![
         tiny.join("config.json"),
         tiny.join("model.safetensors"),
@@ -73,8 +73,8 @@ fn deepseek_input_files() -> Vec<PathBuf> {
 
 /// Every input file of the derivation.
 fn input_files() -> Vec<PathBuf> {
-    let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/tiny");
-    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures");
+    let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/mimo_tiny");
+    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures/mimo");
     vec![
         tiny.join("config.json"),
         tiny.join("model.safetensors"),
@@ -162,8 +162,8 @@ fn ensure_built(
 
 /// Writes the derived model into `out`.
 pub fn write_dev_model(out: &Path) -> std::io::Result<()> {
-    let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/tiny");
-    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures");
+    let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/mimo_tiny");
+    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures/mimo");
     std::fs::create_dir_all(out)?;
 
     // config.json: the fixture's, with the widened head.
@@ -190,7 +190,7 @@ pub fn write_dev_model(out: &Path) -> std::io::Result<()> {
 /// Writes the DeepSeek-V4.1 dev model into `out` (module docs).
 pub fn write_deepseek_dev_model(out: &Path) -> std::io::Result<()> {
     let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/deepseek_tiny");
-    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures/deepseek_v4_1");
+    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures/deepseek");
     std::fs::create_dir_all(out)?;
 
     let mut config: serde_json::Value =

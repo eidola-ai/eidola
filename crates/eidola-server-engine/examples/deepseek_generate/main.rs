@@ -7,7 +7,7 @@
 //!
 //! ```sh
 //! EIDOLA_DSGEN_WEIGHTS_DIR=<checkpoint> EIDOLA_DSGEN_WEIGHTS_SHA256=<hash> \
-//! EIDOLA_DSGEN_OUT=<dir> cargo run --release -p eidola-server-engine --example ds_generate
+//! EIDOLA_DSGEN_OUT=<dir> cargo run --release -p eidola-server-engine --example deepseek_generate
 //! ```
 //!
 //! Environment (the first three required):
@@ -53,7 +53,7 @@ fn config() -> Result<runner::RunConfig, String> {
         || {
             PathBuf::from(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/examples/ds_generate/prompts.json"
+                "/examples/deepseek_generate/prompts.json"
             ))
         },
         PathBuf::from,
@@ -86,7 +86,7 @@ fn config() -> Result<runner::RunConfig, String> {
 fn main() {
     let outcome = config().and_then(|cfg| {
         runner::log(format_args!(
-            "ds_generate: {} prompts, up to {} new tokens each, output in {}",
+            "deepseek_generate: {} prompts, up to {} new tokens each, output in {}",
             cfg.prompts.len(),
             cfg.max_new_tokens,
             cfg.out_dir.display()
@@ -94,7 +94,9 @@ fn main() {
         runner::run(&cfg)
     });
     match outcome {
-        Ok(runner::Outcome::Complete { mismatches: 0 }) => runner::log("ds_generate: complete"),
+        Ok(runner::Outcome::Complete { mismatches: 0 }) => {
+            runner::log("deepseek_generate: complete")
+        }
         Ok(runner::Outcome::Complete { mismatches }) => {
             runner::log(format_args!(
                 "FAILED: {mismatches} prompts' greedy tokens differ between draft widths"

@@ -20,11 +20,12 @@ use eidola_common::engine_protocol::DeclaredPrefixRefusal;
 use eidola_engine::engine::{CacheScope, FinishReason as EngineFinish, Request, RequestId};
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::secret::SaltDeriver;
-use eidola_engine_chat::deepseek_v4_1::{self, EncodeOptions};
+use eidola_engine_chat::deepseek::{self, EncodeOptions};
 use eidola_engine_chat::json::Json;
+use eidola_engine_chat::mimo::RenderOptions;
 use eidola_engine_chat::{
     ChatDelta, ChatInput, Detokenizer, FinishReason, OutputConfig, OutputParser, PrefixedCallIds,
-    Prompt, RenderOptions, StopCause, ToolSchemas,
+    Prompt, StopCause, ToolSchemas,
 };
 
 use crate::api::ValidRequest;
@@ -138,7 +139,7 @@ pub fn prepare(
 /// normalized first; a continuation's prompt ends inside the final message, at the field
 /// it continues, and its output is parsed from there.
 fn render_mimo(
-    template: &eidola_engine_chat::ChatTemplate,
+    template: &eidola_engine_chat::mimo::ChatTemplate,
     messages: Json,
     tools: Option<Json>,
     parse_tools: bool,
@@ -191,18 +192,18 @@ fn render_deepseek(
     }
     let invalid = |e: eidola_engine_chat::ChatError| ApiError::invalid(e.to_string());
     let schemas = match (&tools, parse_tools) {
-        (Some(tools), true) => Some(deepseek_v4_1::tool_schemas(tools).map_err(invalid)?),
+        (Some(tools), true) => Some(deepseek::tool_schemas(tools).map_err(invalid)?),
         _ => None,
     };
     let options = deepseek_options();
     let input = ChatInput { messages, tools };
-    let prompt = deepseek_v4_1::encode(&input, options).map_err(invalid)?;
+    let prompt = deepseek::encode(&input, options).map_err(invalid)?;
     let header = [
-        deepseek_v4_1::ASSISTANT_TOKEN,
+        deepseek::ASSISTANT_TOKEN,
         if options.thinking {
-            deepseek_v4_1::THINK_START
+            deepseek::THINK_START
         } else {
-            deepseek_v4_1::THINK_END
+            deepseek::THINK_END
         },
     ]
     .concat();

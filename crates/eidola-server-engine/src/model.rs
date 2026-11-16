@@ -57,12 +57,13 @@ use std::sync::Arc;
 use eidola_common::architecture::Architecture;
 use eidola_common::weights_manifest;
 use eidola_engine::sampling::SamplingParams;
-use eidola_engine_chat::template::CHAT_TEMPLATE_FILE;
+use eidola_engine_chat::mimo::template::CHAT_TEMPLATE_FILE;
+use eidola_engine_chat::mimo::{ChatTemplate, MimoTokenizer};
 use eidola_engine_chat::tokenizer::{CONFIG_FILE, GENERATION_CONFIG_FILE, TOKENIZER_FILE};
-use eidola_engine_chat::{ChatFormat, ChatTemplate, MimoTokenizer, Tokenizer};
+use eidola_engine_chat::{ChatFormat, Tokenizer};
 use eidola_engine_model::deepseek::{DsConfig, DsLoadOptions, DsModel, DsWeights};
+use eidola_engine_model::mimo::{LoadOptions, ModelConfig, ModelWeights, ReferenceModel};
 use eidola_engine_model::safetensors::{SEMANTIC_FILES, WeightSet};
-use eidola_engine_model::{LoadOptions, ModelConfig, ModelWeights, ReferenceModel};
 use sha2::{Digest, Sha256};
 
 use crate::config::{ExecutorKind, WeightsStorage};
@@ -75,7 +76,7 @@ pub const DEEPSEEK_V4_1_MODEL_TYPE: &str = "deepseek_v41";
 
 /// A tensor of DeepSeek-V4.1's Engram compressed-vocabulary map (one `int32` or `int64`
 /// per token id). The node derives the map from the tokenizer, as the reference does
-/// (`eidola_engine_chat::deepseek_v4_1::compressed_vocab`); shards that carry this tensor
+/// (`eidola_engine_chat::deepseek::compressed_vocab`); shards that carry this tensor
 /// too must carry exactly the derived map, or the model is refused.
 pub const ENGRAM_TOKEN_MAP_TENSOR: &str = "engram.token_map";
 
@@ -342,8 +343,7 @@ impl LoadedModel {
                 )
             }
             _ => {
-                let config = store
-                    .model_config()
+                let config = eidola_engine_model::mimo::config_of(&store)
                     .map_err(|e| ModelError(format!("config.json: {e}")))?;
                 let reference = match executor {
                     ExecutorKind::Cpu => {
@@ -525,7 +525,7 @@ fn load_deepseek(
 /// definition, and checked against [`ENGRAM_TOKEN_MAP_TENSOR`] when the shards carry one.
 /// The model crate checks its size against the config.
 fn engram_token_map(store: &WeightSet, tokenizer: &Tokenizer) -> Result<Vec<u32>, ModelError> {
-    let derived = eidola_engine_chat::deepseek_v4_1::compressed_vocab(tokenizer)
+    let derived = eidola_engine_chat::deepseek::compressed_vocab(tokenizer)
         .map_err(|e| ModelError(format!("the Engram map: {e}")))?
         .map;
     let stored = match store.get(ENGRAM_TOKEN_MAP_TENSOR) {

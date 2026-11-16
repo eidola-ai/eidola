@@ -14,8 +14,9 @@ use eidola_engine::engine::{CacheScope, Engine, Request, SchedulerConfig};
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
-use eidola_engine_chat::{ChatInput, RenderOptions};
-use eidola_engine_cpu::{CpuExecutor, CpuExecutorConfig, MtpHidden};
+use eidola_engine_chat::ChatInput;
+use eidola_engine_chat::mimo::RenderOptions;
+use eidola_engine_cpu::mimo::{CpuExecutor, CpuExecutorConfig, MtpHidden};
 use eidola_server_engine::config::env;
 use serde_json::{Value, json};
 

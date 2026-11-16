@@ -1,4 +1,4 @@
-//! The DeepSeek-V4.1 generation runner (`examples/ds_generate`) over the DeepSeek dev
+//! The DeepSeek-V4.1 generation runner (`examples/deepseek_generate`) over the DeepSeek dev
 //! model: its committed prompts generate through the node's loader, pipeline, executor
 //! configuration and decoder; every request is checkpointed and a rerun skips it; the
 //! width-0 pass matches the drafting one token for token; the draft counts per slot add
@@ -7,7 +7,7 @@
 
 mod common;
 #[allow(dead_code)]
-#[path = "../examples/ds_generate/runner.rs"]
+#[path = "../examples/deepseek_generate/runner.rs"]
 mod runner;
 
 use std::path::Path;
@@ -21,8 +21,10 @@ fn config(out: &Path) -> RunConfig {
         weights_dir: deepseek_model_dir().to_path_buf(),
         weights_sha256: deepseek_weights_hash().to_string(),
         out_dir: out.to_path_buf(),
-        prompts: PromptSpec::parse_file(include_bytes!("../examples/ds_generate/prompts.json"))
-            .unwrap(),
+        prompts: PromptSpec::parse_file(include_bytes!(
+            "../examples/deepseek_generate/prompts.json"
+        ))
+        .unwrap(),
         max_new_tokens: 8,
         draft_width: None,
         time_limit_secs: 3600.0,
@@ -318,8 +320,8 @@ fn a_tool_prompt_is_the_one_the_node_renders_from_the_files_text() {
     // The file's `tool` entry, as a client sends it: every key where the file has it.
     let messages = r#"[{"role": "user", "content": "What is the weather in Paris right now?"}]"#;
     let tools = r#"[{"type": "function", "function": {"name": "get_weather", "description": "The current weather in a city.", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city's name."}}, "required": ["city"]}}}]"#;
-    let file =
-        PromptSpec::parse_file(include_bytes!("../examples/ds_generate/prompts.json")).unwrap();
+    let file = PromptSpec::parse_file(include_bytes!("../examples/deepseek_generate/prompts.json"))
+        .unwrap();
     let tool = file.iter().find(|p| p.name == "tool").unwrap();
     let parse = |t: &str| eidola_engine_chat::json::parse(t).unwrap();
     assert_eq!(tool.messages, parse(messages));
