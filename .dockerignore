@@ -9,5 +9,6 @@ result-*
 docs/
 target/
 **/target/
-*.md
+# Markdown at any depth: no image build reads it.
+**/*.md
 .buildx-cache
