@@ -318,9 +318,22 @@ jobs:
           export PATH="$PWD/crates/devtools/target/debug:$PATH"
           rumdl check .
 
-      - name: Run tests
+      - name: Install cargo-nextest
         if: steps.scope.outputs.rust == 'true'
-        run: cargo test
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-nextest@0.9.150
+
+      - name: Run tests
+        # nextest schedules every test of every binary on one pool, where
+        # `cargo test` runs the binaries one after another and each waits on
+        # its slowest test. It builds the same units `cargo test` does, so
+        # the billing step below still finds them fresh. It does not run
+        # doc-tests; the second command does.
+        if: steps.scope.outputs.rust == 'true'
+        run: |
+          cargo nextest run
+          cargo test --doc
 
       - name: Test billing transactions and recovery with PostgreSQL
         if: steps.scope.outputs.rust == 'true'
