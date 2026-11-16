@@ -10960,3 +10960,271 @@ fn an_unsaved_account_names_the_file_it_was_also_written_to(cx: &mut TestAppCont
         "the line does not name the file: {line}"
     );
 }
+
+/// A temporary directory for the command-line row's tests — never
+/// `/usr/local/bin`. Removed on drop.
+struct CliScratch(std::path::PathBuf);
+
+impl CliScratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("eidola-gui-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(std::fs::canonicalize(&dir).unwrap())
+    }
+
+    /// A bundle with a main binary and a CLI under `name`; returns the main
+    /// binary.
+    fn bundle(&self, name: &str) -> std::path::PathBuf {
+        let macos = self.0.join(name).join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(macos.join("Eidola"), b"").unwrap();
+        std::fs::write(macos.join("eidola-cli"), b"").unwrap();
+        macos.join("Eidola")
+    }
+}
+
+impl Drop for CliScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[gpui::test]
+fn the_command_line_row_says_what_is_at_the_link_and_offers_only_what_is_safe(
+    cx: &mut TestAppContext,
+) {
+    let _guard = probes_on();
+    let scratch = CliScratch::new("states");
+    let exe = scratch.bundle("Eidola.app");
+    let dir = scratch.0.join("bin");
+    let link = dir.join("eidola");
+    let shown_dir = dir.display().to_string();
+    let shown_link = link.display().to_string();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
+    });
+    let stage = |cx: &mut TestAppContext, exe: &std::path::Path| {
+        cx.update(|cx| {
+            view.update(cx, |v, cx| v.stage_cli_link_for_test(exe, &dir, cx));
+        });
+        fresh_entries(cx, window)
+    };
+    let label_of = |entries: &[(String, probe::ProbeEntry)], name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, e)| e.label.to_string())
+    };
+
+    // Nothing there yet: the verb installs into the named directory.
+    let entries = stage(cx, &exe);
+    assert_probe(
+        &entries,
+        "settings/general/cli/status",
+        gpui::Role::Label,
+        &format!(
+            "Not installed. Installing puts an `eidola` command in {shown_dir}, linked to this \
+             copy of Eidola, so you can run it from Terminal."
+        ),
+    );
+    assert_probe(
+        &entries,
+        "settings/general/cli/install",
+        gpui::Role::Button,
+        &format!("Install the eidola command in {shown_dir}"),
+    );
+    // The pane is a destination for the keyboard a verb hands back.
+    assert_probe(
+        &entries,
+        "settings/general/pane",
+        gpui::Role::Region,
+        "General",
+    );
+
+    // A regular file — the reader's own build, the standalone download — is
+    // named and never offered for replacement.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&link, b"mine").unwrap();
+    let entries = stage(cx, &exe);
+    assert_eq!(
+        label_of(&entries, "settings/general/cli/status").as_deref(),
+        Some(
+            format!(
+                "{shown_link} is already a file Eidola didn't put there, so Eidola won't \
+                 replace it. If you no longer want it, move or delete it yourself, then install."
+            )
+            .as_str()
+        )
+    );
+    for verb in [
+        "settings/general/cli/install",
+        "settings/general/cli/update",
+    ] {
+        assert!(
+            label_of(&entries, verb).is_none(),
+            "{verb} offered over a file"
+        );
+    }
+
+    // A link left by a copy of the app that has since moved: dangling, and the
+    // verb updates it.
+    std::fs::remove_file(&link).unwrap();
+    let gone = scratch.0.join("Gone/Eidola.app/Contents/MacOS/eidola-cli");
+    std::os::unix::fs::symlink(&gone, &link).unwrap();
+    let entries = stage(cx, &exe);
+    let status = label_of(&entries, "settings/general/cli/status").unwrap();
+    assert!(
+        status.contains("is no longer there") && status.contains(&gone.display().to_string()),
+        "{status}"
+    );
+    assert_probe(
+        &entries,
+        "settings/general/cli/update",
+        gpui::Role::Button,
+        &format!("Point {shown_link} at this copy of Eidola"),
+    );
+
+    // Pressing it replaces the link — the real write, into the temporary
+    // directory — and the row reads the result back: installed, no verb. The
+    // write runs `/bin/sh` on a thread of its own, so the scheduler is allowed
+    // to park while it does; it runs on macOS only (the feature's platform,
+    // and a Nix build sandbox has no `/bin/ln`), and elsewhere the link is
+    // laid down by hand so the rest of the row is still read.
+    if cfg!(target_os = "macos") {
+        cx.executor().allow_parking();
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.install_cli(window, cx));
+        })
+        .unwrap();
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if !view.read_with(cx, |v, _| v.cli_install_pending()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    } else {
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(exe.with_file_name("eidola-cli"), &link).unwrap();
+        cx.update(|cx| view.update(cx, |v, cx| v.pane_activated(cx)));
+    }
+    assert_eq!(
+        std::fs::canonicalize(&link).unwrap(),
+        exe.with_file_name("eidola-cli")
+    );
+    let entries = fresh_entries(cx, window);
+    assert_eq!(
+        label_of(&entries, "settings/general/cli/status").as_deref(),
+        Some(
+            format!(
+                "Installed — `eidola` in Terminal runs this copy of Eidola, through {shown_link}."
+            )
+            .as_str()
+        )
+    );
+    for verb in [
+        "settings/general/cli/install",
+        "settings/general/cli/update",
+    ] {
+        assert!(
+            label_of(&entries, verb).is_none(),
+            "{verb} offered when installed"
+        );
+    }
+
+    // The words follow the reader; the probe names do not.
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    cx.run_until_parked();
+    let entries = fresh_entries(cx, window);
+    assert_eq!(
+        label_of(&entries, "settings/general/cli/status").as_deref(),
+        Some(
+            format!("Installée — `eidola` dans le Terminal lance cette copie d'Eidola, via {shown_link}.")
+                .as_str()
+        )
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+
+    // An executable outside any bundle offers nothing at all.
+    let entries = stage(cx, &scratch.0.join("eidola-gui"));
+    assert_eq!(
+        label_of(&entries, "settings/general/cli/status").as_deref(),
+        Some("Available only when Eidola runs as an installed app.")
+    );
+    for verb in [
+        "settings/general/cli/install",
+        "settings/general/cli/update",
+    ] {
+        assert!(
+            label_of(&entries, verb).is_none(),
+            "{verb} offered outside a bundle"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_declined_install_offers_the_terminal_command_in_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let scratch = CliScratch::new("declined");
+    let exe = scratch.bundle("It's Eidola.app");
+    let dir = scratch.0.join("bin");
+    let source = exe.with_file_name("eidola-cli");
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
+    });
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.stage_cli_link_for_test(&exe, &dir, cx);
+            // Only a person can dismiss the administrator prompt; its answer
+            // lands here exactly as the install task lands it.
+            v.finish_cli_install(Err(eidola_gui::cli_link::InstallFailure::Declined), cx);
+        })
+    });
+    // The command creates the missing directory and quotes the bundle path,
+    // apostrophe included.
+    let command = format!(
+        "mkdir -p {} && ln -s {} {}",
+        eidola_gui::cli_link::shell_quote(&dir.display().to_string()),
+        eidola_gui::cli_link::shell_quote(&source.display().to_string()),
+        eidola_gui::cli_link::shell_quote(&dir.join("eidola").display().to_string()),
+    );
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/general/cli/manual",
+        gpui::Role::Label,
+        "Nothing was changed. To install it yourself, run this in Terminal:",
+        &command,
+    );
+    assert_probe(
+        &entries,
+        "settings/general/cli/manual/copy",
+        gpui::Role::Button,
+        "Copy the install command",
+    );
+    assert!(
+        !dir.join("eidola").exists(),
+        "a declined prompt wrote nothing"
+    );
+
+    cx.update(|cx| eidola_gui::i18n::apply("zh-Hant", cx));
+    cx.run_until_parked();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/general/cli/manual",
+        gpui::Role::Label,
+        "沒有做任何更改。若要自行安裝，請在「終端機」中執行：",
+        &command,
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+
+    probe::set_probes_enabled(false);
+}

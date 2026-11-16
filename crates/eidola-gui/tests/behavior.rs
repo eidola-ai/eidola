@@ -14853,7 +14853,7 @@ fn the_login_item_row_starts_from_the_system_and_invents_nothing(cx: &mut TestAp
         cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
     });
 
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
         assert_eq!(v.login_item(), eidola_gui::login_item::state());
         assert!(
             v.login_item_error().is_none(),
@@ -14861,7 +14861,7 @@ fn the_login_item_row_starts_from_the_system_and_invents_nothing(cx: &mut TestAp
         );
         // Whatever the system said, the row has honest copy for it — and an
         // unmanageable login item never reads as a plain "off".
-        assert!(!v.login_item().description().is_empty());
+        assert!(!eidola_gui::general::login_item_copy(v.login_item(), cx).is_empty());
     });
 }
 
