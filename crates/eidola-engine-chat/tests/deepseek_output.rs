@@ -207,6 +207,21 @@ fn reads_what_the_reference_reads() {
     );
 }
 
+/// A parameter name ending in `" string=` is read as the reference's
+/// non-greedy pattern reads it: the marker the encoder wrote begins at the
+/// name's last quote, overlapping the name's own `" string=`.
+#[test]
+fn a_name_ending_in_the_marker_is_read() {
+    let text = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"\" string=\" string=\"true\"></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    for cuts in [vec![], every(text, 1), every(text, 7)] {
+        let (parsed, reason) = run(text, &cuts, false, Some(declare(["f"])));
+        assert_eq!(parsed.content, "");
+        assert_eq!(reason, FinishReason::ToolCalls);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].arguments, r#"{"\" string=": ""}"#);
+    }
+}
+
 const BLOCK: &str = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
 
 /// **The answer loses only its calls**: what the reference refuses is given
