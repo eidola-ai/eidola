@@ -845,7 +845,7 @@ fn run_background_bounds(
     origin: Point<Pixels>,
     row_stride: Pixels,
     row_height: Pixels,
-    block: &RenderBlock,
+    index: &BlockIndex,
     style: &MarkdownStyle,
 ) -> Vec<Bounds<Pixels>> {
     let mut out = Vec::new();
@@ -854,7 +854,7 @@ fn run_background_bounds(
     while i < len {
         let color = display_to_source
             .get(i)
-            .map(|&src| run_background_color(&effective_inline_style(src, block), style));
+            .map(|&src| run_background_color(&index.style_at(src), style));
         let Some(Some(color)) = color else {
             i += 1;
             continue;
@@ -864,7 +864,7 @@ fn run_background_bounds(
         while j < len {
             let next = display_to_source
                 .get(j)
-                .map(|&src| run_background_color(&effective_inline_style(src, block), style));
+                .map(|&src| run_background_color(&index.style_at(src), style));
             if next != Some(Some(color)) {
                 break;
             }
@@ -953,14 +953,14 @@ fn emphasis_dot_bounds(
     origin: Point<Pixels>,
     row_stride: Pixels,
     row_height: Pixels,
-    block: &RenderBlock,
+    index: &BlockIndex,
     style: &MarkdownStyle,
     font_size: Pixels,
     body_ascent: Pixels,
     body_descent: Pixels,
 ) -> Vec<Bounds<Pixels>> {
     let mut out = Vec::new();
-    if block.inlines.iter().all(|run| !run.style.emphasis_dots) {
+    if !index.any_emphasis_dots() {
         return out;
     }
     let diameter = (font_size * style.emphasis_dot_size_factor).max(px(1.5));
@@ -974,7 +974,7 @@ fn emphasis_dot_bounds(
         let Some(&src) = display_to_source.get(i) else {
             continue;
         };
-        if !effective_inline_style(src, block).emphasis_dots {
+        if !index.style_at(src).emphasis_dots {
             continue;
         }
         let Some(upper) = line.position_for_index(i, row_stride) else {
@@ -1125,12 +1125,13 @@ fn measure_pad_advance(
 fn min_content_width(
     range: &Range<usize>,
     block: &RenderBlock,
+    index: &BlockIndex,
     source: &str,
     style: &MarkdownStyle,
     font_size: Pixels,
     window: &mut Window,
 ) -> Pixels {
-    let (display, map) = build_display_line(source, range, block);
+    let (display, map) = build_display_line(source, range, block, index);
     if display.is_empty() {
         return px(0.0);
     }
@@ -1150,7 +1151,7 @@ fn min_content_width(
         let token_map = &map[start..=i];
         // `build_runs_for_line` expects `map.len() == text.len() + 1`.
         debug_assert_eq!(token_map.len(), token.len() + 1);
-        let runs = build_runs_for_line(token, token_map, block, style);
+        let runs = build_runs_for_line(token, token_map, block, index, style);
         let w = window
             .text_system()
             .shape_text(
@@ -1239,6 +1240,7 @@ fn layout_table(
     let edit = *edit_mode;
     let cursor_row = *cursor_row;
     let line_height = font_size * style.line_height.0;
+    let index = BlockIndex::new(block);
 
     use crate::syntax::TableAlignment;
     use crate::table::RowKind;
@@ -1292,8 +1294,8 @@ fn layout_table(
                        wrap: Option<Pixels>,
                        window: &mut Window|
      -> Option<(Arc<WrappedLine>, Vec<usize>)> {
-        let (display, map) = build_display_line(source, range, block);
-        let runs = build_runs_for_line(&display, &map, block, style);
+        let (display, map) = build_display_line(source, range, block, &index);
+        let runs = build_runs_for_line(&display, &map, block, &index, style);
         let line = window
             .text_system()
             .shape_text(SharedString::from(display), font_size, &runs, wrap, None)
@@ -1326,7 +1328,7 @@ fn layout_table(
             if unwrapped.width() > max_w[k] {
                 max_w[k] = unwrapped.width();
             }
-            let atom_w = min_content_width(cell, block, source, style, font_size, window);
+            let atom_w = min_content_width(cell, block, &index, source, style, font_size, window);
             if atom_w > min_w[k] {
                 min_w[k] = atom_w;
             }
@@ -1798,6 +1800,7 @@ fn layout_embed(
                 if let Some(t) = layout_table(block, content, font_size, style, inner_w, window) {
                     let (body_ascent, body_descent) =
                         body_metrics_for_block(&block.kind, style, font_size, window);
+                    let index = BlockIndex::new(block);
                     for piece in t.pieces {
                         let rel_origin =
                             point(indent + piece.rel_origin.x, block_top + piece.rel_origin.y);
@@ -1813,7 +1816,7 @@ fn layout_embed(
                             rel_origin,
                             line_height,
                             line_height,
-                            block,
+                            &index,
                             style,
                             font_size,
                             body_ascent,
@@ -1825,7 +1828,7 @@ fn layout_embed(
                             rel_origin,
                             line_height,
                             line_height,
-                            block,
+                            &index,
                             style,
                         ));
                         out.pieces.push(EmbedPiece {
@@ -1910,6 +1913,7 @@ fn layout_embed(
                     let text_left = indent + pad;
                     y += pad;
                     let shaped = shape_block_lines(content, &b, style, font_size, wrap_w, window);
+                    let index = BlockIndex::new(&b);
                     let mut advanced = false;
                     for sl in shaped {
                         // Fence rows are hidden in readonly render but still
@@ -1960,7 +1964,7 @@ fn layout_embed(
                             point(text_left, row_y),
                             row_stride,
                             line_height,
-                            &b,
+                            &index,
                             style,
                             font_size,
                             body_ascent,
@@ -1972,7 +1976,7 @@ fn layout_embed(
                             point(text_left, row_y),
                             row_stride,
                             line_height,
-                            &b,
+                            &index,
                             style,
                         ));
                         out.pieces.push(EmbedPiece {
@@ -3439,6 +3443,7 @@ impl Element for BlockElement {
                 // ours rather than gpui's, because a row reservation
                 // makes the stride and the fill height differ (see
                 // `run_background_bounds`).
+                let index = BlockIndex::new(&prepaint.shaped_block);
                 for laid in &prepaint.laid_out.lines {
                     for chip in run_background_bounds(
                         &laid.line,
@@ -3446,7 +3451,7 @@ impl Element for BlockElement {
                         laid.origin,
                         laid.row_stride,
                         laid.row_height,
-                        &prepaint.shaped_block,
+                        &index,
                         &self.style,
                     ) {
                         window.paint_quad(fill(chip, self.style.inline_code_background));
@@ -4000,6 +4005,7 @@ fn paint_emphasis_dots(
     }
     let font_size = font_size_for_block(&block.kind, style);
     let (body_ascent, body_descent) = body_metrics_for_block(&block.kind, style, font_size, window);
+    let index = BlockIndex::new(block);
     for line in lines {
         for bounds in emphasis_dot_bounds(
             &line.line,
@@ -4007,7 +4013,7 @@ fn paint_emphasis_dots(
             line.origin,
             line.row_stride,
             line.row_height,
-            block,
+            &index,
             style,
             font_size,
             body_ascent,
@@ -4593,6 +4599,7 @@ fn shape_block_lines(
     };
     let mut out = Vec::new();
     let mut cursor = block.source_range.start;
+    let index = BlockIndex::new(block);
 
     // Synthetic empty paragraphs from `inject_empty_paragraphs` cover a
     // pair of `\n`s in the pairs model — the whole pair is one visible
@@ -4626,7 +4633,7 @@ fn shape_block_lines(
         let line_source_range = cursor..raw_end;
 
         let (display_text, display_to_source) =
-            build_display_line(source, &logical_source_range, block);
+            build_display_line(source, &logical_source_range, block, &index);
 
         // Code-block fence detection: the line's *full* logical
         // content is covered by either a hidden range (cursor
@@ -4664,7 +4671,7 @@ fn shape_block_lines(
             continue;
         }
 
-        let runs = build_runs_for_line(&display_text, &display_to_source, block, style);
+        let runs = build_runs_for_line(&display_text, &display_to_source, block, &index, style);
 
         let shared = SharedString::from(display_text);
         let mut shaped_vec = window
@@ -4750,6 +4757,7 @@ fn build_display_line(
     source: &str,
     line: &Range<usize>,
     block: &RenderBlock,
+    index: &BlockIndex,
 ) -> (String, Vec<usize>) {
     let mut display = String::new();
     let mut map: Vec<usize> = Vec::new();
@@ -4763,11 +4771,7 @@ fn build_display_line(
         // maps to `source_range.start` so a click on the substituted
         // glyph (e.g. a bullet) lands at the start of the original
         // marker bytes.
-        if let Some(sub) = block
-            .substitutions
-            .iter()
-            .find(|s| s.source_range.start == pos && s.source_range.end <= line.end)
-        {
+        if let Some(sub) = index.substitution_at(block, pos, line.end) {
             for _ in 0..sub.display.len() {
                 map.push(sub.source_range.start);
             }
@@ -4776,30 +4780,17 @@ fn build_display_line(
             continue;
         }
 
-        // Find the *furthest* hidden-range end that covers `pos`.
-        // Multiple hidden ranges can overlap on the same byte — the
-        // common case is a blockquote `> ` whose trailing space is
-        // also the leading space of a code-block closing fence's
-        // indent run. The previous `r.start == pos` predicate would
-        // pick whichever range happened to start at `pos`, advance to
-        // its end, then fail to skip the overlapping tail bytes of
-        // the longer range. Finding the maximum `r.end` over all
-        // ranges that cover `pos` skips the entire union in one step.
+        // Several hidden ranges can cover the same byte — a blockquote
+        // `> ` whose trailing space is also the leading space of a
+        // code-block closing fence's indent run — so the skip goes to
+        // the end of their whole union, not of whichever range starts
+        // here.
         //
-        // The filter intentionally does *not* require `r.end <= line.end`:
-        // a `BlockKind::DisplayMath` in display mode pushes one hide
-        // covering the entire math source range (multiple lines), so
-        // `r.end` extends past every individual shaped line's `line.end`.
-        // We clamp `pos = end.min(line.end)` below so the advance never
-        // walks past the current line — the cross-line span just means
-        // every line this range covers contributes zero display bytes.
-        let cover_end = block
-            .hidden_ranges
-            .iter()
-            .filter(|r| r.start <= pos && pos < r.end)
-            .map(|r| r.end)
-            .max();
-        if let Some(end) = cover_end {
+        // A span may extend past `line.end`: a `BlockKind::DisplayMath`
+        // in display mode hides its entire multi-line source range. The
+        // jump clamps to `line.end`, so every line such a span covers
+        // contributes zero display bytes.
+        if let Some(end) = index.hidden_end_at(pos) {
             let mut jump = end.min(line.end);
             // A substitution whose start lies strictly inside the
             // covered span must still get its chance to apply. This
@@ -4811,12 +4802,8 @@ fn build_display_line(
             // skip the substitution entirely — the alignment pads
             // vanish exactly on styled cells. Clamp the jump to the
             // earliest in-span substitution start instead.
-            if let Some(sub_start) = block
-                .substitutions
-                .iter()
-                .filter(|s| s.source_range.start > pos && s.source_range.start < jump)
-                .map(|s| s.source_range.start)
-                .min()
+            if let Some(sub_start) = index.next_substitution_after(pos)
+                && sub_start < jump
             {
                 jump = sub_start;
             }
@@ -4843,6 +4830,7 @@ fn build_runs_for_line(
     display_text: &str,
     display_to_source: &[usize],
     block: &RenderBlock,
+    index: &BlockIndex,
     style: &MarkdownStyle,
 ) -> SmallVec<[TextRun; 8]> {
     let mut runs: SmallVec<[TextRun; 8]> = SmallVec::new();
@@ -4858,11 +4846,11 @@ fn build_runs_for_line(
     let mut i = 0usize;
     while i < len {
         let here_src = display_to_source[i];
-        let here_style = effective_inline_style(here_src, block);
+        let here_style = index.style_at(here_src);
         let mut j = i + 1;
         while j < len {
             let next_src = display_to_source[j];
-            if effective_inline_style(next_src, block) != here_style {
+            if index.style_at(next_src) != here_style {
                 break;
             }
             j += 1;
@@ -4944,6 +4932,8 @@ fn build_runs_for_line(
     runs
 }
 
+/// The merged style of every inline run covering `src_offset`.
+#[cfg(test)]
 fn effective_inline_style(src_offset: usize, block: &RenderBlock) -> InlineStyle {
     let mut acc = InlineStyle::default();
     for run in &block.inlines {
@@ -4952,6 +4942,144 @@ fn effective_inline_style(src_offset: usize, block: &RenderBlock) -> InlineStyle
         }
     }
     acc
+}
+
+/// The lookups the per-line builders make into one block — which
+/// substitution starts at an offset, which hidden span covers it, and
+/// the merged inline style there — built once per block, so laying out
+/// a line costs its own length rather than its length times everything
+/// the block holds.
+pub(crate) struct BlockIndex {
+    /// `(start, k)` for each `block.substitutions[k]`, sorted, so the
+    /// first one listed wins a shared start.
+    subs: Vec<(usize, usize)>,
+    /// The union of the block's hidden ranges as sorted, disjoint spans;
+    /// ranges that overlap or touch join one span. Skipping to the end of
+    /// the span that covers an offset is the same as repeatedly skipping
+    /// to the furthest end of the ranges covering it.
+    hidden: Vec<Range<usize>>,
+    styles: InlineStyleMap,
+}
+
+impl BlockIndex {
+    pub(crate) fn new(block: &RenderBlock) -> Self {
+        let mut subs: Vec<(usize, usize)> = block
+            .substitutions
+            .iter()
+            .enumerate()
+            .map(|(k, s)| (s.source_range.start, k))
+            .collect();
+        subs.sort_unstable();
+        let mut ranges: Vec<Range<usize>> = block
+            .hidden_ranges
+            .iter()
+            .filter(|r| r.start < r.end)
+            .cloned()
+            .collect();
+        ranges.sort_unstable_by_key(|r| r.start);
+        let mut hidden: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            match hidden.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => hidden.push(r),
+            }
+        }
+        Self {
+            subs,
+            hidden,
+            styles: InlineStyleMap::new(&block.inlines),
+        }
+    }
+
+    /// The first substitution starting at `pos` that ends by `limit`.
+    fn substitution_at<'b>(
+        &self,
+        block: &'b RenderBlock,
+        pos: usize,
+        limit: usize,
+    ) -> Option<&'b Substitution> {
+        let first = self.subs.partition_point(|&(start, _)| start < pos);
+        self.subs[first..]
+            .iter()
+            .take_while(|&&(start, _)| start == pos)
+            .map(|&(_, k)| &block.substitutions[k])
+            .find(|s| s.source_range.end <= limit)
+    }
+
+    /// The start of the first substitution after `pos`.
+    fn next_substitution_after(&self, pos: usize) -> Option<usize> {
+        let after = self.subs.partition_point(|&(start, _)| start <= pos);
+        self.subs.get(after).map(|&(start, _)| start)
+    }
+
+    /// The end of the hidden span covering `pos`, if one does.
+    fn hidden_end_at(&self, pos: usize) -> Option<usize> {
+        let covering = self.hidden.partition_point(|r| r.start <= pos);
+        let span = &self.hidden[covering.checked_sub(1)?];
+        (pos < span.end).then_some(span.end)
+    }
+
+    /// The merged style of every inline run covering `src_offset`.
+    fn style_at(&self, src_offset: usize) -> InlineStyle {
+        self.styles.at(src_offset)
+    }
+
+    fn any_emphasis_dots(&self) -> bool {
+        self.styles.styles.iter().any(|s| s.emphasis_dots)
+    }
+}
+
+/// Merged inline styles as the segments on which they are constant: the
+/// answer `effective_inline_style` gives for any offset, in O(log runs).
+/// Merging is a union of flags, so the style at an offset is a count,
+/// per flag, of the runs covering it.
+struct InlineStyleMap {
+    /// Segment `k` covers `starts[k]..starts[k + 1]` (the last one, every
+    /// offset after) and has style `styles[k]`. `starts[0]` is 0.
+    starts: Vec<usize>,
+    styles: Vec<InlineStyle>,
+}
+
+impl InlineStyleMap {
+    fn new(runs: &[InlineRun]) -> Self {
+        // (offset, -1 closes a run / +1 opens one, the run's flags).
+        let mut events: Vec<(usize, i32, [bool; InlineStyle::FLAGS])> = Vec::new();
+        for run in runs {
+            let r = &run.source_range;
+            if r.start < r.end {
+                let flags = run.style.flags();
+                events.push((r.start, 1, flags));
+                events.push((r.end, -1, flags));
+            }
+        }
+        events.sort_unstable_by_key(|&(at, delta, _)| (at, delta));
+        let mut counts = [0i32; InlineStyle::FLAGS];
+        let mut starts = vec![0];
+        let mut styles = Vec::new();
+        let mut k = 0;
+        loop {
+            let at = *starts.last().expect("seeded with 0");
+            while let Some(&(_, delta, flags)) = events.get(k).filter(|e| e.0 <= at) {
+                for (count, set) in counts.iter_mut().zip(flags) {
+                    if set {
+                        *count += delta;
+                    }
+                }
+                k += 1;
+            }
+            styles.push(InlineStyle::from_flags(counts.map(|c| c > 0)));
+            match events.get(k) {
+                Some(&(next, _, _)) => starts.push(next),
+                None => break,
+            }
+        }
+        Self { starts, styles }
+    }
+
+    fn at(&self, src_offset: usize) -> InlineStyle {
+        let k = self.starts.partition_point(|&s| s <= src_offset);
+        self.styles[k - 1].clone()
+    }
 }
 
 fn base_font_for_block(kind: &BlockKind, style: &MarkdownStyle) -> gpui::Font {
@@ -5437,7 +5565,7 @@ mod tests {
                 point(px(0.0), px(0.0)),
                 row_height,
                 row_height,
-                block,
+                &BlockIndex::new(block),
                 &style,
                 font_size,
                 ascent,
@@ -5493,7 +5621,7 @@ mod tests {
                     point(px(0.0), px(0.0)),
                     line_height,
                     line_height,
-                    block,
+                    &BlockIndex::new(block),
                     &style,
                     font_size,
                     body_ascent,
@@ -5539,7 +5667,13 @@ mod tests {
                 window,
             );
             let sl = shaped.into_iter().next().expect("a shaped line");
-            let runs = build_runs_for_line(&sl.line.text, &sl.display_to_source, block, &style);
+            let runs = build_runs_for_line(
+                &sl.line.text,
+                &sl.display_to_source,
+                block,
+                &BlockIndex::new(block),
+                &style,
+            );
             let mut out = Vec::new();
             let mut at = 0usize;
             for run in runs {
@@ -5744,7 +5878,7 @@ mod tests {
                         point(px(0.0), px(0.0)),
                         line_height,
                         line_height,
-                        block,
+                        &BlockIndex::new(block),
                         style,
                         font_size,
                         a,
@@ -5789,7 +5923,7 @@ mod tests {
                 point(px(0.0), px(0.0)),
                 line_height,
                 line_height,
-                block,
+                &BlockIndex::new(block),
                 style,
                 font_size,
                 a,
@@ -5872,7 +6006,7 @@ mod tests {
                     point(px(0.0), px(0.0)),
                     line_height,
                     line_height,
-                    b,
+                    &BlockIndex::new(b),
                     style,
                 )
                 .len()
@@ -5924,7 +6058,7 @@ mod tests {
                 point(px(0.0), px(0.0)),
                 stride,
                 line_height,
-                &augmented,
+                &BlockIndex::new(&augmented),
                 style,
             );
             (chips, line_height, stride)
@@ -5974,7 +6108,7 @@ mod tests {
                 point(px(0.0), px(0.0)),
                 line_height,
                 line_height,
-                block,
+                &BlockIndex::new(block),
                 style,
             );
             let edges = wrap_row_right_edges(&sl.line, line_height).to_vec();
@@ -6688,5 +6822,196 @@ mod tests {
             tall[0],
             short[0],
         );
+    }
+
+    /// `build_display_line` as a walk over every substitution and hidden
+    /// range at every byte: the rule the indexed version must reproduce.
+    fn build_display_line_per_byte(
+        source: &str,
+        line: &Range<usize>,
+        block: &RenderBlock,
+    ) -> (String, Vec<usize>) {
+        let mut display = String::new();
+        let mut map: Vec<usize> = Vec::new();
+
+        let mut pos = line.start;
+        while pos < line.end {
+            if let Some(sub) = block
+                .substitutions
+                .iter()
+                .find(|s| s.source_range.start == pos && s.source_range.end <= line.end)
+            {
+                for _ in 0..sub.display.len() {
+                    map.push(sub.source_range.start);
+                }
+                display.push_str(&sub.display);
+                pos = sub.source_range.end;
+                continue;
+            }
+
+            let cover_end = block
+                .hidden_ranges
+                .iter()
+                .filter(|r| r.start <= pos && pos < r.end)
+                .map(|r| r.end)
+                .max();
+            if let Some(end) = cover_end {
+                let mut jump = end.min(line.end);
+                if let Some(sub_start) = block
+                    .substitutions
+                    .iter()
+                    .filter(|s| s.source_range.start > pos && s.source_range.start < jump)
+                    .map(|s| s.source_range.start)
+                    .min()
+                {
+                    jump = sub_start;
+                }
+                pos = jump;
+                continue;
+            }
+            let ch = source[pos..line.end]
+                .chars()
+                .next()
+                .expect("non-empty remainder");
+            let ch_len = ch.len_utf8();
+            for _ in 0..ch_len {
+                map.push(pos);
+            }
+            display.push(ch);
+            pos += ch_len;
+        }
+        map.push(line.end);
+        debug_assert_eq!(map.len(), display.len() + 1);
+        (display, map)
+    }
+
+    /// Source covering every construct that hides, substitutes or styles
+    /// bytes: delimiters, escapes and entities, links and images, inline
+    /// code and math, CJK emphasis, tables with styled cells, a fenced
+    /// block inside a quote, display math, lists and hard breaks.
+    const DISPLAY_CORPUS: &str = "\
+# Heading with **bold** and `code`
+
+Plain *italic* and ***both*** with ~~strike~~, \\*escaped\\* &amp; &copy; and \
+[a link](https://example.com/a&amp;b) beside ![alt *text*](img.png).  
+Hard break above; `code with \\* inside` and $x^2 + \\$y$ math.
+
+强调**加粗**与*斜体中文*混排 *mixed 中文 text*.
+
+| Left | **Bold** | `code` |
+|:-----|:--------:|-------:|
+| a *b* | ~~c~~ | `d` |
+| &amp; | [e](f) | \\| |
+
+> Quoted **text**
+> ```rust
+> let x = 1;
+> ```
+> - nested *item*
+
+1. one
+   - two **2**
+     - three `3`
+
+$$
+\\frac{a}{b}
+$$
+
+***
+";
+
+    /// Every block of `src` rendered editable and read-only, with the
+    /// cursor at every `step`-th byte that is a char boundary.
+    fn rendered_blocks(src: &str, step: usize) -> Vec<RenderBlock> {
+        let tree = parse(src);
+        let mut out = Vec::new();
+        for cursor in (0..=src.len())
+            .step_by(step)
+            .filter(|&c| src.is_char_boundary(c))
+        {
+            let state = EditorState {
+                markdown: src.into(),
+                selection: Selection::Cursor(cursor),
+                ..Default::default()
+            };
+            out.extend(render(&state, &tree).blocks);
+            out.extend(crate::render::render_readonly(&state, &tree).blocks);
+        }
+        out
+    }
+
+    /// Each source line of `block`, as `shape_block_lines` splits it.
+    fn block_lines(src: &str, block: &RenderBlock) -> Vec<Range<usize>> {
+        let mut cursor = block.source_range.start;
+        let mut out = Vec::new();
+        for raw in src[block.source_range.clone()].split_inclusive('\n') {
+            let end = cursor + raw.len() - usize::from(raw.ends_with('\n'));
+            out.push(cursor..end);
+            cursor += raw.len();
+        }
+        out
+    }
+
+    #[test]
+    fn indexed_display_lines_match_the_per_byte_walk() {
+        let src = DISPLAY_CORPUS;
+        let mut checked = 0;
+        for block in rendered_blocks(src, 3) {
+            // The block as rendered, and again with extra hidden ranges
+            // overlapping, nesting in and touching the ones it has, and
+            // reaching past its lines — shapes the render pipeline merges
+            // away but `build_display_line` promises to handle.
+            let mut perturbed = block.clone();
+            for (k, h) in block.hidden_ranges.iter().enumerate() {
+                let extra = match k % 4 {
+                    0 => h.start + 1..h.end + 2,
+                    1 => h.start..h.start + 1,
+                    2 => h.end..h.end + 1,
+                    _ => h.start.saturating_sub(1)..h.end + 40,
+                };
+                let mut start = extra.start;
+                while !src.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let mut end = extra.end.min(src.len());
+                while !src.is_char_boundary(end) {
+                    end += 1;
+                }
+                perturbed.hidden_ranges.push(start..end);
+            }
+            perturbed.hidden_ranges.reverse();
+            for b in [&block, &perturbed] {
+                for line in block_lines(src, b) {
+                    assert_eq!(
+                        build_display_line(src, &line, b, &BlockIndex::new(b)),
+                        build_display_line_per_byte(src, &line, b),
+                        "line {line:?} of {:?}",
+                        &src[line.clone()],
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000, "only {checked} lines checked");
+    }
+
+    #[test]
+    fn the_inline_style_map_matches_every_covering_run() {
+        let src = DISPLAY_CORPUS;
+        let mut checked = 0;
+        for block in rendered_blocks(src, 3) {
+            let map = InlineStyleMap::new(&block.inlines);
+            for line in block_lines(src, &block) {
+                for offset in line.start..=line.end {
+                    assert_eq!(
+                        map.at(offset),
+                        effective_inline_style(offset, &block),
+                        "offset {offset} of line {line:?}",
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10_000, "only {checked} offsets checked");
     }
 }
