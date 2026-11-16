@@ -451,6 +451,8 @@ struct Loader<'a> {
     bytes: WeightBytes,
     /// Count what is loaded as the drafter's.
     drafter: bool,
+    /// Load the backbone's routed experts; without them a layer's expert addresses are 0.
+    routed: bool,
 }
 
 impl<'a> Loader<'a> {
@@ -620,6 +622,14 @@ impl<'a> Loader<'a> {
         let down = [d * inter / 2, d * inter / 32];
         let sizes = [2 * up[0], 2 * up[1], down[0], down[1]];
         let mut addrs = [0u64; 4];
+        if !self.routed && !self.drafter {
+            return Ok(Experts {
+                up_packed: 0,
+                up_scales: 0,
+                down_packed: 0,
+                down_scales: 0,
+            });
+        }
         let first = self.buffers.len();
         for (addr, bytes) in addrs.iter_mut().zip(sizes) {
             *addr = self.buffer(Count::Experts, n * bytes)?.addr;
@@ -783,12 +793,29 @@ impl HalfWeights {
         max_model_len: u32,
         tables: bool,
     ) -> Result<HalfWeights> {
+        Self::load_with(dev, store, c, shape, half, max_model_len, tables, true)
+    }
+
+    /// As [`HalfWeights::load`]; without `routed` the backbone layers' routed experts
+    /// are neither allocated nor counted (their addresses are 0), the drafter's are.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_with(
+        dev: &dyn Device,
+        store: Option<&WeightSet>,
+        c: &DsConfig,
+        shape: &DsShape,
+        half: Half,
+        max_model_len: u32,
+        tables: bool,
+        routed: bool,
+    ) -> Result<HalfWeights> {
         let mut ld = Loader {
             dev,
             store,
             buffers: Vec::new(),
             bytes: WeightBytes::default(),
             drafter: false,
+            routed,
         };
         let (v, d) = (c.vocab_size, c.dim);
         let mut layers = vec![None; shape.layers];

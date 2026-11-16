@@ -7,6 +7,12 @@ repository.workspace = true
 publish.workspace = true
 license = "AGPL-3.0-only"
 
+[features]
+# Dev-only: the whole DeepSeek-V4.1 model on one GPU with its routed experts cached from
+# host memory (`ds::staged`). Never enabled by the node's image build; a test of this
+# crate holds the release feature set to that.
+dev-staged-experts = []
+
 [dependencies]
 # Driver API only, loaded at run time: no CUDA runtime, no NVRTC, nothing
 # linked at build time, so the crate builds (and its GPU tests skip) on a
@@ -46,6 +52,18 @@ test = true
 name = "ds_halves"
 path = "examples/ds_halves.rs"
 test = true
+
+# The released checkpoint whole on one GPU, its experts staged.
+[[example]]
+name = "ds_whole"
+path = "examples/ds_whole.rs"
+required-features = ["dev-staged-experts"]
+test = true
+
+[[test]]
+name = "ds_staged"
+path = "tests/ds_staged.rs"
+required-features = ["dev-staged-experts"]
 
 # No integer conversion may lose a value silently, in any target (library,
 # tests, examples): counts and ids are converted with `try_from`.

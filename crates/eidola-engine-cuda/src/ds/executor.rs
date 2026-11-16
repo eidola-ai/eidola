@@ -304,6 +304,20 @@ impl DsCudaExecutor {
         token_map: Option<Vec<u32>>,
         cfg: &DsCudaExecutorConfig,
     ) -> Result<DsCudaExecutor> {
+        Self::build_with(encoder, decoder, store, c, token_map, cfg, true)
+    }
+
+    /// As `build`; without `routed` the backbone's routed experts stay off the devices
+    /// (`HalfWeights::load_with`).
+    pub(crate) fn build_with(
+        encoder: Box<dyn Device>,
+        decoder: Box<dyn Device>,
+        store: Option<&WeightSet>,
+        c: &DsConfig,
+        token_map: Option<Vec<u32>>,
+        cfg: &DsCudaExecutorConfig,
+        routed: bool,
+    ) -> Result<DsCudaExecutor> {
         let (shape, spec) = Self::preflight(c, cfg)?;
         let hasher = match (&c.engram, token_map) {
             (Some(e), Some(map)) => Some(
@@ -332,7 +346,7 @@ impl DsCudaExecutor {
         let cap = shape.open_cap();
         let mut halves = Vec::new();
         for (half, dev) in [(Half::Encoder, encoder), (Half::Decoder, decoder)] {
-            let w = HalfWeights::load(
+            let w = HalfWeights::load_with(
                 dev.as_ref(),
                 store,
                 c,
@@ -340,6 +354,7 @@ impl DsCudaExecutor {
                 half,
                 cfg.max_model_len,
                 true,
+                routed,
             )?;
             let mut kv = KvStore::new(
                 dev.as_ref(),
@@ -391,6 +406,12 @@ impl DsCudaExecutor {
     /// Each half's memory by kind: the encoder's, then the decoder's.
     pub fn memory(&self) -> [MemoryBytes; 2] {
         [self.encoder.memory(), self.decoder.memory()]
+    }
+
+    /// Both halves, the encoder's first.
+    #[cfg(feature = "dev-staged-experts")]
+    pub(crate) fn halves_mut(&mut self) -> [&mut HalfNet; 2] {
+        [&mut self.encoder, &mut self.decoder]
     }
 
     /// A half (tests).
