@@ -897,8 +897,6 @@ fn push_row_spanning_bounds(
     // one that *ends* there ends at the upper row's edge, which is what
     // gpui's unbiased answer already gives.
     let start = downstream_row_position(line, lo, start_upper, row_stride);
-    let right_edges = wrap_row_right_edges(line, row_stride);
-    let row_right = |row: usize| origin.x + right_edges.get(row).copied().unwrap_or(line.width());
     if start.y == end.y {
         out.push(Bounds::from_corners(
             point(origin.x + start.x, origin.y + start.y),
@@ -906,6 +904,11 @@ fn push_row_spanning_bounds(
         ));
         return;
     }
+    // Only a span crossing a wrap needs the rows' right edges, and they
+    // cost a walk of the whole line per row: a single-row span, which is
+    // nearly every inline-code chip, never pays for them.
+    let right_edges = wrap_row_right_edges(line, row_stride);
+    let row_right = |row: usize| origin.x + right_edges.get(row).copied().unwrap_or(line.width());
     let first_row = (f32::from(start.y) / f32::from(row_stride)).round() as usize;
     let last_row = (f32::from(end.y) / f32::from(row_stride)).round() as usize;
     out.push(Bounds::from_corners(
