@@ -634,6 +634,7 @@ def main() -> None:
     p.add_argument("--max-new", type=int, default=96)
     p.add_argument("--health-new", type=int, default=64)
     p.add_argument("--wait", type=float, default=3600)
+    p.add_argument("--pid", type=int, default=0, help="the node's process: waiting ends if it exits")
     p.add_argument("--out", type=Path, required=True)
     p = sub.add_parser("quality")
     p.add_argument("--base", required=True)
@@ -665,7 +666,14 @@ def main() -> None:
         write_json(o.out, v)
         (o.out.parent / "weights.sha256").write_text(v["weights_sha256"] + "\n")
     elif o.cmd == "node":
-        wait_healthy(f"{o.base}/healthz", o.wait)
+        def alive() -> bool:
+            try:
+                os.kill(o.pid, 0)
+                return True
+            except OSError:
+                return False
+
+        wait_healthy(f"{o.base}/healthz", o.wait, alive if o.pid else None)
         r = node_session(o.base, o.token, o.weights, o.model, read_json(o.prompts), read_json(o.texts), o.cpu, o.max_new, o.health_new)
         write_json(o.out, r)
         if r["equal_to_cpu"] is False:
