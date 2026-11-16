@@ -32,11 +32,19 @@ pub fn scan(bytes: &[u8], range: Range<usize>, verbatim: &[Range<usize>]) -> Vec
     let mut out = Vec::new();
     let mut i = range.start;
     let limit = range.end.min(bytes.len());
+    // `verbatim` is sorted and non-overlapping, and `i` only moves
+    // forward, so one cursor walks it alongside `i`: start at the first
+    // range that ends past `i`, and step past ranges as `i` leaves them.
+    // The whole scan is O(range + verbatim), whatever the document holds.
+    let mut v = verbatim.partition_point(|r| r.end <= i);
     while i < limit {
-        // Skip verbatim regions. Since `verbatim` is sorted, a linear
-        // probe is fine — at most one match per `i` advance.
-        if let Some(v) = verbatim.iter().find(|v| v.start <= i && i < v.end) {
-            i = v.end;
+        while v < verbatim.len() && verbatim[v].end <= i {
+            v += 1;
+        }
+        if let Some(r) = verbatim.get(v)
+            && r.start <= i
+        {
+            i = r.end;
             continue;
         }
         let b = bytes[i];
@@ -368,6 +376,55 @@ mod tests {
         let r = scan(src.as_bytes(), 0..src.len(), &v);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].source_range, 7..9);
+    }
+
+    /// The per-byte rule the scanner's cursor walk must agree with: a
+    /// construct is reported only when its first byte lies in no verbatim
+    /// range, scanning resumes at the end of whatever range covers a byte,
+    /// and the result is the same wherever inside the document the scanned
+    /// range starts — including inside, between, and past verbatim ranges.
+    #[test]
+    fn many_verbatim_ranges_match_the_per_byte_rule() {
+        let unit = r"a\*`\*`&amp;`&amp;`b";
+        let src = unit.repeat(40);
+        // Each pair of backticks is one inline code span.
+        let ticks: Vec<usize> = src.match_indices('`').map(|(i, _)| i).collect();
+        let verbatim: Vec<Range<usize>> = ticks.chunks(2).map(|p| p[0]..p[1] + 1).collect();
+        let reference = |range: Range<usize>| -> Vec<ResolvedSpan> {
+            let bytes = src.as_bytes();
+            let mut out = Vec::new();
+            let mut i = range.start;
+            while i < range.end {
+                if let Some(v) = verbatim.iter().find(|v| v.start <= i && i < v.end) {
+                    i = v.end;
+                    continue;
+                }
+                let span = match bytes[i] {
+                    b'\\' => scan_backslash_escape(bytes, i, range.end),
+                    b'&' => scan_entity(bytes, i, range.end),
+                    _ => None,
+                };
+                match span {
+                    Some(span) => {
+                        i = span.source_range.end;
+                        out.push(span);
+                    }
+                    None => i += 1,
+                }
+            }
+            out
+        };
+        for start in 0..unit.len() * 3 {
+            for end in [src.len() / 2 + start, src.len()] {
+                assert_eq!(
+                    scan(src.as_bytes(), start..end, &verbatim),
+                    reference(start..end),
+                    "scan of {start}..{end}"
+                );
+            }
+        }
+        // Every unit holds one escape and one entity outside code spans.
+        assert_eq!(scan(src.as_bytes(), 0..src.len(), &verbatim).len(), 80);
     }
 
     #[test]
