@@ -19,6 +19,7 @@ git -C "$repo" config user.email test@example.invalid
 git -C "$repo" config user.name test
 git -C "$repo" config commit.gpgsign false
 git -C "$repo" config tag.gpgsign false
+git -C "$repo" commit -q --allow-empty -m "before any release"
 
 # Commit a trust root pinning PATTERN, and tag that commit with each TAG.
 release() {
@@ -28,7 +29,8 @@ release() {
   printf '{"expected_ci_identity_pattern": "%s"}\n' "$pattern" \
     > "$repo/releases/trust/trust-constants.json"
   git -C "$repo" add -A
-  git -C "$repo" commit -q --allow-empty -m "pin $pattern"
+  # The tags in the message keep two otherwise identical commits apart.
+  git -C "$repo" commit -q --allow-empty -m "pin $pattern for $*"
   for tag in "$@"; do
     git -C "$repo" tag "$tag"
   done
@@ -80,6 +82,27 @@ expect pass "the previous release is the highest version, not the last in text o
 # v0.1.9's clients, which pin the old workflow.
 expect pass "a pre-release is checked by the release below it" \
   "$old@refs/tags/v0.1.10-rc1" v0.1.10-rc1
+
+# Pre-release identifiers compare by precedence, numbers as numbers:
+# rc.10 follows rc.9, so v1.0.0's clients-to-satisfy are rc.10's.
+release "$old@refs/tags/v*" v1.0.0-rc.9
+release "$new@refs/tags/v*" v1.0.0-rc.10
+expect pass "rc.10, not rc.9, precedes the release" \
+  "$new@refs/tags/v1.0.0" v1.0.0
+expect fail "so the workflow rc.9 pinned may not sign it" \
+  "$old@refs/tags/v1.0.0" v1.0.0
+
+# Tags that are not releases are not previous releases, wherever they sit.
+release "$old@refs/tags/v*" immut-test-1
+expect pass "a non-release tag in the history is ignored" \
+  "$new@refs/tags/v1.0.1" v1.0.1
+
+# A release on another line is not in this one's history.
+git -C "$repo" checkout -q -b other HEAD~1
+release "$old@refs/tags/v*" v1.5.0
+git -C "$repo" checkout -q -
+expect pass "a release outside the tag's history is ignored" \
+  "$new@refs/tags/v2.0.0" v2.0.0
 
 # A previous release without trust constants cannot be satisfied knowingly.
 git -C "$repo" rm -q -r releases

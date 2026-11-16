@@ -40,12 +40,43 @@ pub fn fetch_verified_manifest(workspace_root: &Path, repo: &str, tag: &str) -> 
         fs::read(&bundle_path).with_context(|| format!("reading {}", bundle_path.display()))?;
     let trust = eidola_app_core::updater::trust::load()
         .map_err(|e| anyhow::anyhow!("loading sigstore trust root: {e}"))?;
-    let verified = eidola_app_core::updater::ci_sigstore::verify_ci_signature(
+    // The identity this release's signature is checked against by the
+    // clients that will update to it: the one the previous release pins,
+    // which during a CI identity rotation is not the one this tree pins
+    // (releases/README.md → Rotating the CI signing workflow).
+    let (identity_pattern, issuer) =
+        match crate::previous::previous_release_tag(workspace_root, tag)? {
+            Some(previous) => {
+                let pins = crate::previous::ci_pins_at(workspace_root, &previous)?;
+                println!(
+                    "  pins:     as committed at {previous}, whose clients check this release"
+                );
+                pins
+            }
+            None => {
+                println!("  pins:     this tree's own (no release precedes {tag})");
+                (
+                    eidola_app_core::trust_root::EXPECTED_CI_IDENTITY_PATTERN.to_string(),
+                    eidola_app_core::trust_root::EXPECTED_CI_ISSUER.to_string(),
+                )
+            }
+        };
+    let verified = eidola_app_core::updater::ci_sigstore::verify_ci_signature_with(
         &manifest_bytes,
         &bundle_bytes,
         &trust,
+        &identity_pattern,
+        &issuer,
     )
     .map_err(|e| anyhow::anyhow!("verifying CI signature: {e}"))?;
+    // Clients also require the identity to name this release's own tag,
+    // so an authentic manifest of another release cannot stand in for it.
+    if !verified.ci_identity.ends_with(&format!("@refs/tags/{tag}")) {
+        bail!(
+            "the CI signature is from `{}`, which is not bound to `{tag}`",
+            verified.ci_identity
+        );
+    }
     println!("  ✓ CI signature verified");
     println!("      identity: {}", verified.ci_identity);
     println!("      issuer:   {}", verified.ci_issuer);

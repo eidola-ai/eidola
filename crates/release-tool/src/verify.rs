@@ -30,8 +30,7 @@ pub fn run(args: Args) -> Result<()> {
     // and get the exact same bytes they signed off on.
     let tag_commit =
         crate::preflight::assert_release_checkout(&args.workspace_root, &args.repo, &args.tag)?;
-    let prev = previous_release_tag(&args.workspace_root, &args.tag)
-        .ok()
+    let prev = crate::previous::previous_release_tag(&args.workspace_root, &args.tag)?
         .map(|prev_tag| -> Result<(String, String)> {
             let prev_commit = resolve_to_commit(&args.workspace_root, &prev_tag)?;
             Ok((prev_tag, prev_commit))
@@ -92,21 +91,6 @@ fn resolve_to_commit(workspace_root: &std::path::Path, refname: &str) -> Result<
     if !out.status.success() {
         bail!(
             "`git rev-parse {refname}^{{commit}}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(out.stdout)?.trim().to_string())
-}
-
-fn previous_release_tag(workspace_root: &std::path::Path, tag: &str) -> Result<String> {
-    let out = Command::new("git")
-        .current_dir(workspace_root)
-        .args(["describe", "--tags", "--abbrev=0", &format!("{tag}^")])
-        .output()
-        .context("running `git describe --tags --abbrev=0 <tag>^`")?;
-    if !out.status.success() {
-        bail!(
-            "no previous tag reachable from `{tag}` ({})",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }

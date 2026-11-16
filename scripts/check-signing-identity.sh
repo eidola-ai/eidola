@@ -16,12 +16,16 @@
 #
 # IDENTITY is the Fulcio SAN the signing job's token carries,
 # `$GITHUB_SERVER_URL/$GITHUB_WORKFLOW_REF` for a top-level workflow. TAG is
-# the tag being released. REPO (default: this repository) must have every
-# release tag fetched. "The previous release" is the highest `v*` tag below
-# TAG by version, which is the release whose clients update to TAG; with no
-# such tag there is no installed client to satisfy, and the check passes.
-# The pattern is matched as the client matches it (`*` is any run of
-# characters, everything else literal, anchored at both ends).
+# the tag being released. REPO (default: this repository) must have TAG's
+# commit checked out and its history and tags fetched.
+#
+# "The previous release" is the rule release-tool applies
+# (crates/release-tool/src/previous.rs): the highest release version below
+# TAG among the tags in the checked-out commit's history, by semantic-version
+# precedence. Tags that are not releases (`vMAJOR.MINOR.PATCH[-PRE]`) are
+# ignored. With no such tag there is no installed client to satisfy, and the
+# check passes. The pattern is matched as the client matches it (`*` is any
+# run of characters, everything else literal, anchored at both ends).
 #
 # Bash, git and python3 (stdlib only); no network.
 set -euo pipefail
@@ -43,16 +47,27 @@ case "$identity" in
     ;;
 esac
 
-previous="$(git -C "$repo" tag --list 'v*' | python3 -c '
+previous="$(git -C "$repo" tag --merged HEAD --list 'v*' | python3 -c '
 import re, sys
 
+NUMBER = r"(?:0|[1-9][0-9]*)"
+IDENT = r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+RELEASE = re.compile(r"v(%s)\.(%s)\.(%s)(?:-(%s(?:\.%s)*))?" % (NUMBER, NUMBER, NUMBER, IDENT, IDENT))
+
 def key(tag):
-    m = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", tag)
+    m = RELEASE.fullmatch(tag)
     if not m:
         return None
     major, minor, patch, pre = m.groups()
-    # A pre-release sorts below its release (v1.2.3-rc1 < v1.2.3).
-    return (int(major), int(minor), int(patch), pre is None, pre or "")
+    core = (int(major), int(minor), int(patch))
+    if pre is None:
+        # A release sorts above every pre-release of its version.
+        return core + ((1,),)
+    # Semantic-version precedence: identifiers compare left to right,
+    # numeric ones as numbers and below alphanumeric ones, and a longer
+    # list wins when one is a prefix of the other.
+    ids = tuple((0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split("."))
+    return core + ((0,) + ids,)
 
 current = key(sys.argv[1])
 if current is None:
