@@ -87,10 +87,9 @@ impl Config {
             "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string()
         })?;
 
-        // Verify measured secret hashes: if *_HASH env vars are set (committed in
-        // tinfoil-config.yml and thus included in the enclave measurement), verify
-        // that the corresponding runtime secret matches the hash. This binds
-        // injected secrets to the measurement without exposing them in the config.
+        // Verify measured secret hashes: for each *_HASH env var that is set
+        // (in a deployment's config, and so in its measurement), the runtime
+        // secret must match it.
         verify_measured_secrets(&[
             ("CREDENTIAL_MASTER_KEY", &credential_master_key_hex),
             (
@@ -206,9 +205,11 @@ impl Config {
 /// If present, verifies the Argon2id hash matches `value`. If absent, the secret
 /// is not measured and no check is performed.
 ///
-/// The `_HASH` env vars should be hardcoded in `tinfoil-config.yml` so they are
-/// included in the enclave measurement. This cryptographically binds injected
-/// secrets to the measurement without exposing their plaintext in the config.
+/// A `_HASH` env var committed in a deployment's `tinfoil-config.yml` is part
+/// of the enclave measurement, and binds the secret injected beside it to that
+/// measurement without exposing its plaintext. The gateway's own config
+/// measures none: every secret it names reaches a service trusted as its
+/// operator is, so binding its value would hold the operator to nothing.
 fn verify_measured_secrets(secrets: &[(&str, &str)]) -> Result<(), String> {
     use argon2::PasswordVerifier;
 
@@ -510,7 +511,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     /// Written by argon2 0.5.3 (`Argon2::default()`, random salt) for the
-    /// secret below. Measured `*_HASH` values in `tinfoil-config.yml` and
+    /// secret below. Measured `*_HASH` values in deployment configs and
     /// every stored account hash were produced by that version, so an argon2
     /// upgrade must keep verifying them — or the enclave refuses to start
     /// (`verify_measured_secrets`) and every account stops authenticating.
@@ -536,7 +537,7 @@ mod tests {
         use argon2::PasswordHasher;
         // `hash-secret` and account creation both rely on the default
         // parameters; a change here would silently change what new hashes
-        // cost and how they read in `tinfoil-config.yml`.
+        // cost and how they read in a deployment's `tinfoil-config.yml`.
         let hash = argon2::Argon2::default()
             .hash_password(ARGON2_0_5_SECRET)
             .expect("hash")

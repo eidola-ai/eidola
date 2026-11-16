@@ -1,7 +1,8 @@
 //! Generate Argon2id hashes of secrets for measured secret verification.
 //!
-//! These hashes are committed in `tinfoil-config.yml` as `*_HASH` env vars,
-//! binding injected secrets to the enclave measurement.
+//! A hash committed in a deployment's `tinfoil-config.yml` as a `*_HASH` env
+//! var binds the secret injected beside it to the enclave measurement: an
+//! engine deployment measures `GATEWAY_TOKEN_HASH` this way.
 //!
 //! Usage:
 //!   cargo run -p hash-secret                    # reads from stdin

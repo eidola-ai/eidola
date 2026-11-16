@@ -10,7 +10,7 @@
 //!
 //! Usage:
 //!   cargo run -p measure-enclave -- \
-//!     --config tinfoil-config.yml \
+//!     --config deploy/gateway/tinfoil-config.yml \
 //!     --release-manifest tinfoil-inference-vX-manifest.json \
 //!     --igvm tinfoil-snp-vX.igvm
 //!

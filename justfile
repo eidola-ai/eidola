@@ -339,7 +339,7 @@ test-release-assets:
     ./scripts/test-release-assets.sh
     ./scripts/test-weights-hash.sh
 
-# Compute enclave measurements from tinfoil-config.yml and CVM artifacts
+# Compute enclave measurements from deploy/gateway/tinfoil-config.yml and CVM artifacts
 measure:
     ./scripts/artifact-manifest.sh measure
 
@@ -347,7 +347,7 @@ measure:
 # Builds the OCI images plus the current host's Nix-built desktop payloads
 # and flake-built archives (macOS universal CLI + GUI .app on Darwin; the
 # Linux GUI on Linux), then records OCI digest / narHash / archiveSha256.
-# Also stamps image digests into tinfoil-config.yml and computes enclave
+# Also stamps image digests into deploy/gateway/tinfoil-config.yml and computes enclave
 # measurements. The *other* platform's desktop entries are carried over
 # from the committed manifest — no single host builds both; CI's apple +
 # linux-gui jobs verify the full set.

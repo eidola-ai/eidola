@@ -67,6 +67,11 @@ apple=false
 markdown=false
 oci=true' "$engine_trust_path"
 done
+# The gateway's own config is compiled into no image; its engine siblings are.
+assert_scope 'rust=false
+apple=false
+markdown=false
+oci=false' deploy/gateway/tinfoil-config.yml
 assert_scope 'rust=false
 apple=false
 markdown=false

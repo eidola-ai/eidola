@@ -33,7 +33,9 @@ while IFS= read -r path; do
     .github/*|docs/*|www/*|scripts/*|*.sh|justfile) : ;;
     compose*.yaml|compose*.yml|Containerfile*|*.hcl|.dockerignore) : ;;
     flake.nix|flake.lock|*.swift-format) : ;;
-    tinfoil-config.yml|artifact-manifest.json) : ;;
+    # The gateway's deployment config is compiled into nothing: its hash
+    # reaches the clients through server-enclave.json, which is Rust scope.
+    deploy/gateway/*|artifact-manifest.json) : ;;
     .env.example|.env.release) : ;;
     .envrc|.gitignore|.gitattributes|.editorconfig) : ;;
     LICENSE*|SECURITY.md|GEMINI.md|CLA-SIGNERS.txt) : ;;

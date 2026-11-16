@@ -3,21 +3,23 @@
 # Three responsibilities, each in jobs holding only what it needs:
 #
 # 1. **The gateway enclave, cross-checked** (`cross-check`). The gateway
-#    runs on the platform provider's IGVM launch model: `tinfoil-config.yml`
-#    pins a cvmimage release manifest inline, that manifest names one
-#    SEV-SNP IGVM image, and the gateway's identity is that image's launch
-#    digest plus HOST_DATA, the config's SHA-256. Before anything is
-#    released, the enclave block of `artifact-manifest.json` (computed by
-#    our Rust `measure-enclave`) is checked against the provider's own
-#    measurer, `cvmc measure`, run over the same provenance-verified image,
-#    and against the provider's statements of the digest and guest policy.
-#    That runs a binary of the provider's, so the job holds a read-only
-#    token and no OIDC token.
+#    runs on the platform provider's IGVM launch model: its config,
+#    `deploy/gateway/tinfoil-config.yml`, pins a cvmimage release manifest
+#    inline, that manifest names one SEV-SNP IGVM image, and the gateway's
+#    identity is that image's launch digest plus HOST_DATA, the config's
+#    SHA-256. Before anything is released, the enclave block of
+#    `artifact-manifest.json` (computed by our Rust `measure-enclave`) is
+#    checked against the provider's own measurer, `cvmc measure`, run over
+#    the same provenance-verified image, and against the provider's
+#    statements of the digest and guest policy. That runs a binary of the
+#    provider's, so the job holds a read-only token and no OIDC token.
 #
 # 2. **The GitHub release** (`release`), created with the config and the
-#    release manifest it names. Tinfoil's closed-source deployment system
-#    requires this workflow's file to be named `tinfoil-build.yml` — do not
-#    rename.
+#    release manifest it names. Deploying is not part of a release: an
+#    operator deploys the released config's exact bytes with the platform's
+#    CLI, and the attested HOST_DATA binds what runs to them. The platform
+#    no longer requires this file's name; it stays while this workflow
+#    signs, because the previous release's clients pin it (item 3).
 #
 # 3. **Eidola release signing** (`signing-identity`, `sign`,
 #    `attach-signature`). `cosign sign-blob` signs `artifact-manifest.json`
@@ -74,11 +76,11 @@ jobs:
         run: |
           set -euo pipefail
           # The release this config launches, and the manifest it pins.
-          raw="$(sed -n 's/^cvm-version:[[:space:]]*//p' tinfoil-config.yml)"
+          raw="$(sed -n 's/^cvm-version:[[:space:]]*//p' deploy/gateway/tinfoil-config.yml)"
           version="${raw%%@sha256:*}"
           pin="${raw#*@sha256:}"
           if [[ "$raw" != *@sha256:* || ! "$pin" =~ ^[0-9a-f]{64}$ || ! "$version" =~ ^[0-9][0-9A-Za-z.-]*$ ]]; then
-            echo "::error::tinfoil-config.yml must pin a CPU-image release manifest inline: $raw"
+            echo "::error::deploy/gateway/tinfoil-config.yml must pin a CPU-image release manifest inline: $raw"
             exit 1
           fi
           cvm_dir="$RUNNER_TEMP/cvm"
@@ -135,7 +137,7 @@ jobs:
           check "guest policy (image manifest)" "$(enclave sev_snp.guest_policy)" \
             "$(jq -r '.launch.policy' "$igvm_manifest")"
           check "HOST_DATA (config SHA-256)" "$(enclave sev_snp.host_data)" \
-            "$(sha256sum tinfoil-config.yml | cut -d' ' -f1)"
+            "$(sha256sum deploy/gateway/tinfoil-config.yml | cut -d' ' -f1)"
           check "IGVM image" "$(enclave igvm_sha256)" "$(sha256sum "$igvm" | cut -d' ' -f1)"
           check "release" "$(enclave cvm_version)" "$raw"
           # The image is launched without an ID block, which the client
@@ -143,7 +145,7 @@ jobs:
           check "ID key digest (image manifest)" "$(printf '0%.0s' $(seq 96))" \
             "$(jq -r '.launch.id_key_digest' "$igvm_manifest")"
           if [ "$fail" -ne 0 ]; then
-            echo "::error::The server enclave in artifact-manifest.json does not match the platform's measurement of the image tinfoil-config.yml launches."
+            echo "::error::The server enclave in artifact-manifest.json does not match the platform's measurement of the image deploy/gateway/tinfoil-config.yml launches."
             exit 1
           fi
           echo "The server enclave matches the platform's own measurement: $measured"
@@ -169,11 +171,11 @@ jobs:
           # ran the provider's binary, which could have rewritten anything
           # it passed on. Only bytes that hash to the config's pin are
           # attached.
-          raw="$(sed -n 's/^cvm-version:[[:space:]]*//p' tinfoil-config.yml)"
+          raw="$(sed -n 's/^cvm-version:[[:space:]]*//p' deploy/gateway/tinfoil-config.yml)"
           version="${raw%%@sha256:*}"
           pin="${raw#*@sha256:}"
           if [[ "$raw" != *@sha256:* || ! "$pin" =~ ^[0-9a-f]{64}$ || ! "$version" =~ ^[0-9][0-9A-Za-z.-]*$ ]]; then
-            echo "::error::tinfoil-config.yml must pin a CPU-image release manifest inline: $raw"
+            echo "::error::deploy/gateway/tinfoil-config.yml must pin a CPU-image release manifest inline: $raw"
             exit 1
           fi
           manifest="$RUNNER_TEMP/tinfoil-inference-v${version}-manifest.json"
@@ -192,7 +194,8 @@ jobs:
             echo "::error::Release $TAG already exists; refusing to re-publish."
             exit 1
           fi
-          sha256sum tinfoil-config.yml > "$RUNNER_TEMP/tinfoil-config.sha256"
+          # Published under its file name alone, as its checksum line names it.
+          (cd deploy/gateway && sha256sum tinfoil-config.yml) > "$RUNNER_TEMP/tinfoil-config.sha256"
           printf 'Server enclave: SEV-SNP launch digest `%s`, HOST_DATA `%s` (the SHA-256 of `tinfoil-config.yml`), guest policy `%s`, on cvmimage `%s`.\n' \
             "$(jq -r '.enclave.sev_snp.measurement' artifact-manifest.json)" \
             "$(jq -r '.enclave.sev_snp.host_data' artifact-manifest.json)" \
@@ -204,7 +207,7 @@ jobs:
             --title "$TAG" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             --latest=false \
-            tinfoil-config.yml \
+            deploy/gateway/tinfoil-config.yml \
             "$RUNNER_TEMP/tinfoil-config.sha256" \
             "$RUNNER_TEMP"/tinfoil-inference-v*-manifest.json
 
