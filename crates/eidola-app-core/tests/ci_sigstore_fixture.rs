@@ -23,14 +23,26 @@
 
 use eidola_app_core::updater::{ci_sigstore, trust};
 
+/// The CI identity clients pinned when v0.0.8 was signed.
+const V0_0_8_IDENTITY_PATTERN: &str =
+    "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*";
+
 #[test]
 fn verifies_v0_0_8_release_bundle() {
     let manifest = include_bytes!("fixtures/v0.0.8/artifact-manifest.json");
     let bundle = include_bytes!("fixtures/v0.0.8/artifact-manifest.json.sigstore");
 
     let trust = trust::load().expect("loading embedded sigstore trust root");
-    let verified = ci_sigstore::verify_ci_signature(manifest, bundle, &trust)
-        .expect("verify_ci_signature against real v0.0.8 fixture");
+    // The identity v0.0.8 was signed under. The embedded pin has since
+    // moved to the dedicated signing workflow; see the test below.
+    let verified = ci_sigstore::verify_ci_signature_with(
+        manifest,
+        bundle,
+        &trust,
+        V0_0_8_IDENTITY_PATTERN,
+        "https://token.actions.githubusercontent.com",
+    )
+    .expect("verify_ci_signature against real v0.0.8 fixture");
 
     // The identity/issuer assertions are the same ones the embedded trust
     // root globs against; reasserting them here catches any silent
@@ -47,5 +59,23 @@ fn verifies_v0_0_8_release_bundle() {
     assert!(
         verified.rekor_log_index > 0,
         "rekor log index should be set"
+    );
+}
+
+/// The embedded pin names the dedicated signing workflow, so a genuine
+/// signature minted by the release workflow, which also runs the
+/// provider's tooling, no longer verifies.
+#[test]
+fn the_embedded_pin_refuses_the_release_workflow_s_signature() {
+    let manifest = include_bytes!("fixtures/v0.0.8/artifact-manifest.json");
+    let bundle = include_bytes!("fixtures/v0.0.8/artifact-manifest.json.sigstore");
+
+    let trust = trust::load().expect("loading embedded sigstore trust root");
+    let err = ci_sigstore::verify_ci_signature(manifest, bundle, &trust)
+        .expect_err("a tinfoil-build.yml signature must not satisfy the embedded pin");
+    assert!(
+        err.to_string()
+            .contains("not from the pinned release identity"),
+        "{err}"
     );
 }

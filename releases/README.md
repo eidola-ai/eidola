@@ -43,11 +43,15 @@ Every rotation below ships as a normal release signed under the **current** trus
 
 ### Rotating the CI signing workflow
 
-The trust root pins `https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*`. Changes to the workflow file path or repo path break this pattern. Treat as a coordinated rotation:
+The trust root pins the CI identity as `expected_ci_identity_pattern` in `releases/trust/trust-constants.json`. Changes to the workflow file path or repo path break this pattern. Treat as a coordinated rotation:
 
 1. Update `releases/trust/trust-constants.json` with the new pattern.
 2. Cut a release signed by the **current** workflow under the **current** pattern. You can't change the workflow path in the same commit that introduces the new pattern — the next release's CI would sign under the new path, which clients with only the old pattern would reject.
 3. After clients have updated, rename or move the workflow. The next release's CI signs under the new path; clients accept it because they already embed the new pattern.
+
+Step 2's ordering is enforced rather than remembered. The `signing-identity` job runs `scripts/check-signing-identity.sh` before anything is signed, and refuses unless the signing job's identity matches the pattern committed at the previous release tag — the one the clients updating to this release embed. Moving the signing in the same release as the pin stops the release before a signature exists.
+
+**Currently mid-rotation:** clients built from this tree pin `https://github.com/eidola-ai/eidola/.github/workflows/sign-release.yml@refs/tags/v*`, a workflow that only signs, so nothing else a release job runs can mint the identity. The release that carries the pin is still signed by `tinfoil-build.yml`, which the release before it pins. Step 3 is moving the `signing-identity` and `sign` jobs into a top-level `sign-release.yml` (triggered by `v*` tags, never `workflow_call`) once that release is out.
 
 ### Changing attestation templates
 

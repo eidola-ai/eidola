@@ -222,6 +222,7 @@ check:
     ./scripts/test-require-needs-success.sh
     ./scripts/artifact-manifest.sh check-complete
     ./scripts/test-release-assets.sh
+    ./scripts/test-check-signing-identity.sh
     ./scripts/test-weights-hash.sh
     ./scripts/test-platform-endorsements-drift.sh
 
