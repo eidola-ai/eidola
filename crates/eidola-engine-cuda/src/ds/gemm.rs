@@ -9,6 +9,9 @@
 //! layout as the placement writes it, for any `row_align`. Nothing is stored
 //! twice. The forms:
 //!
+//! [`DsGemmSet`] is a half's GEMMs in its form; the executor takes the form from
+//! `DsCudaExecutorConfig::gemm`.
+//!
 //! - [`GemmForm::Exact`]: the scalar integer reference (`ds_reference.cu`),
 //!   the definition.
 //! - [`GemmForm::Banded`]: the tensor-core form whose block products are
@@ -27,11 +30,11 @@
 //! over its own operands in every shape, and the probe holds an MMA element's
 //! bits to its place in the fragment).
 
-use super::abi::{Lin4Params, Lin8Params};
+use super::abi::{GroupedDotParams, Lin4Params, Lin8Params};
 use super::gemm_ref::DsGemmRef;
 use super::ops::{addr, bind, grid, require};
 use crate::module::{Kernel, KernelDir, KernelModule};
-use crate::{Gpu, Result, launch};
+use crate::{CudaError, Gpu, Result, launch};
 
 /// Threads of the tiles' blocks and of the probe's.
 pub const TC_THREADS: u32 = 128;
@@ -459,35 +462,100 @@ impl DsGemmTc {
     }
 }
 
-/// The quantised GEMMs in every form: the reference and the tensor-core
-/// image, for a caller that chooses the form at run time.
-pub struct DsGemms<'a> {
-    pub reference: &'a DsGemmRef,
-    pub tc: &'a DsGemmTc,
+/// The quantised GEMMs of a half in its chosen form: the reference image (which
+/// also holds the attention output's grouped projection), the tensor-core image,
+/// and the form `lin8` and `lin4` run in.
+pub struct DsGemmSet {
+    reference: DsGemmRef,
+    tc: DsGemmTc,
+    form: GemmForm,
 }
 
-impl DsGemms<'_> {
-    /// `lin8` in `form`.
+impl DsGemmSet {
+    /// Both images, in [`GemmForm::Exact`].
+    pub fn load(gpu: &Gpu, dir: &KernelDir) -> Result<DsGemmSet> {
+        Ok(DsGemmSet {
+            reference: DsGemmRef::load(gpu, dir)?,
+            tc: DsGemmTc::load(gpu, dir)?,
+            form: GemmForm::Exact,
+        })
+    }
+
+    pub fn form(&self) -> GemmForm {
+        self.form
+    }
+
+    pub fn set_form(&mut self, form: GemmForm) {
+        self.form = form;
+    }
+
+    /// `lin8` in the set's form.
     ///
     /// # Safety
     ///
     /// As [`DsGemmTc::lin8`].
-    pub unsafe fn lin8(&self, gpu: &Gpu, form: GemmForm, p: &Lin8Params) -> Result<()> {
-        match form.tc() {
+    pub unsafe fn lin8(&self, gpu: &Gpu, p: &Lin8Params) -> Result<()> {
+        match self.form.tc() {
             None => unsafe { self.reference.lin8(gpu, p) },
             Some(f) => unsafe { self.tc.lin8(gpu, f, p) },
         }
     }
 
-    /// `lin4` in `form`.
+    /// `lin4` in the set's form.
     ///
     /// # Safety
     ///
     /// As [`DsGemmTc::lin4`].
-    pub unsafe fn lin4(&self, gpu: &Gpu, form: GemmForm, p: &Lin4Params) -> Result<()> {
-        match form.tc() {
+    pub unsafe fn lin4(&self, gpu: &Gpu, p: &Lin4Params) -> Result<()> {
+        match self.form.tc() {
             None => unsafe { self.reference.lin4(gpu, p) },
             Some(f) => unsafe { self.tc.lin4(gpu, f, p) },
+        }
+    }
+
+    /// The attention output's grouped projection, which has one form.
+    ///
+    /// # Safety
+    ///
+    /// As [`DsGemmRef::grouped_dot`].
+    pub unsafe fn grouped_dot(&self, gpu: &Gpu, p: &GroupedDotParams) -> Result<()> {
+        unsafe { self.reference.grouped_dot(gpu, p) }
+    }
+}
+
+/// The checks a launch of `lin8` passes in every form: the reference's grid and
+/// the tensor-core forms' in the shape each picks (for a device that only checks).
+pub fn lin8_every_grid(p: &Lin8Params) -> Result<[u32; 3]> {
+    for f in [TcForm::Banded, TcForm::Tolerance] {
+        lin8_tc_grid(p, TokenTile::for_lin8(f, p.rows))?;
+    }
+    super::gemm_ref::lin8_grid(p)
+}
+
+/// [`lin8_every_grid`] for `lin4`.
+pub fn lin4_every_grid(p: &Lin4Params) -> Result<[u32; 3]> {
+    for f in [TcForm::Banded, TcForm::Tolerance] {
+        lin4_tc_grid(p, TokenTile::for_lin4(f, p.layout_rows, p.groups))?;
+    }
+    super::gemm_ref::lin4_grid(p)
+}
+
+/// The environment variable the GPU tests and the dev examples read the form
+/// from (`exact`, `banded`, `tolerance`; unset is `exact`).
+pub const GEMM_FORM_ENV: &str = "EIDOLA_DS_GEMM_FORM";
+
+impl GemmForm {
+    /// The form named `name` ([`GemmForm::name`]).
+    pub fn parse(name: &str) -> Option<GemmForm> {
+        GemmForm::ALL.into_iter().find(|f| f.name() == name)
+    }
+
+    /// The form [`GEMM_FORM_ENV`] names, [`GemmForm::Exact`] when it is unset.
+    pub fn from_env() -> Result<GemmForm> {
+        match std::env::var(GEMM_FORM_ENV) {
+            Err(_) => Ok(GemmForm::Exact),
+            Ok(v) => GemmForm::parse(&v)
+                .ok_or_else(|| CudaError::new(format!("{GEMM_FORM_ENV}: no form {v:?}"))),
         }
     }
 }
@@ -527,6 +595,14 @@ mod tests {
             row_align: 1,
             reserved: 0,
         }
+    }
+
+    #[test]
+    fn forms_by_name() {
+        for f in GemmForm::ALL {
+            assert_eq!(GemmForm::parse(f.name()), Some(f));
+        }
+        assert_eq!(GemmForm::parse("fast"), None);
     }
 
     #[test]

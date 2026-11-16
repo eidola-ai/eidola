@@ -56,6 +56,7 @@ use eidola_engine_cuda::ds::abi::EngramGatherParams;
 use eidola_engine_cuda::ds::boundary::{GatheredRows, ToDecoder, ToEncoder};
 use eidola_engine_cuda::ds::dry::DryDevice;
 use eidola_engine_cuda::ds::executor::geometry;
+use eidola_engine_cuda::ds::gemm::GemmForm;
 use eidola_engine_cuda::ds::half::{CudaDevice, Device, bytes_of};
 use eidola_engine_cuda::ds::kv::KvStore;
 use eidola_engine_cuda::ds::model::HalfNet;
@@ -141,6 +142,7 @@ impl Compare {
             host_blocks: 0,
             position_tags: false,
             record: false,
+            gemm: GemmForm::from_env()?,
         };
         let (shape, spec) = DsCudaExecutor::preflight(&c, &cfg)?;
         std::fs::create_dir_all(&out).map_err(fail)?;
@@ -777,6 +779,7 @@ fn generation_config(
         host_blocks: 0,
         position_tags: false,
         record: true,
+        gemm: GemmForm::Exact,
     }
 }
 
@@ -979,7 +982,11 @@ fn main() {
                     out.clone(),
                 )?;
                 let k = kernels()?;
-                let open = || -> Result<Box<dyn Device>> { Ok(Box::new(CudaDevice::open(0, &k)?)) };
+                let open = || -> Result<Box<dyn Device>> {
+                    let mut d = CudaDevice::open(0, &k)?;
+                    d.select_gemm(GemmForm::from_env()?)?;
+                    Ok(Box::new(d))
+                };
                 let (mut v, same) = run.run(&open, &fill, &host, Some(&recorded))?;
                 v["tokens"] = json!(count);
                 v["chunk"] = json!(chunk);

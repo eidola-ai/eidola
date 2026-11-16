@@ -15,6 +15,7 @@ use std::sync::Arc;
 use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::secret::KvKey;
 use eidola_engine_cuda::ds::abi::*;
+use eidola_engine_cuda::ds::gemm::GemmForm;
 use eidola_engine_cuda::ds::half::{AcceptArgs, Device, SampleArgs};
 use eidola_engine_cuda::ds::host::HostDevice;
 use eidola_engine_cuda::ds::kernels::DsKernels;
@@ -153,6 +154,15 @@ families! {
 }
 
 impl Device for CompiledDevice {
+    /// The reference bodies: the exact form, and the banded form, whose outputs are
+    /// the reference's bit for bit.
+    fn select_gemm(&mut self, form: GemmForm) -> Result<()> {
+        match form {
+            GemmForm::Exact | GemmForm::Banded => Ok(()),
+            GemmForm::Tolerance => Err(CudaError::new("the compiled bodies are exact")),
+        }
+    }
+
     fn alloc(&self, bytes: usize) -> Result<(u64, Box<dyn Any>)> {
         self.host.alloc(bytes)
     }

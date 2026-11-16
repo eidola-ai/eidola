@@ -32,6 +32,7 @@ use super::abi::{
     ROT_ROTATE, STATUS_BAD_INDEX, STATUS_BAD_TOKEN,
 };
 use super::boundary::{GatheredRows, StepTransfer, ToDecoder, ToEncoder};
+use super::gemm::GemmForm;
 use super::half::{AcceptArgs, CudaDevice, Device, SampleArgs};
 use super::kv::{Cell, GroupGeometry, KvStore};
 use super::model::{BANK, Dst, HalfNet, LayerRun, MemoryBytes, WINDOW};
@@ -71,6 +72,10 @@ pub struct DsCudaExecutorConfig {
     pub position_tags: bool,
     /// Testing aid: keep each step's [`StepTransfer`] and [`StepStats`].
     pub record: bool,
+    /// The form of the quantised GEMMs (`lin8`, `lin4`) on both halves
+    /// ([`super::gemm`]): [`GemmForm::Exact`] (the reference) or [`GemmForm::Banded`]
+    /// (tensor cores, the same bits); [`GemmForm::Tolerance`] only on a CUDA device.
+    pub gemm: GemmForm,
 }
 
 /// Wall-clock time of one step's parts, each waited for.
@@ -319,6 +324,9 @@ impl DsCudaExecutor {
         routed: bool,
     ) -> Result<DsCudaExecutor> {
         let (shape, spec) = Self::preflight(c, cfg)?;
+        let (mut encoder, mut decoder) = (encoder, decoder);
+        encoder.select_gemm(cfg.gemm)?;
+        decoder.select_gemm(cfg.gemm)?;
         let hasher = match (&c.engram, token_map) {
             (Some(e), Some(map)) => Some(
                 EngramHasher::new(e, c.vocab_size, map)
@@ -1623,6 +1631,7 @@ mod tests {
             host_blocks: 0,
             position_tags: true,
             record: true,
+            gemm: GemmForm::Exact,
         }
     }
 
@@ -2058,6 +2067,7 @@ mod tests {
             host_blocks: 8192,
             position_tags: true,
             record: false,
+            gemm: GemmForm::Exact,
         };
         let capacity = 275_040usize << 20;
         let device = || -> Box<dyn Device> { Box::new(DryDevice::new(Some(capacity))) };

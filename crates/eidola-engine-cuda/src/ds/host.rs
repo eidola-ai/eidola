@@ -28,6 +28,7 @@ use eidola_engine_model::numeric::{E2M1_VALUES, e8m0_to_f32, fp8_e4m3_to_f32};
 use eidola_engine_model::tensor::dot;
 
 use super::abi::*;
+use super::gemm::GemmForm;
 use super::half::{AcceptArgs, Device, SampleArgs};
 use super::kernels::DsKernels;
 use super::plan;
@@ -868,6 +869,17 @@ impl DsKernels for HostDevice {
 }
 
 impl Device for HostDevice {
+    /// The reference forms, and [`GemmForm::Banded`], whose outputs are the
+    /// reference's bit for bit.
+    fn select_gemm(&mut self, form: GemmForm) -> Result<()> {
+        match form {
+            GemmForm::Exact | GemmForm::Banded => Ok(()),
+            GemmForm::Tolerance => Err(CudaError::new(
+                "the host device computes the quantised GEMMs exactly, not in the tolerance form",
+            )),
+        }
+    }
+
     fn alloc(&self, bytes: usize) -> Result<(u64, Box<dyn Any>)> {
         let buf = vec![0u64; bytes.div_ceil(8)].into_boxed_slice();
         Ok((buf.as_ptr() as u64, Box::new(buf)))
