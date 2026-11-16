@@ -49,6 +49,7 @@ use eidola_engine::spec::{Bucket, ModelSpec};
 use eidola_engine_cuda::ds::boundary::{GatheredRows, ToDecoder, ToEncoder};
 use eidola_engine_cuda::ds::dry::DryDevice;
 use eidola_engine_cuda::ds::executor::geometry;
+use eidola_engine_cuda::ds::gemm::GemmForm;
 use eidola_engine_cuda::ds::half::{CudaDevice, Device, bytes_of};
 use eidola_engine_cuda::ds::kv::KvStore;
 use eidola_engine_cuda::ds::model::HalfNet;
@@ -188,6 +189,7 @@ impl Run {
             host_blocks: 0,
             position_tags: false,
             record: false,
+            gemm: GemmForm::from_env().map_err(fail)?,
         };
         let (shape, spec) = DsCudaExecutor::preflight(&c, &cfg)?;
         std::fs::create_dir_all(&out).map_err(fail)?;
@@ -1115,7 +1117,9 @@ fn main() {
     let device = || -> Result<Box<dyn Device>> {
         let kernels = std::env::var_os("EIDOLA_ENGINE_KERNELS_DIR")
             .ok_or_else(|| fail("EIDOLA_ENGINE_KERNELS_DIR is not set"))?;
-        Ok(Box::new(CudaDevice::open(0, &KernelDir::new(kernels))?))
+        let mut d = CudaDevice::open(0, &KernelDir::new(kernels))?;
+        d.select_gemm(GemmForm::from_env()?)?;
+        Ok(Box::new(d))
     };
     match run(&setup, &phases, &device) {
         Ok((summary, equal)) => {

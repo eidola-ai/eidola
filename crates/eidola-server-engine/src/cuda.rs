@@ -568,6 +568,7 @@ pub fn deepseek_config(
         host_blocks: 0,
         position_tags: false,
         record: false,
+        gemm: eidola_engine_cuda::ds::gemm::GemmForm::Exact,
     };
     let (_, spec) = DsCudaExecutor::preflight(ds, &config).map_err(refused)?;
     let blocks = derive_deepseek_kv_blocks(ds, &spec, kv_device_bytes, sizing, cache)?;

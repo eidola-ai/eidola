@@ -426,3 +426,35 @@ fn ds_scalar_kernels_fuse_nothing() {
         }
     }
 }
+
+/// DeepSeek's tensor-core GEMMs (`ds_gemm_tc`): warp-level MMAs (`HMMA`, F16
+/// operands: these parts have no warp-level FP8 MMA, and the kernels convert
+/// their FP8 and FP4 codes exactly) and no tcgen05; built without contraction
+/// and dividing nothing, so their SASS holds no fused multiply-add at all (the
+/// block accumulation `acc + (dot · scale) · scale` is three rounded
+/// operations, as the reference's). The image has exactly its entries.
+#[test]
+fn ds_gemm_tc_runs_on_tensor_cores_and_fuses_nothing() {
+    let manifest = Manifest::embedded();
+    let mut want = vec!["eidola_ds_gemm_probe".to_owned()];
+    for product in ["lin4", "lin8"] {
+        for form in ["banded", "tolerance"] {
+            for tile in ["s8", "t32", "t8"] {
+                want.push(format!("eidola_ds_{product}_{form}_{tile}"));
+            }
+        }
+    }
+    want.sort_unstable();
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        let cubin = manifest.cubin("ds_gemm_tc", arch).expect("ds_gemm_tc");
+        assert_eq!(cubin.profile, "exact");
+        assert!(mma(manifest, "ds_gemm_tc", arch, "HMMA") > 0, "{arch}");
+        assert_eq!(mma(manifest, "ds_gemm_tc", arch, "UTC"), 0, "{arch}");
+        let ops = cubin.float_ops.as_ref().expect("float_ops");
+        assert!(ops.ptx_rounded > 0, "{arch}");
+        assert_eq!(ops.sass_fma, 0, "{arch}");
+        let mut symbols: Vec<String> = cubin.entries.iter().map(|e| e.symbol.clone()).collect();
+        symbols.sort_unstable();
+        assert_eq!(symbols, want, "{arch}");
+    }
+}

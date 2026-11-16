@@ -1041,6 +1041,7 @@ mod tests {
             host_blocks: 0,
             position_tags: false,
             record: false,
+            gemm: crate::ds::gemm::GemmForm::Exact,
         };
         let device = || -> Box<dyn Device> { Box::new(DryDevice::new(None)) };
         let x = DsCudaExecutor::build_with(device(), device(), None, &c, Some(map), &cfg, false)

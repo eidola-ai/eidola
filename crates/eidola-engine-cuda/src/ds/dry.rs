@@ -15,9 +15,10 @@ use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::secret::KvKey;
 
 use super::abi::*;
+use super::gemm::GemmForm;
 use super::half::{AcceptArgs, Device, SampleArgs};
 use super::kernels::DsKernels;
-use super::{attention, gemm_ref, head, index, ops};
+use super::{attention, gemm, gemm_ref, head, index, ops};
 use crate::{CudaError, Result};
 
 /// The dry device. Addresses start well above zero and are 256-byte aligned, as a
@@ -53,6 +54,11 @@ impl DryDevice {
 }
 
 impl Device for DryDevice {
+    /// Every form: its launches are checked against every form's grid.
+    fn select_gemm(&mut self, _form: GemmForm) -> Result<()> {
+        Ok(())
+    }
+
     fn alloc(&self, bytes: usize) -> Result<(u64, Box<dyn Any>)> {
         let size = (bytes as u64).next_multiple_of(256);
         let total = self.allocated.get() + size;
@@ -156,8 +162,8 @@ families! {
     mhc_mix: MhcMixParams, rows => ops::mhc_mix_grid,
     collapse: CollapseParams, rows => ops::collapse_grid,
     expand: ExpandParams, rows => ops::expand_grid,
-    lin8: Lin8Params, rows => gemm_ref::lin8_grid,
-    lin4: Lin4Params, layout_rows => gemm_ref::lin4_grid,
+    lin8: Lin8Params, rows => gemm::lin8_every_grid,
+    lin4: Lin4Params, layout_rows => gemm::lin4_every_grid,
     grouped_dot: GroupedDotParams, rows => gemm_ref::grouped_dot_grid,
     attention: AttnParams, rows => |p| {
         attention::check_attn(p)?;

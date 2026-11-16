@@ -31,6 +31,7 @@ use eidola_engine::sampling::{SamplingParams, mix64};
 use eidola_engine::secret::{BootKey, CacheKey, Lineage, SaltDeriver};
 use eidola_engine::spec::{Bucket, Coverage, ModelSpec};
 use eidola_engine_cpu::deepseek::{DsCpuExecutor, DsCpuExecutorConfig};
+use eidola_engine_cuda::ds::gemm::GemmForm;
 use eidola_engine_cuda::ds::half::Device;
 use eidola_engine_cuda::ds::weights::Half;
 use eidola_engine_cuda::ds::{DsCudaExecutor, DsCudaExecutorConfig, StepStats};
@@ -372,6 +373,7 @@ impl Paired {
             host_blocks: how.host_blocks,
             position_tags: true,
             record: true,
+            gemm: GemmForm::from_env().expect("the GEMM form"),
         };
         #[cfg(feature = "dev-staged-experts")]
         let dev = match STAGED.get() {
