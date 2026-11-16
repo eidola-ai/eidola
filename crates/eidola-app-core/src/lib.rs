@@ -12250,7 +12250,8 @@ impl AppCore {
     }
 
     /// Start the background poll loop: one check immediately, then one
-    /// every [`updates::POLL_INTERVAL`] (~6h) while the process runs.
+    /// after each [`updates::next_poll_delay`] (about an hour) while the
+    /// process runs.
     /// Idempotent — at most one loop is ever spawned.
     pub fn start_update_polling(&self) {
         if self
