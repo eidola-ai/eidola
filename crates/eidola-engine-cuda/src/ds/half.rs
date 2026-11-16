@@ -17,7 +17,7 @@ use eidola_engine::secret::KvKey;
 
 use super::abi::*;
 use super::attention::DsAttention;
-use super::gemm_ref::DsGemmRef;
+use super::gemm::{DsGemmSet, GemmForm};
 use super::head::DsHead;
 use super::index::DsIndex;
 use super::kernels::DsKernels;
@@ -94,6 +94,19 @@ pub struct AcceptArgs {
 /// A device's memory and launches. Every operation is queued in order;
 /// [`Device::download`] waits for everything before it.
 pub trait Device {
+    /// Selects the form this device computes the quantised GEMMs in
+    /// ([`DsKernels::lin8`], [`DsKernels::lin4`]); a device that cannot computes
+    /// refuses it. Called once, before the first launch.
+    fn select_gemm(&mut self, form: GemmForm) -> Result<()> {
+        if form == GemmForm::Exact {
+            Ok(())
+        } else {
+            Err(CudaError::new(format!(
+                "this device computes the quantised GEMMs only in the exact form, not {}",
+                form.name()
+            )))
+        }
+    }
     /// `bytes` zeroed bytes at an address aligned to 8, and what keeps them allocated.
     fn alloc(&self, bytes: usize) -> Result<(u64, Box<dyn Any>)>;
     /// # Safety
@@ -267,13 +280,14 @@ impl Buffer {
 const UPLOAD_PIECE: usize = 1 << 28;
 
 /// A half on a CUDA device: its own stream of an opened device, the sampler and cipher
-/// images, and the forward's kernel images behind their launch wrappers.
+/// images, and the forward's kernel images behind their launch wrappers (the quantised
+/// GEMMs in the form [`Device::select_gemm`] chose).
 pub struct CudaDevice {
     gpu: Gpu,
     sampler: Sampler,
     cipher: Mutex<KvCipher>,
     ops: DsOps,
-    gemm: DsGemmRef,
+    gemm: DsGemmSet,
     head: DsHead,
     attention: DsAttention,
     index: DsIndex,
@@ -288,7 +302,7 @@ impl CudaDevice {
             sampler: Sampler::load(&gpu, dir)?,
             cipher: Mutex::new(KvCipher::load(&gpu, dir)?),
             ops: DsOps::load(&gpu, dir)?,
-            gemm: DsGemmRef::load(&gpu, dir)?,
+            gemm: DsGemmSet::load(&gpu, dir)?,
             head: DsHead::load(&gpu, dir)?,
             attention: DsAttention::load(&gpu, dir)?,
             index: DsIndex::load(&gpu, dir)?,
@@ -307,6 +321,11 @@ impl CudaDevice {
 }
 
 impl Device for CudaDevice {
+    fn select_gemm(&mut self, form: GemmForm) -> Result<()> {
+        self.gemm.set_form(form);
+        Ok(())
+    }
+
     fn alloc(&self, bytes: usize) -> Result<(u64, Box<dyn Any>)> {
         let s = self.gpu.stream();
         let buf = s.alloc_zeros::<u64>(bytes.div_ceil(8))?;

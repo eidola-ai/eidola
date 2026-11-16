@@ -4,11 +4,45 @@
 #
 #   ds_gpu_session.sh [step ...]        (no argument: every step, in order)
 #
-#   steps: setup build kernels ds_ops ds_gemm_ref ds_attention ds_index ds_tiny
-#          ds_tiny_drafting ds_tiny_memory mimo summary
+#   steps: setup build kernels ds_ops ds_gemm_ref ds_gemm ds_gemm_bench
+#          ds_attention ds_index ds_tiny ds_tiny_banded ds_tiny_drafting
+#          ds_tiny_memory mimo summary
+#   named only:  ds_gemm_profile
 #   with the released checkpoint (never run by default; name them):
 #          halves_build halves_encoder halves_decoder halves_reference
-#          halves_invariance
+#          halves_invariance halves_banded
+#
+# `ds_gemm` is the quantised GEMMs on tensor cores: the probe of their block
+# product, both forms against the scalar reference in every block shape, and
+# their batch invariance (`ds_gemm.json`); `ds_gemm_bench` times every form
+# and block shape per row count (`ds_gemm_bench.txt`, and its JSON lines in
+# `ds_gemm_bench.jsonl`). The GEMMs alone, as one command:
+#
+#   ds_gpu_session.sh setup build kernels ds_gemm ds_gemm_bench summary
+#
+# `ds_gemm_profile` (never run by default; name it) profiles the tensor-core
+# GEMMs with NVIDIA Nsight Compute, installing it from NVIDIA's apt repository
+# when no `ncu` is found: both forms of `wo_b` (5120 × 8192) and `wq_b`
+# (32768 × 1280) at 1 and 8 rows in the split block and the 8-row tile, and
+# the routed experts' gate and up at 1 token and at 4,096 tokens (about 64
+# rows an expert) in every block shape, each launched once
+# (`ds_gemm_bench --once`). `ncu` runs under sudo (profiling counters are
+# for administrators unless the driver allows them to all users), with the
+# speed-of-light, memory, launch, occupancy, warp-state, scheduler,
+# instruction and source-counter sections. Under $OUT/ncu: per case the
+# report (`.ncu-rep`), its details page as text and as CSV, a per-kernel
+# summary, and the bench's `launch` lines, which name each profiled launch in
+# order. `DRY_RUN=1` prints every command of the step instead of running it.
+#
+#   ds_gpu_session.sh setup build kernels ds_gemm_profile
+#
+# `ds_tiny_banded` is `ds_tiny` with the executor's quantised GEMMs in the
+# banded form (`EIDOLA_DS_GEMM_FORM=banded`), held to the same CPU reference
+# executor bit for bit (`ds_tiny_banded.json`). `halves_banded` runs both
+# device phases of the released model again in the banded form, under
+# $OUT/ds_halves_banded, and requires every recording (boundary, both halves'
+# layers, logits) to be byte for byte the exact run's: run it after
+# `halves_encoder` and `halves_decoder`.
 #
 # `ds_tiny` is the executor without drafts; `ds_tiny_drafting` is every draft
 # width and acceptance pattern, seeded sampling and the scenarios again with
@@ -61,7 +95,9 @@
 # Expected time on one B300, after `setup` and `build` (about 10 minutes
 # together on a fresh machine): kernels under 1 minute; ds_ops 5 to 10
 # (the casts over every f32 through the probe, the released shapes);
-# ds_gemm_ref 3 to 8 (the whole vocabulary through the head);
+# ds_gemm_ref 3 to 8 (the whole vocabulary through the head); ds_gemm about
+# 12 (the probe is 8.6 billion dot products a case, 48 cases an image) and
+# ds_gemm_bench about 3;
 # ds_attention and ds_index 1 to 3 each; ds_tiny about 1 (the CPU reference
 # executor runs beside the device and is most of it); ds_tiny_drafting 3 to 6
 # and ds_tiny_memory 1 to 3 (not measured); mimo 3 to 6. With the checkpoint:
@@ -163,8 +199,94 @@ kernels() {
 # every f32) before the kernels' cases.
 ds_ops() { device_tests ds_ops; }
 ds_gemm_ref() { device_tests ds_gemm_ref; }
+ds_gemm() { device_tests ds_gemm; }
+ds_gemm_bench() {
+    (cd "$REPO" && cargo run --release --locked -p eidola-engine-cuda --example ds_gemm_bench -- \
+        "$KERNELS" --all-tiles) | tee "$OUT/ds_gemm_bench.txt"
+    grep '^{' "$OUT/ds_gemm_bench.txt" > "$OUT/ds_gemm_bench.jsonl"
+}
 ds_attention() { device_tests ds_attention; }
 ds_index() { device_tests ds_index; }
+# A command, or with DRY_RUN set the command printed.
+x() {
+    if [ -n "${DRY_RUN:-}" ]; then
+        printf 'would run:'
+        printf ' %q' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+find_ncu() {
+    local c
+    for c in "$(command -v ncu 2>/dev/null || true)" /usr/local/cuda/bin/ncu \
+        /opt/nvidia/nsight-compute/*/ncu /usr/local/cuda-*/bin/ncu; do
+        if [ -n "$c" ] && [ -x "$c" ]; then printf '%s\n' "$c"; return 0; fi
+    done
+    return 1
+}
+
+# Nsight Compute from NVIDIA's CUDA apt repository (its keyring first, when
+# the repository is not configured): the newest `nsight-compute-<version>`.
+install_ncu() {
+    . /etc/os-release 2>/dev/null || true
+    local release="ubuntu${VERSION_ID:-24.04}"
+    release="${release//./}"
+    if ! grep -rqs 'developer.download.nvidia.com/compute/cuda/repos' /etc/apt/; then
+        x curl -fsSL -o "$WORK/cuda-keyring.deb" \
+            "https://developer.download.nvidia.com/compute/cuda/repos/$release/x86_64/cuda-keyring_1.1-1_all.deb"
+        x sudo dpkg -i "$WORK/cuda-keyring.deb"
+    fi
+    x sudo apt-get update -y
+    local pkg
+    pkg="$( (apt-cache search --names-only '^nsight-compute-[0-9]' 2>/dev/null || true) |
+        cut -d' ' -f1 | sort -V | tail -1)"
+    [ -n "$pkg" ] || pkg=nsight-compute
+    x sudo apt-get install -y "$pkg"
+}
+
+# profile_case <name> <bench arguments>...: one bench run under ncu, and its
+# report as text.
+profile_case() {
+    local name="$1"
+    shift
+    local ncu="$NCU" bin="$CARGO_TARGET_DIR/release/examples/ds_gemm_bench" dir="$OUT/ncu"
+    local sudo=(sudo -E)
+    [ "$(id -u)" -eq 0 ] && sudo=()
+    x ${sudo[@]+"${sudo[@]}"} "$ncu" --target-processes all --kernel-name regex:'^eidola_ds_lin[48]_' \
+        --section SpeedOfLight --section MemoryWorkloadAnalysis --section MemoryWorkloadAnalysis_Tables \
+        --section LaunchStats --section Occupancy --section WarpStateStats --section SchedulerStats \
+        --section ComputeWorkloadAnalysis --section InstructionStats --section SourceCounters \
+        --export "$dir/$name" --force-overwrite \
+        "$bin" "$KERNELS" --once --forms banded,tolerance "$@" > "$dir/$name.run.txt"
+    grep '^launch ' "$dir/$name.run.txt" > "$dir/$name.launches.txt" || [ -n "${DRY_RUN:-}" ]
+    x ${sudo[@]+"${sudo[@]}"} chown "$(id -u):$(id -g)" "$dir/$name.ncu-rep"
+    x "$ncu" --import "$dir/$name.ncu-rep" --page details > "$dir/$name.details.txt"
+    x "$ncu" --import "$dir/$name.ncu-rep" --page details --csv > "$dir/$name.details.csv"
+    x "$ncu" --import "$dir/$name.ncu-rep" --print-summary per-kernel > "$dir/$name.summary.txt"
+}
+
+# The tensor-core GEMMs under Nsight Compute (the header says what).
+ds_gemm_profile() {
+    [ -n "${DRY_RUN:-}" ] || { [ -n "$KERNELS" ] && [ -d "$KERNELS/cubin" ]; } ||
+        die "no kernel build output: set KERNELS"
+    NCU="$(find_ncu || true)"
+    if [ -z "$NCU" ]; then
+        say "installing Nsight Compute"
+        install_ncu
+        NCU="$(find_ncu || echo /usr/local/cuda/bin/ncu)"
+    fi
+    export NCU
+    x "$NCU" --version
+    (cd "$REPO" && x cargo build --release --locked -p eidola-engine-cuda --example ds_gemm_bench)
+    mkdir -p "$OUT/ncu"
+    profile_case wo_b --only dense --dense 5120,8192 --rows 1,8 --tiles s8,t8
+    profile_case wq_b --only dense --dense 32768,1280 --rows 1,8 --tiles s8,t8
+    profile_case experts --only experts --rows 1,4096 --tiles s8,t8,t32
+    ls -l "$OUT/ncu"
+}
+
 # device_test_named <test binary> <test name>: one test of a binary.
 device_test_named() {
     (cd "$REPO" && cargo test --release --locked -p eidola-engine-cuda --test "$1" -- \
@@ -177,6 +299,10 @@ device_test_named() {
 ds_tiny() { device_test_named ds_tiny the_tiny_model_equals_the_cpu_reference_executor; }
 ds_tiny_drafting() {
     device_test_named ds_tiny the_tiny_model_drafts_as_the_cpu_reference_executor
+}
+ds_tiny_banded() {
+    EIDOLA_DS_GEMM_FORM=banded EIDOLA_DS_TINY_SUMMARY="$OUT/ds_tiny_banded.json" \
+        device_test_named ds_tiny the_tiny_model_equals_the_cpu_reference_executor
 }
 ds_tiny_memory() {
     device_test_named ds_tiny the_tiny_model_keeps_its_memory_as_the_cpu_reference_executor
@@ -215,6 +341,22 @@ halves_invariance() {
         cargo run --release --locked -p eidola-engine-cuda --example ds_halves)
 }
 
+# The released model's device phases with the banded GEMMs, and every
+# recording against the exact run's.
+halves_banded() {
+    [ -n "${CHECKPOINT:-}" ] && [ -d "$CHECKPOINT" ] || die "CHECKPOINT names no directory"
+    [ -f "$OUT/ds_halves/logits.bin" ] || die "run halves_encoder and halves_decoder first"
+    (cd "$REPO" && EIDOLA_DEEPSEEK_FULL_DIR="$CHECKPOINT" EIDOLA_DS_HALVES_OUT="$OUT/ds_halves_banded" \
+        EIDOLA_DS_HALVES_PHASES=encoder,decoder EIDOLA_DS_GEMM_FORM=banded \
+        cargo run --release --locked -p eidola-engine-cuda --example ds_halves)
+    local f
+    for f in boundary_entries.bin boundary_streams.bin boundary_pre.bin encoder_layers.bin \
+        decoder_layers.bin logits.bin; do
+        cmp "$OUT/ds_halves/$f" "$OUT/ds_halves_banded/$f" || die "banded $f differs from the exact run's"
+        say "banded $f: equal"
+    done
+}
+
 summary() {
     {
         printf '{\n  "gpu": "%s",\n  "kernels": "%s",\n  "steps": [\n' \
@@ -233,8 +375,8 @@ summary() {
     cat "$OUT/session.json"
 }
 
-ALL="setup build kernels ds_ops ds_gemm_ref ds_attention ds_index ds_tiny ds_tiny_drafting ds_tiny_memory mimo summary"
-NAMED="halves_build halves_encoder halves_decoder halves_reference halves_invariance"
+ALL="setup build kernels ds_ops ds_gemm_ref ds_gemm ds_gemm_bench ds_attention ds_index ds_tiny ds_tiny_banded ds_tiny_drafting ds_tiny_memory mimo summary"
+NAMED="ds_gemm_profile halves_build halves_encoder halves_decoder halves_reference halves_invariance halves_banded"
 for step in ${*:-$ALL}; do
     case " $ALL $NAMED " in
         *" $step "*) ;;

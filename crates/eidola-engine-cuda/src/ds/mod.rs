@@ -1,6 +1,6 @@
 //! The DeepSeek-V4.1 executor's modules, beside the MiMo-V2.6 ones.
 //!
-//! [`abi`] is the kernels' parameter structs; [`ops`], [`gemm_ref`], [`head`],
+//! [`abi`] is the kernels' parameter structs; [`ops`], [`gemm_ref`], [`gemm`], [`head`],
 //! [`attention`] and [`index`] are the launch wrappers of the kernel images, and
 //! [`kernels`] the launches the executor makes through them. [`executor`] is the seam,
 //! over two [`half`]s whose forward is [`model`], with [`plan`] ordering a step's rows,
@@ -16,6 +16,7 @@ pub mod attention;
 pub mod boundary;
 pub mod dry;
 pub mod executor;
+pub mod gemm;
 pub mod gemm_ref;
 pub mod half;
 pub mod head;
