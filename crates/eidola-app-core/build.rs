@@ -191,6 +191,16 @@ fn main() {
         &supported_attestation_schema_versions,
     );
 
+    push_str_const(
+        &mut out,
+        "RELEASE_TRUST_SHA256",
+        &release_trust_sha256(&[
+            &trust_constants_path,
+            &sigstore_trusted_root_path,
+            &attestation_templates_path,
+        ]),
+    );
+
     out.push_str(&format!(
         "pub const ATTESTATION_TEMPLATES_JSON: &str = include_str!({:?});\n",
         attestation_templates_path
@@ -280,6 +290,24 @@ fn exact_keys(value: &serde_json::Value, keys: &[&str], at: &str) {
     if found != keys {
         panic!("{at} must have exactly the members {keys:?}, found {found:?}");
     }
+}
+
+/// One digest over every file a release verdict is judged against, each
+/// length-prefixed so no two different sets of files share it. A verdict
+/// persisted under another digest was reached under other pins.
+fn release_trust_sha256(paths: &[&Path]) -> String {
+    let mut hasher = Sha256::new();
+    for path in paths {
+        let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(&bytes);
+    }
+    let mut hex = String::with_capacity(64);
+    for b in hasher.finalize() {
+        use std::fmt::Write;
+        write!(hex, "{b:02x}").unwrap();
+    }
+    hex
 }
 
 /// The URL hash: the launch digest says which image, HOST_DATA which
