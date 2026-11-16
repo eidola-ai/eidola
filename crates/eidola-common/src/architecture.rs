@@ -170,15 +170,60 @@ pub struct Shape {
     /// whose weights are bounded by the whole pack
     /// (`engine_deployment::artifact_data_bytes`).
     pub weights_bytes: Option<u64>,
-    /// For an executor that gives every KV group of every device one block
-    /// count (DeepSeek-V4.1's), this device's groups, in the executor's
-    /// block layout; empty for one that sizes each group's pool by its own
-    /// rule (MiMo-V2.6's), whose bounds read the per-position fields above.
+    /// For an executor that gives every bank group of every device one block
+    /// count and every window group another (DeepSeek-V4.1's), this device's
+    /// groups, in the executor's block layout; empty for one that sizes each
+    /// group's pool by its own rule (MiMo-V2.6's), whose bounds read the
+    /// per-position fields above.
     pub uniform_kv_groups: &'static [UniformKvGroup],
+    /// Of [`Shape::weights_bytes`], the drafter's, which an executor that does
+    /// not draft never loads (bounded from below, so the weights without it
+    /// stay bounded from above); 0 where the drafter is elsewhere or none.
+    pub drafter_weights_bytes: u64,
+    /// For an executor whose step scratch this crate counts allocation by
+    /// allocation (DeepSeek-V4.1's), that count; `None` for one whose reserve
+    /// reads the per-token fields above (MiMo-V2.6's).
+    pub step_scratch: Option<StepScratch>,
 }
 
-/// One KV group of an executor whose groups all hold the same number of
-/// blocks (`Shape::uniform_kv_groups`). A block of it is `layers` layers of
+/// A device's step scratch, as an executor sizes it beside its weights and KV
+/// (`eidola-engine-cuda`'s `ds::model::Scratch` and `DraftScratch`, the
+/// pooled sources' open entries): `engine_deployment::cuda_device_reserve_bytes`
+/// reads it for a shape that has it. The byte counts are the executor's own,
+/// held to its allocations by `eidola-server-engine`'s `cuda::tests`.
+///
+/// A step's **rows** are `MAX_BATCHED_TOKENS`, or with drafting
+/// `MAX_SEQS × draft_slots` when that is more (a draft pass computes every
+/// slot of every drafting row). The scratch is then:
+/// - per row, `row_bytes`, with drafting `draft_row_bytes` more, and the
+///   indexer's scores and candidate mask over every visible entry of a
+///   `MAX_MODEL_LEN` sequence: `2 × (MAX_MODEL_LEN / index_ratio + 1)` bytes
+///   of scores and a mask word per 32 candidate blocks of `candidate_entries`
+///   entries (`engine_deployment::index_scratch_row_bytes`), which is what
+///   grows with step tokens × context;
+/// - per seat, `seat_bytes`, `per_draft_seat_bytes` per drafted token and,
+///   with drafting, `drafting_seat_bytes`;
+/// - `fixed_bytes`, which bounds the few allocations of no row or seat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepScratch {
+    pub row_bytes: u64,
+    pub draft_row_bytes: u64,
+    /// Positions per index-score entry: the pooling ratio of the bank this
+    /// device's indexer scores.
+    pub index_ratio: u64,
+    /// Entries per candidate block the mask has a bit for.
+    pub candidate_entries: u64,
+    pub seat_bytes: u64,
+    pub per_draft_seat_bytes: u64,
+    pub drafting_seat_bytes: u64,
+    /// The drafter's slots, every one computed for every drafting row.
+    pub draft_slots: u64,
+    pub fixed_bytes: u64,
+}
+
+/// One KV group of an executor whose bank groups all hold one number of
+/// blocks and whose window groups all hold another
+/// (`Shape::uniform_kv_groups`). A block of it is `layers` layers of
 /// `KV_BLOCK_SIZE / ratio` entries of `entry_bytes` each, padded to 16 bytes
 /// (`eidola-engine-cuda`'s `ds::kv::GroupGeometry::block_bytes`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +234,11 @@ pub struct UniformKvGroup {
     pub ratio: u64,
     /// Bytes of one entry of one layer.
     pub entry_bytes: u64,
+    /// A sliding-window group, whose pool holds running sequences' live
+    /// windows and the windows retained at hit points
+    /// (`engine_deployment::uniform_kv_window_blocks`); otherwise a bank
+    /// (full attention), whose pool holds whole sequences.
+    pub window: bool,
     /// The drafter's group: present only when drafting (`DRAFT_TOKENS` > 0),
     /// and the same size at every draft width.
     pub drafter: bool,
@@ -238,6 +288,8 @@ pub const MIMO_V26_FLASH: Shape = Shape {
     rope_device_bytes_per_position: 3 * 64 * 4,
     weights_bytes: None,
     uniform_kv_groups: &[],
+    drafter_weights_bytes: 0,
+    step_scratch: None,
 };
 
 /// One window-KV cell of DeepSeek-V4.1: 512 FP8 codes and an E8M0 scale per
@@ -255,12 +307,13 @@ const DS_LAYERS_PER_DEVICE: u64 = 20;
 /// `eidola-engine-cpu`'s DeepSeek executor, whose packed forms are the bytes
 /// a device executor holds).
 ///
-/// The executor-scratch fields bound a DeepSeek CUDA executor's own
-/// allocations from above by the same rules as MiMo's, at this model's
-/// widths. They are provisional: that executor's allocations are the
-/// reference, and its derivation must be held to these numbers (or these to
-/// it) when it lands. The KV groups are that executor's (its block layouts,
-/// which `eidola-server-engine`'s `cuda::tests` hold these equal to).
+/// The executor's step scratch is its own count ([`StepScratch`]): the
+/// device reserve reads that, not the per-token, expert-floor and sampler
+/// fields, and `eidola-server-engine`'s `cuda::tests` hold it to the
+/// executor's allocations (the index scratch exactly, the rest within its
+/// `fixed_bytes`) and lay the released model out wherever the shared check
+/// admits it. The KV groups are that executor's (its block layouts, which
+/// the same tests hold these equal to).
 pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
     // Device 0: the embedding, layers 0-19 with the first Engram table, and
     // layer 20's bank stub.
@@ -288,6 +341,21 @@ pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
         rope_device_bytes_per_position: DS_ROPE_DEVICE_BYTES_PER_POSITION,
         // 250.86 GB in the released checkpoint's headers, rounded up.
         weights_bytes: Some(250_870_000_000),
+        drafter_weights_bytes: 0,
+        step_scratch: Some(StepScratch {
+            row_bytes: 602_248,
+            draft_row_bytes: 0,
+            // The encoder's indexers score the pooled bank.
+            index_ratio: 2,
+            candidate_entries: 8,
+            // The pooled sources' open entries: 2 × 3 sources × 512 f32 for
+            // each of `ratio + 1` kept positions, one more per draft.
+            seat_bytes: 36_864,
+            per_draft_seat_bytes: 12_288,
+            drafting_seat_bytes: 0,
+            draft_slots: 5,
+            fixed_bytes: DS_SCRATCH_FIXED_BYTES,
+        }),
         // The executor's encoder groups: the three pooled sources' bank, and
         // layers 0-19's window.
         uniform_kv_groups: &[
@@ -295,12 +363,14 @@ pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
                 layers: 3,
                 ratio: 2,
                 entry_bytes: DS_GLOBAL_CELL,
+                window: false,
                 drafter: false,
             },
             UniformKvGroup {
                 layers: DS_LAYERS_PER_DEVICE,
                 ratio: 1,
                 entry_bytes: DS_WINDOW_CELL,
+                window: true,
                 drafter: false,
             },
         ],
@@ -329,6 +399,27 @@ pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
         rope_device_bytes_per_position: DS_ROPE_DEVICE_BYTES_PER_POSITION,
         // 259.78 GB in the released checkpoint's headers, rounded up.
         weights_bytes: Some(259_790_000_000),
+        // The drafter with its own embedding copy: 9,257,832,840 bytes on
+        // the device, rounded down.
+        drafter_weights_bytes: 9_257_000_000,
+        step_scratch: Some(StepScratch {
+            row_bytes: 538_964,
+            // The draft pass's taps and the main model's rows.
+            draft_row_bytes: 56_804,
+            // The split layer's per-position source.
+            index_ratio: 1,
+            candidate_entries: 8,
+            // A sampling row: the f32 logits over the head's 129,280 rows,
+            // the f64 distribution over the 129,264 sampleable ids, and 36
+            // bytes of row state; one per drafted token more.
+            seat_bytes: 1_551_268,
+            per_draft_seat_bytes: 1_551_268,
+            // The draft pass of every slot (its KV, lists, base logits and
+            // distributions) and the drafter's own logits row.
+            drafting_seat_bytes: 9_312_270,
+            draft_slots: 5,
+            fixed_bytes: DS_SCRATCH_FIXED_BYTES,
+        }),
         // The executor's decoder groups: layer 20's bank, layers 20-39's
         // window, and when drafting the drafter's three blocks' window.
         uniform_kv_groups: &[
@@ -336,23 +427,32 @@ pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
                 layers: 1,
                 ratio: 1,
                 entry_bytes: DS_GLOBAL_CELL,
+                window: false,
                 drafter: false,
             },
             UniformKvGroup {
                 layers: DS_LAYERS_PER_DEVICE,
                 ratio: 1,
                 entry_bytes: DS_WINDOW_CELL,
+                window: true,
                 drafter: false,
             },
             UniformKvGroup {
                 layers: 3,
                 ratio: 1,
                 entry_bytes: DS_WINDOW_CELL,
+                window: true,
                 drafter: true,
             },
         ],
     },
 ];
+
+/// Bounds a device's scratch allocations of no row or seat (the status
+/// words, the expert groups' ends, the drafter's per-step words) and what the
+/// expert layout's rounding adds: at most 37,768 bytes over the released
+/// configuration's sizings, rounded up to 40 KiB.
+const DS_SCRATCH_FIXED_BYTES: u64 = 40 << 10;
 
 /// The f32 logits row (129,280 × 4 bytes), the four residual copies of the
 /// 5,120-wide stream, the 64 query heads of 512 and the six experts' rows:

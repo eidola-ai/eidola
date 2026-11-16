@@ -517,6 +517,8 @@ fn serving_config(
         block_size: block,
         // Every seat's sequence, the null block, and a little room.
         num_blocks: seqs * (max_model_len / block) + 8,
+        // The windows sized as the banks: every seat's whole sequence.
+        window_blocks: seqs * (max_model_len / block) + 8,
         num_state_slots: seqs,
         max_model_len,
         buckets: vec![Bucket {

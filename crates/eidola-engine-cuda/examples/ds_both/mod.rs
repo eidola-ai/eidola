@@ -77,6 +77,7 @@ impl Layout {
         let cfg = DsCudaExecutorConfig {
             block_size: BLOCK,
             num_blocks: slots * (positions / BLOCK) + 2,
+            window_blocks: slots * (positions / BLOCK) + 2,
             num_state_slots: slots,
             max_model_len: positions,
             buckets: vec![Bucket {

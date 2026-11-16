@@ -29,8 +29,14 @@ pub use oracle::{DsDenseOracle, DsDenseRun};
 pub struct DsCpuExecutorConfig {
     /// Positions per KV block (every group); a multiple of the pooling ratio.
     pub block_size: u32,
-    /// Physical blocks per group, including the null block 0.
+    /// Physical blocks per bank group (full attention: the encoder's pooled bank and the
+    /// decoder's per-position one), including the null block 0.
     pub num_blocks: u32,
+    /// Physical blocks per window group (sliding: the encoder's, the decoder's and the
+    /// drafter's windows), including the null block 0. A window group only ever holds
+    /// running sequences' live windows and the windows retained at hit points, so it may
+    /// be far smaller than a bank (`crates/eidola-engine/AGENTS.md` → Window pools).
+    pub window_blocks: u32,
     /// Host-tier blocks per group, including the null block 0; 0 for no host tier.
     pub host_blocks: u32,
     /// Per-sequence state rows.
@@ -55,6 +61,7 @@ impl DsCpuExecutorConfig {
         Self {
             block_size: 16,
             num_blocks: 256,
+            window_blocks: 256,
             host_blocks: 0,
             num_state_slots: 16,
             max_model_len: c.max_positions.unwrap_or(4096) as u32,
@@ -196,7 +203,10 @@ impl DsCpuExecutor {
                 num_kv_heads: 1,
                 head_dim_qk: hd,
                 head_dim_v: hd,
-                num_blocks: cfg.num_blocks,
+                num_blocks: match attention {
+                    AttentionKind::Full => cfg.num_blocks,
+                    AttentionKind::Sliding { .. } => cfg.window_blocks,
+                },
                 host_blocks: cfg.host_blocks,
                 ratio,
                 device,

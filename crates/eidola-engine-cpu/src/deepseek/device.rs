@@ -268,7 +268,7 @@ fn group_mem(
 ) -> GroupMem {
     let g = &spec.kv_groups[global as usize];
     let cells = (spec.block_size / g.ratio * g.num_layers) as usize;
-    let pool = BytePool::new(cell_bytes, cells, cfg.num_blocks as usize);
+    let pool = BytePool::new(cell_bytes, cells, g.num_blocks as usize);
     let host = (cfg.host_blocks > 0).then(|| {
         let mut host = pool.like(cfg.host_blocks as usize);
         host.lock().unwrap_or_else(|e| {
@@ -828,6 +828,7 @@ mod tests {
         let cfg = DsCpuExecutorConfig {
             block_size,
             num_blocks: blocks,
+            window_blocks: blocks,
             host_blocks: 0,
             num_state_slots: 1,
             max_model_len: blocks * block_size,

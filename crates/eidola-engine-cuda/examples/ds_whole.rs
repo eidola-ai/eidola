@@ -360,6 +360,7 @@ fn generation_config(
         block_size: block,
         // The sequence twice over, the null block, and a little room.
         num_blocks: 2 * (max_model_len / block) + 8,
+        window_blocks: 2 * (max_model_len / block) + 8,
         num_state_slots: 2,
         max_model_len,
         buckets: vec![Bucket {

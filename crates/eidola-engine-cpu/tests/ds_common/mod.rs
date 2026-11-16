@@ -150,6 +150,7 @@ pub fn exec_config(blocks: u32, draft_width: u32) -> DsCpuExecutorConfig {
     DsCpuExecutorConfig {
         block_size: 8,
         num_blocks: blocks,
+        window_blocks: blocks,
         host_blocks: 0,
         num_state_slots: 16,
         max_model_len: 1024,
