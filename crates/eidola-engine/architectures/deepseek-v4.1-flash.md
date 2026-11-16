@@ -29,7 +29,7 @@
 
 ## How it is verified
 
-Each rung holds the next one to the one below it bit for bit:
+Each level is held bit for bit to the one before it:
 
 1. **The reference forward** (`eidola-engine-model`) is exact against DeepSeek's released code with the unspecified operations pinned. That holds on a synthetic fixture, on a 12-layer truncation of the real weights and on the first four real layers whole.
 2. **At full depth on the released model** (555 tokens), ours against the reference on a GPU agrees on the top token 94.1–95.7 % of the time with KL 0.023–0.024. The reference against itself gives 94.4 %. Both pass the health check.
