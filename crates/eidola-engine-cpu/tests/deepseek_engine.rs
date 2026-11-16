@@ -4,9 +4,9 @@
 //! draft draw, every produced token), and every finished output against dense
 //! generation. The two logical devices run in every test.
 
-mod ds_common;
+mod deepseek_common;
 
-use ds_common::*;
+use deepseek_common::*;
 use eidola_engine::engine::{CacheScope, FinishReason};
 
 #[test]

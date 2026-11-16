@@ -5,7 +5,7 @@ use eidola_engine::executor::Slot;
 use eidola_engine::spec::NULL_BLOCK;
 
 use super::pool::BytePool;
-use crate::pool::Tag;
+use crate::page::Tag;
 
 /// One KV group on a device.
 #[derive(Debug)]

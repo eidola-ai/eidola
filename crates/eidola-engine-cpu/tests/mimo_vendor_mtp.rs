@@ -8,14 +8,15 @@
 //! A draft chain that feeds one depth's output into the next (or shifts any depth's
 //! token, hidden row or position) fails this bit for bit at depth 1 and beyond.
 
-mod common;
+mod mimo_common;
 
 use std::collections::HashMap;
 
-use common::*;
 use eidola_engine::engine::CacheScope;
 use eidola_engine::sampling::{self, Logits};
-use eidola_engine_model::{ForwardOptions, LogitsAt, Matrix, ReferenceModel};
+use eidola_engine_model::Matrix;
+use eidola_engine_model::mimo::{ForwardOptions, LogitsAt, ReferenceModel};
+use mimo_common::*;
 
 /// Logits of MTP layer `layer`, as draft depth `k`, at every anchor `x` with `t_{x+k+1}`
 /// inside `tokens` (row `x` is anchor `x`).

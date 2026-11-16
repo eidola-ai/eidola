@@ -1,29 +1,29 @@
 //! The engine over the CPU executor on a truncated real MiMo-V2.6-Flash-MOPD checkpoint
 //! (checkpoint layers 0, 1, 2 and 5 plus the three MTP layers; see the model crate's
-//! `golden/README.md` for how it is fetched). Chunked prefill, speculative decoding with
+//! `golden/mimo/README.md` for how it is fetched). Chunked prefill, speculative decoding with
 //! all three MTP depths, and a prefix-cache hit; every computed logit row (target and
 //! drafter) is compared bit for bit with the dense reference forward on the same
 //! truncation. Local only, slow, and needs tens of GB of RAM:
 //!
 //! ```text
-//! cargo test --release -p eidola-engine-cpu --test real_flash -- --ignored --nocapture
+//! cargo test --release -p eidola-engine-cpu --test mimo_real_flash -- --ignored --nocapture
 //! ```
 //!
 //! `EIDOLA_MIMO_TRUNCATED_DIR` overrides the checkpoint directory.
 
-mod common;
+mod mimo_common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use common::*;
 use eidola_engine::engine::CacheScope;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
-use eidola_engine_cpu::{CpuExecutorConfig, MtpHidden};
+use eidola_engine_cpu::mimo::{CpuExecutorConfig, MtpHidden};
+use eidola_engine_model::mimo::{LoadOptions, ModelWeights, ReferenceModel};
 use eidola_engine_model::safetensors::WeightSet;
-use eidola_engine_model::{LoadOptions, ModelWeights, ReferenceModel};
+use mimo_common::*;
 
 fn checkpoint_dir() -> PathBuf {
     if let Ok(d) = std::env::var("EIDOLA_MIMO_TRUNCATED_DIR") {
@@ -38,7 +38,7 @@ fn checkpoint_dir() -> PathBuf {
 }
 
 #[test]
-#[ignore = "needs a locally fetched truncated checkpoint; see the model crate's golden/README.md"]
+#[ignore = "needs a locally fetched truncated checkpoint; see the model crate's golden/mimo/README.md"]
 fn truncated_flash_through_the_engine_matches_the_dense_forward() {
     let dir = checkpoint_dir();
     let golden = WeightSet::open_files(&[dir.join("golden/hf-golden.safetensors")])
@@ -54,8 +54,7 @@ fn truncated_flash_through_the_engine_matches_the_dense_forward() {
 
     let t0 = Instant::now();
     let store = WeightSet::open_dir(&dir).unwrap();
-    let config = store
-        .model_config()
+    let config = eidola_engine_model::mimo::config_of(&store)
         .unwrap()
         .truncated(&[0, 1, 2, 5])
         .unwrap();

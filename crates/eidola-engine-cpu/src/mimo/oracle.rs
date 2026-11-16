@@ -12,9 +12,10 @@
 //! draft for position `p + 1 + i` is depth `i`'s prediction at slot `p + i`.
 
 use eidola_engine::sampling::{self, Logits, SamplingParams};
-use eidola_engine_model::{ForwardOptions, LogitsAt, Matrix, ReferenceModel, Result};
+use eidola_engine_model::mimo::{ForwardOptions, LogitsAt, ReferenceModel};
+use eidola_engine_model::{Matrix, Result};
 
-use crate::executor::MtpHidden;
+use crate::mimo::executor::MtpHidden;
 
 /// Dense logits and drafter outputs for one token sequence.
 #[derive(Debug)]

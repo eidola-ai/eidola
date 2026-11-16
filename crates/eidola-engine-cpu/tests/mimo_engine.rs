@@ -3,15 +3,15 @@
 //! computed position, drafter logits at every drafter row, every draft draw, every
 //! produced token), and every finished output against dense generation.
 
-mod common;
+mod mimo_common;
 
 use std::collections::{BTreeSet, HashMap};
 
-use common::*;
 use eidola_engine::engine::{CacheScope, FinishReason};
 use eidola_engine::sampling::SamplingParams;
-use eidola_engine_cpu::MtpHidden;
-use eidola_engine_model::LoadOptions;
+use eidola_engine_cpu::mimo::MtpHidden;
+use eidola_engine_model::mimo::LoadOptions;
+use mimo_common::*;
 
 #[test]
 fn single_requests_match_the_dense_oracle() {

@@ -6,11 +6,11 @@
 //! a randomized workload holds the engine's invariants after every step with every row
 //! equal to the dense oracle.
 
-mod ds_common;
+mod deepseek_common;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use ds_common::*;
+use deepseek_common::*;
 use eidola_engine::engine::{CacheScope, FinishReason};
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;

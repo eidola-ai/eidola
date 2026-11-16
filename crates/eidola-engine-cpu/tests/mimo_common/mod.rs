@@ -12,12 +12,12 @@ use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::{self, Logits, SamplingParams, Stream, mix64};
 use eidola_engine::secret::{BootKey, CacheKey, Lineage, SaltDeriver};
 use eidola_engine::spec::{Bucket, ModelSpec};
-use eidola_engine_cpu::oracle::check_generation;
-use eidola_engine_cpu::{
+use eidola_engine_cpu::mimo::oracle::check_generation;
+use eidola_engine_cpu::mimo::{
     CpuExecutor, CpuExecutorConfig, DenseOracle, DenseRun, MtpHidden, RowRecord,
 };
+use eidola_engine_model::mimo::{LoadOptions, ModelConfig, ModelWeights, ReferenceModel};
 use eidola_engine_model::safetensors::WeightSet;
-use eidola_engine_model::{LoadOptions, ModelConfig, ModelWeights, ReferenceModel};
 
 /// Deterministic test RNG (SplitMix64).
 pub struct TestRng(pub u64);
@@ -76,8 +76,8 @@ pub fn salt(n: u8) -> Lineage {
 }
 
 pub fn load_fixture(opts: &LoadOptions) -> ReferenceModel {
-    let dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../eidola-engine-model/tests/fixtures/tiny");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../eidola-engine-model/tests/fixtures/mimo_tiny");
     let config = ModelConfig::from_file(&dir.join("config.json")).unwrap();
     let store = Arc::new(WeightSet::open_files(&[dir.join("model.safetensors")]).unwrap());
     ReferenceModel::new(ModelWeights::load(store, config, opts).unwrap())
@@ -489,8 +489,8 @@ impl Harness {
 /// head scaled by `head_scale`, and only the listed layers: a model whose distributions
 /// have few enough outcomes for statistics and drafts that often agree with the target.
 pub fn small_vocab_fixture(vocab: usize, head_scale: f32, layers: &[usize]) -> Arc<ReferenceModel> {
-    let dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../eidola-engine-model/tests/fixtures/tiny");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../eidola-engine-model/tests/fixtures/mimo_tiny");
     let config = ModelConfig::from_file(&dir.join("config.json"))
         .unwrap()
         .truncated(layers)

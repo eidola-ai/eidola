@@ -6,14 +6,14 @@
 //! the branch, preemption and resume, the randomized workload) runs through encryption
 //! and decryption too.
 
-mod common;
+mod mimo_common;
 
 use std::collections::BTreeMap;
 
-use common::*;
 use eidola_engine::engine::CacheScope;
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
+use mimo_common::*;
 
 type Images = BTreeMap<(u32, u32), Vec<u32>>;
 

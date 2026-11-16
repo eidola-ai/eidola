@@ -4,16 +4,16 @@
 //! actually happens (including whole accepted chains), and seeded speculative sampling
 //! draws from exactly the target distribution.
 
-mod common;
+mod mimo_common;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common::*;
 use eidola_engine::engine::CacheScope;
 use eidola_engine::sampling::{self, Logits, SamplingParams};
-use eidola_engine_cpu::{DenseOracle, MtpHidden};
-use eidola_engine_model::ReferenceModel;
+use eidola_engine_cpu::mimo::{DenseOracle, MtpHidden};
+use eidola_engine_model::mimo::ReferenceModel;
+use mimo_common::*;
 
 fn small(vocab: usize) -> Arc<ReferenceModel> {
     small_vocab_fixture(vocab, 1.0, &[0, 1])

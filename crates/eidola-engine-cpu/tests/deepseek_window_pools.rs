@@ -4,9 +4,9 @@
 //! regenerations, and workloads whose windows do not all fit at once: every row equals
 //! the dense oracle bit for bit and every output dense generation.
 
-mod ds_common;
+mod deepseek_common;
 
-use ds_common::*;
+use deepseek_common::*;
 use eidola_engine::engine::{FinishReason, SchedulerConfig};
 use eidola_engine::sampling::SamplingParams;
 

@@ -3,9 +3,8 @@
 //! drafter state carried by boundary taps, batch-composition independence, and panics on
 //! contract violations.
 
-mod common;
+mod mimo_common;
 
-use common::*;
 use eidola_engine::executor::{
     Executor, Maintenance, SeqEntry, Slot, StepInput, StepOutput, TableUpdate,
 };
@@ -13,7 +12,8 @@ use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::secret::KvKey;
 use eidola_engine::spec::NULL_BLOCK;
-use eidola_engine_cpu::{CpuExecutor, DenseRun};
+use eidola_engine_cpu::mimo::{CpuExecutor, DenseRun};
+use mimo_common::*;
 
 fn executor() -> CpuExecutor {
     let mut cfg = exec_config(16, vec![0, 1]);
@@ -113,10 +113,10 @@ fn logits(out: &StepOutput, row: usize) -> &Vec<Vec<f32>> {
 
 fn dense(tokens: &[u32]) -> DenseRun {
     let m = fixture();
-    eidola_engine_cpu::DenseOracle {
+    eidola_engine_cpu::mimo::DenseOracle {
         model: &m,
         mtp_depths: &[0, 1],
-        mtp_hidden: eidola_engine_cpu::MtpHidden::Normed,
+        mtp_hidden: eidola_engine_cpu::mimo::MtpHidden::Normed,
         sampleable_vocab_size: VOCAB,
     }
     .run(tokens)

@@ -5,13 +5,13 @@
 //! device and as a recompute with the cache off. The harness checks after every step that
 //! free host blocks are zero and held ones ciphertext.
 
-mod common;
+mod mimo_common;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use common::*;
 use eidola_engine::engine::CacheScope;
 use eidola_engine::sampling::SamplingParams;
+use mimo_common::*;
 
 type Images = BTreeMap<(u32, u32), Vec<u32>>;
 

@@ -8,14 +8,15 @@ use eidola_engine::executor::{
 };
 use eidola_engine::sampling::{self, Logits, SamplingParams, Stream};
 use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK};
-use eidola_engine_model::ReferenceModel;
-use eidola_engine_model::attention::{apply_rope, attend, rope_cos_sin};
-use eidola_engine_model::config::{AttentionKind as ModelAttention, AttentionSpec};
+use eidola_engine_model::mimo::ReferenceModel;
+use eidola_engine_model::mimo::attention::{apply_rope, attend, rope_cos_sin};
+use eidola_engine_model::mimo::config::{AttentionKind as ModelAttention, AttentionSpec};
+use eidola_engine_model::mimo::weights::{AttentionWeights, FfnWeights};
 use eidola_engine_model::tensor::{Matrix, add_assign, linear, rms_norm_rows};
-use eidola_engine_model::weights::{AttentionWeights, FfnWeights};
 use rayon::prelude::*;
 
-use crate::pool::{GroupLayout, Pool, Tag};
+use crate::mimo::pool::{GroupLayout, Pool};
+use crate::page::Tag;
 
 /// Which of the main model's hidden states feeds the MTP depths (every depth takes the
 /// main model's state, never another depth's output).

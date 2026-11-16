@@ -1,6 +1,6 @@
 //! The DeepSeek-V4.1 CPU executor on a model whose window is wider than one 64-slot
 //! attention block (the fixture's weights under a window of 80 and a five-slot drafter:
-//! see `ds_common::wide`), through the engine, every row against the dense oracle.
+//! see `deepseek_common::wide`), through the engine, every row against the dense oracle.
 //!
 //! At this width the place of an empty window slot decides which block an entry falls
 //! in, and so does the order of a draft pass's context: the canonical list (the window
@@ -10,11 +10,11 @@
 //! only at the committed fixture's shape, so these tests hold the executor to the
 //! oracle and say nothing about the oracle against the reference.
 
-mod ds_common;
+mod deepseek_common;
 
 use std::collections::HashMap;
 
-use ds_common::*;
+use deepseek_common::*;
 use eidola_engine::engine::{CacheScope, FinishReason};
 use eidola_engine::sampling::SamplingParams;
 

@@ -1,9 +1,9 @@
 //! The DeepSeek-V4.1 CPU executor on a truncation of the released checkpoint with every
 //! mechanism at its released width (ignored: needs the fetched weights and goldens, see
-//! the model crate's `golden/deepseek_v41/README.md`).
+//! the model crate's `golden/deepseek/README.md`).
 //!
 //!     EIDOLA_DEEPSEEK_TRUNCATED_DIR=<dir> cargo test --release -p eidola-engine-cpu \
-//!         --test ds_real -- --ignored --nocapture
+//!         --test deepseek_real -- --ignored --nocapture
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use eidola_engine_model::deepseek::engram::{EngramTable, SparseEngramTable};
 use eidola_engine_model::deepseek::forward::DsForwardOptions;
 use eidola_engine_model::deepseek::{DsLoadOptions, DsModel, DsWeights, config_of};
 
-/// The truncation `golden/deepseek_v41/ds_golden/truncated.py` fetches.
+/// The truncation `golden/deepseek/deepseek_golden/truncated.py` fetches.
 const LAYERS: [usize; 12] = [0, 1, 2, 3, 14, 15, 20, 21, 24, 37, 38, 39];
 const BACKBONE_EXPERTS: usize = 32;
 const DRAFTER_EXPERTS: usize = 16;
@@ -547,7 +547,7 @@ fn truncated_generation_follows_the_dense_forward() {
 ///
 ///     EIDOLA_DEEPSEEK_DIR=<checkpoint dir> \
 ///     EIDOLA_DEEPSEEK_TOKEN_MAP=<a safetensors file holding engram.token_map> \
-///         cargo test --release -p eidola-engine-cpu --test ds_real -- \
+///         cargo test --release -p eidola-engine-cpu --test deepseek_real -- \
 ///         --ignored --nocapture released_generation
 #[test]
 #[ignore = "needs the whole released checkpoint"]
