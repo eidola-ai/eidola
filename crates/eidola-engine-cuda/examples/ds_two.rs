@@ -1192,6 +1192,30 @@ mod tests {
         assert_eq!(h[2].tokens[0], bos);
         assert_eq!(h[2].start, 1);
         assert_eq!(v["prompts"].as_array().unwrap().len(), 4);
+        // The tool request as a client sends the file's text: the schema's keys in the
+        // file's order, which the format renders as sent.
+        let tool = v["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "tool")
+            .unwrap();
+        let (_, _, tokenizer, _) =
+            ds_both::prompts(&dir, &ds_both::default_prompts_file()).unwrap();
+        let input = eidola_engine_chat::ChatInput::from_json(
+            r#"[{"role": "user", "content": "What is the weather in Paris right now?"}]"#,
+            Some(
+                r#"[{"type": "function", "function": {"name": "get_weather", "description": "The current weather in a city.", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city's name."}}, "required": ["city"]}}}]"#,
+            ),
+        )
+        .unwrap();
+        let options =
+            eidola_engine_chat::deepseek_v4_1::EncodeOptions::from_request(None, None).unwrap();
+        let sent = eidola_engine_chat::deepseek_v4_1::encode(&input, options).unwrap();
+        assert_eq!(
+            u32_list(&tool["tokens"]).unwrap(),
+            tokenizer.encode_prompt(&sent).unwrap()
+        );
         let bench = v["bench"]["prompts"].as_array().unwrap();
         assert_eq!(bench.len(), 5);
         let bench: Vec<Vec<u32>> = bench.iter().map(|p| u32_list(p).unwrap()).collect();

@@ -620,19 +620,21 @@ pub fn prompts(dir: &Path, file: &Path) -> std::result::Result<Rendered, String>
     let map = deepseek_v4_1::engram::compressed_vocab(&tokenizer)
         .map_err(|e| e.to_string())?
         .map;
-    let text = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
-    let specs: Vec<Value> = serde_json::from_slice(&text).map_err(|e| e.to_string())?;
+    use eidola_engine_chat::json;
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    // The file's own key order: the format renders a tool's schema as the text it was
+    // sent, so a `serde_json::Value` (whose maps sort their keys) would make another prompt.
+    let specs = json::parse(&text).map_err(|e| e.to_string())?;
     let options = EncodeOptions::from_request(None, None).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for s in specs {
-        let name = s["name"]
-            .as_str()
+    for s in specs.as_array().ok_or("the prompts are not an array")? {
+        let name = s
+            .get("name")
+            .and_then(json::Json::as_str)
             .ok_or("a prompt without a name")?
             .to_owned();
-        let messages = serde_json::to_string(&s["messages"]).map_err(|e| e.to_string())?;
-        let tools = s
-            .get("tools")
-            .map(|t| serde_json::to_string(t).expect("JSON"));
+        let messages = json::dumps_default(s.get("messages").ok_or("a prompt without messages")?);
+        let tools = s.get("tools").map(json::dumps_default);
         let input = ChatInput::from_json(&messages, tools.as_deref()).map_err(|e| e.to_string())?;
         let prompt = deepseek_v4_1::encode(&input, options).map_err(|e| e.to_string())?;
         let tokens = tokenizer

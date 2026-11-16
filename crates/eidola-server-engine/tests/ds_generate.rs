@@ -12,7 +12,7 @@ mod runner;
 
 use std::path::Path;
 
-use common::{deepseek_model_dir, deepseek_weights_hash};
+use common::{deepseek_loaded, deepseek_model_dir, deepseek_weights_hash};
 use runner::{Outcome, PromptSpec, RunConfig, run};
 use serde_json::Value;
 
@@ -184,7 +184,10 @@ fn the_runner_generates_checkpoints_and_resumes() {
     }
     // A changed prompt reruns its own requests only.
     let mut edited = shorter.clone();
-    edited.prompts[2].messages[0]["content"] = "Write a Rust function that sums a slice.".into();
+    edited.prompts[2].messages = eidola_engine_chat::json::parse(
+        r#"[{"role": "user", "content": "Write a Rust function that sums a slice."}]"#,
+    )
+    .unwrap();
     let before = snapshot(out.path());
     assert_eq!(run(&edited).unwrap(), Outcome::Complete { mismatches: 0 });
     for (n, (now, then)) in names.iter().zip(snapshot(out.path()).iter().zip(&before)) {
@@ -306,4 +309,56 @@ fn one_new_token_is_bounded_by_the_prefill_alone() {
         assert_eq!(r["generated_tokens"], 1, "{r}");
         assert_eq!(r["decode"]["steps"], 0, "{r}");
     }
+}
+
+/// The runner's prompt is the node's for the prompts file's text: a tool's schema keeps
+/// the key order the file gives it, as the format renders it from the text a client sent.
+#[test]
+fn a_tool_prompt_is_the_one_the_node_renders_from_the_files_text() {
+    // The file's `tool` entry, as a client sends it: every key where the file has it.
+    let messages = r#"[{"role": "user", "content": "What is the weather in Paris right now?"}]"#;
+    let tools = r#"[{"type": "function", "function": {"name": "get_weather", "description": "The current weather in a city.", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city's name."}}, "required": ["city"]}}}]"#;
+    let file =
+        PromptSpec::parse_file(include_bytes!("../examples/ds_generate/prompts.json")).unwrap();
+    let tool = file.iter().find(|p| p.name == "tool").unwrap();
+    let parse = |t: &str| eidola_engine_chat::json::parse(t).unwrap();
+    assert_eq!(tool.messages, parse(messages));
+    assert_eq!(tool.tools.as_ref(), Some(&parse(tools)));
+
+    let body = format!(
+        r#"{{"model": "m", "messages": {messages}, "tools": {tools}, "max_completion_tokens": 1, "temperature": 0.0, "stream": true, "stream_options": {{"include_usage": true}}}}"#
+    );
+    let valid = eidola_server_engine::api::parse_request(body.as_bytes(), "m").unwrap();
+    let node = eidola_server_engine::pipeline::prepare(
+        &deepseek_loaded(),
+        &eidola_engine::secret::SaltDeriver::new(),
+        1024,
+        1,
+        valid,
+    )
+    .unwrap()
+    .request
+    .prompt;
+
+    let out = tempfile::tempdir().unwrap();
+    let mut cfg = config(out.path());
+    cfg.prompts = vec![tool.clone()];
+    cfg.max_new_tokens = 1;
+    cfg.draft_width = Some(0);
+    assert_eq!(run(&cfg).unwrap(), Outcome::Complete { mismatches: 0 });
+    let saved = read(&out.path().join("requests/tool.w0.json"));
+    let ours: Vec<u32> = saved["prompt_token_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect();
+    assert_eq!(ours, node);
+    assert!(
+        saved["prompt_text"]
+            .as_str()
+            .unwrap()
+            .contains(r#"{"name": "get_weather", "description": "The current weather in a city.", "parameters": {"type": "object""#),
+        "the schema in the file's key order"
+    );
 }
