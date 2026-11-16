@@ -9,7 +9,10 @@
 //! position math survives delimiters being literally removed from the
 //! shaped string.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
@@ -1181,6 +1184,7 @@ fn min_content_width(
 /// `| ` / ` | ` / ` |` bytes, single-row, positioned in the gutter
 /// between column boxes). Origins are relative to the table's
 /// content origin; prepaint re-bases them into window coordinates.
+#[derive(Clone)]
 struct TablePiece {
     line: Arc<WrappedLine>,
     rel_origin: Point<Pixels>,
@@ -1190,6 +1194,7 @@ struct TablePiece {
 }
 
 /// The box-model layout of one table.
+#[derive(Clone)]
 struct TableLayoutOut {
     pieces: Vec<TablePiece>,
     size: Size<Pixels>,
@@ -2188,6 +2193,7 @@ impl Element for BlockElement {
 
         let block_clone = self.block.clone();
         let style_clone = self.style.clone();
+        let shape_cache = self.editor.read(cx).shape_cache.clone();
         let id = window.request_measured_layout(
             style,
             move |known_dimensions, available_space, window, _cx| {
@@ -2330,7 +2336,8 @@ impl Element for BlockElement {
                 // it must run against the same inner width prepaint
                 // will use so the two phases agree.
                 if is_table
-                    && let Some(layout) = layout_table(
+                    && let Some(layout) = layout_table_cached(
+                        &shape_cache,
                         &augmented_block,
                         &source,
                         font_size,
@@ -2338,6 +2345,7 @@ impl Element for BlockElement {
                         inner_w,
                         window,
                     )
+                    .as_ref()
                 {
                     let content_h = inner_pad * 2. + layout.size.height.max(line_height);
                     let h = extra_above + spacing_above + content_h + spacing_below + extra_below;
@@ -2348,7 +2356,8 @@ impl Element for BlockElement {
                 }
                 let (body_ascent, body_descent) =
                     body_metrics_for_block(&block_clone.kind, &style_clone, font_size, window);
-                let lines = shape_block_lines(
+                let lines = shape_block_lines_cached(
+                    &shape_cache,
                     &source,
                     &augmented_block,
                     &style_clone,
@@ -2552,22 +2561,32 @@ impl Element for BlockElement {
         // Tables take the box-model layout (rows of independently
         // wrapped cell boxes — see `layout_table`) instead of the
         // per-source-line shape pass.
+        let shape_cache = self.editor.read(cx).shape_cache.clone();
         let table_layout = if is_table {
-            layout_table(
+            Option::clone(&layout_table_cached(
+                &shape_cache,
                 &augmented_block,
                 &source,
                 font_size,
                 &style,
                 block_width,
                 window,
-            )
+            ))
         } else {
             None
         };
         let shaped = if table_layout.is_some() {
             Vec::new()
         } else {
-            shape_block_lines(&source, &augmented_block, &style, font_size, wrap_w, window)
+            Vec::clone(&shape_block_lines_cached(
+                &shape_cache,
+                &source,
+                &augmented_block,
+                &style,
+                font_size,
+                wrap_w,
+                window,
+            ))
         };
 
         let mut lines: Vec<LaidOutLine> = Vec::new();
@@ -4513,11 +4532,189 @@ fn list_marker_display_text(kind: ListItemKind, cursor_inside: bool) -> String {
 
 // ---------- Shaping ----------
 
+#[derive(Clone)]
 struct ShapedLine {
     line: Arc<WrappedLine>,
     source_range: Range<usize>,
     display_to_source: Vec<usize>,
     is_delimiter: bool,
+}
+
+/// Block layouts kept across frames — [`shape_block_lines`] for text
+/// blocks, [`layout_table`] for tables — so a frame that changed nothing
+/// about a block (a scroll, a caret move in another block, a hover) and
+/// the several measure passes within one frame reuse its layout instead
+/// of rebuilding it.
+///
+/// An entry is reused only when every input the layout reads is equal:
+/// the block, its source text, the font size and heading weight the
+/// style gives it, the width, and the rest of the style, which the cache
+/// holds once and empties itself for whenever a lookup brings a
+/// different one.
+#[derive(Default)]
+pub(crate) struct ShapeCache {
+    style: Option<MarkdownStyle>,
+    /// Entries by block start offset, the newest last.
+    entries: HashMap<usize, Vec<ShapeEntry>>,
+}
+
+struct ShapeEntry {
+    block: RenderBlock,
+    text: String,
+    font_size: Pixels,
+    weight: FontWeight,
+    width: Option<Pixels>,
+    layout: CachedLayout,
+}
+
+#[derive(Clone)]
+enum CachedLayout {
+    Lines(Rc<Vec<ShapedLine>>),
+    Table(Rc<Option<TableLayoutOut>>),
+}
+
+impl ShapeCache {
+    /// How many variants of one block are kept — measured and painted
+    /// blocks can differ (an image block hides its source only once it
+    /// paints), and a resize passes through widths.
+    const PER_BLOCK: usize = 4;
+
+    /// Drop the entries of block starts no longer among the document's
+    /// `blocks`, which an edit leaves behind.
+    pub(crate) fn retain_blocks(&mut self, blocks: &[RenderBlock]) {
+        let starts: std::collections::HashSet<usize> =
+            blocks.iter().map(|b| b.source_range.start).collect();
+        self.entries.retain(|start, _| starts.contains(start));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.values().map(Vec::len).sum()
+    }
+
+    /// The cached layout of `block` with these inputs, laid out by `make`
+    /// and kept when there is none. `is_kind` tells the two kinds of
+    /// layout apart.
+    #[allow(clippy::too_many_arguments)]
+    fn get_or_make(
+        cache: &RefCell<Self>,
+        source: &str,
+        block: &RenderBlock,
+        style: &MarkdownStyle,
+        font_size: Pixels,
+        width: Option<Pixels>,
+        is_kind: fn(&CachedLayout) -> bool,
+        make: impl FnOnce() -> CachedLayout,
+    ) -> CachedLayout {
+        let text = source.get(block.source_range.clone()).unwrap_or_default();
+        let weight = base_weight_for_block(&block.kind, style);
+        {
+            let mut cache = cache.borrow_mut();
+            if !cache
+                .style
+                .as_ref()
+                .is_some_and(|s| s.eq_ignoring_heading_fns(style))
+            {
+                cache.entries.clear();
+                cache.style = Some(style.clone());
+            }
+        }
+        let hit = cache
+            .borrow()
+            .entries
+            .get(&block.source_range.start)
+            .and_then(|variants| {
+                variants
+                    .iter()
+                    .find(|e| {
+                        is_kind(&e.layout)
+                            && e.font_size == font_size
+                            && e.weight == weight
+                            && e.width == width
+                            && e.text == text
+                            && e.block == *block
+                    })
+                    .map(|e| e.layout.clone())
+            });
+        if let Some(layout) = hit {
+            return layout;
+        }
+        let layout = make();
+        let mut cache = cache.borrow_mut();
+        let variants = cache.entries.entry(block.source_range.start).or_default();
+        if variants.len() == Self::PER_BLOCK {
+            variants.remove(0);
+        }
+        variants.push(ShapeEntry {
+            block: block.clone(),
+            text: text.to_string(),
+            font_size,
+            weight,
+            width,
+            layout: layout.clone(),
+        });
+        layout
+    }
+}
+
+/// [`shape_block_lines`] through `cache`.
+fn shape_block_lines_cached(
+    cache: &RefCell<ShapeCache>,
+    source: &str,
+    block: &RenderBlock,
+    style: &MarkdownStyle,
+    font_size: Pixels,
+    wrap_width: Option<Pixels>,
+    window: &mut Window,
+) -> Rc<Vec<ShapedLine>> {
+    let layout = ShapeCache::get_or_make(
+        cache,
+        source,
+        block,
+        style,
+        font_size,
+        wrap_width,
+        |l| matches!(l, CachedLayout::Lines(_)),
+        || {
+            CachedLayout::Lines(Rc::new(shape_block_lines(
+                source, block, style, font_size, wrap_width, window,
+            )))
+        },
+    );
+    match layout {
+        CachedLayout::Lines(lines) => lines,
+        CachedLayout::Table(_) => unreachable!("matched by kind"),
+    }
+}
+
+/// [`layout_table`] through `cache`.
+fn layout_table_cached(
+    cache: &RefCell<ShapeCache>,
+    block: &RenderBlock,
+    source: &str,
+    font_size: Pixels,
+    style: &MarkdownStyle,
+    avail_w: Pixels,
+    window: &mut Window,
+) -> Rc<Option<TableLayoutOut>> {
+    let layout = ShapeCache::get_or_make(
+        cache,
+        source,
+        block,
+        style,
+        font_size,
+        Some(avail_w),
+        |l| matches!(l, CachedLayout::Table(_)),
+        || {
+            CachedLayout::Table(Rc::new(layout_table(
+                block, source, font_size, style, avail_w, window,
+            )))
+        },
+    );
+    match layout {
+        CachedLayout::Table(table) => table,
+        CachedLayout::Lines(_) => unreachable!("matched by kind"),
+    }
 }
 
 /// Total inner-content height contributed by a list of shaped lines:
@@ -7017,5 +7214,152 @@ $$
             }
         }
         assert!(checked > 10_000, "only {checked} offsets checked");
+    }
+
+    /// Lay `src` out through a fresh `ShapeCache`, then call `check` with
+    /// a window, the cache, the source's blocks (cursor at offset 0) and
+    /// the style.
+    fn with_shape_cache(
+        cx: &mut TestAppContext,
+        src: &str,
+        check: impl FnOnce(&mut Window, &RefCell<ShapeCache>, &[RenderBlock], &MarkdownStyle),
+    ) {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+            ..Default::default()
+        };
+        let blocks = render(&state, &parse(src)).blocks;
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            check(
+                window,
+                &RefCell::new(ShapeCache::default()),
+                &blocks,
+                &style,
+            );
+        })
+        .unwrap();
+    }
+
+    fn lines_via(
+        cache: &RefCell<ShapeCache>,
+        src: &str,
+        block: &RenderBlock,
+        style: &MarkdownStyle,
+        wrap: Option<Pixels>,
+        window: &mut Window,
+    ) -> Rc<Vec<ShapedLine>> {
+        let font_size = font_size_for_block(&block.kind, style);
+        shape_block_lines_cached(cache, src, block, style, font_size, wrap, window)
+    }
+
+    #[gpui::test]
+    fn the_shape_cache_reuses_lines_while_nothing_changes(cx: &mut TestAppContext) {
+        let src = "# Title\n\nA *paragraph* with `code`.\n";
+        with_shape_cache(cx, src, |window, cache, blocks, style| {
+            let wrap = Some(px(400.0));
+            for block in blocks {
+                let first = lines_via(cache, src, block, style, wrap, window);
+                // A fresh clone of every input — equal, not identical.
+                let again = lines_via(cache, src, &block.clone(), &style.clone(), wrap, window);
+                assert!(Rc::ptr_eq(&first, &again), "block {:?}", block.kind);
+            }
+            // Heading functions built afresh, as a host may each frame,
+            // but answering the same: the same layout.
+            let built = |style: &MarkdownStyle| {
+                style
+                    .clone()
+                    .heading_font_size(|_, base| base * 2.0)
+                    .heading_weight(|_| FontWeight::BOLD)
+            };
+            let heading = &blocks[0];
+            let first = lines_via(cache, src, heading, &built(style), wrap, window);
+            let again = lines_via(cache, src, heading, &built(style), wrap, window);
+            assert!(Rc::ptr_eq(&first, &again));
+        });
+    }
+
+    #[gpui::test]
+    fn the_shape_cache_misses_on_every_input_it_reads(cx: &mut TestAppContext) {
+        let src = "# Title\n\nA *paragraph* with `code`.\n";
+        let edited = "# Title\n\nA *paragraph* with `kode`.\n";
+        with_shape_cache(cx, src, |window, cache, blocks, style| {
+            let wrap = Some(px(400.0));
+            let heading = &blocks[0];
+            let para = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("a paragraph");
+            let base = lines_via(cache, src, para, style, wrap, window);
+            let misses = |other: &Rc<Vec<ShapedLine>>| !Rc::ptr_eq(&base, other);
+
+            // The block's text.
+            let text = lines_via(cache, edited, para, style, wrap, window);
+            assert!(misses(&text));
+            assert!(text[0].line.text.contains("kode"));
+            // The block itself: the caret inside reveals the delimiters.
+            let revealed = render(
+                &EditorState {
+                    markdown: src.into(),
+                    selection: Selection::Cursor(para.source_range.start + 3),
+                    ..Default::default()
+                },
+                &parse(src),
+            )
+            .blocks
+            .into_iter()
+            .find(|b| b.source_range == para.source_range)
+            .expect("the same paragraph");
+            assert_ne!(&revealed, para);
+            assert!(misses(&lines_via(
+                cache, src, &revealed, style, wrap, window
+            )));
+            // The wrap width.
+            assert!(misses(&lines_via(
+                cache,
+                src,
+                para,
+                style,
+                Some(px(300.0)),
+                window
+            )));
+            // Any other style field — a color the runs carry.
+            let mut recolored = style.clone();
+            recolored.text_color = gpui::red();
+            let colored = lines_via(cache, src, para, &recolored, wrap, window);
+            assert!(misses(&colored));
+            // The size a heading function gives the block.
+            let base_heading = lines_via(cache, src, heading, &recolored, wrap, window);
+            let bigger = recolored.clone().heading_font_size(|_, base| base * 3.0);
+            let font_size = font_size_for_block(&heading.kind, &bigger);
+            let resized =
+                shape_block_lines_cached(cache, src, heading, &bigger, font_size, wrap, window);
+            assert!(!Rc::ptr_eq(&base_heading, &resized));
+            // The weight a heading function gives the block.
+            let base_heading = lines_via(cache, src, heading, &bigger, wrap, window);
+            let lighter = bigger.clone().heading_weight(|_| FontWeight::THIN);
+            let reweighted = lines_via(cache, src, heading, &lighter, wrap, window);
+            assert!(!Rc::ptr_eq(&base_heading, &reweighted));
+        });
+    }
+
+    #[gpui::test]
+    fn the_shape_cache_forgets_blocks_the_document_no_longer_has(cx: &mut TestAppContext) {
+        let src = "one\n\ntwo\n\nthree\n";
+        with_shape_cache(cx, src, |window, cache, blocks, style| {
+            for block in blocks {
+                lines_via(cache, src, block, style, None, window);
+            }
+            let laid_out = cache.borrow().len();
+            assert_eq!(laid_out, blocks.len());
+            cache.borrow_mut().retain_blocks(&blocks[..1]);
+            assert_eq!(cache.borrow().len(), 1);
+        });
     }
 }

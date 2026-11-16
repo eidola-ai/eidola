@@ -478,6 +478,95 @@ impl MarkdownStyle {
 
     /// Final font size for `level` (1..=6). Uses the callback if set,
     /// otherwise a sensible default.
+    /// Every field equal except the two heading functions, which cannot be
+    /// compared: they matter only through the size and weight they give
+    /// a heading, which a caller comparing two styles for one block
+    /// compares itself. Hosts may build those functions afresh each
+    /// frame, so comparing them by pointer would call every frame's style
+    /// new.
+    pub fn eq_ignoring_heading_fns(&self, other: &Self) -> bool {
+        let MarkdownStyle {
+            font_family,
+            mono_font_family,
+            font_size,
+            line_height,
+            paragraph_gap,
+            container_boundary_gap,
+            heading_base_font_size,
+            mono_font_size,
+            code_block_background,
+            code_block_content_background,
+            code_block_padding,
+            code_block_content_padding_y,
+            code_block_radius,
+            blockquote_indent,
+            list_item_gap_factor,
+            list_indent,
+            blockquote_border_width,
+            blockquote_border_inset,
+            blockquote_border_color,
+            text_color,
+            delimiter_color,
+            background,
+            caret_color,
+            selection_color,
+            highlight_color,
+            highlight_overlay_color,
+            highlight_accent_color,
+            inline_code_font_family,
+            inline_code_background,
+            link_color,
+            thematic_break_color,
+            thematic_break_thickness,
+            table_header_weight,
+            table_rule_color,
+            emphasis_dot_color,
+            emphasis_dot_size_factor,
+            emphasis_dot_baseline_offset_factor,
+            color_overrides,
+            heading_font_size: _,
+            heading_weight: _,
+        } = self;
+        *font_family == other.font_family
+            && *mono_font_family == other.mono_font_family
+            && *font_size == other.font_size
+            && *line_height == other.line_height
+            && *paragraph_gap == other.paragraph_gap
+            && *container_boundary_gap == other.container_boundary_gap
+            && *heading_base_font_size == other.heading_base_font_size
+            && *mono_font_size == other.mono_font_size
+            && *code_block_background == other.code_block_background
+            && *code_block_content_background == other.code_block_content_background
+            && *code_block_padding == other.code_block_padding
+            && *code_block_content_padding_y == other.code_block_content_padding_y
+            && *code_block_radius == other.code_block_radius
+            && *blockquote_indent == other.blockquote_indent
+            && *list_item_gap_factor == other.list_item_gap_factor
+            && *list_indent == other.list_indent
+            && *blockquote_border_width == other.blockquote_border_width
+            && *blockquote_border_inset == other.blockquote_border_inset
+            && *blockquote_border_color == other.blockquote_border_color
+            && *text_color == other.text_color
+            && *delimiter_color == other.delimiter_color
+            && *background == other.background
+            && *caret_color == other.caret_color
+            && *selection_color == other.selection_color
+            && *highlight_color == other.highlight_color
+            && *highlight_overlay_color == other.highlight_overlay_color
+            && *highlight_accent_color == other.highlight_accent_color
+            && *inline_code_font_family == other.inline_code_font_family
+            && *inline_code_background == other.inline_code_background
+            && *link_color == other.link_color
+            && *thematic_break_color == other.thematic_break_color
+            && *thematic_break_thickness == other.thematic_break_thickness
+            && *table_header_weight == other.table_header_weight
+            && *table_rule_color == other.table_rule_color
+            && *emphasis_dot_color == other.emphasis_dot_color
+            && *emphasis_dot_size_factor == other.emphasis_dot_size_factor
+            && *emphasis_dot_baseline_offset_factor == other.emphasis_dot_baseline_offset_factor
+            && *color_overrides == other.color_overrides
+    }
+
     pub fn size_for_heading(&self, level: u8) -> Pixels {
         let base = self.heading_base_font_size;
         if let Some(f) = &self.heading_font_size {
