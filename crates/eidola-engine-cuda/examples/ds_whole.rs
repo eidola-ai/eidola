@@ -43,507 +43,106 @@
 //! so whatever arithmetic refuses is refused before anything is loaded. The process
 //! exits 1 when anything compared differs and 2 on a failure.
 
+#[path = "ds_both/mod.rs"]
+mod ds_both;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use ds_both::{Layout, Prompt, Watch, fail, golden, n32, prompts, us};
 use eidola_engine::engine::{CacheScope, Engine, Request, SchedulerConfig};
-use eidola_engine::executor::{Executor, ExecutorError, Slot, StepInput, StepOutput};
+use eidola_engine::executor::{Executor, ExecutorError, StepInput, StepOutput};
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::{Bucket, ModelSpec};
-use eidola_engine_cuda::ds::abi::EngramGatherParams;
-use eidola_engine_cuda::ds::boundary::{GatheredRows, ToDecoder, ToEncoder};
 use eidola_engine_cuda::ds::dry::DryDevice;
-use eidola_engine_cuda::ds::executor::geometry;
 use eidola_engine_cuda::ds::gemm::GemmForm;
-use eidola_engine_cuda::ds::half::{CudaDevice, Device, bytes_of};
-use eidola_engine_cuda::ds::kv::KvStore;
+use eidola_engine_cuda::ds::half::{CudaDevice, Device};
 use eidola_engine_cuda::ds::model::HalfNet;
-use eidola_engine_cuda::ds::plan::{PlanRow, StepPlan};
 use eidola_engine_cuda::ds::staged::{self, Capacity, DevOnly, HostExperts, HostMode, StagedStats};
-use eidola_engine_cuda::ds::support::DsShape;
 use eidola_engine_cuda::ds::weights::Half;
 use eidola_engine_cuda::ds::{DsCudaExecutor, DsCudaExecutorConfig};
-use eidola_engine_cuda::{CudaError, KernelDir, Result};
+use eidola_engine_cuda::{KernelDir, Result};
 use eidola_engine_model::WeightSet;
-use eidola_engine_model::deepseek::engram::EngramHasher;
 use eidola_engine_model::deepseek::{DsConfig, config_of};
 use serde_json::{Value, json};
-
-fn fail(e: impl std::fmt::Display) -> CudaError {
-    CudaError::new(e.to_string())
-}
-
-fn us(x: u32) -> usize {
-    x as usize
-}
-
-fn n32(x: usize) -> u32 {
-    u32::try_from(x).expect("a count of this run")
-}
 
 const TOKEN: fn() -> DevOnly = DevOnly::for_tests_and_dev_tools;
 
 /// Slots of the comparison: the text's alone.
 const SLOTS: u32 = 1;
-/// Positions per KV block of the comparison, as `ds_halves`.
-const BLOCK: u32 = 16;
 
 /// Opens the device a half runs on.
 type Open<'a> = &'a dyn Fn() -> Result<Box<dyn Device>>;
 /// How many experts each half's cache holds, asked once both halves are loaded.
 type Size<'a> = &'a dyn Fn(usize) -> Result<[u32; 2]>;
 
-/// The comparison: the text, its steps, and the two halves together.
-struct Compare {
-    store: Option<Arc<WeightSet>>,
-    c: DsConfig,
-    shape: DsShape,
-    spec: ModelSpec,
-    tokens: Vec<u32>,
-    hasher: Option<EngramHasher>,
-    chunk: u32,
-    out: PathBuf,
-}
+/// What each step of the comparison did to the halves' caches.
+struct Caches;
 
-/// What one step of both halves left.
-struct Step {
-    items: Vec<(Slot, usize)>,
-    encoder: Vec<Vec<u16>>,
-    crossing: ToDecoder,
-    decoder: Vec<Vec<u16>>,
-    logits: Vec<f32>,
-    seconds: [f64; 4],
-}
-
-impl Compare {
-    fn new(
-        store: Option<Arc<WeightSet>>,
-        c: DsConfig,
-        tokens: Vec<u32>,
-        token_map: Vec<u32>,
-        chunk: u32,
-        out: PathBuf,
-    ) -> Result<Compare> {
-        let positions = n32(tokens.len()).next_multiple_of(BLOCK);
-        let cfg = DsCudaExecutorConfig {
-            block_size: BLOCK,
-            num_blocks: positions / BLOCK + 2,
-            num_state_slots: SLOTS,
-            max_model_len: positions,
-            buckets: vec![Bucket {
-                max_seqs: chunk,
-                max_tokens: chunk,
-            }],
-            sampleable_vocab_size: n32(c.vocab_size),
-            devices: [0, 0],
-            draft_width: 0,
-            host_blocks: 0,
-            position_tags: false,
-            record: false,
-            gemm: GemmForm::from_env()?,
-        };
-        let (shape, spec) = DsCudaExecutor::preflight(&c, &cfg)?;
-        std::fs::create_dir_all(&out).map_err(fail)?;
-        let hasher = match &c.engram {
-            Some(e) => Some(EngramHasher::new(e, c.vocab_size, token_map).map_err(fail)?),
-            None => None,
-        };
-        Ok(Compare {
-            store,
-            c,
-            shape,
-            spec,
-            tokens,
-            hasher,
-            chunk,
-            out,
-        })
+impl Watch for Caches {
+    type Snap = [StagedStats; 2];
+    fn snap(&self, enc: &HalfNet, dec: &HalfNet) -> [StagedStats; 2] {
+        [enc, dec].map(|n| n.staged.as_ref().map(|c| c.stats()).unwrap_or_default())
     }
-
-    fn width(&self) -> usize {
-        self.c.hc_mult * self.c.dim
-    }
-
-    fn entry_bytes(&self) -> usize {
-        let (w, i) = (self.c.attention.head_dim, self.c.indexer.head_dim);
-        w / 2 + w / 16 + i / 2 + i / 32
-    }
-
-    fn chunks(&self) -> Vec<(usize, usize)> {
-        (0..self.tokens.len())
-            .step_by(us(self.chunk))
-            .map(|from| (from, (from + us(self.chunk)).min(self.tokens.len())))
-            .collect()
-    }
-
-    /// One half, staged, with every block of the sequence mapped.
-    fn half(&self, half: Half, dev: Box<dyn Device>) -> Result<HalfNet> {
-        let positions = self.spec.max_model_len;
-        let w = staged::half_weights(
-            dev.as_ref(),
-            self.store.as_deref(),
-            &self.c,
-            &self.shape,
-            half,
-            positions,
-            TOKEN(),
-        )?;
-        let kv = KvStore::new(
-            dev.as_ref(),
-            geometry(&self.c, &self.spec, half)?,
-            SLOTS,
-            self.spec.max_blocks_per_seq(),
-        )?;
-        let mut n = HalfNet::new(
-            half,
-            dev,
-            w,
-            kv,
-            &self.c,
-            &self.shape,
-            positions,
-            self.chunk,
-            self.chunk,
-            self.chunk,
-            self.spec.sampleable_vocab_size,
-            self.shape.open_cap(),
-        )?;
-        for g in 0..n.kv.groups.len() {
-            for index in 0..self.spec.max_blocks_per_seq() {
-                n.kv.set_table(g, 0, index, index + 1);
-            }
-        }
-        n.kv.flush_tables(n.dev.as_ref())?;
-        Ok(n)
-    }
-
-    fn plan(&self, from: usize, to: usize) -> (Vec<PlanRow>, StepPlan) {
-        let rows = vec![PlanRow {
-            slot: 0,
-            c: n32(from),
-            p: n32(to - 1),
-            sample: false,
-            chain_start: n32(from),
-            drafts: 0,
-        }];
-        let chain = self.spec.window_chain.expect("a window chain");
-        let plan = StepPlan::new(&rows, chain.depth, chain.window);
-        (rows, plan)
-    }
-
-    /// Per Engram layer of the config, the table rows of `items`' positions.
-    fn engram_ids(&self, items: &[(Slot, usize)]) -> Result<Vec<Vec<u32>>> {
-        let (Some(e), Some(hasher)) = (&self.c.engram, &self.hasher) else {
-            return Ok(Vec::new());
-        };
-        let mut out = vec![Vec::new(); e.layers.len()];
-        for (slot, spec) in e.layers.iter().enumerate() {
-            if self.shape.engram_layer[slot].is_none() {
-                continue;
-            }
-            for &(_, pos) in items {
-                let lookback = &self.tokens[(pos + 1).saturating_sub(e.max_ngram)..=pos];
-                for row in hasher.rows(spec, lookback, pos) {
-                    out[slot].push(u32::try_from(row).map_err(fail)?);
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// The decoder half's part of the Engram lookups, gathered from the tables on its
-    /// device (as the executor's step gathers them).
-    fn gather(&self, n: &HalfNet, ids: &[Vec<u32>], rows: u32) -> Result<ToEncoder> {
-        let dev = n.dev.as_ref();
-        let mut gathered = vec![None; ids.len()];
-        for (slot, ids) in ids.iter().enumerate() {
-            let Some(table) = n.w.tables.get(slot).copied().flatten() else {
-                continue;
-            };
-            n.s.eids.write(dev, 0, ids)?;
-            let (codes, scales) = &n.s.gathered[slot];
-            // SAFETY: the table, and `rows` rows of ids and of gathered rows.
-            unsafe {
-                dev.kernels().engram_gather(&EngramGatherParams {
-                    codes: table.codes,
-                    scales: table.scales,
-                    ids: n.s.eids.addr,
-                    out_codes: codes.addr,
-                    out_scales: scales.addr,
-                    status: n.s.status.addr,
-                    table_rows: table.rows,
-                    rows,
-                    ids_per_row: n.d.lookups,
-                    width: n.d.engram_width / n.d.lookups,
-                    reserved: 0,
-                })?;
-            }
-            let width = us(n.d.engram_width);
-            gathered[slot] = Some(GatheredRows {
-                codes: codes.read(dev, 0, us(rows) * width)?,
-                scales: scales.read(dev, 0, us(rows) * width / 32)?,
-            });
-        }
-        Ok(ToEncoder { gathered })
-    }
-
-    /// Positions `from .. to` through both halves.
-    fn step(&self, enc: &mut HalfNet, dec: &mut HalfNet, from: usize, to: usize) -> Result<Step> {
-        let began = Instant::now();
-        let (plan_rows, plan) = self.plan(from, to);
-        let items: Vec<(Slot, usize)> = plan.items.iter().map(|it| (it.slot, us(it.pos))).collect();
-        let tokens: Vec<u32> = items.iter().map(|(_, p)| self.tokens[*p]).collect();
-        let (count, width) = (items.len(), self.width());
-        let ids = self.engram_ids(&items)?;
-        let to_encoder = self.gather(dec, &ids, n32(count))?;
-        let gather = began.elapsed().as_secs_f64();
-        let at = Instant::now();
-        let mut encoder = vec![Vec::new(); self.shape.split];
-        let crossing = DsCudaExecutor::encode_half(
-            enc,
-            &self.c,
-            &self.shape,
-            &plan,
-            &plan_rows,
-            &tokens,
-            &ids,
-            &to_encoder,
-            &mut |l, n: &HalfNet| {
-                encoder[l] = n.s.x.read::<u16>(n.dev.as_ref(), 0, count * width)?;
-                Ok(())
-            },
-        )?;
-        assert_eq!(us(crossing.rows), count, "every position's row crosses");
-        let encode = at.elapsed().as_secs_f64();
-
-        // The decoder reads every position's logits.
-        let at = Instant::now();
-        let (_, mut dplan) = self.plan(from, to);
-        for it in &mut dplan.items {
-            it.top = true;
-        }
-        dplan.top_rows = n32(count);
-        assert_eq!(
-            dplan
-                .items
-                .iter()
-                .map(|it| (it.slot, it.pos))
-                .collect::<Vec<_>>(),
-            crossing.positions,
-            "the head's rows keep the crossing's order"
-        );
-        crossing.check(&dplan, width, self.c.hc_mult, 0)?;
-        let split = self.shape.split;
-        let mut decoder = vec![Vec::new(); self.shape.depth()];
-        let top = DsCudaExecutor::decode_half(
-            dec,
-            &self.c,
-            &self.shape,
-            &dplan,
-            &crossing,
-            &mut |l, n: &HalfNet| {
-                decoder[l - split] = n.s.x.read::<u16>(n.dev.as_ref(), 0, count * width)?;
-                Ok(())
-            },
-        )?;
-        assert_eq!(us(top), count);
-        let logits = dec
-            .s
-            .logits
-            .read::<f32>(dec.dev.as_ref(), 0, count * self.c.vocab_size)?;
-        let status = dec.status()?;
-        if status != 0 {
-            return Err(fail(format!("the decoder raised status {status:#x}")));
-        }
-        let decode = at.elapsed().as_secs_f64();
-        Ok(Step {
-            items,
-            encoder,
-            crossing,
-            decoder,
-            logits,
-            seconds: [gather, encode, decode, began.elapsed().as_secs_f64()],
-        })
-    }
-
-    /// Both halves loaded staged on devices from `open`, over every chunk; the
-    /// recordings written, and compared with `recorded`'s when given.
-    fn run(
-        &self,
-        open: Open<'_>,
-        size: Size<'_>,
-        host: &Arc<HostExperts>,
-        recorded: Option<&Path>,
-    ) -> Result<(Value, bool)> {
-        let began = Instant::now();
-        let mut enc = self.half(Half::Encoder, open()?)?;
-        let mut dec = self.half(Half::Decoder, open()?)?;
-        enc.dev.synchronize()?;
-        dec.dev.synchronize()?;
-        let load = began.elapsed().as_secs_f64();
-        let caps = size(host.expert_bytes())?;
-        staged::attach(&mut enc, &self.shape, host, caps[0], TOKEN())?;
-        staged::attach(&mut dec, &self.shape, host, caps[1], TOKEN())?;
-        let memory = json!([enc.memory().total(), dec.memory().total()]);
-        eprintln!("both halves loaded in {load:.0} s; caches of {caps:?} experts; bytes {memory}");
-        let (split, depth) = (self.shape.split, self.shape.depth());
-        let mut encoder: Vec<Vec<u16>> = vec![Vec::new(); split];
-        let mut decoder: Vec<Vec<u16>> = vec![Vec::new(); depth];
-        let (mut entries, mut streams, mut pre, mut logits) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let mut steps = Vec::new();
-        for (from, to) in self.chunks() {
-            let before =
-                [&enc, &dec].map(|n| n.staged.as_ref().map(|c| c.stats()).unwrap_or_default());
-            let s = self.step(&mut enc, &mut dec, from, to)?;
-            assert!(s.items.iter().all(|(slot, _)| *slot == 0));
-            for (all, layer) in encoder.iter_mut().zip(&s.encoder) {
-                all.extend_from_slice(layer);
-            }
-            for (all, layer) in decoder.iter_mut().zip(&s.decoder) {
-                all.extend_from_slice(layer);
-            }
-            entries.extend_from_slice(&s.crossing.entries);
-            streams.extend_from_slice(&s.crossing.streams);
-            pre.extend_from_slice(&s.crossing.pre_mix);
-            logits.extend_from_slice(&s.logits);
-            let after =
-                [&enc, &dec].map(|n| n.staged.as_ref().map(|c| c.stats()).unwrap_or_default());
-            eprintln!("{from}..{to}: {:.2} s", s.seconds[3]);
-            steps.push(json!({
-                "positions": to - from,
-                "seconds": s.seconds[3], "gather_seconds": s.seconds[0],
-                "encoder_seconds": s.seconds[1], "decoder_seconds": s.seconds[2],
-                "cache": [stats_delta(&before[0], &after[0]), stats_delta(&before[1], &after[1])],
-            }));
-        }
-        let write =
-            |name: &str, bytes: &[u8]| std::fs::write(self.out.join(name), bytes).map_err(fail);
-        write("encoder_layers.bin", bytes_of(&encoder.concat()))?;
-        write("boundary_entries.bin", &entries)?;
-        write("boundary_streams.bin", bytes_of(&streams))?;
-        write("boundary_pre.bin", bytes_of(&pre))?;
-        write("decoder_layers.bin", bytes_of(&decoder.concat()))?;
-        write("logits.bin", bytes_of(&logits))?;
-        let mut checks = Vec::new();
-        let mut equal = true;
-        if let Some(dir) = recorded {
-            let read = |name: &str| {
-                std::fs::read(dir.join(name)).map_err(|e| fail(format!("{name}: {e}")))
-            };
-            let (n, width, eb, vocab) = (
-                self.tokens.len(),
-                self.width(),
-                self.entry_bytes(),
-                self.c.vocab_size,
-            );
-            let mut check = |name: String, got: Vec<u32>, want: Vec<u32>, row: usize| {
-                let c = first_difference(&name, &got, &want, row);
-                equal &= c["equal"] == json!(true);
-                eprintln!("{c}");
-                checks.push(c);
-            };
-            let layers = u16s(&read("encoder_layers.bin")?);
-            for (i, got) in encoder.iter().enumerate() {
-                let want = layers
-                    .get(i * n * width..(i + 1) * n * width)
-                    .unwrap_or(&[]);
-                check(
-                    format!("streams after encoder layer {i}"),
-                    bf16_bits(got),
-                    bf16_bits(want),
-                    width,
-                );
-            }
-            check(
-                "bank entries".into(),
-                entries.iter().map(|b| u32::from(*b)).collect(),
-                read("boundary_entries.bin")?
-                    .iter()
-                    .map(|b| u32::from(*b))
-                    .collect(),
-                eb,
-            );
-            check(
-                "boundary streams".into(),
-                bf16_bits(&streams),
-                bf16_bits(&u16s(&read("boundary_streams.bin")?)),
-                width,
-            );
-            check(
-                "boundary collapse weights".into(),
-                u32s(bytes_of(&pre)),
-                u32s(&read("boundary_pre.bin")?),
-                self.c.hc_mult,
-            );
-            let layers = u16s(&read("decoder_layers.bin")?);
-            for (j, got) in decoder.iter().enumerate() {
-                let want = layers
-                    .get(j * n * width..(j + 1) * n * width)
-                    .unwrap_or(&[]);
-                check(
-                    format!("streams after decoder layer {}", split + j),
-                    bf16_bits(got),
-                    bf16_bits(want),
-                    width,
-                );
-            }
-            check(
-                "logits".into(),
-                u32s(bytes_of(&logits)),
-                u32s(&read("logits.bin")?),
-                vocab,
-            );
-        }
-        let cache = [&enc, &dec].map(|n| n.staged.as_ref().map(|c| stats_json(&c.stats())));
-        Ok((
-            json!({
-                "load_seconds": load, "capacity": caps, "device_bytes": memory,
-                "steps": steps, "cache": cache,
-                "recorded": recorded.map(|p| p.display().to_string()),
-                "equal": equal, "checks": checks,
-            }),
-            equal,
-        ))
+    fn delta(&self, a: &[StagedStats; 2], b: &[StagedStats; 2]) -> Value {
+        json!([stats_delta(&a[0], &b[0]), stats_delta(&a[1], &b[1])])
     }
 }
 
-fn u16s(b: &[u8]) -> Vec<u16> {
-    b.chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect()
+/// One half, staged, with every block of the sequence mapped.
+fn staged_half(l: &Layout, half: Half, dev: Box<dyn Device>) -> Result<HalfNet> {
+    let w = staged::half_weights(
+        dev.as_ref(),
+        l.store.as_deref(),
+        &l.c,
+        &l.shape,
+        half,
+        l.spec.max_model_len,
+        TOKEN(),
+    )?;
+    l.net(half, dev, w)
 }
 
-fn u32s(b: &[u8]) -> Vec<u32> {
-    b.chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
-}
-
-fn bf16_bits(bits: &[u16]) -> Vec<u32> {
-    bits.iter().map(|b| u32::from(*b) << 16).collect()
-}
-
-/// Whether two arrays of rows of `row` elements are equal bit for bit, and where they
-/// first differ.
-fn first_difference(name: &str, got: &[u32], want: &[u32], row: usize) -> Value {
-    if got.len() != want.len() {
-        return json!({"what": name, "equal": false, "lengths": [got.len(), want.len()]});
-    }
-    let differing = got.iter().zip(want).filter(|(a, b)| a != b).count();
-    let first = got.iter().zip(want).position(|(a, b)| a != b);
-    json!({
-        "what": name,
-        "equal": differing == 0,
-        "elements": got.len(),
-        "differing": differing,
-        "first": first.map(|at| json!({
-            "position": at / row, "element": at % row,
-            "got": format!("{:#010x}", got[at]), "want": format!("{:#010x}", want[at]),
-        })),
-    })
+/// Both halves loaded staged on devices from `open`, over every chunk of `tokens`; the
+/// recordings written to `out`, and compared with `recorded`'s when given.
+fn compare(
+    l: &Layout,
+    tokens: &[u32],
+    out: &Path,
+    open: Open<'_>,
+    size: Size<'_>,
+    host: &Arc<HostExperts>,
+    recorded: Option<&Path>,
+) -> Result<(Value, bool)> {
+    let began = Instant::now();
+    let mut enc = staged_half(l, Half::Encoder, open()?)?;
+    let mut dec = staged_half(l, Half::Decoder, open()?)?;
+    enc.dev.synchronize()?;
+    dec.dev.synchronize()?;
+    let load = began.elapsed().as_secs_f64();
+    let caps = size(host.expert_bytes())?;
+    staged::attach(&mut enc, &l.shape, host, caps[0], TOKEN())?;
+    staged::attach(&mut dec, &l.shape, host, caps[1], TOKEN())?;
+    let memory = json!([enc.memory().total(), dec.memory().total()]);
+    eprintln!("both halves loaded in {load:.0} s; caches of {caps:?} experts; bytes {memory}");
+    let r = l.seq(tokens, 0).run(&mut enc, &mut dec, &Caches)?;
+    r.write(out)?;
+    let (checks, equal) = match recorded {
+        Some(dir) => r.compare(l, tokens.len(), dir)?,
+        None => (Vec::new(), true),
+    };
+    let cache = [&enc, &dec].map(|n| n.staged.as_ref().map(|c| stats_json(&c.stats())));
+    Ok((
+        json!({
+            "load_seconds": load, "capacity": caps, "device_bytes": memory,
+            "steps": r.steps, "cache": cache,
+            "recorded": recorded.map(|p| p.display().to_string()),
+            "equal": equal, "checks": checks,
+        }),
+        equal,
+    ))
 }
 
 fn stats_json(s: &StagedStats) -> Value {
@@ -627,12 +226,6 @@ impl Executor for Probe<'_> {
         }));
         Ok(out)
     }
-}
-
-/// One prompt to generate from: its name and tokens.
-struct Prompt {
-    name: String,
-    tokens: Vec<u32>,
 }
 
 /// Greedy generation of every prompt at each width, through the engine over `x`; the
@@ -783,72 +376,6 @@ fn generation_config(
     }
 }
 
-/// The text and the Engram map's file: the one named, else the checkpoint's pinned
-/// golden, else any of its reference goldens (as `ds_halves`).
-fn golden(dir: &Path) -> PathBuf {
-    if let Some(path) = std::env::var_os("EIDOLA_DS_HALVES_GOLDEN") {
-        return PathBuf::from(path);
-    }
-    let golden = dir.join("golden");
-    let pinned = golden.join("reference-pinned.safetensors");
-    if pinned.exists() {
-        return pinned;
-    }
-    let mut others: Vec<PathBuf> = std::fs::read_dir(&golden)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|f| f.to_str())
-                .is_some_and(|f| f.starts_with("reference-") && f.ends_with(".safetensors"))
-        })
-        .collect();
-    others.sort();
-    others.into_iter().next().unwrap_or(pinned)
-}
-
-/// The rendered prompts, the end-of-sequence ids, the tokenizer and the Engram map.
-type Rendered = (
-    Vec<Prompt>,
-    Vec<u32>,
-    eidola_engine_chat::Tokenizer,
-    Vec<u32>,
-);
-
-/// The prompts of `ds_generate`'s file, rendered and tokenized as the node does.
-fn prompts(dir: &Path, file: &Path) -> std::result::Result<Rendered, String> {
-    use eidola_engine_chat::deepseek_v4_1::{self, EncodeOptions};
-    use eidola_engine_chat::{ChatFormat, ChatInput, Tokenizer};
-    let tokenizer = Tokenizer::for_format_from_model_dir(ChatFormat::DeepSeekV4_1, dir)
-        .map_err(|e| e.to_string())?;
-    let map = deepseek_v4_1::engram::compressed_vocab(&tokenizer)
-        .map_err(|e| e.to_string())?
-        .map;
-    let text = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
-    let specs: Vec<Value> = serde_json::from_slice(&text).map_err(|e| e.to_string())?;
-    let options = EncodeOptions::from_request(None, None).map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for s in specs {
-        let name = s["name"]
-            .as_str()
-            .ok_or("a prompt without a name")?
-            .to_owned();
-        let messages = serde_json::to_string(&s["messages"]).map_err(|e| e.to_string())?;
-        let tools = s
-            .get("tools")
-            .map(|t| serde_json::to_string(t).expect("JSON"));
-        let input = ChatInput::from_json(&messages, tools.as_deref()).map_err(|e| e.to_string())?;
-        let prompt = deepseek_v4_1::encode(&input, options).map_err(|e| e.to_string())?;
-        let tokens = tokenizer
-            .encode_prompt(&prompt)
-            .map_err(|e| e.to_string())?;
-        out.push(Prompt { name, tokens });
-    }
-    let eos = tokenizer.eos_token_ids().to_vec();
-    Ok((out, eos, tokenizer, map))
-}
-
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
@@ -962,46 +489,34 @@ fn main() {
                 let mut tokens = ints("tokens")?;
                 tokens.truncate(count);
                 let map = ints("engram.token_map")?;
-                let dry = Compare::new(
-                    None,
-                    c.clone(),
-                    tokens.clone(),
-                    map.clone(),
-                    chunk,
-                    out.join("dry"),
-                )?;
+                let dry = Layout::new(None, c.clone(), map.clone(), count, SLOTS, chunk)?;
                 let open_dry = || -> Result<Box<dyn Device>> { Ok(Box::new(DryDevice::new(None))) };
-                dry.run(&open_dry, &|_| Ok([1600, 1600]), &host, None)?;
-                eprintln!("dry run: every launch of both halves is accepted");
-                let run = Compare::new(
-                    Some(store.clone()),
-                    c.clone(),
-                    tokens,
-                    map,
-                    chunk,
-                    out.clone(),
+                compare(
+                    &dry,
+                    &tokens,
+                    &out.join("dry"),
+                    &open_dry,
+                    &|_| Ok([1600, 1600]),
+                    &host,
+                    None,
                 )?;
+                eprintln!("dry run: every launch of both halves is accepted");
+                let run = Layout::new(Some(store.clone()), c.clone(), map, count, SLOTS, chunk)?;
                 let k = kernels()?;
                 let open = || -> Result<Box<dyn Device>> {
                     let mut d = CudaDevice::open(0, &k)?;
                     d.select_gemm(GemmForm::from_env()?)?;
                     Ok(Box::new(d))
                 };
-                let (mut v, same) = run.run(&open, &fill, &host, Some(&recorded))?;
+                let (mut v, same) =
+                    compare(&run, &tokens, &out, &open, &fill, &host, Some(&recorded))?;
                 v["tokens"] = json!(count);
                 v["chunk"] = json!(chunk);
                 Ok((v, same))
             })(),
             "generate" => (|| -> Result<(Value, bool)> {
-                let file = var("EIDOLA_DS_WHOLE_PROMPTS").map_or_else(
-                    || {
-                        PathBuf::from(concat!(
-                            env!("CARGO_MANIFEST_DIR"),
-                            "/../eidola-server-engine/examples/ds_generate/prompts.json"
-                        ))
-                    },
-                    PathBuf::from,
-                );
+                let file = var("EIDOLA_DS_WHOLE_PROMPTS")
+                    .map_or_else(ds_both::default_prompts_file, PathBuf::from);
                 let (prompts, eos, tokenizer, map) = prompts(&dir, &file).map_err(fail)?;
                 let widths: Vec<u32> = var("EIDOLA_DS_WHOLE_WIDTHS")
                     .unwrap_or_else(|| "0,5".into())
@@ -1103,30 +618,30 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ds_whole_fixture_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let open = || -> Result<Box<dyn Device>> { Ok(Box::new(HostDevice)) };
-        let first = Compare::new(
-            Some(store.clone()),
-            c.clone(),
-            tokens.clone(),
-            map.clone(),
-            16,
-            base.join("all"),
+        let l = Layout::new(Some(store.clone()), c.clone(), map, tokens.len(), SLOTS, 16).unwrap();
+        let (v, _) = compare(
+            &l,
+            &tokens,
+            &base.join("all"),
+            &open,
+            &|_| Ok([32, 32]),
+            &host,
+            None,
         )
         .unwrap();
-        let (v, _) = first.run(&open, &|_| Ok([32, 32]), &host, None).unwrap();
         assert_eq!(v["steps"].as_array().unwrap().len(), 5);
         assert_eq!(v["cache"][0]["evictions"], 0);
-        let again = Compare::new(
-            Some(store.clone()),
-            c.clone(),
-            tokens,
-            map,
-            16,
-            base.join("two"),
+        let all = base.join("all");
+        let (v, equal) = compare(
+            &l,
+            &tokens,
+            &base.join("two"),
+            &open,
+            &|_| Ok([2, 2]),
+            &host,
+            Some(&all),
         )
         .unwrap();
-        let (v, equal) = again
-            .run(&open, &|_| Ok([2, 2]), &host, Some(&base.join("all")))
-            .unwrap();
         assert!(equal, "{v:#}");
         // 4 encoder layers, the boundary's three arrays, 4 decoder layers, the logits.
         assert_eq!(v["checks"].as_array().unwrap().len(), 4 + 3 + 4 + 1);
@@ -1137,14 +652,21 @@ mod tests {
 
         let path = base.join("all/decoder_layers.bin");
         let mut layers = std::fs::read(&path).unwrap();
-        let width = first.width();
+        let width = l.width();
         // Position 3 of decoder layer 5 (the second of the decoder), element 9.
         let at = 2 * (70 * width + 3 * width + 9);
         layers[at] ^= 1;
         std::fs::write(&path, layers).unwrap();
-        let (v, equal) = again
-            .run(&open, &|_| Ok([3, 2]), &host, Some(&base.join("all")))
-            .unwrap();
+        let (v, equal) = compare(
+            &l,
+            &tokens,
+            &base.join("two"),
+            &open,
+            &|_| Ok([3, 2]),
+            &host,
+            Some(&all),
+        )
+        .unwrap();
         assert!(!equal);
         let bad: Vec<&Value> = v["checks"]
             .as_array()
