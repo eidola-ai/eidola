@@ -9965,6 +9965,49 @@ fn content_y_for_offset_answers_for_offsets_the_caret_is_not_at(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn blocks_outside_the_window_still_record_their_geometry(cx: &mut TestAppContext) {
+    // Sixty paragraphs in a 400px-tall window: most of them lie far below
+    // it and are not drawn, but every one must still answer for its rows —
+    // caret motion, hit-testing and a host's scroll-into-view ask about
+    // text that is off screen.
+    let markdown: String = (0..60)
+        .map(|i| format!("paragraph number {i}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let initial = EditorState {
+        markdown: markdown.clone(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+
+    editor.read_with(cx, |e, _| {
+        assert!(
+            e.content_height() > px(2000.),
+            "the document runs far past the window: {:?}",
+            e.content_height(),
+        );
+        let mut previous = None;
+        for i in 0..60 {
+            let at = markdown
+                .find(&format!("paragraph number {i}"))
+                .expect("fixture");
+            let (top, bottom) = e.content_y_for_offset(at).expect("laid out");
+            assert!(bottom > top, "paragraph {i} is a row");
+            if let Some(previous) = previous {
+                assert!(
+                    top > previous,
+                    "paragraph {i} sits below the one before it: {previous:?} then {top:?}",
+                );
+            }
+            previous = Some(top);
+        }
+    });
+}
+
+#[gpui::test]
 fn content_y_for_offset_resolves_a_wrap_boundary_downstream(cx: &mut TestAppContext) {
     // The same boundary offset the caret can render on either row of: End
     // leaves Upstream affinity (upper row), while `content_y_for_offset` has no
