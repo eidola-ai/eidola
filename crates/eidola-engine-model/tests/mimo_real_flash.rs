@@ -1,9 +1,9 @@
 //! Truncated real MiMo-V2.6-Flash-MOPD against the HF remote code. Local only:
-//! needs the checkpoint subset and goldens produced by `golden/` (see
-//! `golden/README.md`), several GB of RAM, and an optimised build:
+//! needs the checkpoint subset and goldens produced by `golden/mimo/` (see
+//! `golden/mimo/README.md`), several GB of RAM, and an optimised build:
 //!
 //! ```text
-//! cargo test --release -p eidola-engine-model --test real_flash -- --ignored --nocapture
+//! cargo test --release -p eidola-engine-model --test mimo_real_flash -- --ignored --nocapture
 //! ```
 //!
 //! `EIDOLA_MIMO_TRUNCATED_DIR` overrides the checkpoint directory and
@@ -15,11 +15,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use eidola_engine_model::Matrix;
 use eidola_engine_model::compare::{compare_logits, max_abs_diff};
-use eidola_engine_model::safetensors::WeightSet;
-use eidola_engine_model::{
-    ForwardOptions, LoadOptions, LogitsAt, Matrix, ModelWeights, ReferenceModel,
+use eidola_engine_model::mimo::{
+    ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel,
 };
+use eidola_engine_model::safetensors::WeightSet;
 
 const REVISION_PREFIX: &str = "2479e2d0029e";
 
@@ -62,7 +63,7 @@ fn tokens(set: &WeightSet, name: &str) -> Vec<u32> {
 }
 
 #[test]
-#[ignore = "needs a locally fetched truncated checkpoint; see golden/README.md"]
+#[ignore = "needs a locally fetched truncated checkpoint; see golden/mimo/README.md"]
 fn truncated_flash_matches_hf_remote_code() {
     let layers = layers();
     let dir = checkpoint_dir(&layers);
@@ -87,7 +88,10 @@ fn truncated_flash_matches_hf_remote_code() {
         .to_string();
     let store = Arc::new(store);
 
-    let config = store.model_config().unwrap().truncated(&layers).unwrap();
+    let config = eidola_engine_model::mimo::config_of(&store)
+        .unwrap()
+        .truncated(&layers)
+        .unwrap();
     let t0 = Instant::now();
     let model =
         ReferenceModel::new(ModelWeights::load(store, config, &LoadOptions::default()).unwrap());

@@ -44,10 +44,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch  # noqa: E402
 
-from ds_golden import kernel_shim, pinned_ops, st, synthetic  # noqa: E402
-from ds_golden.kernel_compare import failures as kernel_failures  # noqa: E402
-from ds_golden.kernel_compare import generated_calls, instrumented, print_stats  # noqa: E402
-from ds_golden.reference import Reference, args_from_hf_config, load_reference_modules  # noqa: E402
+from deepseek_golden import kernel_shim, pinned_ops, st, synthetic  # noqa: E402
+from deepseek_golden.kernel_compare import failures as kernel_failures  # noqa: E402
+from deepseek_golden.kernel_compare import generated_calls, instrumented, print_stats  # noqa: E402
+from deepseek_golden.reference import Reference, args_from_hf_config, load_reference_modules  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "deepseek_tiny"
 

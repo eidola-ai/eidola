@@ -4,11 +4,13 @@
 
 use rayon::prelude::*;
 
-use crate::attention::{apply_rope, attend, rope_cos_sin, visible};
-use crate::config::{AttentionSpec, MoeSpec};
 use crate::error::{Error, Result};
+use crate::mimo::attention::{apply_rope, attend, rope_cos_sin, visible};
+use crate::mimo::config::{AttentionSpec, MoeSpec};
+use crate::mimo::weights::{
+    AttentionWeights, DenseFfnWeights, FfnWeights, ModelWeights, MtpWeights,
+};
 use crate::tensor::{Matrix, add_assign, dot, linear, rms_norm_rows, sigmoid, silu};
-use crate::weights::{AttentionWeights, DenseFfnWeights, FfnWeights, ModelWeights, MtpWeights};
 
 /// Which positions to compute logits for.
 #[derive(Debug, Clone, PartialEq, Eq)]

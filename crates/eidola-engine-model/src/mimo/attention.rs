@@ -1,7 +1,7 @@
 //! Partial NeoX RoPE and single-query attention with GQA, sliding windows and
 //! learned sinks.
 
-use crate::config::AttentionSpec;
+use crate::mimo::config::AttentionSpec;
 use crate::tensor::dot;
 
 /// `cos`/`sin` for one position: `rope_dim` entries each, the second half a
@@ -92,7 +92,7 @@ pub fn attend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AttentionKind;
+    use crate::mimo::config::AttentionKind;
 
     fn spec(window: Option<usize>) -> AttentionSpec {
         AttentionSpec {

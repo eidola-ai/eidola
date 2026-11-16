@@ -3,7 +3,7 @@
     uv run python fetch_truncated.py --dir <checkpoint dir> [--truncation prefix] [--reuse <other dir>]
 
 `config.json`, `tokenizer.json`, and the tensors the chosen truncation of
-`ds_golden/truncated.py` keeps (`spread`: about 14 GB; `prefix`: about 32 GB),
+`deepseek_golden/truncated.py` keeps (`spread`: about 14 GB; `prefix`: about 32 GB),
 re-packed byte for byte into one local file per upstream shard. Every file is
 checked against the recorded hashes of `upstream-sha256.json` and refused on a
 mismatch, a shard already present included, so an interrupted fetch resumes
@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ds_golden import truncated, upstream  # noqa: E402
+from deepseek_golden import truncated, upstream  # noqa: E402
 
 
 def main() -> None:

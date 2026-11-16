@@ -2,7 +2,7 @@
 
     uv run python check_halves.py --reference-dir <dir holding model.py and engram.py>
 
-The reference is run whole and then as two halves (`ds_golden/halves.py`), on
+The reference is run whole and then as two halves (`deepseek_golden/halves.py`), on
 the emulated kernels with the arithmetic pinned, for one prefill chunk, for
 one token per call and for a prefill chunk followed by single tokens. Every
 layer's streams, the final normed state and the logits must be equal bit for
@@ -20,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch  # noqa: E402
 
-from ds_golden import halves, pinned_ops, st, synthetic  # noqa: E402
-from ds_golden.reference import Reference, args_from_hf_config, load_reference_modules  # noqa: E402
+from deepseek_golden import halves, pinned_ops, st, synthetic  # noqa: E402
+from deepseek_golden.reference import Reference, args_from_hf_config, load_reference_modules  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "deepseek_tiny"
 

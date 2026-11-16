@@ -1,6 +1,6 @@
 # Golden generation (dev-only)
 
-This page is the MiMo-V2.6 tooling. The DeepSeek-V4.1 tooling is a separate project with its own pins: [`deepseek_v41/README.md`](deepseek_v41/README.md).
+This page is the MiMo-V2.6 tooling. The DeepSeek-V4.1 tooling is a separate project with its own pins: [`../deepseek/README.md`](../deepseek/README.md).
 
 Python tooling that produces the reference outputs `eidola-engine-model` is checked against. It is never a build input: `cargo test` reads only the committed fixture under `tests/fixtures/` and needs neither Python nor the network.
 
@@ -11,7 +11,7 @@ The oracle is the Hugging Face remote code for MiMo-V2 (`modeling_mimo_v2.py` / 
 [uv](https://docs.astral.sh/uv/) and Python 3.12. Versions are pinned in `pyproject.toml` and locked in `uv.lock`. Everything runs on CPU, so torch comes from PyTorch's CPU-only index and the lock carries no CUDA runtime (`nvidia-*`, `triton`):
 
 ```sh
-cd crates/eidola-engine-model/golden
+cd crates/eidola-engine-model/golden/mimo
 uv sync
 ```
 
@@ -23,7 +23,7 @@ Downloads (remote code, tokenizer, checkpoint subsets) are cached under `~/.cach
 uv run python make_synthetic.py
 ```
 
-This rewrites `tests/fixtures/tiny/`:
+This rewrites `tests/fixtures/mimo_tiny/`:
 
 - `config.json`
 - `model.safetensors`: a 4-layer MiMo-shaped model with seeded random weights in the real storage formats.
@@ -45,7 +45,7 @@ This follows the published structure of the MTP layer: `eh_proj([enorm(embed) â€
 ```sh
 uv run python fetch_truncated.py      # ~15 GB of HTTP range reads
 uv run python real_golden.py          # HF forward; ~35 GB peak RAM
-cd ../../.. && cargo test --release -p eidola-engine-model --test real_flash -- --ignored --nocapture
+cd ../../../.. && cargo test --release -p eidola-engine-model --test mimo_real_flash -- --ignored --nocapture
 ```
 
 `fetch_truncated.py` fetches the following, and nothing else:

@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch  # noqa: E402
 
-from ds_golden import pinned_ops, st, synthetic  # noqa: E402
-from ds_golden.reference import Reference, args_from_hf_config, load_reference_modules, place_weights  # noqa: E402
+from deepseek_golden import pinned_ops, st, synthetic  # noqa: E402
+from deepseek_golden.reference import Reference, args_from_hf_config, load_reference_modules, place_weights  # noqa: E402
 
 SHORT_PREFILL = 40
 FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "deepseek_tiny"

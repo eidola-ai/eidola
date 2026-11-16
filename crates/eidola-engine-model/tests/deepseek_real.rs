@@ -1,6 +1,6 @@
 //! Local check against a truncation of the real DeepSeek-V4.1-Flash-1017
 //! checkpoint (ignored: needs the fetched weights and goldens, see
-//! `golden/deepseek_v41/README.md`).
+//! `golden/deepseek/README.md`).
 //!
 //!     EIDOLA_DEEPSEEK_TRUNCATED_DIR=<dir> cargo test --release -p eidola-engine-model \
 //!         --test deepseek_real -- --ignored --nocapture
@@ -16,7 +16,7 @@ use eidola_engine_model::deepseek::engram::{EngramTable, SparseEngramTable};
 use eidola_engine_model::deepseek::forward::DsForwardOptions;
 use eidola_engine_model::deepseek::{DsLoadOptions, DsModel, DsWeights, config_of};
 
-/// The truncation `golden/deepseek_v41/ds_golden/truncated.py` fetches.
+/// The truncation `golden/deepseek/deepseek_golden/truncated.py` fetches.
 const LAYERS: [usize; 12] = [0, 1, 2, 3, 14, 15, 20, 21, 24, 37, 38, 39];
 const BACKBONE_EXPERTS: usize = 32;
 const DRAFTER_EXPERTS: usize = 16;

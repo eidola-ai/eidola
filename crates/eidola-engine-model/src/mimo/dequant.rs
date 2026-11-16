@@ -9,8 +9,8 @@
 
 use rayon::prelude::*;
 
-use crate::config::AttentionSpec;
 use crate::error::{Error, Result};
+use crate::mimo::config::AttentionSpec;
 use crate::numeric::{E2M1_VALUES, e8m0_to_f32, fp8_e4m3_to_f32};
 use crate::tensor::Matrix;
 
@@ -252,7 +252,7 @@ pub enum QkvWeight<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AttentionKind;
+    use crate::mimo::config::AttentionKind;
 
     fn flash_global() -> AttentionSpec {
         AttentionSpec {

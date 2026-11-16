@@ -6,7 +6,7 @@
 Writes `golden/hf-golden.safetensors` under the checkpoint directory: the token ids
 of the text below, logits at every position, the residual stream after every
 kept layer, and MTP layer 0's outputs over the shifted sequence. The Rust side
-is the ignored test `tests/real_flash.rs`.
+is the ignored test `tests/mimo_real_flash.rs`.
 """
 
 import argparse

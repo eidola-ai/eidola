@@ -39,8 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch  # noqa: E402
 from tokenizers import Tokenizer  # noqa: E402
 
-from ds_golden import kernel_compare, pinned_ops, st, truncated  # noqa: E402
-from ds_golden.reference import Reference, args_from_hf_config, load_reference_modules, place_weights  # noqa: E402
+from deepseek_golden import kernel_compare, pinned_ops, st, truncated  # noqa: E402
+from deepseek_golden.reference import Reference, args_from_hf_config, load_reference_modules, place_weights  # noqa: E402
 
 TEXT = '''The keeper of the northern light kept two logbooks. In the first he wrote what the service required: the hour the lamp was lit, the hour it was put out, the state of the sea, the direction of the wind, and the quantity of oil consumed during the night. In the second, which nobody had asked him to keep, he wrote down everything else. He recorded the colour of the water at dawn, the birds that struck the glass in fog, and the names of the vessels he could identify as they passed, together with a guess at their cargo and their destination. Over thirty years the second book grew to eleven volumes, and it was the second book, not the first, that the harbour board asked to see when the old charts were finally redrawn.
 

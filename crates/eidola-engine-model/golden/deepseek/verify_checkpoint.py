@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ds_golden import upstream  # noqa: E402
+from deepseek_golden import upstream  # noqa: E402
 
 
 def main() -> None:

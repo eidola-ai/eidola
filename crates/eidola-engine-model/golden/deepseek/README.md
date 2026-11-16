@@ -8,10 +8,10 @@ Python tooling that produces the reference outputs the DeepSeek-V4.1 forward (`s
 
 The reference is the inference code published with the checkpoint: `inference/model.py` and `inference/engram.py` of `deepseek-ai/DeepSeek-V4.1-Flash-1017` at revision `08c8657f02291e11b6f6b63e0e16014f8e748518`. Those two files run unmodified. Nothing from that repository is vendored here: every script takes the directory holding them as `--reference-dir`.
 
-Three things stand between that code and a CPU, and each is supplied by `ds_golden/`:
+Three things stand between that code and a CPU, and each is supplied by `deepseek_golden/`:
 
-1. **The kernels.** The reference's `inference/kernel.py` is a set of tilelang CUDA kernels. `ds_golden/kernel_shim.py` has the same function signatures and computes what the kernel source specifies, in plain PyTorch on a CPU. Where the kernel source does not determine the bits (the accumulation order inside its GEMMs and reductions, the rounding of a float to FP8 or FP4, `exp`, `sigmoid`), the shim takes the rule this crate fixes (`AGENTS.md` → DeepSeek-V4.1 → Numerics contract).
-2. **Library arithmetic the reference leaves unspecified.** `ds_golden/pinned_ops.py` replaces, in the `torch` namespace the reference reads them from, exactly the operations whose bits depend on the library or the call shape: the summation order of `F.linear`, `einsum`, `sum` and `mean`; the last bit of `exp`, `log`, `sin` and `cos`; whether a complex multiply is fused; and which of several equal values `topk` returns. Its module docstring lists each operation and its rule.
+1. **The kernels.** The reference's `inference/kernel.py` is a set of tilelang CUDA kernels. `deepseek_golden/kernel_shim.py` has the same function signatures and computes what the kernel source specifies, in plain PyTorch on a CPU. Where the kernel source does not determine the bits (the accumulation order inside its GEMMs and reductions, the rounding of a float to FP8 or FP4, `exp`, `sigmoid`), the shim takes the rule this crate fixes (`AGENTS.md` → DeepSeek-V4.1 → Numerics contract).
+2. **Library arithmetic the reference leaves unspecified.** `deepseek_golden/pinned_ops.py` replaces, in the `torch` namespace the reference reads them from, exactly the operations whose bits depend on the library or the call shape: the summation order of `F.linear`, `einsum`, `sum` and `mean`; the last bit of `exp`, `log`, `sin` and `cos`; whether a complex multiply is fused; and which of several equal values `topk` returns. Its module docstring lists each operation and its rule.
 3. **Modules the text path never uses.** `image_processor` and `vision` are empty stand-ins (the real ones need Pillow).
 
 With the kernels emulated and the arithmetic pinned, the reference's output is a function of the tokens and of how they are split into its prefill chunk and decode steps (its prefill and decode passes lay attention out in different 64-slot blocks), and the Rust forward reproduces it **bit for bit** for either. That exactness is what the committed tests assert. It is agreement between this crate and the reference's model code under this crate's rules. How far the real kernels and a GPU's own arithmetic are from those rules is a separate measurement, made once on a GPU (below, and `AGENTS.md`).
@@ -23,7 +23,7 @@ No workaround was needed for dtypes: PyTorch 2.10 on a CPU allocates, views, ind
 [uv](https://docs.astral.sh/uv/) and Python 3.12. This directory is its own project, with versions pinned in `pyproject.toml` and locked in `uv.lock` (torch from PyTorch's CPU-only index). It is separate from the MiMo tooling one level up, whose pins it does not move.
 
 ```sh
-cd crates/eidola-engine-model/golden/deepseek_v41
+cd crates/eidola-engine-model/golden/deepseek
 uv sync
 ```
 
@@ -38,7 +38,7 @@ uv run python make_synthetic.py --reference-dir <dir>
 This rewrites `tests/fixtures/deepseek_tiny/`:
 
 - `config.json`: the checkpoint's config shape at small sizes.
-- `model.safetensors`: seeded random weights in the real storage formats. `ds_golden/synthetic.py` explains the shape choices: every mechanism is present and does real work within the 96-token sequence.
+- `model.safetensors`: seeded random weights in the real storage formats. `deepseek_golden/synthetic.py` explains the shape choices: every mechanism is present and does real work within the 96-token sequence.
 - `golden.safetensors`:
   - `tokens`, and `engram.token_map` (the compressed-vocabulary map the reference built from the fixture's stand-in tokenizer);
   - `step.*`: one token per call, the reference's decode pattern. Every layer's streams, each sub-layer's output, the final normed state, the logits, the Engram table rows, the drafter's input, and the drafter's greedy chain at every position from 1 on;
@@ -59,7 +59,7 @@ cd ../../../.. && EIDOLA_DEEPSEEK_TRUNCATED_DIR=<checkpoint dir> \
     cargo test --release -p eidola-engine-model --test deepseek_real -- --ignored --nocapture
 ```
 
-`fetch_truncated.py` fetches `config.json`, `tokenizer.json` and the tensors `ds_golden/truncated.py` keeps, re-packed byte for byte into one local file per upstream shard. Every file is checked against the recorded hashes before it gets the name anything loads, and the Rust test checks them again before loading (Recorded hashes, below). The truncation is:
+`fetch_truncated.py` fetches `config.json`, `tokenizer.json` and the tensors `deepseek_golden/truncated.py` keeps, re-packed byte for byte into one local file per upstream shard. Every file is checked against the recorded hashes before it gets the name anything loads, and the Rust test checks them again before loading (Recorded hashes, below). The truncation is:
 
 - checkpoint layers 0, 1, 2, 3, 14, 15, 20, 21, 24, 37, 38 and 39, which cover every layer kind and the drafter's three target layers;
 - the first 32 of each backbone layer's 384 routed experts and the first 16 of each draft block's 128. The router's rows are cut to match, so routing chooses among the kept experts. Every tensor is the checkpoint's own; the model is smaller than the released one, not an approximation of it;
@@ -95,7 +95,7 @@ This exists because a size check is not enough. A whole-checkpoint download made
 
 ## Health: is this the model
 
-Agreement with the reference shows that a forward computes what `model.py` computes on the files both were given. `health_check.py` is the check that the files, and everything else both share, are the released model, against things outside this tooling (`ds_golden/health.py`):
+Agreement with the reference shows that a forward computes what `model.py` computes on the files both were given. `health_check.py` is the check that the files, and everything else both share, are the released model, against things outside this tooling (`deepseek_golden/health.py`):
 
 - **A publicly reported reply.** For the system prompt "You are a helpful assistant." and the user message "hello", without thinking, at temperature 0, discussion #33 of the upstream model repository reports the reply `Hello! How can\n can I help you today?` (repeated word and all), byte for byte the same from the vendor's hosted API and from a self-hosted SGLang deployment of this checkpoint, and reports the three most likely tokens after "How can" as a newline, `#` and `<` at about -2.4 each. This is a third party's public report of two production-lineage systems, not a measurement made here. The request is rendered by the repository's own `encoding/encoding.py`, unmodified. The check: at every position of the reply the most likely token is the reply's, except at that reported near-tie, where it must be one of the three.
 - **Next-token accuracy floors.** Over an original story as the reply to a chat request, at least 0.55; over the passage the whole-model goldens are made on, at least 0.55 (asserted by `tests/deepseek_real_full.rs` for our forward and for every golden).
@@ -122,7 +122,7 @@ On the damaged copy the same four accuracies were 0.171, 0.179, 0.211 and 0.229,
 On a fresh Ubuntu 24.04 machine with the NVIDIA driver and CUDA installed (root only for `apt-get install -y git curl build-essential`):
 
 ```sh
-git clone <this repository> eidola && cd eidola/crates/eidola-engine-model/golden/deepseek_v41
+git clone <this repository> eidola && cd eidola/crates/eidola-engine-model/golden/deepseek
 ./gpu_session.sh all          # setup, probes, kernels, fetch, real, summary
 ./gpu_session.sh rust         # our forward against the goldens, on that machine
 ```
@@ -168,7 +168,7 @@ Put `goldens/spread/reference-gpu-*.safetensors` into `<12-layer dir>/golden/` a
 
 ## The whole model, one half at a time
 
-The checkpoint (about 510 GB) does not fit one GPU, and the truncations cannot say how the final logits of the whole model respond to the bits the reference leaves open. `full_halves.py` runs the reference over all 40 layers on one GPU: the unmodified `model.py` built for layers 0–19, run, its boundary recorded (the residual copies and collapse weights leaving layer 19), freed; then built for layers 20–39 with the head and teacher-forced from that boundary by a forward pre-hook on its first layer (`ds_golden/halves.py`). Layer 20 is the KV source every later layer reads, so nothing else crosses. The Engram tables are never loaded: only the rows the tokens touch are read from their shards.
+The checkpoint (about 510 GB) does not fit one GPU, and the truncations cannot say how the final logits of the whole model respond to the bits the reference leaves open. `full_halves.py` runs the reference over all 40 layers on one GPU: the unmodified `model.py` built for layers 0–19, run, its boundary recorded (the residual copies and collapse weights leaving layer 19), freed; then built for layers 20–39 with the head and teacher-forced from that boundary by a forward pre-hook on its first layer (`deepseek_golden/halves.py`). Layer 20 is the KV source every later layer reads, so nothing else crosses. The Engram tables are never loaded: only the rows the tokens touch are read from their shards.
 
 `check_halves.py` checks the driver on the synthetic fixture with the emulated kernels: the two halves reproduce the whole model bit for bit, in every layer's streams, the final normed state and the logits, for one prefill chunk, for one token per call and for a prefill chunk followed by single tokens. `full_halves.py --first-layers 4 --split 2` runs the same command line over the first four real layers, where its streams equal `real_golden.py`'s exactly and, with `EIDOLA_DEEPSEEK_FULL_FIRST_LAYERS=4` and `EIDOLA_DEEPSEEK_FULL_GOLDEN_DIR`, the Rust test equals its logits exactly in both layouts: the whole chain has run on real weights at four layers, not at forty.
 

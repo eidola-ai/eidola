@@ -2,7 +2,7 @@
 //! DeepSeek-V4.1-Flash-1017 checkpoint, whole (every routed expert): how the
 //! residual streams respond to the bits the reference leaves unspecified.
 //! Ignored: needs the fetched weights and goldens, see
-//! `golden/deepseek_v41/README.md`.
+//! `golden/deepseek/README.md`.
 //!
 //!     EIDOLA_DEEPSEEK_PREFIX_DIR=<dir> cargo test --release -p eidola-engine-model \
 //!         --test deepseek_real_prefix -- --ignored --nocapture

@@ -1,5 +1,5 @@
 //! DeepSeek-V4.1 (text): configuration, weight loading and the dense
-//! reference forward, beside the MiMo-V2.6 modules at the crate root.
+//! reference forward.
 //!
 //! - [`config`] reads either config shape into a typed per-layer table.
 //! - [`numeric`], [`quant`], [`linear`], [`rope`], [`mhc`], [`attention`],

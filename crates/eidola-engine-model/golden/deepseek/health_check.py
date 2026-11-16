@@ -10,7 +10,7 @@ half, and it fails loudly:
 
 - every checkpoint file is first checked against the recorded upstream hashes
   (`upstream-sha256.json`);
-- the `hello` request of `ds_golden/health.py` must be answered, token for
+- the `hello` request of `deepseek_golden/health.py` must be answered, token for
   token, with the publicly reported reply: at every position of it the most
   likely token is the reply's, except at the one position the report gives as
   a near three-way tie, where it must be one of the three reported;
@@ -18,7 +18,7 @@ half, and it fails loudly:
 
 `--encoding-dir` holds the repository's `encoding/encoding.py`, the published
 prompt format, unmodified. The model runs one half at a time
-(`ds_golden/halves.py`), both halves loaded once for all sequences.
+(`deepseek_golden/halves.py`), both halves loaded once for all sequences.
 
 Writes `<dir>/golden/health.safetensors` for `tests/deepseek_real_full.rs`:
 each sequence's tokens (`<name>.tokens`), where its scored reply starts
@@ -47,8 +47,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch  # noqa: E402
 from tokenizers import Tokenizer  # noqa: E402
 
-from ds_golden import halves, health, pinned_ops, st, truncated, upstream  # noqa: E402
-from ds_golden.reference import args_from_hf_config, load_reference_modules  # noqa: E402
+from deepseek_golden import halves, health, pinned_ops, st, truncated, upstream  # noqa: E402
+from deepseek_golden.reference import args_from_hf_config, load_reference_modules  # noqa: E402
 from full_halves import local_rows  # noqa: E402
 from real_golden import TokenizerShim, fetch_engram_rows, log  # noqa: E402
 

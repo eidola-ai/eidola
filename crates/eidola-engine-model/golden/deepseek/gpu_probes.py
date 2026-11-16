@@ -1,6 +1,6 @@
 """Small probes of the reference's real kernels, answering what their source
 leaves open. Each compares the real kernel (`--reference-dir/kernel.py`, on
-CUDA) with the emulation (`ds_golden/kernel_shim.py`, on the CPU) and records
+CUDA) with the emulation (`deepseek_golden/kernel_shim.py`, on the CPU) and records
 what the real kernel did:
 
 1. float -> FP8 cast: every exact tie between adjacent E4M3 codes, both signs.
@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch  # noqa: E402
 
-from ds_golden import kernel_shim as ks  # noqa: E402
+from deepseek_golden import kernel_shim as ks  # noqa: E402
 
 BF16 = torch.bfloat16
 

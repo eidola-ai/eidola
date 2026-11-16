@@ -7,9 +7,11 @@
 
 use std::sync::Arc;
 
-use crate::config::{AttentionSpec, FfnKind, ModelConfig};
-use crate::dequant::{QkvSharding, QkvWeight, deinterleave_qkv, fp8_block_dequant, mxfp4_dequant};
 use crate::error::{Error, Result};
+use crate::mimo::config::{AttentionSpec, FfnKind, ModelConfig};
+use crate::mimo::dequant::{
+    QkvSharding, QkvWeight, deinterleave_qkv, fp8_block_dequant, mxfp4_dequant,
+};
 use crate::safetensors::{Dtype, WeightSet};
 use crate::tensor::Matrix;
 

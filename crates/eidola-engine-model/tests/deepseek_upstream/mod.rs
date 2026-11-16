@@ -1,5 +1,5 @@
 //! The released DeepSeek-V4.1-Flash-1017 checkpoint's recorded bytes, for the
-//! real-weights tests: `golden/deepseek_v41/upstream-sha256.json` holds the
+//! real-weights tests: `golden/deepseek/upstream-sha256.json` holds the
 //! SHA-256 of every published file at the pinned revision and of every
 //! re-packed file of each truncation. A test loads nothing it has not checked
 //! against that list: a download of the right size and the wrong bytes gives
@@ -12,7 +12,7 @@ use std::path::Path;
 use eidola_engine_model::WeightSet;
 use eidola_engine_model::safetensors::SEMANTIC_FILES;
 
-const RECORDED: &str = include_str!("../../golden/deepseek_v41/upstream-sha256.json");
+const RECORDED: &str = include_str!("../../golden/deepseek/upstream-sha256.json");
 
 /// Next-token accuracy a healthy model reaches over the passage the
 /// whole-model goldens are made on, scored after its first token. The

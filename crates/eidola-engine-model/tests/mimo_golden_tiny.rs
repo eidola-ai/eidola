@@ -1,18 +1,19 @@
 //! The reference forward against goldens produced by the Hugging Face MiMo-V2
 //! remote code (fp32, CPU) on the committed synthetic checkpoint. Regenerate
-//! with `golden/make_synthetic.py` (see `golden/README.md`).
+//! with `golden/mimo/make_synthetic.py` (see `golden/mimo/README.md`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use eidola_engine_model::Matrix;
 use eidola_engine_model::compare::{compare_logits, max_abs_diff};
-use eidola_engine_model::safetensors::WeightSet;
-use eidola_engine_model::{
-    ForwardOptions, LoadOptions, LogitsAt, Matrix, ModelConfig, ModelWeights, ReferenceModel,
+use eidola_engine_model::mimo::{
+    ForwardOptions, LoadOptions, LogitsAt, ModelConfig, ModelWeights, ReferenceModel,
 };
+use eidola_engine_model::safetensors::WeightSet;
 
 fn fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mimo_tiny")
 }
 
 struct Golden(WeightSet);
@@ -226,7 +227,7 @@ fn integrity_manifest_covers_config_and_index() {
     );
     store.verify_sha256(&manifest).unwrap();
     assert_eq!(store.metadata("tp_size"), Some("4"));
-    let config = store.model_config().unwrap();
+    let config = eidola_engine_model::mimo::config_of(&store).unwrap();
     assert_eq!(
         config.num_layers(),
         ModelConfig::from_file(&src.join("config.json"))

@@ -3,7 +3,7 @@
     python full_halves.py --dir <whole checkpoint dir> --reference-dir <dir> [--kernels real]
 
 The checkpoint (about 510 GB) does not fit one GPU; each half of the model
-does (about 150 GB). `ds_golden/halves.py` builds the unmodified `model.py`
+does (about 150 GB). `deepseek_golden/halves.py` builds the unmodified `model.py`
 for layers 0-19, runs it and records the boundary, frees it, then builds
 layers 20-39 with the head and teacher-forces them from that boundary.
 `check_halves.py` shows on the synthetic fixture that the two halves are the
@@ -47,9 +47,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch  # noqa: E402
 from tokenizers import Tokenizer  # noqa: E402
 
-from ds_golden import halves, pinned_ops, st  # noqa: E402
-from ds_golden.reference import args_from_hf_config, load_reference_modules  # noqa: E402
-from ds_golden import truncated  # noqa: E402
+from deepseek_golden import halves, pinned_ops, st  # noqa: E402
+from deepseek_golden.reference import args_from_hf_config, load_reference_modules  # noqa: E402
+from deepseek_golden import truncated  # noqa: E402
 from real_golden import TEXT, TokenizerShim, log  # noqa: E402
 from real_golden import _rows_tensor as rows_tensor  # noqa: E402
 from real_golden import _stored_rows as stored_rows  # noqa: E402

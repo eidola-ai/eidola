@@ -190,7 +190,7 @@ pub const SEMANTIC_FILES: [&str; 2] = ["config.json", "model.safetensors.index.j
 ///
 /// **Integrity covers every semantic input.** [`WeightSet::open_dir`] reads the
 /// [`SEMANTIC_FILES`] present in the directory once, keeps their bytes, and
-/// uses only those bytes afterwards ([`WeightSet::model_config`], index
+/// uses only those bytes afterwards ([`WeightSet::semantic_file`], index
 /// metadata). [`WeightSet::sha256_manifest`] and [`WeightSet::verify_sha256`]
 /// cover them alongside the shards, so one manifest pins everything the loader
 /// reads.
@@ -324,19 +324,6 @@ impl WeightSet {
 
     pub fn file_names(&self) -> Vec<&str> {
         self.files.iter().map(|f| f.name.as_str()).collect()
-    }
-
-    /// The model configuration from the `config.json` this set read (and hashed)
-    /// in [`WeightSet::open_dir`].
-    pub fn model_config(&self) -> Result<crate::ModelConfig> {
-        let bytes = self
-            .semantic
-            .get("config.json")
-            .ok_or_else(|| Error::Safetensors {
-                path: self.dir.join("config.json"),
-                reason: "no config.json was read with these weights".into(),
-            })?;
-        crate::ModelConfig::from_json_bytes(bytes, "config.json")
     }
 
     /// The bytes of one of the [`SEMANTIC_FILES`] this set read (and hashed)

@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use eidola_engine_model::Error;
-use eidola_engine_model::config::{AttentionKind, FfnKind, ModelConfig};
+use eidola_engine_model::mimo::config::{AttentionKind, FfnKind, ModelConfig};
 use serde_json::Value;
 
 fn data(name: &str) -> Value {

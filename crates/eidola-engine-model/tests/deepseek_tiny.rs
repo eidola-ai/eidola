@@ -1,6 +1,6 @@
 //! The DeepSeek-V4.1 reference forward against the committed synthetic
 //! fixture, whose goldens are the released model code run over an emulated
-//! kernel layer with its library arithmetic pinned (see `golden/README.md`).
+//! kernel layer with its library arithmetic pinned (see `golden/deepseek/README.md`).
 //! Under those rules the reference is a function of the tokens alone, and
 //! every comparison here is exact.
 
