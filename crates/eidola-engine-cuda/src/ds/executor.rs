@@ -1,17 +1,19 @@
 //! [`DsCudaExecutor`]: the serving core's [`Executor`] for DeepSeek-V4.1 on two logical
 //! devices, eager (every step is launched afresh; no graph is captured).
 //!
-//! It reports the model as the CPU reference executor does without drafts (the same
-//! four groups, ratios, devices and coverage, the window chain, the token history) and
-//! runs a step in that executor's order: maintenance and table updates; the decoder's
-//! device gathers the Engram rows of the tables it holds; the encoder runs every layer
-//! before the split at every position, then the split layer's bank stub; the crossing
-//! is checked; the decoder stores the bank entries, runs each chain layer over the rows
-//! the row rule gives it, the head over the sampling rows, and samples on its device.
+//! It reports the model as the CPU reference executor does (the same groups, ratios,
+//! devices and coverage, the window chain, the token history, and with `draft_width` > 0
+//! the drafter's group) and runs a step in that executor's order: maintenance (the host
+//! tier's `Demote`, `Promote` and `ZeroHost` among it, with `host_blocks` > 0) and table
+//! updates; the draft pass of the rows that draft; the decoder's device gathers the
+//! Engram rows of the tables it holds; the encoder runs every layer before the split at
+//! every position, then the split layer's bank stub; the crossing is checked; the
+//! decoder stores the bank entries, runs each chain layer over the rows the row rule
+//! gives it, the head over the sampling rows and drafted positions, and samples on its
+//! device, or accepts a drafting row's drafts there.
 //!
-//! Not supported, and refused before a step takes any effect: drafts (a row asking for
-//! them is a host bug and panics, as at the seam), and the host tier (`Demote`,
-//! `Promote`, `ZeroHost` fail the step).
+//! Not supported: decode graphs, and the drafter's confidence head. A row asking for more
+//! drafts than `draft_width` is a host bug and panics, as at the seam.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -118,8 +120,8 @@ fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1e3
 }
 
-/// The seam's description of the model under `cfg`: the CPU reference executor's
-/// without drafts.
+/// The seam's description of the model under `cfg`: the CPU reference executor's, the
+/// drafter's group among it when drafting.
 fn model_spec(c: &DsConfig, shape: &DsShape, cfg: &DsCudaExecutorConfig) -> Result<ModelSpec> {
     let window: u32 = narrow(c.attention.window, "window")?;
     let hd: u32 = narrow(c.attention.head_dim, "head dim")?;
@@ -302,6 +304,20 @@ impl DsCudaExecutor {
         token_map: Option<Vec<u32>>,
         cfg: &DsCudaExecutorConfig,
     ) -> Result<DsCudaExecutor> {
+        Self::build_with(encoder, decoder, store, c, token_map, cfg, true)
+    }
+
+    /// As `build`; without `routed` the backbone's routed experts stay off the devices
+    /// (`HalfWeights::load_with`).
+    pub(crate) fn build_with(
+        encoder: Box<dyn Device>,
+        decoder: Box<dyn Device>,
+        store: Option<&WeightSet>,
+        c: &DsConfig,
+        token_map: Option<Vec<u32>>,
+        cfg: &DsCudaExecutorConfig,
+        routed: bool,
+    ) -> Result<DsCudaExecutor> {
         let (shape, spec) = Self::preflight(c, cfg)?;
         let hasher = match (&c.engram, token_map) {
             (Some(e), Some(map)) => Some(
@@ -330,7 +346,7 @@ impl DsCudaExecutor {
         let cap = shape.open_cap();
         let mut halves = Vec::new();
         for (half, dev) in [(Half::Encoder, encoder), (Half::Decoder, decoder)] {
-            let w = HalfWeights::load(
+            let w = HalfWeights::load_with(
                 dev.as_ref(),
                 store,
                 c,
@@ -338,6 +354,7 @@ impl DsCudaExecutor {
                 half,
                 cfg.max_model_len,
                 true,
+                routed,
             )?;
             let mut kv = KvStore::new(
                 dev.as_ref(),
@@ -389,6 +406,12 @@ impl DsCudaExecutor {
     /// Each half's memory by kind: the encoder's, then the decoder's.
     pub fn memory(&self) -> [MemoryBytes; 2] {
         [self.encoder.memory(), self.decoder.memory()]
+    }
+
+    /// Both halves, the encoder's first.
+    #[cfg(feature = "dev-staged-experts")]
+    pub(crate) fn halves_mut(&mut self) -> [&mut HalfNet; 2] {
+        [&mut self.encoder, &mut self.decoder]
     }
 
     /// A half (tests).

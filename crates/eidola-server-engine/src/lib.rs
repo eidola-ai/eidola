@@ -388,6 +388,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
             Served::DeepSeek {
                 config: ds,
                 model: reference,
+                ..
             },
         ) => {
             let reference = reference.clone().ok_or_else(|| {
@@ -415,20 +416,46 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
             );
             (engine, None)
         }
-        // The DeepSeek-V4.1 CUDA executor (two devices) is constructed here; this build
-        // has none, so the boot ends rather than falling back.
+        // DeepSeek-V4.1 on two GPUs, device `d` on GPU `d`. Never a fallback: a refusal
+        // here ends the boot.
         #[cfg(feature = "cuda")]
         (
             ExecutorConfig::Cuda {
+                kernels_dir,
+                kv_device_bytes,
                 further_kv_device_bytes,
-                ..
+                graphs,
+                gpu_cc,
             },
             Served::DeepSeek { .. },
         ) => {
             check_device_budgets(model.architecture(), 1 + further_kv_device_bytes.len())?;
-            return Err(BootError(
-                "cuda: unsupported model: this build has no CUDA executor for DeepSeek-V4.1".into(),
-            ));
+            let budgets = [*kv_device_bytes, further_kv_device_bytes[0]];
+            let prepared = cuda::prepare_deepseek(
+                &model,
+                &sizing,
+                kernels_dir,
+                budgets,
+                config.kv_host_bytes,
+                *graphs,
+                *gpu_cc,
+            )?;
+            let report = prepared.report();
+            let c = prepared.config();
+            tracing::info!(
+                devices = ?c.devices,
+                kv_blocks = c.num_blocks,
+                host_kv_blocks = c.host_blocks,
+                draft_tokens = c.draft_width,
+                "loading the model onto the devices"
+            );
+            let engine = worker::spawn(
+                move || prepared.build(),
+                scheduler,
+                SWEEP_INTERVAL,
+                stopped_tx,
+            );
+            (engine, Some(report))
         }
         (ExecutorConfig::Cpu { kv_blocks }, Served::Mimo { .. }) => {
             let reference = model.reference().cloned().ok_or_else(|| {

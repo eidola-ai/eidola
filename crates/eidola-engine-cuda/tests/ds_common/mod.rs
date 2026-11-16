@@ -266,6 +266,43 @@ impl Default for Drafting {
     }
 }
 
+thread_local! {
+    /// With the staged-experts feature: when set, the executor under test is built with
+    /// the backbone's routed experts staged (`ds::staged`) from host memory read this
+    /// way, with caches of these many experts (the encoder's, the decoder's).
+    #[cfg(feature = "dev-staged-experts")]
+    pub static STAGED: std::cell::Cell<Option<(eidola_engine_cuda::ds::staged::HostMode, [u32; 2])>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The executor under test with its experts staged.
+#[cfg(feature = "dev-staged-experts")]
+fn staged(
+    m: &Model,
+    device: &dyn Fn() -> Box<dyn Device>,
+    cfg: &DsCudaExecutorConfig,
+    mode: &eidola_engine_cuda::ds::staged::HostMode,
+    capacity: &[u32; 2],
+) -> DsCudaExecutor {
+    use eidola_engine_cuda::ds::staged::{DevOnly, HostExperts};
+    use eidola_engine_cuda::ds::support::check_supported;
+    let token = DevOnly::for_tests_and_dev_tools();
+    let shape = check_supported(&m.config, cfg.draft_width).unwrap();
+    let host = Arc::new(HostExperts::new(&m.store, &m.config, &shape, *mode, token).unwrap());
+    DsCudaExecutor::staged_with_devices(
+        device(),
+        device(),
+        &m.store,
+        &m.config,
+        Some(m.token_map.clone()),
+        cfg,
+        &host,
+        *capacity,
+        token,
+    )
+    .expect("the staged executor under test")
+}
+
 /// What a run compared.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Compared {
@@ -332,6 +369,20 @@ impl Paired {
             position_tags: true,
             record: true,
         };
+        #[cfg(feature = "dev-staged-experts")]
+        let dev = match STAGED.get() {
+            Some((mode, capacity)) => staged(m, device, &cfg, &mode, &capacity),
+            None => DsCudaExecutor::with_devices(
+                device(),
+                device(),
+                &m.store,
+                &m.config,
+                Some(m.token_map.clone()),
+                &cfg,
+            )
+            .expect("the executor under test"),
+        };
+        #[cfg(not(feature = "dev-staged-experts"))]
         let dev = DsCudaExecutor::with_devices(
             device(),
             device(),

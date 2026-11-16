@@ -7,7 +7,9 @@
 //! [`kv`] and [`weights`] laying out each half's memory, and [`boundary`] what crosses
 //! between them. [`host`] runs the same executor on host memory with the reference
 //! numerics, and [`dry`] with no memory at all: the accounting and the launch checks
-//! of a configuration at any scale.
+//! of a configuration at any scale. `staged` (dev-only, behind the
+//! `dev-staged-experts` feature) runs the whole model on one GPU with the routed experts
+//! cached from host memory.
 
 pub mod abi;
 pub mod attention;
@@ -25,6 +27,8 @@ pub mod kv;
 pub mod model;
 pub mod ops;
 pub mod plan;
+#[cfg(feature = "dev-staged-experts")]
+pub mod staged;
 pub mod support;
 pub mod weights;
 

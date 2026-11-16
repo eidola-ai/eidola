@@ -181,10 +181,13 @@ pub enum Served {
         reference: Option<Arc<ReferenceModel>>,
         template: ChatTemplate,
     },
-    /// DeepSeek-V4.1-Flash, text only: its configuration and the reference model (CPU
-    /// executor only). The prompt encoder is compiled into the chat crate.
+    /// DeepSeek-V4.1-Flash, text only: its configuration, the Engram compressed-vocabulary
+    /// map when the model has Engram layers (`engram_token_map`, for either executor), and
+    /// the reference model (CPU executor only). The prompt encoder is compiled into the
+    /// chat crate.
     DeepSeek {
         config: DsConfig,
+        token_map: Option<Vec<u32>>,
         model: Option<Arc<DsModel>>,
     },
 }
@@ -314,14 +317,29 @@ impl LoadedModel {
                         config.vocab_size
                     )));
                 }
+                let token_map = if config.engram.is_some() {
+                    Some(engram_token_map(&store, &tokenizer)?)
+                } else {
+                    None
+                };
                 let model = match executor {
-                    ExecutorKind::Cpu => {
-                        Some(Arc::new(load_deepseek(&store, config.clone(), &tokenizer)?))
-                    }
+                    ExecutorKind::Cpu => Some(Arc::new(load_deepseek(
+                        &store,
+                        config.clone(),
+                        token_map.clone(),
+                    )?)),
                     #[cfg(feature = "cuda")]
                     ExecutorKind::Cuda => None,
                 };
-                (Served::DeepSeek { config, model }, tokenizer, defaults)
+                (
+                    Served::DeepSeek {
+                        config,
+                        token_map,
+                        model,
+                    },
+                    tokenizer,
+                    defaults,
+                )
             }
             _ => {
                 let config = store
@@ -495,13 +513,8 @@ fn architecture_of(config_json: &[u8]) -> Result<Architecture, ModelError> {
 fn load_deepseek(
     store: &Arc<WeightSet>,
     config: DsConfig,
-    tokenizer: &Tokenizer,
+    token_map: Option<Vec<u32>>,
 ) -> Result<DsModel, ModelError> {
-    let token_map = if config.engram.is_some() {
-        Some(engram_token_map(store, tokenizer)?)
-    } else {
-        None
-    };
     let weights = DsWeights::load(store.clone(), config, &DsLoadOptions::default())
         .map_err(|e| ModelError(format!("cannot load the weights: {e}")))?;
     DsModel::new(weights, token_map)

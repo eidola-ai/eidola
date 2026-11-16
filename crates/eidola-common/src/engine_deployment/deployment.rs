@@ -1162,12 +1162,18 @@ shim:
     }
 
     /// The MiMo deployment's shape for DeepSeek-V4.1-Flash on two B300s: two
-    /// GPUs attested, a KV budget per device, the published text-only pack.
-    fn deepseek_deployment(kv: &str, gpus: u64) -> (String, String) {
+    /// GPUs attested, a KV budget per device, the published text-only pack,
+    /// and a `max_model_len` context (MiMo's whole 2^20 window does not fit
+    /// DeepSeek-V4.1's device 1: `deepseek_does_not_fit_two_b300s_at_its_whole_window`).
+    fn deepseek_deployment(kv: &str, gpus: u64, max_model_len: u32) -> (String, String) {
         let config = std::str::from_utf8(MIMO_CONFIG)
             .unwrap()
             .replace("gpus: 1\n", &format!("gpus: {gpus}\n"))
             .replace("\"85899345920\"", &format!("\"{kv}\""))
+            .replace(
+                "EIDOLA_ENGINE_MAX_MODEL_LEN: \"1048576\"",
+                &format!("EIDOLA_ENGINE_MAX_MODEL_LEN: \"{max_model_len}\""),
+            )
             .replace(
                 "XiaomiMiMo/MiMo-V2.6-Flash-MOPD@2479e2d0029eca9a34cc7e7f55a121925f81908e",
                 "deepseek-ai/DeepSeek-V4.1-Flash-1017@08c8657f02291e11b6f6b63e0e16014f8e748518",
@@ -1194,10 +1200,26 @@ shim:
     #[test]
     fn a_deepseek_deployment_names_a_budget_per_device_and_fits_each() {
         let check = |kv: &str, gpus: u64| {
-            let (config, sidecar) = deepseek_deployment(kv, gpus);
+            let (config, sidecar) = deepseek_deployment(kv, gpus, 1 << 17);
             check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
         };
         let d = check("16000000000,8000000000", 2).unwrap();
+        // The whole 2^20 window: device 1's least KV (every group one whole
+        // sequence) is past what its GPU has left.
+        let (config, sidecar) = deepseek_deployment("16000000000,13107400000", 2, 1 << 20);
+        let err = check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
+            .unwrap_err();
+        assert!(
+            err.contains("device 1:") && err.contains("device memory"),
+            "{err}"
+        );
+        let (config, sidecar) = deepseek_deployment("16000000000,13107399999", 2, 1 << 20);
+        let err = check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
+            .unwrap_err();
+        assert!(
+            err.contains("device 1:") && err.contains("smallest"),
+            "{err}"
+        );
         assert_eq!(d.architecture, Architecture::DeepSeekV41Flash);
         assert_eq!(
             d.measured.executor.kv_device_budgets(),
