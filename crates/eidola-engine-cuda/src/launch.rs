@@ -19,7 +19,7 @@ pub fn dptr_at<T: DeviceRepr>(slice: &CudaSlice<T>, stream: &CudaStream, offset:
 }
 
 /// A device range by address and length, named for diagnostics: what the
-/// executor scrubs ([`crate::CudaExecutor`] → idle scrub) and its tests read.
+/// executor scrubs ([`crate::mimo::CudaExecutor`] → idle scrub) and its tests read.
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceRange {
     pub name: &'static str,

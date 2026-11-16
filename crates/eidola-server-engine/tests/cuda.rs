@@ -35,7 +35,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use eidola_engine_cuda::{CudaGraphs, Gpu};
+use eidola_engine_cuda::Gpu;
+use eidola_engine_cuda::mimo::CudaGraphs;
 use eidola_server_engine::config::{ExecutorConfig, ExecutorKind, GpuCc, WeightsStorage, env};
 use serde_json::{Value, json};
 
@@ -536,8 +537,8 @@ fn greedy<E: eidola_engine::executor::Executor>(
 #[test]
 fn the_nodes_deepseek_configuration_computes_what_the_cpu_executor_does() {
     use eidola_engine_cpu::deepseek::{DsCpuExecutor, DsCpuExecutorConfig};
-    use eidola_engine_cuda::ds::DsCudaExecutor;
-    use eidola_engine_cuda::ds::host::HostDevice;
+    use eidola_engine_cuda::deepseek::DsCudaExecutor;
+    use eidola_engine_cuda::deepseek::host::HostDevice;
     use eidola_server_engine::model::Served;
 
     let model = deepseek_loaded();
@@ -555,7 +556,7 @@ fn the_nodes_deepseek_configuration_computes_what_the_cpu_executor_does() {
         None,
     )
     .unwrap();
-    let prompt = eidola_engine_chat::deepseek_v4_1::encode(
+    let prompt = eidola_engine_chat::deepseek::encode(
         &input,
         eidola_server_engine::pipeline::deepseek_options(),
     )
@@ -801,9 +802,9 @@ async fn real_flash_serves_what_the_executor_computes() {
         use eidola_engine::engine::{CacheScope, Engine, FinishReason, Request, SchedulerConfig};
         use eidola_engine::kv::CachePolicy;
         use eidola_engine::sampling::SamplingParams;
+        use eidola_engine_chat::mimo::RenderOptions;
         use eidola_engine_chat::{
-            ChatDelta, ChatInput, OutputConfig, OutputParser, PrefixedCallIds, RenderOptions,
-            StopCause,
+            ChatDelta, ChatInput, OutputConfig, OutputParser, PrefixedCallIds, StopCause,
         };
 
         let messages = json!([{"role": "user", "content": text}]).to_string();

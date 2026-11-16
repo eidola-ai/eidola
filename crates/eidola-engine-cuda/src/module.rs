@@ -349,7 +349,7 @@ mod tests {
         assert!(check_entry(rms, "engine_ops", Some("eidola_embed")).is_err());
         // Each GEMM kind binds its own image only: both share a Params size,
         // so the size check alone would not tell them apart.
-        use crate::gemm::GemmKind;
+        use crate::mimo::gemm::GemmKind;
         let kinds = [GemmKind::Fp8Blockwise, GemmKind::Bf16];
         for kind in kinds {
             let (image, entry) = kind.kernel();

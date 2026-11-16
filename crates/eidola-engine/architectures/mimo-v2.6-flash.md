@@ -19,17 +19,15 @@
 
 ## Where the code lives
 
-MiMo predates the second architecture: much of its code is at each crate's root, beside the code all architectures share.
-
 | Crate | MiMo-V2.6 code |
 |---|---|
 | `eidola-common` | `architecture.rs` (`MimoV26Flash`); `engine_deployment` (one-device grammar) |
-| `eidola-engine` | the seam's MiMo shapes (global, sliding and drafter groups, MTP and block drafting); `mock.rs` |
-| `eidola-engine-model` | `src/{config,forward,attention,weights,dequant}.rs`; `tests/{config,golden_tiny,real_flash}.rs`; `golden/` (outside `golden/deepseek_v41/`) |
-| `eidola-engine-chat` | `src/{template,tool_call,reasoning}.rs`, the Jinja template path and its `pysem` semantics; `tests/` (outside `deepseek_*`) |
-| `eidola-engine-cpu` | `src/{executor,oracle,pool}.rs`; `tests/` (outside `ds_*`) |
-| `eidola-engine-kernels` | `csrc/` (outside `ds_*`), the CUTLASS, DeepGEMM and FlashInfer instantiations |
-| `eidola-engine-cuda` | `src/` (outside `ds/`); `tests/` (outside `ds_*`); `examples/{eval,decode_bench,…}.rs` |
+| `eidola-engine` | the seam's MiMo shapes (global, sliding and drafter groups, MTP and block drafting); the MiMo-shaped mock in `mock.rs` (`mimo_like_spec`) |
+| `eidola-engine-model` | `src/mimo/`; `tests/mimo_*`; `tests/fixtures/mimo_tiny/`; `tests/data/`; `golden/mimo/` |
+| `eidola-engine-chat` | `src/mimo/` (the Jinja template, `<think>` reasoning and `<tool_call>` parsers); `tests/mimo_*`; `tests/fixtures/mimo/`; `dev/mimo_*` |
+| `eidola-engine-cpu` | `src/mimo/`; `tests/mimo_*` |
+| `eidola-engine-kernels` | `csrc/` (outside `ds_*`), the CUTLASS, DeepGEMM and FlashInfer instantiations and `engine_ops.cu` |
+| `eidola-engine-cuda` | `src/mimo/`; `oracle/cutlass_params.cu`; `tests/mimo_*`; `tests/data/cutlass_params.jsonl`; `examples/mimo_*` |
 | `eidola-server-engine` | the MiMo arms in `lib.rs`, `cuda.rs`, `model.rs`, `pipeline.rs` |
 | `models/mimo/`, `deploy/engine/mimo-v2.6-flash/` | the catalog row and the pinned deployment |
 

@@ -79,9 +79,9 @@ SPDX-License-Identifier = "LicenseRef-Eidola-Legal"
 # XiaomiMiMo/MiMo-V2.6-Flash-MOPD, declared MIT), kept as test fixtures.
 [[annotations]]
 path = [
-    "crates/eidola-engine-chat/tests/fixtures/chat_template.jinja",
-    "crates/eidola-engine-chat/tests/fixtures/generation_config.json",
-    "crates/eidola-engine-chat/tests/fixtures/tokenizer.json.gz",
+    "crates/eidola-engine-chat/tests/fixtures/mimo/chat_template.jinja",
+    "crates/eidola-engine-chat/tests/fixtures/mimo/generation_config.json",
+    "crates/eidola-engine-chat/tests/fixtures/mimo/tokenizer.json.gz",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "© 2026 Xiaomi Corporation"
@@ -102,8 +102,8 @@ SPDX-License-Identifier = "MIT"
 # Test fixtures generated from the MiMo-V2.6 template and tokenizer.
 [[annotations]]
 path = [
-    "crates/eidola-engine-chat/tests/fixtures/template_cases.json",
-    "crates/eidola-engine-chat/tests/fixtures/template_token_ids.json",
+    "crates/eidola-engine-chat/tests/fixtures/mimo/template_cases.json",
+    "crates/eidola-engine-chat/tests/fixtures/mimo/template_token_ids.json",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = ["© Eidola, Inc. and contributors", "© 2026 Xiaomi Corporation"]
@@ -113,8 +113,8 @@ SPDX-License-Identifier = "AGPL-3.0-only AND MIT"
 # deepseek-ai/DeepSeek-V4.1-Flash-1017, declared MIT), kept as test fixtures.
 [[annotations]]
 path = [
-    "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/config.json",
-    "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/tokenizer.json.gz",
+    "crates/eidola-engine-chat/tests/fixtures/deepseek/config.json",
+    "crates/eidola-engine-chat/tests/fixtures/deepseek/tokenizer.json.gz",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "© 2023 DeepSeek"
@@ -124,11 +124,11 @@ SPDX-License-Identifier = "MIT"
 # tokenizer and Engram map.
 [[annotations]]
 path = [
-    "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/encoding_cases.json",
-    "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/output_cases.json",
-    "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/token_ids.json",
-    "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/token_map.bin.gz",
-    "crates/eidola-engine-chat/tests/fixtures/deepseek_v4_1/token_map.json",
+    "crates/eidola-engine-chat/tests/fixtures/deepseek/encoding_cases.json",
+    "crates/eidola-engine-chat/tests/fixtures/deepseek/output_cases.json",
+    "crates/eidola-engine-chat/tests/fixtures/deepseek/token_ids.json",
+    "crates/eidola-engine-chat/tests/fixtures/deepseek/token_map.bin.gz",
+    "crates/eidola-engine-chat/tests/fixtures/deepseek/token_map.json",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = ["© Eidola, Inc. and contributors", "© 2023 DeepSeek"]

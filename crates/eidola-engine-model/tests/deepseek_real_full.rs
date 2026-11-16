@@ -1,8 +1,8 @@
 //! The whole DeepSeek-V4.1-Flash-1017 model, all 40 layers and every routed
 //! expert, against the reference run one half at a time
-//! (`golden/deepseek_v41/full_halves.py`). Ignored: needs the whole
+//! (`golden/deepseek/full_halves.py`). Ignored: needs the whole
 //! checkpoint (about 510 GB) and goldens made on a machine that can run it;
-//! see `golden/deepseek_v41/README.md`.
+//! see `golden/deepseek/README.md`.
 //!
 //!     EIDOLA_DEEPSEEK_FULL_DIR=<dir> cargo test --release -p eidola-engine-model \
 //!         --test deepseek_real_full -- --ignored --nocapture
@@ -16,7 +16,7 @@
 //! whatever goldens are present, the test also asserts against the world:
 //!
 //! - every checkpoint file is the recorded upstream one
-//!   (`golden/deepseek_v41/upstream-sha256.json`), before anything loads;
+//!   (`golden/deepseek/upstream-sha256.json`), before anything loads;
 //! - next-token accuracy over the goldens' passage reaches its floor, for our
 //!   forward and for every golden;
 //! - with `golden/health.safetensors` (`health_check.py`), our forward

@@ -15,7 +15,7 @@ use eidola_engine::engine::{CacheScope, Engine, FinishReason, Request, Scheduler
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
-use eidola_engine_chat::deepseek_v4_1::{self, EncodeOptions, ReasoningEffort};
+use eidola_engine_chat::deepseek::{self, EncodeOptions, ReasoningEffort};
 use eidola_engine_chat::{
     ChatDelta, ChatFormat, ChatInput, OutputConfig, OutputParser, PrefixedCallIds, StopCause,
 };
@@ -63,7 +63,7 @@ fn prompt_tokens(messages: &Value, tools: Option<&Value>, options: EncodeOptions
         tools.map(|t| t.to_string()).as_deref(),
     )
     .unwrap();
-    let prompt = deepseek_v4_1::encode(&input, options).unwrap();
+    let prompt = deepseek::encode(&input, options).unwrap();
     model.tokenizer().encode_prompt(&prompt).unwrap()
 }
 
@@ -205,7 +205,7 @@ fn the_engram_map_is_derived_from_the_tokenizer() {
     assert!(model.store().get(ENGRAM_TOKEN_MAP_TENSOR).is_err());
     let reference = reference(&model);
     let spec = reference.config().engram.as_ref().expect("Engram layers");
-    let derived = deepseek_v4_1::compressed_vocab(model.tokenizer()).unwrap();
+    let derived = deepseek::compressed_vocab(model.tokenizer()).unwrap();
     assert_eq!(derived.classes, fixture::DEEPSEEK_COMPRESSED_VOCAB);
     assert_eq!(spec.compressed_vocab, derived.classes);
     // " The", "the" and "THE" are one token each, of one class.
@@ -283,9 +283,9 @@ async fn every_prompt_thinks_at_the_default_effort() {
 
     let messages = json!([{"role": "user", "content": "hi"}]);
     let input = ChatInput::from_json(&messages.to_string(), None).unwrap();
-    let thinking = deepseek_v4_1::encode(&input, options).unwrap();
-    let chat = deepseek_v4_1::encode(&input, EncodeOptions::new(false)).unwrap();
-    assert!(thinking.text().starts_with(deepseek_v4_1::BOS_TOKEN));
+    let thinking = deepseek::encode(&input, options).unwrap();
+    let chat = deepseek::encode(&input, EncodeOptions::new(false)).unwrap();
+    assert!(thinking.text().starts_with(deepseek::BOS_TOKEN));
     assert!(
         thinking.text().ends_with("<｜Assistant｜><think>"),
         "{}",
@@ -303,7 +303,7 @@ async fn every_prompt_thinks_at_the_default_effort() {
     // The BOS is the prompt's own text: one, at the start.
     let bos = deepseek_loaded()
         .tokenizer()
-        .encode(deepseek_v4_1::BOS_TOKEN)
+        .encode(deepseek::BOS_TOKEN)
         .unwrap();
     assert_eq!(&on[..bos.len()], &bos[..]);
 }
@@ -403,12 +403,12 @@ async fn a_tool_round_is_encoded_as_the_format_does() {
          <｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n\
          <｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n\
          </｜DSML｜ invoke>\n</｜DSML｜ calls>{}",
-        deepseek_v4_1::EOS_TOKEN
+        deepseek::EOS_TOKEN
     );
     let model = deepseek_loaded();
     let tokens = model.tokenizer().encode(&text).unwrap();
     let declared = eidola_engine_chat::json::parse(&tools().to_string()).unwrap();
-    let schemas = deepseek_v4_1::tool_schemas(&declared).unwrap();
+    let schemas = deepseek::tool_schemas(&declared).unwrap();
     let mut decoder = Decoder::new(
         model.clone(),
         OutputConfig::deepseek_v4_1(true, Some(schemas)),
@@ -511,7 +511,7 @@ async fn images_are_refused() {
     );
     let (status, v) = node.chat_json(&image).await;
     assert_eq!(status, 400, "{v}");
-    let spelled = user(&format!("look: {}", deepseek_v4_1::IMAGE_PLACEHOLDER), 2);
+    let spelled = user(&format!("look: {}", deepseek::IMAGE_PLACEHOLDER), 2);
     let (status, v) = node.chat_json(&spelled).await;
     assert_invalid(status, &v, "unsupported content");
 }

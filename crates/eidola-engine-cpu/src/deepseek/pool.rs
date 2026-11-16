@@ -21,7 +21,7 @@
 use eidola_engine::kv_cipher::{KvKeystream, KvNonce};
 use eidola_engine::secret::KvKey;
 
-use crate::pool::{PageBuf, Tag};
+use crate::page::{PageBuf, Tag};
 
 #[derive(Debug)]
 pub(crate) struct BytePool {

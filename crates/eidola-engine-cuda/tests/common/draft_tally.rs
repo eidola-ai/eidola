@@ -1,5 +1,5 @@
 //! Drafting acceptance per depth, tallied from what each row was asked to
-//! draft. Shared by `examples/eval.rs` and `tests/drafting.rs`, each of which
+//! draft. Shared by `examples/mimo_eval.rs` and `tests/mimo_drafting.rs`, each of which
 //! includes this file by path, so it is the one definition both report.
 //!
 //! Depth `d`'s rate is conditional: draft `d` accepted among the rows that

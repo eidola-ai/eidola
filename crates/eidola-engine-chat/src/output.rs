@@ -21,17 +21,19 @@
 //!
 //! A response cut off by `length` keeps the calls already completed; a call
 //! whose closing tag never arrived is given out as content (see
-//! [`crate::tool_call`]).
+//! [`crate::mimo::tool_call`] and [`crate::deepseek::output`]).
 
 use std::ops::Range;
 
 use crate::ChatFormat;
 use crate::args::ToolSchemas;
-use crate::deepseek_v4_1::output::{DsmlParser, ReasoningSplitter};
+use crate::deepseek::output::{DsmlParser, ReasoningSplitter};
 use crate::error::ChatError;
-use crate::reasoning::{ReasoningDelta, ReasoningParser};
+use crate::mimo::reasoning::ReasoningParser;
+use crate::mimo::tool_call::ToolCallParser;
+use crate::reasoning::ReasoningDelta;
 use crate::tokenizer::{Detokenizer, Tokenizer};
-use crate::tool_call::{CallIdSource, ToolCall, ToolCallDelta, ToolCallParser};
+use crate::tool_call::{CallIdSource, ToolCall, ToolCallDelta};
 
 /// Why the engine stopped generating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +86,7 @@ pub struct OutputConfig {
     /// Drop special tokens from the text (the OpenAI-compatible default).
     pub skip_special_tokens: bool,
     /// The final message's field the prompt ended inside
-    /// ([`crate::RenderOptions::continue_final_message`]), so the output
+    /// ([`crate::mimo::RenderOptions::continue_final_message`]), so the output
     /// continues it: `reasoning_content` starts inside the reasoning, any other
     /// field in the answer. `None` for a new assistant turn.
     pub continuing: Option<&'static str>,
@@ -105,8 +107,8 @@ impl OutputConfig {
     }
 
     /// The configuration for a DeepSeek-V4.1 response to a prompt encoded
-    /// with [`crate::deepseek_v4_1::EncodeOptions::thinking`] as `thinking`;
-    /// `tools` are the request's, from [`crate::deepseek_v4_1::tool_schemas`].
+    /// with [`crate::deepseek::EncodeOptions::thinking`] as `thinking`;
+    /// `tools` are the request's, from [`crate::deepseek::tool_schemas`].
     pub fn deepseek_v4_1(thinking: bool, tools: Option<ToolSchemas>) -> OutputConfig {
         OutputConfig {
             thinking,
@@ -309,7 +311,7 @@ impl OutputParser {
     /// order. A continued prompt encodes an added token only where the template
     /// writes one, the `<think>` and `</think>` around the reasoning, and
     /// everything given out as reasoning or content is request data there, which
-    /// spells none ([`crate::MimoTokenizer::encode_prompt`]). So the verdict is
+    /// spells none ([`crate::mimo::MimoTokenizer::encode_prompt`]). So the verdict is
     /// true only when the model sampled exactly those tags as tokens and no
     /// other: a sampled added token that reached the text, or a tag the model
     /// wrote out of ordinary tokens, would come back as different tokens.

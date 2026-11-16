@@ -4,7 +4,7 @@
 //!
 //! [`prepare`] is MiMo-V2.6-Flash's executor on one GPU (`eidola-engine-cuda`'s
 //! `check_supported` and `check_device`); [`prepare_deepseek`] is DeepSeek-V4.1's on two,
-//! device `d` on GPU `d` (`eidola_engine_cuda::ds`). The node never narrows or widens
+//! device `d` on GPU `d` (`eidola_engine_cuda::deepseek`). The node never narrows or widens
 //! what an executor supports: it hands the executor the configuration and returns the
 //! executor's own refusal. Nothing here changes a number the model computes; it only
 //! sizes and constructs.
@@ -13,12 +13,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec};
-use eidola_engine_cuda::ds::weights::Half;
-use eidola_engine_cuda::ds::{DsCudaExecutor, DsCudaExecutorConfig};
-use eidola_engine_cuda::kv::{GroupGeometry, KvLayout};
-use eidola_engine_cuda::{
-    CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, KernelDir, KvBlocks, MtpHidden,
-};
+use eidola_engine_cuda::deepseek::weights::Half;
+use eidola_engine_cuda::deepseek::{DsCudaExecutor, DsCudaExecutorConfig};
+use eidola_engine_cuda::mimo::kv::{GroupGeometry, KvLayout};
+use eidola_engine_cuda::mimo::{CudaExecutor, CudaExecutorConfig, CudaGraphs, KvBlocks, MtpHidden};
+use eidola_engine_cuda::{Gpu, KernelDir};
 use eidola_engine_model::deepseek::DsConfig;
 use eidola_engine_model::safetensors::WeightSet;
 
@@ -376,14 +375,14 @@ pub const DEEPSEEK_DEVICES: [usize; 2] = [0, 1];
 
 /// Bytes of one block of every KV group on `half`'s device together, banks (full
 /// attention) and windows (sliding) apart: the executor's own block layouts
-/// (`eidola_engine_cuda::ds::executor::geometry`, each group's block one image padded to
+/// (`eidola_engine_cuda::deepseek::executor::geometry`, each group's block one image padded to
 /// 16 bytes).
 fn deepseek_half_block_bytes(
     ds: &DsConfig,
     spec: &ModelSpec,
     half: Half,
 ) -> Result<DsBlockBytes, BootError> {
-    let groups = eidola_engine_cuda::ds::executor::geometry(ds, spec, half)
+    let groups = eidola_engine_cuda::deepseek::executor::geometry(ds, spec, half)
         .map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
     let overflow = || BootError(format!("{} overflows the KV sizing", env::KV_DEVICE_BYTES));
     let mut bytes = DsBlockBytes::default();
@@ -568,7 +567,7 @@ pub fn deepseek_config(
         host_blocks: 0,
         position_tags: false,
         record: false,
-        gemm: eidola_engine_cuda::ds::gemm::GemmForm::Exact,
+        gemm: eidola_engine_cuda::deepseek::gemm::GemmForm::Exact,
     };
     let (_, spec) = DsCudaExecutor::preflight(ds, &config).map_err(refused)?;
     let blocks = derive_deepseek_kv_blocks(ds, &spec, kv_device_bytes, sizing, cache)?;
@@ -947,8 +946,10 @@ mod tests {
                     };
                     assert_eq!(
                         u64::from(
-                            eidola_engine_cuda::executor::split_partial_rows(bucket, draft, len)
-                                .unwrap()
+                            eidola_engine_cuda::mimo::executor::split_partial_rows(
+                                bucket, draft, len
+                            )
+                            .unwrap()
                         ),
                         eidola_common::engine_deployment::split_partial_rows(&sizing),
                         "{sizing:?}"
@@ -1077,7 +1078,7 @@ mod tests {
     fn deepseek_released() -> DsConfig {
         DsConfig::from_file(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../eidola-engine-chat/tests/fixtures/deepseek_v4_1/config.json"),
+                .join("../eidola-engine-chat/tests/fixtures/deepseek/config.json"),
         )
         .unwrap()
     }
@@ -1109,7 +1110,7 @@ mod tests {
         let (_, spec) = DsCudaExecutor::preflight(ds, &config).unwrap();
         let per = |half| {
             let mut bytes = DsBlockBytes::default();
-            for g in eidola_engine_cuda::ds::executor::geometry(ds, &spec, half).unwrap() {
+            for g in eidola_engine_cuda::deepseek::executor::geometry(ds, &spec, half).unwrap() {
                 match spec.kv_groups[g.global as usize].attention {
                     AttentionKind::Full => bytes.bank += g.block_bytes() as u64,
                     AttentionKind::Sliding { .. } => bytes.window += g.block_bytes() as u64,
@@ -1338,7 +1339,7 @@ mod tests {
         budgets: [u64; 2],
         capacity: Option<u64>,
     ) -> Result<DsCudaExecutor, String> {
-        use eidola_engine_cuda::ds::dry::DryDevice;
+        use eidola_engine_cuda::deepseek::dry::DryDevice;
         let ds = deepseek_released();
         let e = ds.engram.clone().unwrap();
         let map: Vec<u32> = (0..ds.vocab_size)
@@ -1354,7 +1355,7 @@ mod tests {
             129_264,
         )
         .map_err(|e| e.0)?;
-        let device = || -> Box<dyn eidola_engine_cuda::ds::half::Device> {
+        let device = || -> Box<dyn eidola_engine_cuda::deepseek::half::Device> {
             Box::new(DryDevice::new(
                 capacity.map(|c| usize::try_from(c).unwrap()),
             ))

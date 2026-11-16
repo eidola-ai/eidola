@@ -20,7 +20,7 @@ use tokenizers::tokenizer::{Model, Normalizer, OffsetType, PreTokenizedString, P
 
 use crate::ChatFormat;
 use crate::error::ChatError;
-use crate::template::{Prompt, sha256_hex};
+use crate::prompt::{Prompt, sha256_hex};
 
 /// File name of the tokenizer inside a model directory.
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
@@ -893,7 +893,7 @@ pub(crate) mod tests {
 
 /// Comparison against the reference Python tokenizer on the real MiMo
 /// `tokenizer.json`. The pinned file is committed gzip-compressed under
-/// `tests/fixtures/`; `EIDOLA_MIMO_MODEL_DIR` may name a model directory to
+/// `tests/fixtures/mimo/`; `EIDOLA_MIMO_MODEL_DIR` may name a model directory to
 /// use instead. Either way the decompressed bytes must match the pin.
 #[cfg(test)]
 mod reference_tests {
@@ -911,18 +911,19 @@ mod reference_tests {
         if let Some(dir) = std::env::var_os(MODEL_DIR_ENV) {
             return MimoTokenizer::from_model_dir(&PathBuf::from(dir)).expect("pinned tokenizer");
         }
-        let compressed = std::fs::read(fixtures_dir().join("tokenizer.json.gz")).unwrap();
+        let compressed = std::fs::read(fixtures_dir().join("mimo/tokenizer.json.gz")).unwrap();
         let mut tokenizer_json = Vec::new();
         flate2::read::GzDecoder::new(compressed.as_slice())
             .read_to_end(&mut tokenizer_json)
             .unwrap();
-        let generation_config = std::fs::read(fixtures_dir().join(GENERATION_CONFIG_FILE)).unwrap();
+        let generation_config =
+            std::fs::read(fixtures_dir().join("mimo").join(GENERATION_CONFIG_FILE)).unwrap();
         MimoTokenizer::from_bytes(&tokenizer_json, &generation_config).expect("pinned tokenizer")
     }
 
     fn token_fixtures() -> serde_json::Value {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/template_token_ids.json");
+            .join("tests/fixtures/mimo/template_token_ids.json");
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
@@ -945,7 +946,7 @@ mod reference_tests {
         let cases: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/template_cases.json"),
+                    .join("tests/fixtures/mimo/template_cases.json"),
             )
             .unwrap(),
         )
@@ -1064,7 +1065,7 @@ mod reference_tests {
     }
 
     fn deepseek() -> Tokenizer {
-        let dir = fixtures_dir().join("deepseek_v4_1");
+        let dir = fixtures_dir().join("deepseek");
         let compressed = std::fs::read(dir.join("tokenizer.json.gz")).unwrap();
         let mut tokenizer_json = Vec::new();
         flate2::read::GzDecoder::new(compressed.as_slice())

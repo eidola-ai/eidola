@@ -1,6 +1,6 @@
 # eidola-engine-model — Agent Development Guide
 
-This crate holds the engine's model definitions, text only: the MiMo-V2.6 family (Flash-MOPD and Pro-MOPD) at the crate root, and DeepSeek-V4.1 under `src/deepseek/` ([DeepSeek-V4.1](#deepseek-v41) below). The two share the weight set, the matrix kernels and the comparison metrics, and nothing else: MiMo's modules do not know the second architecture exists.
+This crate holds the engine's model definitions, text only, one module per architecture: the MiMo-V2.6 family (Flash-MOPD and Pro-MOPD) under `src/mimo/`, and DeepSeek-V4.1 under `src/deepseek/` ([DeepSeek-V4.1](#deepseek-v41) below). The two share the root modules (the weight set, the scalar decoders, the matrix kernels and the comparison metrics) and nothing else: neither architecture's modules know the other exists.
 
 For MiMo it covers four things:
 
@@ -15,17 +15,18 @@ The reference forward is the golden oracle. Every faster executor (paged CPU, GP
 
 | Module | Role |
 |---|---|
-| `config` | `RawConfig` (serde) → `ModelConfig`. Builds the per-layer `LayerSpec` table (attention geometry, RoPE, window, sinks, FFN kind) from the config's own fields. Unsupported features are rejected. Every stored float (RoPE thetas, `layernorm_epsilon`, `attention_value_scale`, `routed_scaling_factor`, the softmax scale) is validated after conversion to f32, as finite and positive (`positive_f32`), so `rope_theta: 1e40` cannot become infinity. `truncated()` keeps a subset of checkpoint layers. Every `quantization_config` key is read (an unknown one is refused) and `QuantSpec` keeps what an executor may need to pin, `activation_scheme` included, though the f32 reference does not use it. Likewise `MoeSpec::router_dtype` (`moe_router_dtype`) and `attention_chunk_size` are kept as declared rather than dropped after parsing. |
-| `deepseek` | The second architecture, self-contained. See [DeepSeek-V4.1](#deepseek-v41). |
-| `safetensors` | `WeightSet` covers every `*.safetensors` file in a directory. Files are mmapped and tensors read lazily, and a subset of shards or tensors is fine. Index and `__metadata__` values (`tp_size`) are read. One sha256 manifest covers every file the loader reads, shards plus `config.json` and the index (`SEMANTIC_FILES`), whose bytes are read once and only used as hashed (`WeightSet::model_config`). The manifest is keyed by file name, so a name that is not UTF-8 is refused (before the file is opened), never converted lossily. |
-| `numeric` | Exact BF16, FP8 e4m3fn, E2M1 and E8M0 decoders. |
-| `dequant` | FP8 block-scaled linears, MXFP4 experts, and the rank-major pre-sharded fused QKV. |
-| `weights` | `ModelWeights::load`. Dense tensors are dequantised once. Routed experts stay mapped and are dequantised per forward call (`ModelWeights::expert`). Optionally folds the value scale into `o_proj`. |
-| `tensor` | `Matrix` plus the kernels: `dot`, `linear`, `rms_norm`, `silu` and `sigmoid`. |
-| `attention` | RoPE tables, partial rotate-half, window visibility, and single-query attention with a sink. |
-| `forward` | `ReferenceModel::forward` (logits at chosen positions, plus optional per-layer residual streams), `mtp_forward`, `route` and `swiglu`. |
-| `compare` | Top-1 agreement, KL divergence and max-abs-diff for golden checks, and for certifying faster executors. Fail-closed: any NaN or infinity on either side is a `NonFinite` error, never a metric (a NaN off the winning logit would otherwise pass with perfect top-1, zero KL and zero max-abs-diff). |
-| `golden/` | Dev-only Python that produces goldens from the HF remote code. See `golden/README.md`. |
+| `mimo` | MiMo-V2.6: the modules below marked `mimo::`, `config_of` (the `ModelConfig` from the `config.json` a weight set read and hashed) and `load_reference`. |
+| `deepseek` | DeepSeek-V4.1, self-contained. See [DeepSeek-V4.1](#deepseek-v41). |
+| `mimo::config` | `RawConfig` (serde) → `ModelConfig`. Builds the per-layer `LayerSpec` table (attention geometry, RoPE, window, sinks, FFN kind) from the config's own fields. Unsupported features are rejected. Every stored float (RoPE thetas, `layernorm_epsilon`, `attention_value_scale`, `routed_scaling_factor`, the softmax scale) is validated after conversion to f32, as finite and positive (`positive_f32`), so `rope_theta: 1e40` cannot become infinity. `truncated()` keeps a subset of checkpoint layers. Every `quantization_config` key is read (an unknown one is refused) and `QuantSpec` keeps what an executor may need to pin, `activation_scheme` included, though the f32 reference does not use it. Likewise `MoeSpec::router_dtype` (`moe_router_dtype`) and `attention_chunk_size` are kept as declared rather than dropped after parsing. |
+| `safetensors` | Shared. `WeightSet` covers every `*.safetensors` file in a directory. Files are mmapped and tensors read lazily, and a subset of shards or tensors is fine. Index and `__metadata__` values (`tp_size`) are read. One sha256 manifest covers every file the loader reads, shards plus `config.json` and the index (`SEMANTIC_FILES`), whose bytes are read once and only used as hashed (`WeightSet::semantic_file`, which `mimo::config_of` and `deepseek::config_of` read). The manifest is keyed by file name, so a name that is not UTF-8 is refused (before the file is opened), never converted lossily. |
+| `numeric` | Shared. Exact BF16, FP8 e4m3fn, E2M1 and E8M0 decoders. |
+| `mimo::dequant` | FP8 block-scaled linears, MXFP4 experts, and the rank-major pre-sharded fused QKV. |
+| `mimo::weights` | `ModelWeights::load`. Dense tensors are dequantised once. Routed experts stay mapped and are dequantised per forward call (`ModelWeights::expert`). Optionally folds the value scale into `o_proj`. |
+| `tensor` | Shared. `Matrix` plus the kernels: `dot`, `linear`, `rms_norm`, `silu` and `sigmoid`. |
+| `mimo::attention` | RoPE tables, partial rotate-half, window visibility, and single-query attention with a sink. |
+| `mimo::forward` | `ReferenceModel::forward` (logits at chosen positions, plus optional per-layer residual streams), `mtp_forward`, `route` and `swiglu`. |
+| `compare` | Shared. Top-1 agreement, KL divergence and max-abs-diff for golden checks, and for certifying faster executors. Fail-closed: any NaN or infinity on either side is a `NonFinite` error, never a metric (a NaN off the winning logit would otherwise pass with perfect top-1, zero KL and zero max-abs-diff). |
+| `golden/mimo/`, `golden/deepseek/` | Dev-only Python that produces each architecture's goldens, one project per architecture. See `golden/mimo/README.md` and `golden/deepseek/README.md`. |
 
 ## Numerics contract
 
@@ -37,14 +38,14 @@ The reference forward is the golden oracle. Every faster executor (paged CPU, GP
 
   So a token's result is bit-identical whatever else is in the batch, and a prefix run reproduces the prefix rows exactly (`prefix_rows_are_bit_identical`).
 
-  An executor that wants bit equality with the oracle (a paged CPU executor, say) calls these same public kernels: `attention::attend`, `forward::route`, `tensor::dot` and friends. It must not reimplement them.
+  An executor that wants bit equality with the oracle (a paged CPU executor, say) calls these same public kernels: `mimo::attention::attend`, `mimo::forward::route`, `tensor::dot` and friends. It must not reimplement them.
 - RoPE tables are computed in f32 the way the HF reference does: `1 / θ^(2i/d)`, then `· pos`, then `sin`/`cos`.
 
 ## Architecture quirks: each one is a silent-wrong-output trap
 
 Each item names the test that fails if it regresses. In the synthetic-fixture tests, each was checked by mutating the code and watching `main_model_matches_hf_remote_code` or `mtp_layers_match_hf_modules` fail.
 
-1. **The layer pattern is irregular and comes from the config.** `hybrid_layer_pattern` gives 0 (global) or 1 (sliding window), and `moe_layer_freq` gives 0 (dense) or 1 (MoE). Flash's global layers are 0, 5, 11, …, 47 and Pro's are 0, 7, 15, …, 62, 69. Never hard-code a ratio. Test: `tests/config.rs`.
+1. **The layer pattern is irregular and comes from the config.** `hybrid_layer_pattern` gives 0 (global) or 1 (sliding window), and `moe_layer_freq` gives 0 (dense) or 1 (MoE). Flash's global layers are 0, 5, 11, …, 47 and Pro's are 0, 7, 15, …, 62, 69. Never hard-code a ratio. Test: `tests/mimo_config.rs`.
 2. **KV heads differ by layer type.** Flash has 4 on global layers and 8 on sliding ones, set through the `swa_*` overrides. GQA maps query head `h` to KV head `h / (nq / nkv)`, so groups are contiguous.
 3. **Partial NeoX RoPE.** The rotary width is `int(head_dim × partial_rotary_factor)`, a truncation in double precision: `int(192 × 0.334) = 64`. Rotate-half applies to dims `[0, 64)` of each 192-dim Q/K head, and the rest pass through. The HF code reads the factor from `rope_parameters` for the tables and from the top level for the split, so a config where the two disagree is rejected.
 4. **θ differs by layer type.** Global layers use `rope_theta` (1e7) and sliding layers use `swa_rope_theta` (1e4).
@@ -79,17 +80,17 @@ Each item names the test that fails if it regresses. In the synthetic-fixture te
 
 ## What is verified against what
 
-- **Committed synthetic fixture** (`tests/golden_tiny.rs`, `tests/fixtures/tiny/`, about 4.7 MB).
+- **Committed synthetic fixture** (`tests/mimo_golden_tiny.rs`, `tests/fixtures/mimo_tiny/`, about 4.7 MB).
   - The model is 4 layers at hidden size 256:
     - global plus dense;
     - sliding-window MoE twice;
     - global MoE;
     - two MTP layers.
   - All weights are random, in the real storage formats.
-  - Goldens come from the HF remote code at a pinned revision, run in fp32 on CPU, with weights dequantised by `golden/mimo_golden/dequant.py`.
+  - Goldens come from the HF remote code at a pinned revision, run in fp32 on CPU, with weights dequantised by `golden/mimo/mimo_golden/dequant.py`.
   - Tolerance is a max absolute difference of `2e-5 ×` the reference's scale, on every layer's residual stream, the normed hidden state and the logits. The two sides differ only in summation order.
   - Top-1 must agree at every position, and KL must be below 1e-9.
-- **Local truncated real Flash-MOPD** (`tests/real_flash.rs`, ignored).
+- **Local truncated real Flash-MOPD** (`tests/mimo_real_flash.rs`, ignored).
   - The model is checkpoint layers 0, 1, 2 and 5, the embeddings and head, and MTP layer 0, all fetched by HTTP range reads.
   - We are compared against the HF remote code over 363 tokens of real text (prose plus code).
   - Acceptance is top-1 ≥ 99.9 % and mean KL < 1e-3.
@@ -104,7 +105,7 @@ Each item names the test that fails if it regresses. In the synthetic-fixture te
 
 ## Regenerating goldens
 
-See `golden/README.md`. Python is dev-only and never a build input. `cargo test` needs neither Python nor the network.
+See `golden/mimo/README.md`. Python is dev-only and never a build input. `cargo test` needs neither Python nor the network.
 
 ## Not here
 
@@ -189,9 +190,9 @@ One rule the fixture cannot distinguish: a block dot computed exactly, as agains
 
 ### What is verified against what
 
-**Agreement is not health.** Everything below except the last item says that this forward computes what the reference computes on the files both were given. It says nothing about those files. A whole-checkpoint copy whose `embed.weight` shard had the right size and the wrong bytes gave a reference and a forward that agreed with each other about a model that was not the released one. So every real-weights test first checks each file against the recorded upstream SHA-256 (`golden/deepseek_v41/upstream-sha256.json`, `tests/deepseek_upstream/`), and the whole-model test also holds the model to the world (the last item).
+**Agreement is not health.** Everything below except the last item says that this forward computes what the reference computes on the files both were given. It says nothing about those files. A whole-checkpoint copy whose `embed.weight` shard had the right size and the wrong bytes gave a reference and a forward that agreed with each other about a model that was not the released one. So every real-weights test first checks each file against the recorded upstream SHA-256 (`golden/deepseek/upstream-sha256.json`, `tests/deepseek_upstream/`), and the whole-model test also holds the model to the world (the last item).
 
-The goldens are the released model code run over an **emulated kernel layer** (the reference's kernels are tilelang CUDA kernels) with the library arithmetic it leaves unspecified pinned to the rules above. `golden/deepseek_v41/README.md` says exactly what is emulated and pinned. Under those rules the reference is a function of the tokens alone and this forward equals it bit for bit; how far the real kernels and a GPU's arithmetic are from the rules was measured in one GPU session (below). The committed fixture itself cannot run on the real kernels: tilelang 0.1.12 does not compile `sparse_attn` at its head dimension of 32.
+The goldens are the released model code run over an **emulated kernel layer** (the reference's kernels are tilelang CUDA kernels) with the library arithmetic it leaves unspecified pinned to the rules above. `golden/deepseek/README.md` says exactly what is emulated and pinned. Under those rules the reference is a function of the tokens alone and this forward equals it bit for bit; how far the real kernels and a GPU's arithmetic are from the rules was measured in one GPU session (below). The committed fixture itself cannot run on the real kernels: tilelang 0.1.12 does not compile `sparse_attn` at its head dimension of 32.
 
 - **Committed synthetic fixture** (`tests/deepseek_tiny.rs`, `tests/fixtures/deepseek_tiny/`, about 2.7 MB). Eight layers at hidden size 64 covering every mechanism, a three-block drafter, 96 tokens; the window (48), top-k (24) and candidate pool (8 blocks of 4) are small enough that the window slides, both top-ks prune, and an attention list spans two 64-slot blocks.
   - **Exact** (zero elements differ): every layer's streams, each sub-layer's output, the final normed state, the logits, the Engram rows, the drafter's input, and the drafter's tokens, logits and confidences, against the reference run one token per call.
@@ -208,7 +209,7 @@ The goldens are the released model code run over an **emulated kernel layer** (t
     - drafter: 480 of 480 draft tokens equal, logits and confidences equal.
   - **The canonical layout against the reference's prefill layout**, same weights and rules, only the 64-slot blocks differing: top-1 165/256 (64.5 %), KL mean 0.28, max 3.5. Against the reference's decode steps that follow its window-long prefill (whose window KV those steps read): top-1 43/96, KL mean 0.25.
   - **Against the reference with PyTorch's own CPU arithmetic and `topk`** (kernels still emulated): top-1 91/256 (35.5 %), KL mean 0.82, max 5.1; the streams' relative error grows from 1.6e-3 after layer 0 to 0.77 after the last layer. Reported by the test, not asserted.
-  - **What those two numbers mean.** The statistical target MiMo's real test meets (top-1 ≥ 99.9 %, mean KL < 1e-3) is met here only against the pinned reference, where agreement is exact. This truncation is not a stable function of its unspecified bits: two runs of the reference's own code that differ only in summation order, or only in attention block layout, disagree with each other as much as with us. FP8 and FP4 activations make a one-ulp difference a whole quantisation step at a rounding boundary, the router chooses 6 of 32 kept experts where the model was trained with 384, and layers 4–13, 16–19, 22–23 and 25–36 are missing, so the later layers see inputs they were not trained on. Whether the full model is as sensitive is not known from this test. It needs the full checkpoint on GPUs (`golden/deepseek_v41/compare_real_kernels.py` measures the fixture there, not the real model).
+  - **What those two numbers mean.** The statistical target MiMo's real test meets (top-1 ≥ 99.9 %, mean KL < 1e-3) is met here only against the pinned reference, where agreement is exact. This truncation is not a stable function of its unspecified bits: two runs of the reference's own code that differ only in summation order, or only in attention block layout, disagree with each other as much as with us. FP8 and FP4 activations make a one-ulp difference a whole quantisation step at a rounding boundary, the router chooses 6 of 32 kept experts where the model was trained with 384, and layers 4–13, 16–19, 22–23 and 25–36 are missing, so the later layers see inputs they were not trained on. Whether the full model is as sensitive is not known from this test. It needs the full checkpoint on GPUs (`golden/deepseek/compare_real_kernels.py` measures the fixture there, not the real model).
 - **Local whole early layers of the real checkpoint** (`tests/deepseek_real_prefix.rs`, ignored; revision `08c8657f`).
   - Checkpoint layers 0–3 whole, all 384 routed experts each, with the Engram rows the tokens touch: about 32 GB, likewise compared after the fact with shards matching the upstream hashes (9,347 tensors and 12,568 Engram rows equal) and checked against recorded hashes on every run. These are the full model's first four layers, so the residual streams after each are the full model's and so is their sensitivity to the bits the reference leaves unspecified. Four layers have no meaningful logits; the measurement is the streams and each token's routed experts. 555 tokens of prose and code. The ratio-2 global KV holds at most 277 entries here, under the top-k of 512, so the indexer never prunes and index scores decide nothing.
   - Against the pinned reference: **0 elements differ** in any layer's streams and every token's routed experts are the same, for one prefill chunk of 555 tokens (its layout reproduced) and for 96 tokens one per call (the canonical layout). Asserted.
@@ -223,7 +224,7 @@ The goldens are the released model code run over an **emulated kernel layer** (t
 
     The largest single difference is 0.25 after layer 3 (0.14 between the layouts). The layouts first part at position 64, where a prefill's left-aligned window first crosses a 64-slot block.
   - **Reading.** The instability of the 12-layer truncation is not an artefact of that truncation. With every layer and every expert in place, a run of the reference's own code that differs only in summation order and library rounding is 0.3 % away after one layer and 1.1 % after four, growing by about 1.6× per layer, and by then one token in five goes to a different set of experts. The mechanism is the precision model itself: a last-bit difference before an FP8 or FP4 quantiser becomes a whole code step at a rounding boundary, the dense layer after it spreads that step over every output, and the router's top-6 turns small differences into different experts. The reference without pins is therefore not one function, and "top-1 ≥ 99.9 % against it" is a property of how tolerant the remaining 36 layers and the head are of percent-level stream differences, which four layers cannot show and which the 12-layer truncation (0.77 relative error at its end, top-1 35 %) suggests is not a given. Exact agreement with the reference under fixed rules is what this crate can and does assert; the unpinned numbers are measurements of the model.
-- **The reference's real kernels, on a GPU** (one session: one NVIDIA B300, torch 2.10.0 with CUDA 13, tilelang 0.1.12; `golden/deepseek_v41/gpu_session.sh`).
+- **The reference's real kernels, on a GPU** (one session: one NVIDIA B300, torch 2.10.0 with CUDA 13, tilelang 0.1.12; `golden/deepseek/gpu_session.sh`).
   - **What the real kernels confirmed** (`gpu_probes.py`):
     - float → FP8: all 252 exact ties between adjacent E4M3 codes go to the even code, through the in-place path and the code path;
     - float → FP4: all 14 exact ties go to the even code with the power-of-two scale and with the E4M3 scale; the E4M3 scale itself rounds a tie to even; `amax / scale` above 6 saturates. Each equals the emulation;
@@ -252,11 +253,11 @@ The goldens are the released model code run over an **emulated kernel layer** (t
     | Reference: GPU pinned vs GPU as released | 79 / 256 | 1.06 |
     | Reference: CPU unpinned vs GPU pinned | 95 / 256 | 0.86 |
 
-  - **What this shows, and what it does not.** Over the first four whole layers of the model, our forward is as far from the reference as it runs on a GPU as the reference is from itself: from its own CPU run, from its own run under pinned arithmetic, and nearly from its own other attention layout. Pinning the arithmetic and emulating the kernels do not move us outside the reference's own spread, at any of the four layers, in the streams or in the routing. The same holds for the logits of the 12-layer truncation, where every pair of runs disagrees about equally. It does not show agreement of final logits for the whole model: whether the full depth damps or amplifies a 1 % difference in the streams after layer 3 is what `full_halves.py` and `tests/deepseek_real_full.rs` measure (`golden/deepseek_v41/README.md` → The whole model, one half at a time).
+  - **What this shows, and what it does not.** Over the first four whole layers of the model, our forward is as far from the reference as it runs on a GPU as the reference is from itself: from its own CPU run, from its own run under pinned arithmetic, and nearly from its own other attention layout. Pinning the arithmetic and emulating the kernels do not move us outside the reference's own spread, at any of the four layers, in the streams or in the routing. The same holds for the logits of the 12-layer truncation, where every pair of runs disagrees about equally. It does not show agreement of final logits for the whole model: whether the full depth damps or amplifies a 1 % difference in the streams after layer 3 is what `full_halves.py` and `tests/deepseek_real_full.rs` measure (`golden/deepseek/README.md` → The whole model, one half at a time).
   - Record new numbers here whenever numerics change.
 - **The whole model** (`tests/deepseek_real_full.rs`, ignored; the checkpoint as published, about 510 GB, on a machine that holds it).
   - **Withdrawn.** The first whole-model measurements (our forward's final logits against the reference run on a GPU, the reference's patterns and runs against each other, and a next-token accuracy of about 22 % over the passage) were made on a copy of the checkpoint whose embedding table was damaged: the shard holding `embed.weight` had been left with the right length and the wrong bytes by an interrupted download, and nothing checked hashes. Both sides read the same damaged table, so those agreement figures describe a model that is not the released one. None of them is recorded here; the figures below replace them.
-  - **Health of the reference on the verified checkpoint** (every shard matching its upstream SHA-256; real kernels, CUDA's own arithmetic; `golden/deepseek_v41/health_check.py`, and README → Health):
+  - **Health of the reference on the verified checkpoint** (every shard matching its upstream SHA-256; real kernels, CUDA's own arithmetic; `golden/deepseek/health_check.py`, and README → Health):
     - the publicly reported reply to a "hello" request (a third party's report of the vendor's API and of a production-lineage deployment, not a measurement made here) is reproduced at all 11 positions, and at the position reported as a near three-way tie the three most likely tokens are the reported three (-2.23, -2.34, -2.69 against a reported "about -2.4 each");
     - next-token accuracy is 0.665 over an 825-token story as a chat reply (0.663 after a thinking preamble), 0.683 over 1,379 positions of plain text, and 0.670 over the 554 scored positions of the goldens' passage in a prefill chunk (0.666 one token per call, 0.664 reshaped). Public GPT-2 small and large score 0.380 and 0.431 on the passage. The damaged copy scored 0.171, 0.179, 0.211 and 0.229.
   - **Final logits at full depth on the verified checkpoint**: all 40 layers, the goldens' 555-token passage, the reference with real kernels and CUDA's own arithmetic, one half at a time:

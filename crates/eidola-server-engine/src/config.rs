@@ -51,7 +51,7 @@ pub enum ExecutorConfig {
         /// for one on a single device; [`crate::check_device_budgets`]).
         further_kv_device_bytes: Vec<u64>,
         /// Whether decode steps replay captured graphs.
-        graphs: eidola_engine_cuda::CudaGraphs,
+        graphs: eidola_engine_cuda::mimo::CudaGraphs,
         /// Whether the GPUs must be in confidential-computing mode before the device opens
         /// (`crate::gpu_cc`).
         gpu_cc: GpuCc,
@@ -147,10 +147,10 @@ impl Config {
                 further_kv_device_bytes,
                 graphs: match graphs {
                     eidola_common::engine_deployment::CudaGraphs::On => {
-                        eidola_engine_cuda::CudaGraphs::On
+                        eidola_engine_cuda::mimo::CudaGraphs::On
                     }
                     eidola_common::engine_deployment::CudaGraphs::Off => {
-                        eidola_engine_cuda::CudaGraphs::Off
+                        eidola_engine_cuda::mimo::CudaGraphs::Off
                     }
                 },
                 gpu_cc,

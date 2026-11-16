@@ -2,14 +2,14 @@
 //! length: many blocks, many calls in one block, many parameters in one call.
 //!
 //! The measure is bytes allocated, counted by this binary's allocator, as in
-//! `linear_parsing.rs`; the time bound catches a scan that allocates nothing.
+//! `mimo_linear_parsing.rs`; the time bound catches a scan that allocates nothing.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use eidola_engine_chat::deepseek_v4_1::output::DsmlParser;
-use eidola_engine_chat::deepseek_v4_1::tool_schemas;
+use eidola_engine_chat::deepseek::output::DsmlParser;
+use eidola_engine_chat::deepseek::tool_schemas;
 use eidola_engine_chat::{PrefixedCallIds, json};
 
 struct Counting;

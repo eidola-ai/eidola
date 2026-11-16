@@ -43,7 +43,7 @@ Each level is held bit for bit to the one before it:
 5. **Through the node, on two B300s**, greedy tokens equal the CPU executor's at draft widths 0 and 3.
 6. **Against vLLM 0.33 (TP2) on the same machine and checkpoint**, quality is within noise: next-token accuracy 0.659 / 0.666 against vLLM's 0.663 / 0.657, and 94–96 % top-1 agreement.
 
-Each crate's `AGENTS.md` lists its suites and the commands that run the GPU and checkpoint-scale ones. The session scripts are `crates/eidola-engine-cuda/scripts/ds_gpu_session.sh` (one GPU) and `ds_two_gpu_session.sh` (two GPUs, the node and the vLLM yardstick).
+Each crate's `AGENTS.md` lists its suites and the commands that run the GPU and checkpoint-scale ones. The session scripts are `crates/eidola-engine-cuda/scripts/deepseek_gpu_session.sh` (one GPU) and `deepseek_two_gpu_session.sh` (two GPUs, the node and the vLLM yardstick).
 
 ## Where the code lives
 
@@ -51,12 +51,12 @@ Each crate's `AGENTS.md` lists its suites and the commands that run the GPU and 
 |---|---|
 | `eidola-common` | `architecture.rs` (`DeepSeekV41Flash`, `DEEPSEEK_V41_FLASH`: device split, KV groups, step scratch); `engine_deployment` (two-device grammar, per-device KV minimums and reserve); `weights_manifest` (required files) |
 | `eidola-engine` | the seam's DeepSeek shapes (`spec.rs`: pooled groups, `coverage: Chain`, `window_chain`, `token_history`); `mock/chain.rs`; `tests/window_chain.rs` |
-| `eidola-engine-model` | `src/deepseek/`; `tests/deepseek_*.rs`; `golden/deepseek_v41/` (pinned reference tooling, upstream hashes, health check) |
-| `eidola-engine-chat` | `src/deepseek_v4_1/` (encoder, output parser, Engram vocabulary map); `tests/deepseek_*.rs` |
-| `eidola-engine-cpu` | `src/deepseek/`; `tests/ds_*.rs` |
-| `eidola-engine-kernels` | `csrc/ds_*.cu{,h}` and `kernels.json` entries; `oracle/ds_*.cc`; `tests/ds_*.rs` |
-| `eidola-engine-cuda` | `src/ds/`; `tests/ds_*`; `examples/ds_*` (halves, whole model staged, two GPUs, GEMM bench); `scripts/ds_*` |
-| `eidola-server-engine` | the DeepSeek arms in `lib.rs`, `cuda.rs`, `model.rs`, `pipeline.rs`; `tests/deepseek.rs`; `examples/ds_generate/` |
+| `eidola-engine-model` | `src/deepseek/`; `tests/deepseek_*`; `tests/fixtures/deepseek_tiny/`; `golden/deepseek/` (pinned reference tooling, upstream hashes, health check) |
+| `eidola-engine-chat` | `src/deepseek/` (encoder, output parser, Engram vocabulary map); `tests/deepseek_*`; `tests/fixtures/deepseek/`; `dev/deepseek_*` |
+| `eidola-engine-cpu` | `src/deepseek/`; `tests/deepseek_*` |
+| `eidola-engine-kernels` | `csrc/ds_*.cu{,h}` and `kernels.json` entries; `oracle/ds_*.cc`; `tests/deepseek_*`; `tests/data/ds_*` |
+| `eidola-engine-cuda` | `src/deepseek/`; `oracle/ds_launch_host.cc`; `tests/deepseek_*`; `examples/deepseek_*` (halves, whole model staged, two GPUs, GEMM bench); `scripts/deepseek_*` |
+| `eidola-server-engine` | the DeepSeek arms in `lib.rs`, `cuda.rs`, `model.rs`, `pipeline.rs`; `tests/deepseek*.rs`; `examples/deepseek_generate/` |
 
 ## Outstanding work
 

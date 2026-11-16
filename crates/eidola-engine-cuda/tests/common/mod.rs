@@ -1,8 +1,6 @@
 //! GPU test setup: a device, a kernel build output, and the images to test.
 #![allow(dead_code)]
 
-pub mod qref;
-
 use eidola_engine_cuda::KernelDir;
 use eidola_engine_cuda::{Gpu, ImageArch, ImageSource, KernelModule};
 

@@ -2,7 +2,7 @@
 // launch the executor makes, running the body the device compiles
 // (`eidola-engine-kernels`' `csrc/ds_ops.cuh`, `ds_attention.cuh`,
 // `ds_index.cuh`) thread by thread over the grid the launch wrapper chose.
-// `tests/ds_common` loads it as a device's kernels, so the executor's host
+// `tests/deepseek_common` loads it as a device's kernels, so the executor's host
 // scenarios run over the same C++ a GPU runs and a wrong parameter, grid or
 // assumption about a kernel fails there.
 //

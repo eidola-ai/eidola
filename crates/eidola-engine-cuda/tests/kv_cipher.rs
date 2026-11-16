@@ -15,9 +15,9 @@ use common::{Lcg, setup};
 use eidola_engine::executor::Maintenance;
 use eidola_engine::kv_cipher::{KvKeystream, KvNonce};
 use eidola_engine::secret::KvKey;
-use eidola_engine_cuda::kv::{GroupGeometry, KvLayout, KvStore};
 use eidola_engine_cuda::kv_cipher::{CipherItem, CipherItems, KvCipher};
 use eidola_engine_cuda::launch::dptr;
+use eidola_engine_cuda::mimo::kv::{GroupGeometry, KvLayout, KvStore};
 
 struct Case {
     key: [u8; 32],

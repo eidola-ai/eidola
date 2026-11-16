@@ -13,7 +13,7 @@
 // `get_workspace_size`). It prints, one JSON object per line: the `Params`
 // bytes, a mask of the bytes CUTLASS defines, the grid, the workspace size,
 // and every `cuTensorMapEncodeTiled` call it made. The Rust mirror in
-// `src/gemm.rs` must reproduce those bytes (`tests/cutlass_params.rs` compares
+// `src/mimo/gemm.rs` must reproduce those bytes (`tests/mimo_cutlass_params.rs` compares
 // against the committed output in `tests/data/cutlass_params.jsonl`).
 //
 // CUTLASS version: use a checkout of the revision the kernels crate pins

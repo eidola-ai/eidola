@@ -10,7 +10,7 @@
 //   c++ -std=c++17 -O2 -ffp-contract=off -I csrc oracle/ds_numeric_host.cc -o ds_numeric_host
 //   ./ds_numeric_host tests/data/ds_numeric.vectors [tests/data/ds_numeric.exhaustive]
 //
-// `tests/ds_numeric_host.rs` runs exactly that. Exit status 0 means every
+// `tests/deepseek_numeric_host.rs` runs exactly that. Exit status 0 means every
 // record matched.
 
 #include <cstdio>

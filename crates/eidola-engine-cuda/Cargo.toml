@@ -9,7 +9,7 @@ license = "AGPL-3.0-only"
 
 [features]
 # Dev-only: the whole DeepSeek-V4.1 model on one GPU with its routed experts cached from
-# host memory (`ds::staged`). Never enabled by the node's image build; a test of this
+# host memory (`deepseek::staged`). Never enabled by the node's image build; a test of this
 # crate holds the release feature set to that.
 dev-staged-experts = []
 
@@ -46,32 +46,32 @@ rustix = { version = "1", features = ["process"] }
 
 # The evaluator's scoring and comparison logic is unit-tested with the crate.
 [[example]]
-name = "eval"
-path = "examples/eval.rs"
+name = "mimo_eval"
+path = "examples/mimo_eval.rs"
 test = true
 
 # The released-weights measurement's flow is unit-tested on the fixture.
 [[example]]
-name = "ds_halves"
-path = "examples/ds_halves.rs"
+name = "deepseek_halves"
+path = "examples/deepseek_halves.rs"
 test = true
 
 # The released checkpoint whole on one GPU, its experts staged.
 [[example]]
-name = "ds_whole"
-path = "examples/ds_whole.rs"
+name = "deepseek_whole"
+path = "examples/deepseek_whole.rs"
 required-features = ["dev-staged-experts"]
 test = true
 
 # The released checkpoint on two GPUs, every weight resident.
 [[example]]
-name = "ds_two"
-path = "examples/ds_two.rs"
+name = "deepseek_two"
+path = "examples/deepseek_two.rs"
 test = true
 
 [[test]]
-name = "ds_staged"
-path = "tests/ds_staged.rs"
+name = "deepseek_staged"
+path = "tests/deepseek_staged.rs"
 required-features = ["dev-staged-experts"]
 
 # No integer conversion may lose a value silently, in any target (library,

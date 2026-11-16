@@ -1,4 +1,4 @@
-//! Scalar decoders for the storage formats MiMo checkpoints use.
+//! Scalar decoders for the storage formats the checkpoints use.
 //!
 //! Every decode here is exact: each format's values are representable in f32.
 

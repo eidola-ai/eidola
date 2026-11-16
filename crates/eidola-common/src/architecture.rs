@@ -187,7 +187,7 @@ pub struct Shape {
 }
 
 /// A device's step scratch, as an executor sizes it beside its weights and KV
-/// (`eidola-engine-cuda`'s `ds::model::Scratch` and `DraftScratch`, the
+/// (`eidola-engine-cuda`'s `deepseek::model::Scratch` and `DraftScratch`, the
 /// pooled sources' open entries): `engine_deployment::cuda_device_reserve_bytes`
 /// reads it for a shape that has it. The byte counts are the executor's own,
 /// held to its allocations by `eidola-server-engine`'s `cuda::tests`.
@@ -225,7 +225,7 @@ pub struct StepScratch {
 /// blocks and whose window groups all hold another
 /// (`Shape::uniform_kv_groups`). A block of it is `layers` layers of
 /// `KV_BLOCK_SIZE / ratio` entries of `entry_bytes` each, padded to 16 bytes
-/// (`eidola-engine-cuda`'s `ds::kv::GroupGeometry::block_bytes`).
+/// (`eidola-engine-cuda`'s `deepseek::kv::GroupGeometry::block_bytes`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UniformKvGroup {
     pub layers: u64,
