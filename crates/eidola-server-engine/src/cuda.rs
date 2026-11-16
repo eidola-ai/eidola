@@ -1330,61 +1330,156 @@ mod tests {
         assert_eq!(blocks.bank, i32::MAX as u32);
     }
 
-    /// The released model at its whole 2^20-position window on two B300s: with each
-    /// device's budget the shared minimum (`cuda_kv_min_bytes`: one sequence of banks,
-    /// every seat's windows), the node derives the counts and the executor lays both
-    /// devices out with no checkpoint, every allocation at its size, the weights and the
-    /// step's scratch among them, within a B300's memory less the 4 GiB the driver's
-    /// context takes (which a dry device does not hold). Undrafted at 8,192-token steps,
-    /// and drafting three at 4,096-token steps: the indexer's scores grow with a step's
-    /// tokens times the context, and at 8,192 tokens they and the drafter's weights leave
-    /// device 1 no room for KV at this context.
-    #[test]
-    fn the_released_model_lays_out_on_two_b300s_at_its_whole_window() {
-        use eidola_common::architecture::DEEPSEEK_V41_FLASH;
-        use eidola_common::engine_deployment::{SUPPORTED_GPU_MEMORY_BYTES, cuda_kv_min_bytes};
+    /// The released configuration laid out with no checkpoint, every allocation at its
+    /// size, on dry devices; `budgets` the KV budgets, the counts the node derives.
+    fn released_layout(
+        sizing: &Sizing,
+        budgets: [u64; 2],
+        capacity: Option<u64>,
+    ) -> Result<DsCudaExecutor, String> {
         use eidola_engine_cuda::ds::dry::DryDevice;
         let ds = deepseek_released();
         let e = ds.engram.clone().unwrap();
         let map: Vec<u32> = (0..ds.vocab_size)
             .map(|i| u32::try_from(i % e.compressed_vocab).unwrap())
             .collect();
-        let capacity = SUPPORTED_GPU_MEMORY_BYTES - (4 << 30);
-        for (draft, step, windows) in [(0, 8192, 609), (3, 4096, 593)] {
-            let sizing = Sizing {
-                kv_block_size: 256,
-                max_model_len: 1 << 20,
-                max_seqs: 64,
-                max_batched_tokens: step,
-                max_prefill_chunk: 4096,
-                draft_tokens: draft,
-                max_requests: 64,
-            };
-            let budgets = DEEPSEEK_V41_FLASH.map(|d| cuda_kv_min_bytes(&d, &sizing, &cache(true)));
-            let config = deepseek_config(
-                &ds,
-                &sizing,
-                &cache(true),
-                budgets,
-                0,
-                CudaGraphs::Off,
-                129_280,
-            )
-            .unwrap();
-            assert_eq!((config.num_blocks, config.window_blocks), (4097, windows));
-            let device = || -> Box<dyn eidola_engine_cuda::ds::half::Device> {
-                Box::new(DryDevice::new(Some(usize::try_from(capacity).unwrap())))
-            };
-            let x = DsCudaExecutor::layout(device(), device(), &ds, Some(map.clone()), &config)
+        let config = deepseek_config(
+            &ds,
+            sizing,
+            &cache(true),
+            budgets,
+            0,
+            CudaGraphs::Off,
+            129_264,
+        )
+        .map_err(|e| e.0)?;
+        let device = || -> Box<dyn eidola_engine_cuda::ds::half::Device> {
+            Box::new(DryDevice::new(
+                capacity.map(|c| usize::try_from(c).unwrap()),
+            ))
+        };
+        DsCudaExecutor::layout(device(), device(), &ds, Some(map), &config)
+            .map_err(|e| e.to_string())
+    }
+
+    fn released_sizing(len: u32, seats: u32, step: u32, draft: u32) -> Sizing {
+        Sizing {
+            kv_block_size: 256,
+            max_model_len: len,
+            max_seqs: seats,
+            max_batched_tokens: step,
+            max_prefill_chunk: step.min(4096),
+            draft_tokens: draft,
+            max_requests: 64,
+        }
+    }
+
+    /// The gateway's build bounds each device's step scratch by
+    /// `engine_deployment::step_scratch_bytes` of the released shapes
+    /// (`DEEPSEEK_V41_FLASH`'s `step_scratch`). Across contexts, step sizes (below and
+    /// above a draft pass's rows), seats and draft widths, laid out by the executor
+    /// itself: the indexer's scores and candidate mask, the part that grows with step
+    /// tokens times the context, are exactly `step_scratch_rows × index_scratch_row_bytes`
+    /// on each device; the whole scratch and open entries are at most the shared count
+    /// and at least that less its `fixed_bytes`; the block tables are within the shared
+    /// term; and the weights the executor loads (its RoPE tables among them) are within
+    /// `device_weights_bytes` and the shared RoPE term.
+    #[test]
+    fn the_shared_step_scratch_is_the_executors() {
+        use eidola_common::architecture::DEEPSEEK_V41_FLASH;
+        use eidola_common::engine_deployment::{
+            device_weights_bytes, index_scratch_row_bytes, step_scratch_bytes, step_scratch_rows,
+        };
+        for len in [4096u32, 1 << 20] {
+            for step in [320u32, 8192] {
+                for seats in [16u32, 64] {
+                    for draft in [0u32, 1, 3] {
+                        let sizing = released_sizing(len, seats, step, draft);
+                        let at = (len, step, seats, draft);
+                        let x = released_layout(&sizing, [1 << 32; 2], None)
+                            .unwrap_or_else(|e| panic!("{at:?}: {e}"));
+                        for ((half, shape), m) in [Half::Encoder, Half::Decoder]
+                            .into_iter()
+                            .zip(&DEEPSEEK_V41_FLASH)
+                            .zip(x.memory())
+                        {
+                            let n = x.half(half);
+                            let index = (n.s.scores.bytes + n.s.mask.bytes) as u64;
+                            assert_eq!(
+                                step_scratch_rows(shape, &sizing)
+                                    * index_scratch_row_bytes(shape, &sizing),
+                                index,
+                                "{at:?} {half:?}"
+                            );
+                            let shared = step_scratch_bytes(shape, &sizing);
+                            let fixed = shape.step_scratch.unwrap().fixed_bytes;
+                            let held = m.scratch + m.state;
+                            assert!(
+                                held <= shared && shared - held <= fixed,
+                                "{at:?} {half:?}: {held} against {shared}"
+                            );
+                            let blocks = u64::from(len.div_ceil(256));
+                            let groups = eidola_common::engine_deployment::kv_groups(draft);
+                            assert!(m.tables <= u64::from(seats) * blocks * groups * 4);
+                            let rope = u64::from(len) * shape.rope_device_bytes_per_position;
+                            assert!(
+                                m.weights <= device_weights_bytes(shape, &sizing).unwrap() + rope,
+                                "{at:?} {half:?}: weights {}",
+                                m.weights
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A gateway never pins a DeepSeek-V4.1 deployment the node cannot lay out. At its
+    /// whole 2^20-position window, with each device's budget the most the shared check
+    /// accepts (`check_device_resources`: the budget, `device_weights_bytes` and
+    /// `cuda_device_reserve_bytes` exactly a B300's memory; one byte more is refused),
+    /// the node derives the counts and the executor lays both devices out, every
+    /// allocation at its size, within a B300's memory less the reserve's fixed 4 GiB
+    /// (the driver's context and the kernel modules, which a dry device does not hold):
+    /// undrafted at 8,192-token steps and drafting three at 4,096. Drafting three at
+    /// 8,192, which the shared check refuses at any budget, does not lay out even with
+    /// the least KV.
+    #[test]
+    fn the_released_model_lays_out_wherever_the_shared_check_admits_it() {
+        use eidola_common::architecture::DEEPSEEK_V41_FLASH;
+        use eidola_common::engine_deployment::{
+            DEVICE_FIXED_RESERVE_BYTES, SUPPORTED_GPU_MEMORY_BYTES, cuda_device_reserve_bytes,
+            cuda_kv_min_bytes, device_weights_bytes,
+        };
+        let capacity = SUPPORTED_GPU_MEMORY_BYTES - DEVICE_FIXED_RESERVE_BYTES;
+        let room = |sizing: &Sizing| {
+            DEEPSEEK_V41_FLASH.map(|d| {
+                (SUPPORTED_GPU_MEMORY_BYTES as i128)
+                    - device_weights_bytes(&d, sizing).unwrap() as i128
+                    - cuda_device_reserve_bytes(&d, sizing) as i128
+            })
+        };
+        for (draft, step) in [(0, 8192), (3, 4096)] {
+            let sizing = released_sizing(1 << 20, 64, step, draft);
+            let budgets = room(&sizing).map(|r| u64::try_from(r).unwrap());
+            let x = released_layout(&sizing, budgets, Some(capacity))
                 .unwrap_or_else(|e| panic!("drafts {draft}: {e}"));
             for (d, m) in x.memory().iter().enumerate() {
-                assert_eq!(m.kv, budgets[d], "device {d}");
+                assert!(m.kv <= budgets[d], "device {d}");
                 eprintln!(
-                    "drafts {draft}, step {step}, device {d}: {m:?}, {} bytes free",
+                    "drafts {draft}, step {step}, device {d}: budget {}, {} bytes to spare",
+                    budgets[d],
                     capacity - m.total()
                 );
             }
         }
+        let crowded = released_sizing(1 << 20, 64, 8192, 3);
+        assert!(room(&crowded)[1] < 0);
+        let least = DEEPSEEK_V41_FLASH.map(|d| cuda_kv_min_bytes(&d, &crowded, &cache(true)));
+        let e = released_layout(&crowded, least, Some(capacity))
+            .err()
+            .unwrap();
+        assert!(e.contains("out of device memory"), "{e}");
     }
 
     /// The host tier: one count for every group of both devices, its bytes within the

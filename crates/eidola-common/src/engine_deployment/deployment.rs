@@ -1163,10 +1163,14 @@ shim:
 
     /// The MiMo deployment's shape for DeepSeek-V4.1-Flash on two B300s: two
     /// GPUs attested, a KV budget per device, the published text-only pack,
-    /// and a `max_model_len` context.
-    fn deepseek_deployment(kv: &str, gpus: u64, max_model_len: u32) -> (String, String) {
+    /// a `max_model_len` context and steps of `step` tokens.
+    fn deepseek_stepped(kv: &str, gpus: u64, max_model_len: u32, step: u32) -> (String, String) {
         let config = std::str::from_utf8(MIMO_CONFIG)
             .unwrap()
+            .replace(
+                "EIDOLA_ENGINE_MAX_BATCHED_TOKENS: \"8192\"",
+                &format!("EIDOLA_ENGINE_MAX_BATCHED_TOKENS: \"{step}\""),
+            )
             .replace("gpus: 1\n", &format!("gpus: {gpus}\n"))
             .replace("\"85899345920\"", &format!("\"{kv}\""))
             .replace(
@@ -1196,6 +1200,11 @@ shim:
         (config, sidecar)
     }
 
+    /// [`deepseek_stepped`] at the MiMo deployment's 8,192-token steps.
+    fn deepseek_deployment(kv: &str, gpus: u64, max_model_len: u32) -> (String, String) {
+        deepseek_stepped(kv, gpus, max_model_len, 8192)
+    }
+
     #[test]
     fn a_deepseek_deployment_names_a_budget_per_device_and_fits_each() {
         let check = |kv: &str, gpus: u64| {
@@ -1203,19 +1212,26 @@ shim:
             check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
         };
         let d = check("16000000000,8000000000", 2).unwrap();
-        // The whole 2^20 window fits as well. In blocks of 16, device 1's least
-        // is 65,537 bank blocks of 5,696 bytes beside 2,881 window blocks of
-        // 194,304 (64 seats of four windows of nine blocks and one more, and a
-        // step's 512).
-        let whole = |kv: &str| {
-            let (config, sidecar) = deepseek_deployment(kv, 2, 1 << 20);
+        // The whole 2^20 window with three drafts at 8,192-token steps: the
+        // step's index scratch alone leaves device 1 no room, at any budget.
+        let whole = |kv: &str, step: u32| {
+            let (config, sidecar) = deepseek_stepped(kv, 2, 1 << 20, step);
             check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
         };
-        let least = 65_537 * 5_696 + 2_881 * 194_304;
-        assert_eq!(least, 933_088_576);
-        whole("16000000000,8000000000").unwrap();
-        whole(&format!("16000000000,{least}")).unwrap();
-        let err = whole(&format!("16000000000,{}", least - 1)).unwrap_err();
+        let err = whole("16000000000,1000000000", 8192).unwrap_err();
+        assert!(
+            err.contains("device 1:") && err.contains("device memory"),
+            "{err}"
+        );
+        // At 4,096-token steps it fits. In blocks of 16, device 1's least is
+        // 65,537 bank blocks of 5,696 bytes beside 2,625 window blocks of
+        // 194,304 (64 seats of four windows of nine blocks and one more, and a
+        // step's 256).
+        let least = 65_537 * 5_696 + 2_625 * 194_304;
+        assert_eq!(least, 883_346_752);
+        whole("16000000000,8000000000", 4096).unwrap();
+        whole(&format!("16000000000,{least}"), 4096).unwrap();
+        let err = whole(&format!("16000000000,{}", least - 1), 4096).unwrap_err();
         assert!(
             err.contains("device 1:") && err.contains("smallest"),
             "{err}"
