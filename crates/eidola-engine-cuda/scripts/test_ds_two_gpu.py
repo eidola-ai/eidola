@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import http.server
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -307,6 +308,23 @@ class Summary(unittest.TestCase):
         text = (out / "summary.txt").read_text()
         self.assertIn("weights hash ab", text)
         self.assertIn("90.0 out tok/s", text)
+
+
+class SummaryFailure(unittest.TestCase):
+    def test_the_summary_fails_when_the_node_disagrees_across_widths(self):
+        out = Path(tempfile.mkdtemp())
+        one = {"results": [{"prompt": "plain", "reasoning_content": "a", "content": "b", "tool_calls": [], "usage": {"completion_tokens": 3}}], "equal_to_cpu": None}
+        other = {"results": [{"prompt": "plain", "reasoning_content": "a", "content": "c", "tool_calls": [], "usage": {"completion_tokens": 3}}], "equal_to_cpu": None}
+        t.write_json(out / "node_w0.json", one)
+        script = Path(t.__file__)
+        run = lambda: subprocess.run([sys.executable, "-I", str(script), "summarize", "--out", str(out)], capture_output=True, text=True)
+        t.write_json(out / "node_w3.json", one)
+        self.assertEqual(run().returncode, 0)
+        t.write_json(out / "node_w3.json", other)
+        r = run()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("differ across draft widths", r.stderr)
+        self.assertTrue((out / "summary.txt").exists())
 
 
 class NodeFailures(unittest.TestCase):

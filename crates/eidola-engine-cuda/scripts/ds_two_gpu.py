@@ -694,6 +694,9 @@ def main() -> None:
     elif o.cmd == "summarize":
         s = summarize(o.out)
         print(render(s), end="")
+        # The report is written either way; a greedy disagreement across draft widths fails it.
+        if (s.get("node") or {}).get("across_widths", {}).get("equal") is False:
+            sys.exit("the node's answers differ across draft widths")
 
 
 if __name__ == "__main__":

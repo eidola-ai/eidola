@@ -749,6 +749,15 @@ fn bench(x: &mut DsCudaExecutor, prompts: &[Vec<u32>], s: &Serving) -> Result<Va
             }
             let mut eng = engine(x, width, c, s.chunk, &[])?;
             let (courses, wall) = drive(&mut eng, &prompts[..n], s.bench_out, us(c))?;
+            // A fixed-length benchmark: a request that stopped short (a context limit
+            // clamped the run) measures a different workload from the yardstick's.
+            if let Some(short) = courses.iter().find(|c| c.tokens.len() != us(s.bench_out)) {
+                return Err(fail(format!(
+                    "width {width}, concurrency {c}: a request produced {} of {} tokens",
+                    short.tokens.len(),
+                    s.bench_out
+                )));
+            }
             let stats = eng.stats();
             let ttft: Vec<f64> = courses
                 .iter()
