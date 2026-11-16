@@ -399,7 +399,7 @@ void split_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
         static uint32_t a[32][1][2][4], b[32][1][2][2];
         static float dot[32][1][1][4];
         for (uint32_t l = 0; l < 32; ++l) {
-          dstc::split_operands<kFp4>(p, l, blk, &o[l]);
+          dstc::split_operands<kFp4>(dstc::split_rows<kFp4>(p, l), blk, &o[l]);
           dstc::split_frags<kFp4>(o[l], a[l], b[l]);
         }
         frag_dots<kFp4, kBanded>(a, b, nt0, nt1, adder, rng, dot);

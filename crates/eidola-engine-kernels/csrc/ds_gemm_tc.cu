@@ -328,6 +328,16 @@ __device__ __forceinline__ void tile_pass(Stage<C> (&s)[2], const Pass& p) {
   }
 }
 
+// A warp's operands of the chunk from block `c0`.
+template <bool kFp4>
+__device__ __forceinline__ void split_load(const dstc::SplitRows& r, uint32_t kb, uint32_t first,
+                                           dstc::SplitOperands (&o)[dstc::kSplitPerWarp]) {
+#pragma unroll
+  for (uint32_t j = 0; j < dstc::kSplitPerWarp; ++j) {
+    if (first + j < kb) dstc::split_operands<kFp4>(r, first + j, &o[j]);
+  }
+}
+
 // One pass over K in the split block. Each chunk: every warp computes the
 // contributions of its `kSplitPerWarp` consecutive blocks from operands it
 // loaded into registers, the next chunk's operands are loaded while thread
@@ -344,15 +354,15 @@ __device__ __forceinline__ void split_pass(dstc::SplitContributions& c, const Pa
   const uint32_t mine_f = threadIdx.x / dstc::kSplitTokens, mine_r = threadIdx.x % dstc::kSplitTokens;
   const bool sums = threadIdx.x < kSums;
   float acc = 0.0f;
+  const dstc::SplitRows rows = dstc::split_rows<kFp4>(p, lane);
+  // Where this lane's contributions go and where this thread's sums come
+  // from, computed once (pinned, as `split_rows` pins its addresses).
+  float* mine = &c.c[warp * kPer][dstc::d_feature(0, lane, 0, 0)][dstc::d_token(lane, 0, 0)];
+  const float* sum_from = &c.c[0][mine_f][mine_r];
+  asm volatile("" : "+l"(mine), "+l"(sum_from));
+  constexpr uint32_t kBlockStride = dstc::kSplitFeatures * dstc::kSplitTokens;
   dstc::SplitOperands o[kPer];
-  const auto load = [&](uint32_t c0) {
-#pragma unroll
-    for (uint32_t j = 0; j < kPer; ++j) {
-      const uint32_t blk = c0 + warp * kPer + j;
-      if (blk < kb) dstc::split_operands<kFp4>(p, lane, blk, &o[j]);
-    }
-  };
-  load(0);
+  split_load<kFp4>(rows, kb, warp * kPer, o);
   for (uint32_t c0 = 0; c0 < kb; c0 += kChunk) {
 #pragma unroll
     for (uint32_t j = 0; j < kPer; ++j) {
@@ -363,15 +373,16 @@ __device__ __forceinline__ void split_pass(dstc::SplitContributions& c, const Pa
       frag_dots<kFp4, kBanded>(a, b, nt0, nt1, dot);
 #pragma unroll
       for (uint32_t i = 0; i < 4; ++i) {
-        c.c[warp * kPer + j][dstc::d_feature(0, lane, 0, i)][dstc::d_token(lane, 0, i)] =
+        // Element `i` is 8 outputs on for `i >= 2` and one row on for odd `i`.
+        mine[j * kBlockStride + (i >> 1) * 8 * dstc::kSplitTokens + (i & 1u)] =
             dstc::split_contribution(o[j], i, dot[0][0][i]);
       }
     }
     __syncthreads();
-    if (c0 + kChunk < kb) load(c0 + kChunk);
+    if (c0 + kChunk < kb) split_load<kFp4>(rows, kb, c0 + kChunk + warp * kPer, o);
     const uint32_t n = kb - c0 < kChunk ? kb - c0 : kChunk;
     if (sums) {
-      for (uint32_t b = 0; b < n; ++b) acc = acc + c.c[b][mine_f][mine_r];
+      for (uint32_t b = 0; b < n; ++b) acc = acc + sum_from[b * kBlockStride];
     }
     __syncthreads();
   }

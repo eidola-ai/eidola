@@ -510,35 +510,63 @@ DSTC_FN uint32_t clamp_row(uint32_t r, uint32_t lo, uint32_t hi) {
   return r < lo ? lo : r >= hi ? hi - 1 : r;
 }
 
+// A lane's rows for the split block's pass: where its operands of block 0
+// start (each block's are 32 bytes on, 16 for packed FP4, and one scale
+// byte on).
+struct SplitRows {
+  const uint8_t* w0;   // weight row of output g
+  const uint8_t* w1;   // of output g + 8
+  const uint8_t* x;    // activation row g
+  const uint8_t* ws0;  // weight scales of output g (its 32-row tile's, for FP8)
+  const uint8_t* ws1;  // of output g + 8
+  const uint8_t* xs0;  // activation scales of row 2q
+  const uint8_t* xs1;  // of row 2q + 1
+};
+
 template <bool kFp4>
-DSTC_FN void split_operands(const Pass& p, uint32_t lane, uint32_t blk, SplitOperands* o) {
+DSTC_FN SplitRows split_rows(const Pass& p, uint32_t lane) {
   const uint32_t g = lane >> 2, q = lane & 3u, kb = p.k / 32;
   const uint32_t w0 = clamp_row(p.f0 + g, 0, p.n), w1 = clamp_row(p.f0 + g + 8, 0, p.n);
-  const uint32_t x0 = clamp_row(g, p.lo, p.hi);
   const uint64_t row_bytes = kFp4 ? p.k / 2 : p.k;
-  const uint8_t* wr0 = p.w + w0 * row_bytes;
-  const uint8_t* wr1 = p.w + w1 * row_bytes;
+  const uint64_t lane_bytes = kFp4 ? q * 2 : q * 4;
+  SplitRows r;
+  r.w0 = p.w + w0 * row_bytes + lane_bytes;
+  r.w1 = p.w + w1 * row_bytes + lane_bytes;
+  r.x = p.x + static_cast<uint64_t>(clamp_row(g, p.lo, p.hi)) * p.k + q * 4;
+  r.ws0 = p.ws + (kFp4 ? static_cast<uint64_t>(w0) : static_cast<uint64_t>(w0 / 32)) * kb;
+  r.ws1 = p.ws + (kFp4 ? static_cast<uint64_t>(w1) : static_cast<uint64_t>(w1 / 32)) * kb;
+  r.xs0 = p.xs + static_cast<uint64_t>(clamp_row(2 * q, p.lo, p.hi)) * kb;
+  r.xs1 = p.xs + static_cast<uint64_t>(clamp_row(2 * q + 1, p.lo, p.hi)) * kb;
+#if defined(__CUDA_ARCH__)
+  // Every row's address is computed here, once: without the barrier the
+  // compiler's placement of these computations among the loads differed
+  // between the x86_64 and aarch64 builds of the toolkit, and with it the
+  // image's bytes.
+  asm volatile("" : "+l"(r.w0), "+l"(r.w1), "+l"(r.x), "+l"(r.ws0), "+l"(r.ws1), "+l"(r.xs0),
+               "+l"(r.xs1));
+#endif
+  return r;
+}
+
+template <bool kFp4>
+DSTC_FN void split_operands(const SplitRows& r, uint32_t blk, SplitOperands* o) {
   if (kFp4) {
-    const uint64_t at = static_cast<uint64_t>(blk) * 16 + q * 2;
-    o->w[0] = load16(wr0 + at) | load16(wr0 + at + 8) << 16;
-    o->w[1] = load16(wr1 + at) | load16(wr1 + at + 8) << 16;
+    const uint64_t at = static_cast<uint64_t>(blk) * 16;
+    o->w[0] = load16(r.w0 + at) | load16(r.w0 + at + 8) << 16;
+    o->w[1] = load16(r.w1 + at) | load16(r.w1 + at + 8) << 16;
     o->w[2] = 0;
     o->w[3] = 0;
   } else {
-    const uint64_t at = static_cast<uint64_t>(blk) * 32 + q * 4;
-    o->w[0] = load32(wr0 + at);
-    o->w[1] = load32(wr0 + at + 16);
-    o->w[2] = load32(wr1 + at);
-    o->w[3] = load32(wr1 + at + 16);
+    const uint64_t at = static_cast<uint64_t>(blk) * 32;
+    o->w[0] = load32(r.w0 + at);
+    o->w[1] = load32(r.w0 + at + 16);
+    o->w[2] = load32(r.w1 + at);
+    o->w[3] = load32(r.w1 + at + 16);
   }
-  const uint8_t* xr = p.x + static_cast<uint64_t>(x0) * p.k + static_cast<uint64_t>(blk) * 32 + q * 4;
-  o->x[0] = load32(xr);
-  o->x[1] = load32(xr + 16);
-  const uint64_t ws0 = kFp4 ? static_cast<uint64_t>(w0) * kb : static_cast<uint64_t>(w0 / 32) * kb;
-  const uint64_t ws1 = kFp4 ? static_cast<uint64_t>(w1) * kb : static_cast<uint64_t>(w1 / 32) * kb;
-  o->scales = static_cast<uint32_t>(p.ws[ws0 + blk]) | static_cast<uint32_t>(p.ws[ws1 + blk]) << 8 |
-              static_cast<uint32_t>(p.xs[static_cast<uint64_t>(clamp_row(2 * q, p.lo, p.hi)) * kb + blk]) << 16 |
-              static_cast<uint32_t>(p.xs[static_cast<uint64_t>(clamp_row(2 * q + 1, p.lo, p.hi)) * kb + blk]) << 24;
+  o->x[0] = load32(r.x + static_cast<uint64_t>(blk) * 32);
+  o->x[1] = load32(r.x + static_cast<uint64_t>(blk) * 32 + 16);
+  o->scales = static_cast<uint32_t>(r.ws0[blk]) | static_cast<uint32_t>(r.ws1[blk]) << 8 |
+              static_cast<uint32_t>(r.xs0[blk]) << 16 | static_cast<uint32_t>(r.xs1[blk]) << 24;
 }
 
 // The fragments of a lane's loaded operands, as `load_frags` makes them.
