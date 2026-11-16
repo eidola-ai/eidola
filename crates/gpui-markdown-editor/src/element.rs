@@ -107,7 +107,7 @@ impl IntoElement for BlockElement {
 /// (source offsets, the caret) and [`emphasis_dot_bounds`] (display
 /// indices, the dots) both come through here.
 fn downstream_row_position(
-    line: &WrappedLine,
+    line: &(impl LinePositions + ?Sized),
     display_index: usize,
     upper: Point<Pixels>,
     row_stride: Pixels,
@@ -116,7 +116,7 @@ fn downstream_row_position(
         return upper;
     }
     let k = (upper.y / row_stride).round() as i64; // upper-affinity row index
-    let last_row = line.wrap_boundaries().len() as i64; // rows are 0..=last_row
+    let last_row = line.wrap_count() as i64; // rows are 0..=last_row
     if k < 0 || k >= last_row {
         return upper; // already on the last row
     }
@@ -136,6 +136,212 @@ fn downstream_row_position(
         point(px(0.0), row_stride * ((k + 1) as f32))
     } else {
         upper
+    }
+}
+
+/// The position queries the decoration and caret geometry asks of a
+/// shaped line, answered either by gpui directly or by a [`LineGlyphs`]
+/// index built over the same layout. Both answer identically; the index
+/// answers in logarithmic time where gpui walks the line's glyphs.
+trait LinePositions {
+    fn position_for_index(&self, index: usize, row_stride: Pixels) -> Option<Point<Pixels>>;
+    fn closest_index_for_position(
+        &self,
+        position: Point<Pixels>,
+        row_stride: Pixels,
+    ) -> Result<usize, usize>;
+    /// The number of soft wraps; the line has one more row than this.
+    fn wrap_count(&self) -> usize;
+    fn width(&self) -> Pixels;
+}
+
+impl LinePositions for WrappedLine {
+    fn position_for_index(&self, index: usize, row_stride: Pixels) -> Option<Point<Pixels>> {
+        gpui::WrappedLineLayout::position_for_index(self, index, row_stride)
+    }
+    fn closest_index_for_position(
+        &self,
+        position: Point<Pixels>,
+        row_stride: Pixels,
+    ) -> Result<usize, usize> {
+        gpui::WrappedLineLayout::closest_index_for_position(self, position, row_stride)
+    }
+    fn wrap_count(&self) -> usize {
+        self.wrap_boundaries().len()
+    }
+    fn width(&self) -> Pixels {
+        gpui::WrappedLineLayout::width(self)
+    }
+}
+
+/// One shaped line's glyphs, flattened and searchable.
+///
+/// gpui's `position_for_index` and `closest_index_for_position` walk every
+/// glyph before the one they answer for, so a line asked about once per
+/// inline-code chip or emphasized character costs chips × glyphs. This
+/// reproduces both answers from one pass over the glyphs: "the first glyph
+/// in shaping order whose index (or x) reaches the target" is a binary
+/// search over the running maximum of that field, which is the same glyph
+/// whatever order the shaper emitted them in.
+struct LineGlyphs<'a> {
+    line: &'a WrappedLine,
+    /// Each glyph's text index and x, in shaping order.
+    index: Vec<usize>,
+    x: Vec<Pixels>,
+    /// Running maxima of `index` and `x`.
+    max_index: Vec<usize>,
+    max_x: Vec<Pixels>,
+    /// The text index and x of the glyph each soft wrap breaks before.
+    wraps: SmallVec<[(usize, Pixels); 4]>,
+    /// Whether the row ends ascend, so a row can be found by search.
+    wraps_sorted: bool,
+}
+
+impl<'a> LineGlyphs<'a> {
+    fn new(line: &'a WrappedLine) -> Self {
+        let count = line.runs().iter().map(|r| r.glyphs.len()).sum();
+        let mut index = Vec::with_capacity(count);
+        let mut x = Vec::with_capacity(count);
+        let mut max_index = Vec::with_capacity(count);
+        let mut max_x = Vec::with_capacity(count);
+        for glyph in line.runs().iter().flat_map(|r| r.glyphs.iter()) {
+            index.push(glyph.index);
+            x.push(glyph.position.x);
+            max_index.push(
+                max_index
+                    .last()
+                    .map_or(glyph.index, |&m: &usize| m.max(glyph.index)),
+            );
+            max_x.push(
+                max_x
+                    .last()
+                    .map_or(glyph.position.x, |&m: &Pixels| m.max(glyph.position.x)),
+            );
+        }
+        let runs = line.runs();
+        let wraps: SmallVec<[(usize, Pixels); 4]> = line
+            .wrap_boundaries()
+            .iter()
+            .map(|b| {
+                let glyph = &runs[b.run_ix].glyphs[b.glyph_ix];
+                (glyph.index, glyph.position.x)
+            })
+            .collect();
+        let wraps_sorted = wraps.windows(2).all(|w| w[0].0 <= w[1].0);
+        Self {
+            line,
+            index,
+            x,
+            max_index,
+            max_x,
+            wraps,
+            wraps_sorted,
+        }
+    }
+
+    fn unwrapped_width(&self) -> Pixels {
+        self.line.unwrapped_layout.width
+    }
+
+    /// gpui's `LineLayout::x_for_index`.
+    fn x_for_index(&self, target: usize) -> Pixels {
+        let p = self.max_index.partition_point(|&m| m < target);
+        self.x
+            .get(p)
+            .copied()
+            .unwrap_or_else(|| self.unwrapped_width())
+    }
+
+    /// gpui's `LineLayout::closest_index_for_x`.
+    fn closest_index_for_x(&self, target: Pixels) -> usize {
+        let p = self.max_x.partition_point(|&m| m < target);
+        if let Some(&glyph_x) = self.x.get(p) {
+            let (prev_index, prev_x) = match p.checked_sub(1) {
+                Some(q) => (self.index[q], self.x[q]),
+                None => (0, px(0.)),
+            };
+            return if glyph_x - target < target - prev_x {
+                self.index[p]
+            } else {
+                prev_index
+            };
+        }
+        let len = self.line.unwrapped_layout.len;
+        if len == 1 {
+            return if target > self.unwrapped_width() / 2. {
+                1
+            } else {
+                0
+            };
+        }
+        len
+    }
+}
+
+impl LinePositions for LineGlyphs<'_> {
+    /// gpui's `WrappedLineLayout::position_for_index`.
+    fn position_for_index(&self, index: usize, row_stride: Pixels) -> Option<Point<Pixels>> {
+        let len = self.line.len();
+        let end_of = |row: usize| self.wraps.get(row).map_or(len, |w| w.0);
+        let row = if self.wraps_sorted && len >= self.wraps.last().map_or(0, |w| w.0) {
+            let row = self.wraps.partition_point(|w| w.0 < index);
+            (index <= end_of(row)).then_some(row)?
+        } else {
+            let mut start = 0;
+            let mut found = None;
+            for row in 0..=self.wraps.len() {
+                let end = end_of(row);
+                if index < start {
+                    break;
+                } else if index > end {
+                    start = end;
+                } else {
+                    found = Some(row);
+                    break;
+                }
+            }
+            found?
+        };
+        let start = row.checked_sub(1).map_or(0, end_of);
+        let x = self.x_for_index(index) - self.x_for_index(start);
+        Some(point(x, row_stride * (row as f32)))
+    }
+
+    /// gpui's `WrappedLineLayout::closest_index_for_position`.
+    fn closest_index_for_position(
+        &self,
+        position: Point<Pixels>,
+        row_stride: Pixels,
+    ) -> Result<usize, usize> {
+        let row = (position.y / row_stride) as usize;
+        let (start_index, start_x) = if row > 0 {
+            let Some(&w) = self.wraps.get(row - 1) else {
+                return Err(0);
+            };
+            w
+        } else {
+            (0, Pixels::ZERO)
+        };
+        let (end_index, end_x) = match self.wraps.get(row) {
+            Some(&w) => w,
+            None => (self.line.unwrapped_layout.len, self.unwrapped_width()),
+        };
+        let x = position.x + start_x;
+        if x < start_x {
+            Err(start_index)
+        } else if x >= end_x {
+            Err(end_index)
+        } else {
+            Ok(self.closest_index_for_x(x))
+        }
+    }
+
+    fn wrap_count(&self) -> usize {
+        self.wraps.len()
+    }
+
+    fn width(&self) -> Pixels {
+        self.line.width()
     }
 }
 
@@ -232,7 +438,7 @@ impl LaidOutLine {
         let display = self.display_offset_for_source(source_offset);
         self.line
             .position_for_index(display, self.row_stride)
-            .unwrap_or_else(|| end_of_line_position(&self.line, self.row_stride))
+            .unwrap_or_else(|| end_of_line_position(&*self.line, self.row_stride))
     }
 
     /// Like [`Self::local_position_for_source_offset`], but when `downstream` is
@@ -253,7 +459,7 @@ impl LaidOutLine {
             return upper;
         }
         downstream_row_position(
-            &self.line,
+            &*self.line,
             self.display_offset_for_source(source_offset),
             upper,
             self.row_stride,
@@ -776,8 +982,11 @@ fn compute_image_row_extra(
 ///
 /// The last row has no boundary after it; it ends at the line's own
 /// width, which for the last row is the honest value.
-fn wrap_row_right_edges(line: &WrappedLine, row_stride: Pixels) -> SmallVec<[Pixels; 4]> {
-    let rows = line.wrap_boundaries().len() + 1;
+fn wrap_row_right_edges(
+    line: &(impl LinePositions + ?Sized),
+    row_stride: Pixels,
+) -> SmallVec<[Pixels; 4]> {
+    let rows = line.wrap_count() + 1;
     let mut out: SmallVec<[Pixels; 4]> = SmallVec::with_capacity(rows);
     if row_stride > px(0.) {
         for k in 0..rows - 1 {
@@ -816,8 +1025,8 @@ fn wrap_row_right_edges(line: &WrappedLine, row_stride: Pixels) -> SmallVec<[Pix
 /// wash that treated the unanswerable end as a failure would discard
 /// every quad of a span whose *start* resolved perfectly well, losing a
 /// whole decoration to a partial answer.
-fn end_of_line_position(line: &WrappedLine, row_stride: Pixels) -> Point<Pixels> {
-    let last_row = line.wrap_boundaries().len();
+fn end_of_line_position(line: &(impl LinePositions + ?Sized), row_stride: Pixels) -> Point<Pixels> {
+    let last_row = line.wrap_count();
     point(line.width(), row_stride * (last_row as f32))
 }
 
@@ -857,6 +1066,7 @@ fn run_background_bounds(
 ) -> Vec<Bounds<Pixels>> {
     let mut out = Vec::new();
     let len = line.text.len();
+    let mut glyphs: Option<LineGlyphs> = None;
     let mut i = 0usize;
     while i < len {
         let color = display_to_source
@@ -877,7 +1087,8 @@ fn run_background_bounds(
             }
             j += 1;
         }
-        push_row_spanning_bounds(line, i, j, origin, row_stride, row_height, &mut out);
+        let glyphs = glyphs.get_or_insert_with(|| LineGlyphs::new(line));
+        push_row_spanning_bounds(glyphs, i, j, origin, row_stride, row_height, &mut out);
         i = j;
     }
     out
@@ -886,7 +1097,7 @@ fn run_background_bounds(
 /// Emit one quad per visual row covered by the display range `lo..hi`.
 #[allow(clippy::too_many_arguments)]
 fn push_row_spanning_bounds(
-    line: &WrappedLine,
+    line: &(impl LinePositions + ?Sized),
     lo: usize,
     hi: usize,
     origin: Point<Pixels>,
@@ -974,6 +1185,7 @@ fn emphasis_dot_bounds(
     let radius = diameter / 2.0;
     let half_leading = ((row_height - body_ascent - body_descent) / 2.0).max(px(0.0));
     let drop = font_size * style.emphasis_dot_baseline_offset_factor;
+    let mut glyphs: Option<LineGlyphs> = None;
     for (i, ch) in line.text.char_indices() {
         if !crate::cjk::takes_emphasis_dot(ch) {
             continue;
@@ -984,13 +1196,14 @@ fn emphasis_dot_bounds(
         if !index.style_at(src).emphasis_dots {
             continue;
         }
-        let Some(upper) = line.position_for_index(i, row_stride) else {
+        let glyphs = &*glyphs.get_or_insert_with(|| LineGlyphs::new(line));
+        let Some(upper) = glyphs.position_for_index(i, row_stride) else {
             continue;
         };
         // A character that *opens* a wrap row is a boundary index, which
         // gpui resolves to the row above — the dot would land at the
         // previous row's right edge, past the wrap width.
-        let lead = downstream_row_position(line, i, upper, row_stride);
+        let lead = downstream_row_position(glyphs, i, upper, row_stride);
         // A character that *ends* its wrap row has no trailing edge on
         // the same row; a CJK glyph is an em square, so its own font
         // size is the honest width to center within.
@@ -1000,7 +1213,7 @@ fn emphasis_dot_bounds(
         // index is *at or after* the one asked for, so a selector that
         // shaped into its base's cluster (no glyph of its own) is
         // skipped and the base still measures its own advance.
-        let advance = match line.position_for_index(i + ch.len_utf8(), row_stride) {
+        let advance = match glyphs.position_for_index(i + ch.len_utf8(), row_stride) {
             Some(trail) if trail.y == lead.y => trail.x - lead.x,
             _ => font_size,
         };
@@ -5474,7 +5687,7 @@ fn paint_selection_for_line(
     // Per-row right edges, not the configured wrap width — see
     // `wrap_row_right_edges`. The wash hugs the text on every row it
     // crosses, the way the inline-code chip does.
-    let right_edges = wrap_row_right_edges(&line.line, row_stride);
+    let right_edges = wrap_row_right_edges(&*line.line, row_stride);
     let row_right = |row: usize| {
         line.origin.x
             + right_edges
@@ -6323,9 +6536,74 @@ mod tests {
                 &BlockIndex::new(block),
                 style,
             );
-            let edges = wrap_row_right_edges(&sl.line, line_height).to_vec();
+            let edges = wrap_row_right_edges(&*sl.line, line_height).to_vec();
             (chips, edges)
         })
+    }
+
+    #[gpui::test]
+    fn the_glyph_index_answers_every_position_query_as_gpui_does(cx: &mut TestAppContext) {
+        let docs = [
+            "`alpha beta gamma delta epsilon zeta` tail with `more code` and words",
+            "plain prose that wraps over several rows at a narrow width, again and again",
+            "混合 **着重** text 中文字符 with `代码` and emoji 🎉👩‍👩‍👧 then more 汉字汉字汉字",
+            "עברית mixed with English and العربية too, wrapping across rows",
+            "x",
+            "trailing spaces   ",
+        ];
+        for src in docs {
+            let state = EditorState {
+                markdown: src.into(),
+                selection: Selection::Cursor(src.len()),
+                ..Default::default()
+            };
+            let tree = parse(src);
+            let blocks = render(&state, &tree).blocks;
+            with_style(cx, |window, style| {
+                let block = blocks
+                    .iter()
+                    .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                    .expect("paragraph");
+                let font_size = font_size_for_block(&block.kind, style);
+                let stride = font_size * style.line_height.0;
+                for wrap_w in [None, Some(px(60.0)), Some(px(150.0))] {
+                    let shaped = shape_block_lines(src, block, style, font_size, wrap_w, window);
+                    for sl in &shaped {
+                        let line: &WrappedLine = &sl.line;
+                        let glyphs = LineGlyphs::new(line);
+                        assert_eq!(glyphs.wrap_count(), LinePositions::wrap_count(line));
+                        assert_eq!(LinePositions::width(&glyphs), LinePositions::width(line));
+                        for i in 0..=line.text.len() + 2 {
+                            assert_eq!(
+                                LinePositions::position_for_index(&glyphs, i, stride),
+                                LinePositions::position_for_index(line, i, stride),
+                                "{src:?} at {wrap_w:?}: position of index {i}"
+                            );
+                        }
+                        let rows = glyphs.wrap_count() + 2;
+                        let right = f32::from(line.unwrapped_layout.width) + 20.0;
+                        let mut y = -0.5f32;
+                        while y < rows as f32 {
+                            let mut x = -5.0f32;
+                            while x < right {
+                                let p = point(px(x), stride * y);
+                                assert_eq!(
+                                    LinePositions::closest_index_for_position(&glyphs, p, stride),
+                                    LinePositions::closest_index_for_position(line, p, stride),
+                                    "{src:?} at {wrap_w:?}: index closest to {p:?}"
+                                );
+                                x += 1.7;
+                            }
+                            y += 0.25;
+                        }
+                        assert_eq!(
+                            wrap_row_right_edges(&glyphs, stride),
+                            wrap_row_right_edges(line, stride)
+                        );
+                    }
+                }
+            });
+        }
     }
 
     #[gpui::test]
@@ -6402,7 +6680,7 @@ mod tests {
 
             let mut out = Vec::new();
             push_row_spanning_bounds(
-                &sl.line,
+                &*sl.line,
                 0,
                 unanswerable,
                 point(px(0.0), px(0.0)),
@@ -6417,7 +6695,7 @@ mod tests {
             let last = out.last().expect("a quad");
             assert_eq!(
                 last.origin.x + last.size.width,
-                end_of_line_position(&sl.line, line_height).x,
+                end_of_line_position(&*sl.line, line_height).x,
                 "the end falls back to the caret's end-of-line rule"
             );
         });
@@ -6458,7 +6736,7 @@ mod tests {
                 display_to_source: sl.display_to_source,
                 is_delimiter: sl.is_delimiter,
             };
-            let edges = wrap_row_right_edges(&laid.line, line_height).to_vec();
+            let edges = wrap_row_right_edges(&*laid.line, line_height).to_vec();
             let mut out = Vec::new();
             paint_selection_for_line(
                 &laid,
