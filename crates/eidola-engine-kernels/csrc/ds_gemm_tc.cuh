@@ -97,13 +97,26 @@ struct Cfg {
 // (`_t8`) or 32 rows by 128 (`_t32`).
 template <bool kFp4, uint32_t kTokens>
 using TileCfg = Cfg<kFp4, kTokens == 8 ? 1 : 2, kTokens / 8, kWarps, 4, 2>;
-// The split block (`_s8`): 8 rows by 16 outputs. Each warp computes a
-// quarter of each step's 16 blocks, and the blocks' contributions are then
-// added in ascending block order, one thread per output and row. Many small
-// blocks with deep staging, for row counts whose GEMM is a stream of the
-// weights.
-template <bool kFp4>
-using SplitCfg = Cfg<kFp4, 1, 1, 1, 16, kFp4 ? 8 : 6>;
+// The split block (`_s8`): 8 rows by 16 outputs, `kSplitThreads` threads
+// whose `kSplitWarps` warps share out K in chunks of `kSplitChunk` blocks,
+// each warp `kSplitPerWarp` consecutive blocks of a chunk. A warp reads its
+// operands straight from global memory into registers (no staging: at these
+// row counts the product is a stream of the weights, and staging costs more
+// instructions than it saves) and writes each block's contribution
+// `(dot · activation scale) · weight scale` to shared memory; then thread
+// `t < 128` adds output `t / 8`'s contributions to row `t % 8` in ascending
+// block order.
+constexpr uint32_t kSplitThreads = 256;
+constexpr uint32_t kSplitWarps = kSplitThreads / 32;
+constexpr uint32_t kSplitPerWarp = 4;
+constexpr uint32_t kSplitChunk = kSplitWarps * kSplitPerWarp;
+constexpr uint32_t kSplitFeatures = 16;
+constexpr uint32_t kSplitTokens = 8;
+
+// A chunk's contributions, per block, output and row.
+struct SplitContributions {
+  float c[kSplitChunk][kSplitFeatures][kSplitTokens];
+};
 
 // One staged step: weight rows, activation rows, and the scale bytes of the
 // step's blocks (a weight scale per output row, expanded from the 32 × 32
@@ -115,19 +128,6 @@ struct alignas(16) Stage {
   uint8_t ws[C::kFeatures][C::kStepBlocks];
   uint8_t xs[C::kTokens][C::kStepBlocks];
 };
-
-// The split block's contributions of one step, `(dot · activation scale) ·
-// weight scale` per block, output and row, before they are added in order.
-template <class C>
-struct Contributions {
-  float c[C::kStepBlocks][C::kFeatures][C::kTokens];
-};
-
-// Dynamic shared memory of the split block: its stages, then its contributions.
-template <class C>
-constexpr uint32_t split_smem_bytes() {
-  return static_cast<uint32_t>(C::kStages * sizeof(Stage<C>) + sizeof(Contributions<C>));
-}
 
 // What one pass over K computes: the rows `[lo, hi)` of a tile (relative to
 // its first row) against one weight. `lin8` is one pass a tile; `lin4` one
@@ -295,12 +295,24 @@ DSTC_FN uint32_t byte_perm(uint32_t a, uint32_t b, uint32_t sel) {
 // 0x40, 0x42, 0x44, 0x46; `prmt` picks each high byte by the code (selector
 // nibbles with bit 3 clear copy bytes, replicating no sign) and a zero byte
 // (pool byte 0, the code 0's) for each low byte; the sign moves to bit 15.
+// On the device the hardware converts.
 DSTC_FN void e2m1x4_to_f16(uint32_t v, uint32_t* lo, uint32_t* hi) {
+#if defined(__CUDA_ARCH__)
+  // The hardware conversion (`F2FP.F16.E2M1.UNPACK_B`): a byte's low nibble
+  // to the low half, and the same values.
+  asm("{.reg .b8 b0, b1;\n"
+      "mov.b16 {b0, b1}, %2;\n"
+      "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
+      "cvt.rn.f16x2.e2m1x2 %1, b1;}\n"
+      : "=r"(*lo), "=r"(*hi)
+      : "h"(static_cast<uint16_t>(v)));
+#else
   constexpr uint32_t kPoolLo = 0x3e3c3800u, kPoolHi = 0x46444240u;
   *lo = byte_perm(kPoolLo, kPoolHi, (v << 4 & 0x0070u) | (v << 8 & 0x7000u)) |
         (v & 0x0008u) << 12 | (v & 0x0080u) << 24;
   *hi = byte_perm(kPoolLo, kPoolHi, (v >> 4 & 0x0070u) | (v & 0x7000u)) |
         (v & 0x0800u) << 4 | (v & 0x8000u) << 16;
+#endif
 }
 
 // ---- bands ----
@@ -350,18 +362,33 @@ DSTC_FN void split3(uint32_t x, uint32_t t1, uint32_t t2, uint32_t* b0, uint32_t
   *b2 = x & m2;
 }
 
-// A band pair's exact sum (an f32 holding it exactly) as an integer in the
-// block dot's unit: 2^-18 for FP8 × FP8 (below 2^41 in all), 2^-10 for
-// FP8 × FP4 (below 2^27). Every product is a multiple of the unit, so the
-// scaled sum is an integer and the conversion exact.
-DSTC_FN int64_t band_units8(float sum) { return static_cast<int64_t>(sum * 262144.0f); }
-DSTC_FN int32_t band_units4(float sum) { return static_cast<int32_t>(sum * 1024.0f); }
-// The block dot from the pairs' integer sum, rounded once: `ds::fp8_fp8_block_dot`
-// rounds `sum · 2^-18` from f64; rounding `sum` and then scaling by a power of
-// two is the same value, since the result is at least 2^-18 when not zero.
-DSTC_FN float block_dot8(int64_t units) { return static_cast<float>(units) * 3.814697265625e-06f; }
-// `ds::fp8_fp4_block_dot`'s own expression.
-DSTC_FN float block_dot4(int32_t units) { return static_cast<float>(units) * 0.0009765625f; }
+// The exact sum of a block's band pairs, rounded once, in f32 arithmetic.
+// Every pair's sum `p` is an exact f32, a multiple of the block's unit
+// (2^-18 for FP8 × FP8, 2^-10 for FP8 × FP4), and the magnitudes of all the
+// pairs together are below the block's bound (`32 · 448 · 448 < 2^23` and
+// `32 · 448 · 6 < 2^17`). Each `p` is split exactly into an integer part
+// `r · 2^c` and a remainder `p - r · 2^c` of magnitude at most `2^(c - 1)`,
+// `r` the nearest integer to `p / 2^c` (`(x + 1.5 · 2^23) - 1.5 · 2^23`, exact
+// for `|x| < 2^22`); the integer parts add exactly in `hi` (below 2^24 in
+// all) and the remainders exactly in `lo` (below 2^24 units in all). The
+// block dot is then `hi · 2^c + lo` with one rounding: an IEEE addition of
+// two exact values whose exact sum is the dot product, so the nearest f32 to
+// it, ties to even, which is `ds::fp8_fp8_block_dot` / `fp8_fp4_block_dot`.
+// FP8 × FP8 splits at `c = 1`, FP8 × FP4 at `c = 0`. All of it is FP32
+// addition and multiplication by powers of two.
+constexpr float kRound = 12582912.0f;  // 1.5 · 2^23
+DSTC_FN void pair8(float p, float* hi, float* lo) {
+  const float r = (p * 0.5f + kRound) - kRound;
+  *hi = *hi + r;
+  *lo = *lo + (p - r * 2.0f);
+}
+DSTC_FN float block_dot8(float hi, float lo) { return hi * 2.0f + lo; }
+DSTC_FN void pair4(float p, float* hi, float* lo) {
+  const float r = (p + kRound) - kRound;
+  *hi = *hi + r;
+  *lo = *lo + (p - r);
+}
+DSTC_FN float block_dot4(float hi, float lo) { return hi + lo; }
 
 // ---- fragments ----
 //
@@ -461,6 +488,80 @@ DSTC_FN void store(const Pass& p, uint32_t f, uint32_t r, float acc) {
   if (n < p.n && r >= p.lo && r < p.hi) {
     p.out[static_cast<uint64_t>(r) * p.n + n] = ds::bf16_store(ds::bf16_round(acc));
   }
+}
+
+// ---- the split block's operands, straight from global memory ----
+
+// A lane's operands of block `blk` for the split block, as loaded: the
+// words of its two weight rows (outputs `p.f0 + g`, `+ 8`) and of its row of
+// the tile (`g`) that the tiles' `load_frags` reads for the same lane, and
+// the scale bytes its four elements of D need (its two outputs' weight
+// scales, its two rows' activation scales). They are converted to fragments
+// when the block is computed (`split_frags`), so a warp holds a whole chunk's
+// operands in few registers. A row past `n` or outside the pass reads a row
+// that exists (its outputs are not stored): no branch per element.
+struct SplitOperands {
+  uint32_t w[4];  // FP8: [row][half] words; FP4: [row] 32 bits = two halves' 16 bits
+  uint32_t x[2];  // [half]
+  uint32_t scales;  // bytes: weight scale of g, of g + 8, activation scale of 2q, of 2q + 1
+};
+
+DSTC_FN uint32_t clamp_row(uint32_t r, uint32_t lo, uint32_t hi) {
+  return r < lo ? lo : r >= hi ? hi - 1 : r;
+}
+
+template <bool kFp4>
+DSTC_FN void split_operands(const Pass& p, uint32_t lane, uint32_t blk, SplitOperands* o) {
+  const uint32_t g = lane >> 2, q = lane & 3u, kb = p.k / 32;
+  const uint32_t w0 = clamp_row(p.f0 + g, 0, p.n), w1 = clamp_row(p.f0 + g + 8, 0, p.n);
+  const uint32_t x0 = clamp_row(g, p.lo, p.hi);
+  const uint64_t row_bytes = kFp4 ? p.k / 2 : p.k;
+  const uint8_t* wr0 = p.w + w0 * row_bytes;
+  const uint8_t* wr1 = p.w + w1 * row_bytes;
+  if (kFp4) {
+    const uint64_t at = static_cast<uint64_t>(blk) * 16 + q * 2;
+    o->w[0] = load16(wr0 + at) | load16(wr0 + at + 8) << 16;
+    o->w[1] = load16(wr1 + at) | load16(wr1 + at + 8) << 16;
+    o->w[2] = 0;
+    o->w[3] = 0;
+  } else {
+    const uint64_t at = static_cast<uint64_t>(blk) * 32 + q * 4;
+    o->w[0] = load32(wr0 + at);
+    o->w[1] = load32(wr0 + at + 16);
+    o->w[2] = load32(wr1 + at);
+    o->w[3] = load32(wr1 + at + 16);
+  }
+  const uint8_t* xr = p.x + static_cast<uint64_t>(x0) * p.k + static_cast<uint64_t>(blk) * 32 + q * 4;
+  o->x[0] = load32(xr);
+  o->x[1] = load32(xr + 16);
+  const uint64_t ws0 = kFp4 ? static_cast<uint64_t>(w0) * kb : static_cast<uint64_t>(w0 / 32) * kb;
+  const uint64_t ws1 = kFp4 ? static_cast<uint64_t>(w1) * kb : static_cast<uint64_t>(w1 / 32) * kb;
+  o->scales = static_cast<uint32_t>(p.ws[ws0 + blk]) | static_cast<uint32_t>(p.ws[ws1 + blk]) << 8 |
+              static_cast<uint32_t>(p.xs[static_cast<uint64_t>(clamp_row(2 * q, p.lo, p.hi)) * kb + blk]) << 16 |
+              static_cast<uint32_t>(p.xs[static_cast<uint64_t>(clamp_row(2 * q + 1, p.lo, p.hi)) * kb + blk]) << 24;
+}
+
+// The fragments of a lane's loaded operands, as `load_frags` makes them.
+template <bool kFp4>
+DSTC_FN void split_frags(const SplitOperands& o, uint32_t (&a)[1][2][4], uint32_t (&b)[1][2][2]) {
+  for (uint32_t h = 0; h < 2; ++h) {
+    if (kFp4) {
+      e2m1x4_to_f16(o.w[0] >> (16 * h), &a[0][h][0], &a[0][h][2]);
+      e2m1x4_to_f16(o.w[1] >> (16 * h), &a[0][h][1], &a[0][h][3]);
+    } else {
+      fp8_word(o.w[h], &a[0][h][0], &a[0][h][2]);
+      fp8_word(o.w[2 + h], &a[0][h][1], &a[0][h][3]);
+    }
+    fp8_word(o.x[h], &b[0][h][0], &b[0][h][1]);
+  }
+}
+
+// Element `i`'s contribution from a block's dot product: `(dot · activation
+// scale) · weight scale`, the product `ds::gemm_accumulate` adds.
+DSTC_FN float split_contribution(const SplitOperands& o, uint32_t i, float dot) {
+  const uint8_t ws = static_cast<uint8_t>(o.scales >> (8 * (i >> 1)));
+  const uint8_t xs = static_cast<uint8_t>(o.scales >> (16 + 8 * (i & 1u)));
+  return dot * ds::act_scale_decode(xs) * ds::e8m0_decode(ws);
 }
 
 // ---- lin4's groups ----

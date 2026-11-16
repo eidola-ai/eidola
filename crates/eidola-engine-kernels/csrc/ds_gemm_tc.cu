@@ -154,16 +154,12 @@ __device__ __forceinline__ void cut3(const uint32_t (&v)[kN][2][kW], uint32_t t1
   }
 }
 
-// The block dot products of block `blk` of the staged step, for the warp's
-// tiles from staged weight row `frow` and the n-tiles `[nt0, nt1)`. A band
-// empty across the warp is skipped: its products would add exact zeros.
-template <class C, bool kBanded>
-__device__ __forceinline__ void block_dots(const Stage<C>& s, uint32_t frow, uint32_t lane,
-                                           uint32_t blk, uint32_t nt0, uint32_t nt1,
-                                           float (&dot)[C::kMTiles][C::kNTiles][4]) {
-  constexpr uint32_t kMT = C::kMTiles, kNT = C::kNTiles;
-  uint32_t a[kMT][2][4], b[kNT][2][2];
-  dstc::load_frags<C>(s, frow, lane, blk, a, b);
+// The block dot products of a block's fragments for the n-tiles
+// `[nt0, nt1)`. A band empty across the warp is skipped: its products would
+// add exact zeros.
+template <bool kFp4, bool kBanded, uint32_t kMT, uint32_t kNT>
+__device__ __forceinline__ void frag_dots(const uint32_t (&a)[kMT][2][4], const uint32_t (&b)[kNT][2][2],
+                                          uint32_t nt0, uint32_t nt1, float (&dot)[kMT][kNT][4]) {
   if (!kBanded) {
 #pragma unroll
     for (uint32_t mt = 0; mt < kMT; ++mt) {
@@ -172,8 +168,8 @@ __device__ __forceinline__ void block_dots(const Stage<C>& s, uint32_t frow, uin
         if (nt >= nt0 && nt < nt1) mma(dot[mt][nt], a[mt], b[nt]);
       }
     }
-  } else if (C::kFp4) {
-    int32_t u[kMT][kNT][4] = {};
+  } else if (kFp4) {
+    float hi[kMT][kNT][4] = {}, lo[kMT][kNT][4] = {};
     uint32_t bm[2][kNT][2][2];
     cut2(b, dstc::kX4Cut, bm[0], bm[1]);
 #pragma unroll
@@ -187,7 +183,7 @@ __device__ __forceinline__ void block_dots(const Stage<C>& s, uint32_t frow, uin
           float d[4];
           mma(d, a[mt], bm[xb][nt]);
 #pragma unroll
-          for (uint32_t i = 0; i < 4; ++i) u[mt][nt][i] += dstc::band_units4(d[i]);
+          for (uint32_t i = 0; i < 4; ++i) dstc::pair4(d[i], &hi[mt][nt][i], &lo[mt][nt][i]);
         }
       }
     }
@@ -196,11 +192,11 @@ __device__ __forceinline__ void block_dots(const Stage<C>& s, uint32_t frow, uin
 #pragma unroll
       for (uint32_t nt = 0; nt < kNT; ++nt) {
 #pragma unroll
-        for (uint32_t i = 0; i < 4; ++i) dot[mt][nt][i] = dstc::block_dot4(u[mt][nt][i]);
+        for (uint32_t i = 0; i < 4; ++i) dot[mt][nt][i] = dstc::block_dot4(hi[mt][nt][i], lo[mt][nt][i]);
       }
     }
   } else {
-    int64_t u[kMT][kNT][4] = {};
+    float hi[kMT][kNT][4] = {}, lo[kMT][kNT][4] = {};
     uint32_t bm[3][kNT][2][2], am[2][kMT][2][4];
     cut3(b, dstc::kX8Cut1, dstc::kX8Cut2, bm);
     cut2(a, dstc::kW8Cut, am[0], am[1]);
@@ -221,7 +217,7 @@ __device__ __forceinline__ void block_dots(const Stage<C>& s, uint32_t frow, uin
             float d[4];
             mma(d, am[wb][mt], bm[xb][nt]);
 #pragma unroll
-            for (uint32_t i = 0; i < 4; ++i) u[mt][nt][i] += dstc::band_units8(d[i]);
+            for (uint32_t i = 0; i < 4; ++i) dstc::pair8(d[i], &hi[mt][nt][i], &lo[mt][nt][i]);
           }
         }
       }
@@ -231,10 +227,21 @@ __device__ __forceinline__ void block_dots(const Stage<C>& s, uint32_t frow, uin
 #pragma unroll
       for (uint32_t nt = 0; nt < kNT; ++nt) {
 #pragma unroll
-        for (uint32_t i = 0; i < 4; ++i) dot[mt][nt][i] = dstc::block_dot8(u[mt][nt][i]);
+        for (uint32_t i = 0; i < 4; ++i) dot[mt][nt][i] = dstc::block_dot8(hi[mt][nt][i], lo[mt][nt][i]);
       }
     }
   }
+}
+
+// The block dot products of block `blk` of the staged step, for the warp's
+// tiles from staged weight row `frow` and the n-tiles `[nt0, nt1)`.
+template <class C, bool kBanded>
+__device__ __forceinline__ void block_dots(const Stage<C>& s, uint32_t frow, uint32_t lane,
+                                           uint32_t blk, uint32_t nt0, uint32_t nt1,
+                                           float (&dot)[C::kMTiles][C::kNTiles][4]) {
+  uint32_t a[C::kMTiles][2][4], b[C::kNTiles][2][2];
+  dstc::load_frags<C>(s, frow, lane, blk, a, b);
+  frag_dots<C::kFp4, kBanded>(a, b, nt0, nt1, dot);
 }
 
 // One pass over K in a tile: stage `step % 2` holds the step while the next
@@ -275,6 +282,23 @@ __device__ __forceinline__ void tile_pass(Stage<C> (&s)[2], const Pass& p) {
         if (blk >= vb) continue;
         float dot[kMT][kNT][4];
         block_dots<C, kBanded>(cur, frow, lane, blk, nt0, nt1, dot);
+        // The block's scales, once each: rows 2q, 2q + 1 of each n-tile and
+        // outputs g, g + 8 of each m-tile.
+        float sa[kNT][2], sb[kMT][2];
+#pragma unroll
+        for (uint32_t nt = 0; nt < kNT; ++nt) {
+#pragma unroll
+          for (uint32_t j = 0; j < 2; ++j) {
+            sa[nt][j] = ds::act_scale_decode(cur.xs[dstc::d_token(lane, nt, j)][blk]);
+          }
+        }
+#pragma unroll
+        for (uint32_t mt = 0; mt < kMT; ++mt) {
+#pragma unroll
+          for (uint32_t j = 0; j < 2; ++j) {
+            sb[mt][j] = ds::e8m0_decode(cur.ws[dstc::d_feature(frow, lane, mt, 2 * j)][blk]);
+          }
+        }
 #pragma unroll
         for (uint32_t mt = 0; mt < kMT; ++mt) {
 #pragma unroll
@@ -282,9 +306,8 @@ __device__ __forceinline__ void tile_pass(Stage<C> (&s)[2], const Pass& p) {
             if (nt < nt0 || nt >= nt1) continue;
 #pragma unroll
             for (uint32_t i = 0; i < 4; ++i) {
-              acc[mt][nt][i] = dstc::accumulate<C>(cur, dstc::d_feature(frow, lane, mt, i),
-                                                   dstc::d_token(lane, nt, i), blk, acc[mt][nt][i],
-                                                   dot[mt][nt][i]);
+              acc[mt][nt][i] =
+                  ds::gemm_accumulate(acc[mt][nt][i], dot[mt][nt][i], sa[nt][i & 1u], sb[mt][i >> 1]);
             }
           }
         }
@@ -305,49 +328,54 @@ __device__ __forceinline__ void tile_pass(Stage<C> (&s)[2], const Pass& p) {
   }
 }
 
-// One pass over K in the split block: `kStages` stages in flight; each warp
-// computes the contributions of its quarter of the step's blocks, then
-// thread `t` adds output `t / 8`'s contributions to row `t % 8` in ascending
-// block order.
-template <class C, bool kBanded>
-__device__ __forceinline__ void split_pass(Stage<C>* s, dstc::Contributions<C>& c, const Pass& p) {
-  static_assert(C::kFeatures * C::kTokens == kThreads, "a thread per output and row");
-  constexpr uint32_t kNS = C::kStages, kPerWarp = C::kStepBlocks / C::kKWarps;
+// One pass over K in the split block. Each chunk: every warp computes the
+// contributions of its `kSplitPerWarp` consecutive blocks from operands it
+// loaded into registers, the next chunk's operands are loaded while thread
+// `t` adds output `t / 8`'s contributions to row `t % 8` in ascending block
+// order.
+template <bool kFp4, bool kBanded>
+__device__ __forceinline__ void split_pass(dstc::SplitContributions& c, const Pass& p) {
+  constexpr uint32_t kSums = dstc::kSplitFeatures * dstc::kSplitTokens;
+  static_assert(kSums <= dstc::kSplitThreads, "a thread per output and row");
+  constexpr uint32_t kPer = dstc::kSplitPerWarp, kChunk = dstc::kSplitChunk;
   const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-  const uint32_t steps = dstc::steps<C>(p);
+  const uint32_t kb = p.k / 32;
   const uint32_t nt0 = dstc::ntile_first(p), nt1 = dstc::ntile_last(p);
-  const uint32_t mine_f = threadIdx.x / C::kTokens, mine_r = threadIdx.x % C::kTokens;
+  const uint32_t mine_f = threadIdx.x / dstc::kSplitTokens, mine_r = threadIdx.x % dstc::kSplitTokens;
+  const bool sums = threadIdx.x < kSums;
   float acc = 0.0f;
+  dstc::SplitOperands o[kPer];
+  const auto load = [&](uint32_t c0) {
 #pragma unroll
-  for (uint32_t j = 0; j + 1 < kNS; ++j) {
-    if (j < steps) fill<C>(s[j], p, j);
-    commit();
-  }
-  for (uint32_t step = 0; step < steps; ++step) {
-    if (step + kNS - 1 < steps) fill<C>(s[(step + kNS - 1) % kNS], p, step + kNS - 1);
-    commit();
-    wait_copies<kNS - 1>();
-    __syncthreads();
-    const Stage<C>& cur = s[step % kNS];
-    const uint32_t vb = dstc::blocks_in_step<C>(p, step);
+    for (uint32_t j = 0; j < kPer; ++j) {
+      const uint32_t blk = c0 + warp * kPer + j;
+      if (blk < kb) dstc::split_operands<kFp4>(p, lane, blk, &o[j]);
+    }
+  };
+  load(0);
+  for (uint32_t c0 = 0; c0 < kb; c0 += kChunk) {
 #pragma unroll
-    for (uint32_t j = 0; j < kPerWarp; ++j) {
-      const uint32_t blk = warp * kPerWarp + j;
-      if (blk >= vb) continue;
+    for (uint32_t j = 0; j < kPer; ++j) {
+      if (c0 + warp * kPer + j >= kb) continue;
+      uint32_t a[1][2][4], b[1][2][2];
+      dstc::split_frags<kFp4>(o[j], a, b);
       float dot[1][1][4];
-      block_dots<C, kBanded>(cur, 0, lane, blk, nt0, nt1, dot);
+      frag_dots<kFp4, kBanded>(a, b, nt0, nt1, dot);
 #pragma unroll
       for (uint32_t i = 0; i < 4; ++i) {
-        const uint32_t f = dstc::d_feature(0, lane, 0, i), r = dstc::d_token(lane, 0, i);
-        c.c[blk][f][r] = dstc::contribution<C>(cur, f, r, blk, dot[0][0][i]);
+        c.c[warp * kPer + j][dstc::d_feature(0, lane, 0, i)][dstc::d_token(lane, 0, i)] =
+            dstc::split_contribution(o[j], i, dot[0][0][i]);
       }
     }
     __syncthreads();
-    for (uint32_t blk = 0; blk < vb; ++blk) acc = acc + c.c[blk][mine_f][mine_r];
+    if (c0 + kChunk < kb) load(c0 + kChunk);
+    const uint32_t n = kb - c0 < kChunk ? kb - c0 : kChunk;
+    if (sums) {
+      for (uint32_t b = 0; b < n; ++b) acc = acc + c.c[b][mine_f][mine_r];
+    }
+    __syncthreads();
   }
-  dstc::store(p, mine_f, mine_r, acc);
-  // The next pass's first contributions are written only after its first
-  // barrier, which every thread reaches after this pass's last sums.
+  if (sums) dstc::store(p, mine_f, mine_r, acc);
 }
 
 template <uint32_t kTokens, bool kBanded>
@@ -373,67 +401,48 @@ __device__ __forceinline__ void lin4_tile(const DsLin4Params& p) {
   }
 }
 
-extern __shared__ __align__(16) uint8_t split_smem[];
-
-template <class C>
-__device__ __forceinline__ Stage<C>* split_stages() {
-  return reinterpret_cast<Stage<C>*>(split_smem);
-}
-template <class C>
-__device__ __forceinline__ dstc::Contributions<C>& split_contributions() {
-  return *reinterpret_cast<dstc::Contributions<C>*>(split_smem + C::kStages * sizeof(Stage<C>));
-}
-
 template <bool kBanded>
 __device__ __forceinline__ void lin8_split(const DsLin8Params& p) {
-  using C = dstc::SplitCfg<false>;
-  const uint32_t r0 = blockIdx.y * C::kTokens;
-  const uint32_t r1 = p.rows - r0 < C::kTokens ? p.rows : r0 + C::kTokens;
-  split_pass<C, kBanded>(split_stages<C>(), split_contributions<C>(),
-                         dstc::lin8_pass(p, r0, r1, blockIdx.x * C::kFeatures));
+  __shared__ dstc::SplitContributions c;
+  const uint32_t r0 = blockIdx.y * dstc::kSplitTokens;
+  const uint32_t r1 = p.rows - r0 < dstc::kSplitTokens ? p.rows : r0 + dstc::kSplitTokens;
+  split_pass<false, kBanded>(c, dstc::lin8_pass(p, r0, r1, blockIdx.x * dstc::kSplitFeatures));
 }
 
 template <bool kBanded>
 __device__ __forceinline__ void lin4_split(const DsLin4Params& p) {
-  using C = dstc::SplitCfg<true>;
-  const uint32_t r0 = blockIdx.y * C::kTokens;
-  const uint32_t r1 = p.layout_rows - r0 < C::kTokens ? p.layout_rows : r0 + C::kTokens;
-  const uint32_t f0 = blockIdx.x * C::kFeatures;
+  __shared__ dstc::SplitContributions c;
+  const uint32_t r0 = blockIdx.y * dstc::kSplitTokens;
+  const uint32_t r1 = p.layout_rows - r0 < dstc::kSplitTokens ? p.layout_rows : r0 + dstc::kSplitTokens;
+  const uint32_t f0 = blockIdx.x * dstc::kSplitFeatures;
   for (uint32_t g = dstc::first_group(p, r0); g < p.groups; ++g) {
     if (dstc::group_start(p, g) >= r1) break;
     const Pass pass = dstc::lin4_pass(p, g, r0, r1, f0);
-    if (pass.lo < pass.hi) {
-      split_pass<C, kBanded>(split_stages<C>(), split_contributions<C>(), pass);
-      // Every thread has read its sums before another pass refills the stages.
-      __syncthreads();
-    }
+    if (pass.lo < pass.hi) split_pass<true, kBanded>(c, pass);
   }
 }
 
-constexpr uint32_t kSplit8Smem = dstc::split_smem_bytes<dstc::SplitCfg<false>>();
-constexpr uint32_t kSplit4Smem = dstc::split_smem_bytes<dstc::SplitCfg<true>>();
-
 }  // namespace
 
-#define DS_GEMM_TC_ENTRY(NAME, BODY, PARAMS, SMEM)                                    \
-  extern "C" __global__ void __launch_bounds__(kThreads)                              \
+#define DS_GEMM_TC_ENTRY(NAME, BODY, PARAMS, THREADS)                                 \
+  extern "C" __global__ void __launch_bounds__(THREADS)                               \
       NAME(const __grid_constant__ PARAMS p) {                                        \
     BODY(p);                                                                          \
   }                                                                                   \
-  EIDOLA_KERNEL_META(NAME, kThreads, 1, 1, SMEM, 1, 1, 1, sizeof(PARAMS))
+  EIDOLA_KERNEL_META(NAME, THREADS, 1, 1, 0, 1, 1, 1, sizeof(PARAMS))
 
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_s8, (lin8_split<true>), DsLin8Params, kSplit8Smem);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t8, (lin8_tile<8, true>), DsLin8Params, 0);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t32, (lin8_tile<32, true>), DsLin8Params, 0);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_s8, (lin8_split<false>), DsLin8Params, kSplit8Smem);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t8, (lin8_tile<8, false>), DsLin8Params, 0);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t32, (lin8_tile<32, false>), DsLin8Params, 0);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_s8, (lin4_split<true>), DsLin4Params, kSplit4Smem);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t8, (lin4_tile<8, true>), DsLin4Params, 0);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t32, (lin4_tile<32, true>), DsLin4Params, 0);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_s8, (lin4_split<false>), DsLin4Params, kSplit4Smem);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t8, (lin4_tile<8, false>), DsLin4Params, 0);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t32, (lin4_tile<32, false>), DsLin4Params, 0);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_s8, (lin8_split<true>), DsLin8Params, dstc::kSplitThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t8, (lin8_tile<8, true>), DsLin8Params, kThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t32, (lin8_tile<32, true>), DsLin8Params, kThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_s8, (lin8_split<false>), DsLin8Params, dstc::kSplitThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t8, (lin8_tile<8, false>), DsLin8Params, kThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t32, (lin8_tile<32, false>), DsLin8Params, kThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_s8, (lin4_split<true>), DsLin4Params, dstc::kSplitThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t8, (lin4_tile<8, true>), DsLin4Params, kThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t32, (lin4_tile<32, true>), DsLin4Params, kThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_s8, (lin4_split<false>), DsLin4Params, dstc::kSplitThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t8, (lin4_tile<8, false>), DsLin4Params, kThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t32, (lin4_tile<32, false>), DsLin4Params, kThreads);
 
 // ---- the probe ----
 

@@ -217,13 +217,10 @@ void mma(Adder adder, Rng& rng, const uint32_t (&a)[32][2][4], const uint32_t (&
 
 // ---- the blocks of the grid, as `ds_gemm_tc.cu` runs them ----
 
-// `block_dots` of `ds_gemm_tc.cu` over a warp's 32 lanes.
-template <class C, bool kBanded>
-void block_dots(const dstc::Stage<C>& s, uint32_t frow, uint32_t blk, uint32_t nt0, uint32_t nt1,
-                Adder adder, Rng& rng, float (&dot)[32][C::kMTiles][C::kNTiles][4]) {
-  constexpr uint32_t kMT = C::kMTiles, kNT = C::kNTiles;
-  static uint32_t a[32][kMT][2][4], b[32][kNT][2][2];
-  for (uint32_t l = 0; l < 32; ++l) dstc::load_frags<C>(s, frow, l, blk, a[l], b[l]);
+// `frag_dots` of `ds_gemm_tc.cu` over a warp's 32 lanes' fragments.
+template <bool kFp4, bool kBanded, uint32_t kMT, uint32_t kNT>
+void frag_dots(const uint32_t (&a)[32][kMT][2][4], const uint32_t (&b)[32][kNT][2][2], uint32_t nt0,
+               uint32_t nt1, Adder adder, Rng& rng, float (&dot)[32][kMT][kNT][4]) {
   for (uint32_t mt = 0; mt < kMT; ++mt) {
     for (uint32_t nt = nt0; nt < nt1; ++nt) {
       static uint32_t am[32][2][4], bm[32][2][2];
@@ -239,17 +236,16 @@ void block_dots(const dstc::Stage<C>& s, uint32_t frow, uint32_t blk, uint32_t n
         }
         continue;
       }
-      int64_t u8[32][4] = {};
-      int32_t u4[32][4] = {};
-      const uint32_t wbands = C::kFp4 ? 1 : dstc::kW8Bands;
-      const uint32_t xbands = C::kFp4 ? dstc::kX4Bands : dstc::kX8Bands;
+      float hi[32][4] = {}, lo[32][4] = {};
+      const uint32_t wbands = kFp4 ? 1 : dstc::kW8Bands;
+      const uint32_t xbands = kFp4 ? dstc::kX4Bands : dstc::kX8Bands;
       for (uint32_t wb = 0; wb < wbands; ++wb) {
         for (uint32_t xb = 0; xb < xbands; ++xb) {
           for (uint32_t l = 0; l < 32; ++l) {
             for (uint32_t h = 0; h < 2; ++h) {
               uint32_t parts[3];
               for (uint32_t j = 0; j < 4; ++j) {
-                if (C::kFp4) {
+                if (kFp4) {
                   am[l][h][j] = a[l][mt][h][j];
                 } else {
                   cut(0, a[l][mt][h][j], parts);
@@ -257,7 +253,7 @@ void block_dots(const dstc::Stage<C>& s, uint32_t frow, uint32_t blk, uint32_t n
                 }
               }
               for (uint32_t j = 0; j < 2; ++j) {
-                cut(C::kFp4 ? 2 : 1, b[l][nt][h][j], parts);
+                cut(kFp4 ? 2 : 1, b[l][nt][h][j], parts);
                 bm[l][h][j] = parts[xb];
               }
             }
@@ -265,10 +261,10 @@ void block_dots(const dstc::Stage<C>& s, uint32_t frow, uint32_t blk, uint32_t n
           mma(adder, rng, am, bm, d);
           for (uint32_t l = 0; l < 32; ++l) {
             for (uint32_t i = 0; i < 4; ++i) {
-              if (C::kFp4) {
-                u4[l][i] += dstc::band_units4(d[l][i]);
+              if (kFp4) {
+                dstc::pair4(d[l][i], &hi[l][i], &lo[l][i]);
               } else {
-                u8[l][i] += dstc::band_units8(d[l][i]);
+                dstc::pair8(d[l][i], &hi[l][i], &lo[l][i]);
               }
             }
           }
@@ -276,11 +272,21 @@ void block_dots(const dstc::Stage<C>& s, uint32_t frow, uint32_t blk, uint32_t n
       }
       for (uint32_t l = 0; l < 32; ++l) {
         for (uint32_t i = 0; i < 4; ++i) {
-          dot[l][mt][nt][i] = C::kFp4 ? dstc::block_dot4(u4[l][i]) : dstc::block_dot8(u8[l][i]);
+          dot[l][mt][nt][i] =
+              kFp4 ? dstc::block_dot4(hi[l][i], lo[l][i]) : dstc::block_dot8(hi[l][i], lo[l][i]);
         }
       }
     }
   }
+}
+
+// `block_dots`: a staged block's fragments, then their products.
+template <class C, bool kBanded>
+void block_dots(const dstc::Stage<C>& s, uint32_t frow, uint32_t blk, uint32_t nt0, uint32_t nt1,
+                Adder adder, Rng& rng, float (&dot)[32][C::kMTiles][C::kNTiles][4]) {
+  static uint32_t a[32][C::kMTiles][2][4], b[32][C::kNTiles][2][2];
+  for (uint32_t l = 0; l < 32; ++l) dstc::load_frags<C>(s, frow, l, blk, a[l], b[l]);
+  frag_dots<C::kFp4, kBanded>(a, b, nt0, nt1, adder, rng, dot);
 }
 
 // One step's stage, copied or zeroed as `fill` does; staged bytes start as
@@ -372,44 +378,65 @@ void tile_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
   }
 }
 
-// `split_pass`: each warp's quarter of a step's blocks into contributions
-// (the warps in descending order), then each thread's ordered sum.
-template <class C, bool kBanded>
+// `split_pass`: per chunk, each warp's blocks (warps in descending order)
+// from operands loaded per lane into contributions that start as garbage,
+// then each thread's ordered sum.
+template <bool kFp4, bool kBanded>
 void split_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
-  constexpr uint32_t kPerWarp = C::kStepBlocks / C::kKWarps;
-  auto s = std::make_unique<dstc::Stage<C>>();
-  auto c = std::make_unique<dstc::Contributions<C>>();
+  constexpr uint32_t kPer = dstc::kSplitPerWarp, kChunk = dstc::kSplitChunk;
+  const uint32_t kb = p.k / 32;
   const uint32_t nt0 = dstc::ntile_first(p), nt1 = dstc::ntile_last(p);
-  float acc[dstc::kThreads] = {};
-  for (uint32_t step = 0; step < dstc::steps<C>(p); ++step) {
-    fill<C>(*s, p, step);
+  auto c = std::make_unique<dstc::SplitContributions>();
+  constexpr uint32_t kSums = dstc::kSplitFeatures * dstc::kSplitTokens;
+  float acc[kSums] = {};
+  for (uint32_t c0 = 0; c0 < kb; c0 += kChunk) {
     std::memset(c.get(), 0x5a, sizeof *c);
-    const uint32_t vb = dstc::blocks_in_step<C>(p, step);
-    for (uint32_t warp = dstc::kWarps; warp-- > 0;) {
-      for (uint32_t j = 0; j < kPerWarp; ++j) {
-        const uint32_t blk = warp * kPerWarp + j;
-        if (blk >= vb) continue;
+    for (uint32_t warp = dstc::kSplitWarps; warp-- > 0;) {
+      for (uint32_t j = 0; j < kPer; ++j) {
+        const uint32_t blk = c0 + warp * kPer + j;
+        if (blk >= kb) continue;
+        static dstc::SplitOperands o[32];
+        static uint32_t a[32][1][2][4], b[32][1][2][2];
         static float dot[32][1][1][4];
-        block_dots<C, kBanded>(*s, 0, blk, nt0, nt1, adder, rng, dot);
+        for (uint32_t l = 0; l < 32; ++l) {
+          dstc::split_operands<kFp4>(p, l, blk, &o[l]);
+          dstc::split_frags<kFp4>(o[l], a[l], b[l]);
+        }
+        frag_dots<kFp4, kBanded>(a, b, nt0, nt1, adder, rng, dot);
         for (uint32_t l = 0; l < 32; ++l) {
           for (uint32_t i = 0; i < 4; ++i) {
-            const uint32_t f = dstc::d_feature(0, l, 0, i), r = dstc::d_token(l, 0, i);
-            c->c[blk][f][r] = dstc::contribution<C>(*s, f, r, blk, dot[l][0][0][i]);
+            c->c[warp * kPer + j][dstc::d_feature(0, l, 0, i)][dstc::d_token(l, 0, i)] =
+                dstc::split_contribution(o[l], i, dot[l][0][0][i]);
           }
         }
       }
     }
-    for (uint32_t t = 0; t < dstc::kThreads; ++t) {
-      for (uint32_t blk = 0; blk < vb; ++blk) acc[t] = acc[t] + c->c[blk][t / C::kTokens][t % C::kTokens];
+    const uint32_t n = std::min(kChunk, kb - c0);
+    for (uint32_t t = 0; t < kSums; ++t) {
+      for (uint32_t blk = 0; blk < n; ++blk) {
+        acc[t] = acc[t] + c->c[blk][t / dstc::kSplitTokens][t % dstc::kSplitTokens];
+      }
     }
   }
-  for (uint32_t t = 0; t < dstc::kThreads; ++t) dstc::store(p, t / C::kTokens, t % C::kTokens, acc[t]);
+  for (uint32_t t = 0; t < kSums; ++t) {
+    dstc::store(p, t / dstc::kSplitTokens, t % dstc::kSplitTokens, acc[t]);
+  }
 }
+
+// The split block's shape, for the grids below.
+template <bool kFp4_>
+struct SplitShape {
+  static constexpr bool kFp4 = kFp4_;
+  static constexpr uint32_t kFeatures = dstc::kSplitFeatures;
+  static constexpr uint32_t kTokens = dstc::kSplitTokens;
+};
+using SplitShape8 = SplitShape<false>;
+using SplitShape4 = SplitShape<true>;
 
 template <class C, bool kSplit, bool kBanded>
 void run_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
   if constexpr (kSplit) {
-    split_pass<C, kBanded>(p, adder, rng);
+    split_pass<C::kFp4, kBanded>(p, adder, rng);
   } else {
     tile_pass<C, kBanded>(p, adder, rng);
   }
@@ -502,6 +529,13 @@ void lin8_cases(Rng& g, Tally& t) {
     auto ws = extreme ? scales(g, size_t((n + 31) / 32) * (k / 32), 0, 255)
                       : scales(g, size_t((n + 31) / 32) * (k / 32), 110, 30);
     if (c == 5) xs[0] = 255;  // an infinite activation scale
+    if (c % 8 == 6) {
+      // The largest block dot: every code 448 (or -448 in the activations'
+      // first row), where the exact sum is near its bound.
+      for (auto& v : x) v = 0x7e;
+      for (uint32_t j = 0; j < k; ++j) x[j] = 0xfe;
+      for (auto& v : w) v = 0x7e;
+    }
     std::vector<uint16_t> want(size_t(rows) * n, 0xdead);
     DsLin8Params p{x.data(), xs.data(), w.data(), ws.data(), want.data(), rows, n, k, 0};
     for (uint32_t row = rows; row-- > 0;) {
@@ -513,7 +547,7 @@ void lin8_cases(Rng& g, Tally& t) {
       std::vector<uint16_t> got(want.size(), 0xdead);
       p.out = got.data();
       const Adder adder = c % 2 ? Adder::Shuffled : Adder::Exact;
-      using S = dstc::SplitCfg<false>;
+      using S = SplitShape8;
       using T8 = dstc::TileCfg<false, 8>;
       using T32 = dstc::TileCfg<false, 32>;
       switch (form) {
@@ -567,7 +601,7 @@ void lin4_cases(Rng& g, Tally& t) {
       std::vector<uint16_t> got(want.size(), 0xdead);
       p.out = got.data();
       const Adder adder = c % 2 ? Adder::Shuffled : Adder::Exact;
-      using S = dstc::SplitCfg<true>;
+      using S = SplitShape4;
       using T8 = dstc::TileCfg<true, 8>;
       using T32 = dstc::TileCfg<true, 32>;
       switch (form) {

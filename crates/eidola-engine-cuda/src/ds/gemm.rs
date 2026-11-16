@@ -33,8 +33,10 @@ use super::ops::{addr, bind, grid, require};
 use crate::module::{Kernel, KernelDir, KernelModule};
 use crate::{Gpu, Result, launch};
 
-/// Threads of every tensor-core GEMM block and of the probe.
+/// Threads of the tiles' blocks and of the probe's.
 pub const TC_THREADS: u32 = 128;
+/// Threads of a split block.
+pub const SPLIT_THREADS: u32 = 256;
 /// Activation and weight codes are copied 16 bytes at a time.
 pub const TC_OPERAND_ALIGN: u64 = 16;
 /// `lin8` runs split blocks ([`TokenTile::S8`]) up to this many rows: there
@@ -85,8 +87,9 @@ impl GemmForm {
 /// The shape of a tensor-core GEMM's blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TokenTile {
-    /// 8 rows by 16 outputs, the four warps sharing out each step's blocks
-    /// and their contributions added in block order: the split block.
+    /// 8 rows by 16 outputs: the split block. Its eight warps share out K,
+    /// reading their operands straight from global memory, and the blocks'
+    /// contributions are added in block order.
     S8,
     /// 8 rows by 64 outputs, a warp per 16.
     T8,
@@ -133,6 +136,14 @@ impl TokenTile {
             TokenTile::S8 => 16,
             TokenTile::T8 => 64,
             TokenTile::T32 => 128,
+        }
+    }
+
+    /// Threads of one block.
+    pub fn threads(self) -> u32 {
+        match self {
+            TokenTile::S8 => SPLIT_THREADS,
+            TokenTile::T8 | TokenTile::T32 => TC_THREADS,
         }
     }
 
@@ -347,9 +358,9 @@ impl DsGemmTc {
             let bind_one = |tile: TokenTile| {
                 let symbol = format!("eidola_ds_{product}_{form}_{}", tile.name());
                 if product == "lin8" {
-                    bind::<Lin8Params>(&m, &symbol, TC_THREADS)
+                    bind::<Lin8Params>(&m, &symbol, tile.threads())
                 } else {
-                    bind::<Lin4Params>(&m, &symbol, TC_THREADS)
+                    bind::<Lin4Params>(&m, &symbol, tile.threads())
                 }
             };
             Ok([
