@@ -13166,6 +13166,18 @@ impl AppCore {
         pending
     }
 
+    /// Test-only seam: whether a branch-summary trigger for the space is
+    /// waiting out its debounce (its stamp is still held; [`summaries`]).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_summary_trigger_pending(&self, space_id: &str) -> bool {
+        self.inner
+            .summary_triggers
+            .lock()
+            .expect("summary trigger lock poisoned")
+            .contains_key(space_id)
+    }
+
     /// Test-only seam: run one branch-summary pass to completion.
     ///
     /// Production triggers this in the background after a post or a turn
