@@ -8,12 +8,12 @@ committed, and `cargo test` never runs Python.
 
 Usage (versions pinned in requirements.txt):
 
-    python -I dev/gen_template_fixtures.py --model-dir /path/to/MiMo-V2.6-Flash
+    python -I dev/mimo_gen_template_fixtures.py --model-dir /path/to/MiMo-V2.6-Flash
 
 `--model-dir` must hold `chat_template.jinja`, `tokenizer.json`,
 `tokenizer_config.json` and `generation_config.json` from the model release.
-Writes `tests/fixtures/template_cases.json` and
-`tests/fixtures/template_token_ids.json`, and refreshes the copies of the model
+Writes `tests/fixtures/mimo/template_cases.json` and
+`tests/fixtures/mimo/template_token_ids.json`, and refreshes the copies of the model
 files the tests load (`chat_template.jinja`, `generation_config.json`, and
 `tokenizer.json.gz`, gzip with a zero timestamp so the bytes are reproducible).
 """
@@ -678,7 +678,7 @@ def render(tokenizer, messages, tools, agp, thinking, continue_final_message=Non
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)
-    parser.add_argument("--out-dir", type=pathlib.Path, default=CRATE / "tests" / "fixtures")
+    parser.add_argument("--out-dir", type=pathlib.Path, default=CRATE / "tests" / "fixtures" / "mimo")
     args = parser.parse_args()
 
     import jinja2
@@ -752,7 +752,7 @@ def main():
     string_ids = [[text, tokenizer.encode(text, add_special_tokens=False)] for text in strings]
 
     meta = {
-        "generator": "dev/gen_template_fixtures.py",
+        "generator": "dev/mimo_gen_template_fixtures.py",
         "python": sys.version.split()[0],
         "transformers": transformers.__version__,
         "jinja2": jinja2.__version__,

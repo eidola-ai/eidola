@@ -1,7 +1,7 @@
 //! Differential tests against SGLang's MiMo tool-call detector.
 //!
 //! Expected values were produced by executing SGLang's own sources (see
-//! `dev/gen_sglang_fixtures.py`), with the per-parameter failure containment
+//! `dev/mimo_gen_sglang_fixtures.py`), with the per-parameter failure containment
 //! documented in `src/args.rs` applied around them.
 //!
 //! The parser's own typing rule is the round-trip one, and it keeps text that
@@ -13,13 +13,12 @@ use std::path::PathBuf;
 
 use eidola_engine_chat::args::{ArgumentTyping, ToolSchemas, convert_parameter_sglang};
 use eidola_engine_chat::json::{self, Json};
-use eidola_engine_chat::tool_call::{
-    ParsedToolCalls, PrefixedCallIds, ToolCallParser, UnparsedText, parse_complete,
-};
+use eidola_engine_chat::mimo::tool_call::{ToolCallParser, parse_complete};
+use eidola_engine_chat::tool_call::{ParsedToolCalls, PrefixedCallIds, UnparsedText};
 
 fn fixture(name: &str) -> serde_json::Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
+        .join("tests/fixtures/mimo")
         .join(name);
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }

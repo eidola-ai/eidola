@@ -1,4 +1,5 @@
-//! Chat-template rendering, byte-identical to Python `transformers`.
+//! MiMo-V2.6's chat-template rendering, byte-identical to Python
+//! `transformers`.
 //!
 //! The template is the model's own `chat_template.jinja`, executed by
 //! minijinja in an environment configured like the one `transformers` builds
@@ -22,10 +23,10 @@ use minijinja::value::{Kwargs, Object, ObjectRepr, Value, ValueKind};
 use minijinja::{
     AutoEscape, Environment, Error as JinjaError, ErrorKind, State, UndefinedBehavior,
 };
-use sha2::{Digest, Sha256};
 
 use crate::error::ChatError;
 use crate::json::{self, BigInt, DumpOptions, Json};
+use crate::prompt::{ChatInput, Prompt, sha256_hex};
 
 /// File name of the template inside a model directory.
 pub const CHAT_TEMPLATE_FILE: &str = "chat_template.jinja";
@@ -65,73 +66,7 @@ const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
 /// put around its output. The template never reads it.
 const DATA_MARKS_VAR: &str = "eidola_data_marks";
 
-/// A rendered prompt: its text, and which parts of it the request supplied.
-///
-/// Everything the template writes from the request (a role, message content,
-/// reasoning, a tool call's name, argument names and values, tool definitions)
-/// is data; the rest is the template's own text, which alone may spell the
-/// model's added tokens ([`crate::MimoTokenizer::encode_prompt`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Prompt {
-    text: String,
-    data: Vec<Range<usize>>,
-}
-
-impl Prompt {
-    /// A prompt from its text and data spans (ascending, disjoint, non-empty,
-    /// on character boundaries).
-    pub(crate) fn from_parts(text: String, data: Vec<Range<usize>>) -> Prompt {
-        Prompt { text, data }
-    }
-
-    /// The prompt text, byte-identical to the reference rendering's.
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    /// The byte ranges of [`Self::text`] that are request data: ascending,
-    /// disjoint, non-empty, on character boundaries.
-    pub fn data_spans(&self) -> &[Range<usize>] {
-        &self.data
-    }
-
-    pub fn into_text(self) -> String {
-        self.text
-    }
-
-    /// Cuts the prompt to its first `len` bytes.
-    fn truncate(&mut self, len: usize) {
-        self.text.truncate(len);
-        self.data.retain_mut(|span| {
-            span.end = span.end.min(len);
-            span.start < span.end
-        });
-    }
-}
-
-/// OpenAI-shaped chat input: the `messages` array and the optional `tools`
-/// array of a chat-completions request.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ChatInput {
-    pub messages: Json,
-    pub tools: Option<Json>,
-}
-
 impl ChatInput {
-    /// Parses the request's `messages` and `tools` JSON texts, preserving key
-    /// order (which `tojson` reproduces in the prompt).
-    pub fn from_json(messages: &str, tools: Option<&str>) -> Result<ChatInput, ChatError> {
-        let messages =
-            json::parse(messages).map_err(|e| ChatError::InvalidInput(format!("messages: {e}")))?;
-        let tools = match tools {
-            None => None,
-            Some(text) => Some(
-                json::parse(text).map_err(|e| ChatError::InvalidInput(format!("tools: {e}")))?,
-            ),
-        };
-        Ok(ChatInput { messages, tools })
-    }
-
     /// Replaces every assistant tool call's string `arguments` with the JSON
     /// object it encodes.
     ///
@@ -357,7 +292,7 @@ impl ChatTemplate {
             Some(marks),
         )?;
         match strip_marks(&marked, marks) {
-            Some((stripped, data)) if stripped == text => Ok(Prompt { text, data }),
+            Some((stripped, data)) if stripped == text => Ok(Prompt::from_parts(text, data)),
             _ => Err(ChatError::Template(
                 "the prompt's request data could not be told from the template's text".into(),
             )),
@@ -609,11 +544,6 @@ fn continued_messages(
     let original = text.clone();
     text.push_str(CONTINUE_FINAL_MESSAGE_TAG);
     Ok((messages, original))
-}
-
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Checks that the input lies in the domain where minijinja's rendering of the
@@ -912,7 +842,7 @@ mod tests {
     /// holds the environment to the one `transformers` builds regardless.
     #[test]
     fn whitespace_settings_are_the_ones_transformers_uses() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mimo");
         let template = ChatTemplate::from_model_dir(&dir).unwrap();
         let syntax = template.env.syntax();
         assert!(syntax.trim_blocks());

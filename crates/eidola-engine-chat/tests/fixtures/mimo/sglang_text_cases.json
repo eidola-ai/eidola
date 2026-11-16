@@ -1,6 +1,6 @@
 {
 "meta": {
-"generator": "dev/gen_sglang_fixtures.py",
+"generator": "dev/mimo_gen_sglang_fixtures.py",
 "python": "3.12.12",
 "sglang_commit": "0b635266d4a09f8db2d12bdcb793b085199faa8f"
 },

@@ -11,10 +11,10 @@ use crate::tokenizer::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChatFormat {
     /// MiMo-V2.6 (Flash and Pro): the model's Jinja template
-    /// ([`crate::ChatTemplate`]) and `<tool_call>` markup.
+    /// ([`crate::mimo::ChatTemplate`]) and `<tool_call>` markup.
     MimoV2_6,
     /// DeepSeek-V4.1: the prompt encoder and DSML tool calls of
-    /// [`crate::deepseek_v4_1`].
+    /// [`crate::deepseek`].
     DeepSeekV4_1,
 }
 

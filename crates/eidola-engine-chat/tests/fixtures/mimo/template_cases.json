@@ -1,6 +1,6 @@
 {
  "meta": {
-  "generator": "dev/gen_template_fixtures.py",
+  "generator": "dev/mimo_gen_template_fixtures.py",
   "python": "3.12.12",
   "transformers": "5.19.0",
   "jinja2": "3.1.6",

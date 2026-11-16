@@ -51,7 +51,7 @@ use super::{
 use crate::args::ToolSchemas;
 use crate::error::ChatError;
 use crate::json::{self, Json};
-use crate::template::{ChatInput, Prompt};
+use crate::prompt::{ChatInput, Prompt};
 
 /// The reasoning budget written at the start of a thinking-mode prompt: an
 /// integer from 1 to 100, which the reference's named levels are aliases of.

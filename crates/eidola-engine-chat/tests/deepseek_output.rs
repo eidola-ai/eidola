@@ -1,7 +1,7 @@
 //! The DeepSeek-V4.1 output parsers: agreement with the reference's
 //! `parse_message_from_completion_text` on the output it accepts
-//! (`fixtures/deepseek_v4_1/output_cases.json`, from
-//! `dev/gen_deepseek_fixtures.py`), and property tests that no input panics,
+//! (`fixtures/deepseek/output_cases.json`, from
+//! `dev/deepseek_gen_fixtures.py`), and property tests that no input panics,
 //! that streaming equals parsing the whole output for every split, that an
 //! answer loses only its calls, and that parsing inverts the encoder.
 
@@ -9,10 +9,10 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-use eidola_engine_chat::deepseek_v4_1::output::{
+use eidola_engine_chat::deepseek::output::{
     DsmlParser, ReasoningSplitter, parse_complete, split_reasoning,
 };
-use eidola_engine_chat::deepseek_v4_1::{self, EncodeOptions};
+use eidola_engine_chat::deepseek::{self, EncodeOptions};
 use eidola_engine_chat::json::{self, Json};
 use eidola_engine_chat::tool_call::ParsedToolCalls;
 use eidola_engine_chat::{
@@ -22,7 +22,7 @@ use eidola_engine_chat::{
 use proptest::prelude::*;
 
 fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deepseek_v4_1")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deepseek")
 }
 
 static TOKENIZER: LazyLock<Tokenizer> = LazyLock::new(|| {
@@ -45,7 +45,7 @@ fn declare<'a>(names: impl IntoIterator<Item = &'a str>) -> ToolSchemas {
             )])
         })
         .collect();
-    deepseek_v4_1::tool_schemas(&Json::Array(tools)).unwrap()
+    deepseek::tool_schemas(&Json::Array(tools)).unwrap()
 }
 
 fn parser(thinking: bool, tools: Option<ToolSchemas>) -> OutputParser {
@@ -553,7 +553,7 @@ proptest! {
             ]),
             tools: None,
         };
-        let prompt = deepseek_v4_1::encode(&input, EncodeOptions::new(thinking)).unwrap();
+        let prompt = deepseek::encode(&input, EncodeOptions::new(thinking)).unwrap();
         let header = if thinking { "<｜Assistant｜><think>" } else { "<｜Assistant｜></think>" };
         let output = prompt.text().split_once(header).unwrap().1;
         let declared = declare(calls.iter().map(|(name, _)| name.as_str()));

@@ -12,11 +12,12 @@
 use std::io::Read;
 use std::path::PathBuf;
 
-use eidola_engine_chat::{ChatInput, ChatTemplate, MimoTokenizer, Prompt, RenderOptions};
+use eidola_engine_chat::mimo::{ChatTemplate, MimoTokenizer, RenderOptions};
+use eidola_engine_chat::{ChatInput, Prompt};
 use serde_json::{Value, json};
 
 fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mimo")
 }
 
 fn template() -> ChatTemplate {

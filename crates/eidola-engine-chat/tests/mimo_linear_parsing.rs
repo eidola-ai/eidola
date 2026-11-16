@@ -9,7 +9,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use eidola_engine_chat::json;
-use eidola_engine_chat::tool_call::ToolCallParser;
+use eidola_engine_chat::mimo::tool_call::ToolCallParser;
 use eidola_engine_chat::{PrefixedCallIds, ToolSchemas};
 
 struct Counting;

@@ -10,14 +10,14 @@ Runs the model repository's reference encoder (`encoding/encoding.py` of
 and tokenizes with the reference `tokenizers` build. Dev-only: the outputs are
 committed, and `cargo test` never runs Python. See `dev/README.md`.
 
-    uv run --script dev/gen_deepseek_fixtures.py \
+    uv run --script dev/deepseek_gen_fixtures.py \
         --model-dir /path/to/DeepSeek-V4.1-Flash-1017 --revision <commit sha>
 
 `--model-dir` is a checkout of the model repository at `--revision` (its
 `encoding/`, `inference/engram.py`, `tokenizer.json` and `config.json`; no
 weights). The reference is
 loaded from that path, never vendored. Writes, under
-`tests/fixtures/deepseek_v4_1/`:
+`tests/fixtures/deepseek/`:
 
 - `encoding_cases.json`: conversations with the prompt `encode_messages`
   returns for each, or the fact that it must be refused;
@@ -968,7 +968,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-dir", required=True, type=pathlib.Path, help="checkout of the model repository")
     parser.add_argument("--revision", required=True, help="the checkout's commit on Hugging Face")
-    parser.add_argument("--out-dir", type=pathlib.Path, default=CRATE / "tests" / "fixtures" / "deepseek_v4_1")
+    parser.add_argument("--out-dir", type=pathlib.Path, default=CRATE / "tests" / "fixtures" / "deepseek")
     args = parser.parse_args()
 
     import tokenizers
@@ -1032,7 +1032,7 @@ def main():
         "tokenizer_sha256": sha256(args.model_dir / "tokenizer.json"),
         "python": sys.version.split()[0],
         "tokenizers": tokenizers.__version__,
-        "generator": "dev/gen_deepseek_fixtures.py",
+        "generator": "dev/deepseek_gen_fixtures.py",
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
 

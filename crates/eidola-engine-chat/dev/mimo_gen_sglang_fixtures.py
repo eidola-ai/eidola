@@ -8,7 +8,7 @@ out, so the expected outputs are the reference implementation's, not a
 re-implementation's. Dev-only: outputs are committed; `cargo test` never runs
 Python.
 
-    python -I dev/gen_sglang_fixtures.py --sglang-src /path/to/sglang --sglang-commit <sha>
+    python -I dev/mimo_gen_sglang_fixtures.py --sglang-src /path/to/sglang --sglang-commit <sha>
 
 `--sglang-src` is a checkout (or an export of `python/sglang/srt/function_call/`
 laid out at the same relative path) of the pinned commit.
@@ -22,8 +22,8 @@ harness applies the same containment around SGLang's `_convert_param_value`
 so those cases still compare value for value, and marks each case where it
 fired (`contained: true`).
 
-Writes tests/fixtures/sglang_param_cases.json and
-tests/fixtures/sglang_text_cases.json.
+Writes tests/fixtures/mimo/sglang_param_cases.json and
+tests/fixtures/mimo/sglang_text_cases.json.
 """
 
 import argparse
@@ -315,7 +315,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sglang-src", required=True, type=pathlib.Path)
     parser.add_argument("--sglang-commit", required=True, help="commit the sources were taken from")
-    parser.add_argument("--out-dir", type=pathlib.Path, default=CRATE / "tests" / "fixtures")
+    parser.add_argument("--out-dir", type=pathlib.Path, default=CRATE / "tests" / "fixtures" / "mimo")
     args = parser.parse_args()
 
     commit = args.sglang_commit
@@ -439,7 +439,7 @@ def main():
         })
 
     meta = {
-        "generator": "dev/gen_sglang_fixtures.py",
+        "generator": "dev/mimo_gen_sglang_fixtures.py",
         "python": sys.version.split()[0],
         "sglang_commit": commit,
     }

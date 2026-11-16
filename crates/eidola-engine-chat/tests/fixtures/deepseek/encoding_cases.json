@@ -6,7 +6,7 @@
   "tokenizer_sha256": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
   "python": "3.12.12",
   "tokenizers": "0.23.2",
-  "generator": "dev/gen_deepseek_fixtures.py"
+  "generator": "dev/deepseek_gen_fixtures.py"
  },
  "cases": [
   {

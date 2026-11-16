@@ -1,15 +1,16 @@
 //! Byte-exact comparison against `transformers.apply_chat_template`.
 //!
 //! The expected strings in `fixtures/template_cases.json` were produced by the
-//! reference implementation (see `dev/gen_template_fixtures.py`).
+//! reference implementation (see `dev/mimo_gen_template_fixtures.py`).
 
 use std::path::PathBuf;
 
+use eidola_engine_chat::ChatInput;
 use eidola_engine_chat::json::{self, Json};
-use eidola_engine_chat::{ChatInput, ChatTemplate, RenderOptions};
+use eidola_engine_chat::mimo::{ChatTemplate, RenderOptions};
 
 fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mimo")
 }
 
 pub fn load_template() -> ChatTemplate {

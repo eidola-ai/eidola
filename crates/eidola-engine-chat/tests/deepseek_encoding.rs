@@ -2,19 +2,19 @@
 //! model repository's reference (`encoding/encoding.py`), and of the
 //! tokenizer against Python `tokenizers`.
 //!
-//! The expected prompts and token ids in `fixtures/deepseek_v4_1/` were
-//! produced by the reference (see `dev/gen_deepseek_fixtures.py`).
+//! The expected prompts and token ids in `fixtures/deepseek/` were
+//! produced by the reference (see `dev/deepseek_gen_fixtures.py`).
 
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 
-use eidola_engine_chat::deepseek_v4_1::{self, EncodeOptions, ReasoningEffort};
+use eidola_engine_chat::deepseek::{self, EncodeOptions, ReasoningEffort};
 use eidola_engine_chat::json::{self, Json};
 use eidola_engine_chat::{ChatError, ChatFormat, ChatInput, Prompt, Tokenizer};
 
 fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deepseek_v4_1")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deepseek")
 }
 
 fn corpus(name: &str) -> serde_json::Value {
@@ -56,7 +56,7 @@ fn input(case: &serde_json::Value) -> Result<ChatInput, ChatError> {
 }
 
 fn encode(case: &serde_json::Value) -> Result<Prompt, ChatError> {
-    input(case).and_then(|input| deepseek_v4_1::encode(&input, options(case)))
+    input(case).and_then(|input| deepseek::encode(&input, options(case)))
 }
 
 fn first_difference(a: &str, b: &str) -> String {
@@ -293,8 +293,8 @@ fn request_data_spells_no_added_token() {
                 spell(tools, token, false);
             }
             let options = options(case);
-            let plain = deepseek_v4_1::encode(&original, options).unwrap();
-            let Ok(prompt) = deepseek_v4_1::encode(&spelled, options) else {
+            let plain = deepseek::encode(&original, options).unwrap();
+            let Ok(prompt) = deepseek::encode(&spelled, options) else {
                 continue;
             };
             let name = case["name"].as_str().unwrap();
@@ -403,13 +403,13 @@ fn declared_tools_are_named_as_the_model_calls_them() {
             {"type":"function","function":{"name":"search::lookup"}}]"#,
     )
     .unwrap();
-    let schemas = deepseek_v4_1::tool_schemas(&tools).unwrap();
+    let schemas = deepseek::tool_schemas(&tools).unwrap();
     for name in ["plain", "files::read", "search::lookup"] {
         assert!(schemas.contains(name), "{name}");
     }
     assert!(!schemas.contains("read"));
     assert!(
-        deepseek_v4_1::tool_schemas(&json::parse(r#"[{"function":{"name":"a::b::c"}}]"#).unwrap())
+        deepseek::tool_schemas(&json::parse(r#"[{"function":{"name":"a::b::c"}}]"#).unwrap())
             .is_err()
     );
 }

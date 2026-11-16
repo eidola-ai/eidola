@@ -1,6 +1,6 @@
 //! A continued message resumes exactly where its generation stopped.
 //!
-//! `template_fixtures.rs` holds the continued render byte-exact to
+//! `mimo_template_fixtures.rs` holds the continued render byte-exact to
 //! `transformers`. This holds it to what continuation is for: the continued
 //! prompt is the original request's prompt followed by what the model
 //! generated, as text and as tokens, so the engine's prefix cache can serve it
@@ -14,13 +14,13 @@ use std::path::PathBuf;
 
 use eidola_engine_chat::json::Json;
 
+use eidola_engine_chat::mimo::{ChatTemplate, MimoTokenizer, RenderOptions};
 use eidola_engine_chat::{
-    ChatInput, ChatTemplate, MimoTokenizer, OutputConfig, OutputParser, PrefixedCallIds, Prompt,
-    RenderOptions, StopCause,
+    ChatInput, OutputConfig, OutputParser, PrefixedCallIds, Prompt, StopCause,
 };
 
 fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mimo")
 }
 
 fn template() -> ChatTemplate {

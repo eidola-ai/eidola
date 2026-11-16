@@ -5,13 +5,14 @@
 //! the counterexamples are pinned here so the difference stays visible.
 
 use eidola_engine_chat::json::{self, BigInt, Json};
-use eidola_engine_chat::tool_call::parse_complete;
-use eidola_engine_chat::{ArgumentTyping, ChatInput, ChatTemplate, RenderOptions, ToolSchemas};
+use eidola_engine_chat::mimo::tool_call::parse_complete;
+use eidola_engine_chat::mimo::{ChatTemplate, RenderOptions};
+use eidola_engine_chat::{ArgumentTyping, ChatInput, ToolSchemas};
 use proptest::prelude::*;
 
 fn template() -> ChatTemplate {
     ChatTemplate::from_model_dir(
-        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"),
+        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mimo"),
     )
     .unwrap()
 }

@@ -114,7 +114,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixtures() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deepseek_v4_1")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deepseek")
     }
 
     fn deepseek() -> Tokenizer {
