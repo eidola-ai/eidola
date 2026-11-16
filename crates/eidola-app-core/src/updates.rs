@@ -341,7 +341,6 @@ pub struct VerifiedRelease {
     /// cert's `@refs/tags/…` identity suffix.
     pub tag: String,
     /// The commit the release was built from, as its attestations name it.
-    #[serde(default)]
     pub git_commit: String,
     /// The release page, derived from the releases location and the tag.
     pub release_url: Option<String>,
@@ -354,7 +353,6 @@ pub struct VerifiedRelease {
     pub rekor_log_index: u64,
     /// Every human attestation that verified, in the order the release
     /// lists them.
-    #[serde(default)]
     pub attestants: Vec<ReleaseAttestant>,
     /// Hex sha256 of the verified manifest bytes — the durable handle an
     /// accepted claims-change is recorded against.
@@ -424,13 +422,39 @@ pub struct AcceptedClaims {
 // Persisted state — last check + accepted claims choice
 // ---------------------------------------------------------------------------
 
+/// The rules a persisted verdict was reached under. A verdict is only as
+/// good as the checks behind it, so state written under any other rules is
+/// discarded on load ([`load_state`]) rather than shown, held against a
+/// later failure, or promoted by an acceptance. Raise this whenever what
+/// "verified" means for a release changes.
+///
+/// `1`: CI's signature bound to the release's tag, **and** the human
+/// attestations the embedded policy requires ([`crate::updater::verify_release`]).
+/// State with no stamp predates that and holds verdicts reached on CI's
+/// signature alone.
+pub const VERDICT_RULES: u32 = 1;
+
 /// On-disk update-check state (`<data_dir>/update-state.json`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateState {
+    /// The [`VERDICT_RULES`] `last` and `accepted` were reached under;
+    /// absent (0) in state written before the stamp existed.
+    #[serde(default)]
+    pub verdict_rules: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<UpdateCheckSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted: Option<AcceptedClaims>,
+}
+
+impl Default for UpdateState {
+    fn default() -> Self {
+        Self {
+            verdict_rules: VERDICT_RULES,
+            last: None,
+            accepted: None,
+        }
+    }
 }
 
 impl UpdateState {
@@ -457,12 +481,17 @@ pub fn state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("update-state.json")
 }
 
-/// Load persisted state; missing or corrupt files yield the default.
+/// Load persisted state. Missing or corrupt files, and state reached under
+/// rules other than [`VERDICT_RULES`], yield the default: the next check
+/// reaches a fresh verdict, and nothing is shown or accepted before it.
 pub fn load_state(data_dir: &Path) -> UpdateState {
     let Ok(bytes) = std::fs::read(state_path(data_dir)) else {
         return UpdateState::default();
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    match serde_json::from_slice::<UpdateState>(&bytes) {
+        Ok(state) if state.verdict_rules == VERDICT_RULES => state,
+        _ => UpdateState::default(),
+    }
 }
 
 /// Persist the state, creating the data dir as needed.
@@ -2203,6 +2232,89 @@ mod tests {
         save_state(dir.path(), &state).unwrap();
         let loaded = load_state(dir.path());
         assert_eq!(loaded, state);
+    }
+
+    /// A standing claims-changed verdict with an acceptance recorded for
+    /// it — the state that can promote itself to an available update.
+    fn state_with_accepted_claims_change() -> UpdateState {
+        let release = VerifiedRelease {
+            version: "9.9.9".into(),
+            tag: "v9.9.9".into(),
+            git_commit: "c".repeat(40),
+            release_url: None,
+            published_at: None,
+            ci_identity: "x".into(),
+            rekor_log_index: 1,
+            attestants: vec![ReleaseAttestant {
+                name: "Ada Example".into(),
+                jurisdiction: "Somewhere".into(),
+                rekor_log_index: 2,
+            }],
+            manifest_sha256: "ab".repeat(32),
+            claims_accepted: false,
+        };
+        UpdateState {
+            last: Some(UpdateCheckSnapshot {
+                checked_at_ms: 1,
+                result: UpdateCheckResult::ClaimsChanged {
+                    release,
+                    comparison: ClaimsComparison {
+                        expected: vec![],
+                        attested: vec![],
+                        deltas: vec![ClaimDelta {
+                            key: "x".into(),
+                            expected: Some("a".into()),
+                            attested: None,
+                        }],
+                    },
+                },
+            }),
+            accepted: Some(AcceptedClaims {
+                version: "9.9.9".into(),
+                manifest_sha256: "ab".repeat(32),
+                accepted_at_ms: 2,
+            }),
+            ..UpdateState::default()
+        }
+    }
+
+    #[test]
+    fn state_reached_under_the_current_rules_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_accepted_claims_change();
+        save_state(dir.path(), &state).unwrap();
+        assert_eq!(load_state(dir.path()), state);
+    }
+
+    /// State written before verdicts required a human attestation holds
+    /// releases CI's signature alone vouched for. None of it may be shown,
+    /// held against a later failure, or promoted by its acceptance.
+    #[test]
+    fn state_from_before_human_attestation_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy = serde_json::to_value(state_with_accepted_claims_change()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("verdict_rules").unwrap();
+        let release = object["last"]["result"]["release"].as_object_mut().unwrap();
+        release.remove("attestants").unwrap();
+        release.remove("git_commit").unwrap();
+        std::fs::write(state_path(dir.path()), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(load_state(dir.path()), UpdateState::default());
+    }
+
+    /// The stamp alone decides it: a release shaped like today's, under
+    /// rules other than today's, is still discarded.
+    #[test]
+    fn state_stamped_with_other_rules_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        for rules in [0, VERDICT_RULES + 1] {
+            let state = UpdateState {
+                verdict_rules: rules,
+                ..state_with_accepted_claims_change()
+            };
+            save_state(dir.path(), &state).unwrap();
+            assert_eq!(load_state(dir.path()), UpdateState::default(), "{rules}");
+        }
     }
 
     #[test]
