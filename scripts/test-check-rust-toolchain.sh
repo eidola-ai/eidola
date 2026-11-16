@@ -56,6 +56,10 @@ edit "$work/tree/oci/eidola-server-gateway/Containerfile" 's/(FROM stagex\/palle
 expect fail "one Containerfile pins another pallet-rust"
 
 fresh
+edit "$work/tree/oci/eidola-cli-arm64/Containerfile" 's/(FROM --platform=[^ ]+ stagex\/pallet-rust:[^@]*@sha256:)[0-9a-f]{64}/\10000000000000000000000000000000000000000000000000000000000000000/'
+expect fail "a platform-pinned Containerfile pins another pallet-rust"
+
+fresh
 printf 'rust 1.97.1\n' >>"$work/tree/oci/pallet-rust"
 expect fail "the record states the Rust version twice"
 
@@ -65,7 +69,7 @@ expect fail "the record is missing"
 
 fresh
 for containerfile in "$work"/tree/oci/*/Containerfile; do
-  edit "$containerfile" '/^FROM stagex\/pallet-rust/d'
+  edit "$containerfile" '/^FROM (--platform=[^ ]+ )?stagex\/pallet-rust/d'
 done
 expect fail "no Containerfile pins pallet-rust"
 

@@ -14,6 +14,7 @@
 //! through `EntityInputHandler` so dead-key composition, non-Latin layouts,
 //! and pasted text all share one code path.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -373,6 +374,10 @@ pub struct MarkdownEditorState {
     /// rather than from a bare offset. Ignored in [`SelectMode::Char`].
     select_anchor_range: Range<usize>,
     pub(crate) last_blocks: HashMap<usize, LaidOutBlock>,
+    /// Shaped lines of each block, reused across frames while the block,
+    /// its text, the style and the width are unchanged. Shared with the
+    /// blocks' measure closures, which outlive any borrow of this state.
+    pub(crate) shape_cache: Rc<RefCell<crate::element::ShapeCache>>,
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
     pub(crate) frame_input_handler_set: bool,
     /// Whether the editor held focus at the last paint. Read only to notice
@@ -512,6 +517,7 @@ impl MarkdownEditorState {
             select_mode: SelectMode::Char,
             select_anchor_range: 0..0,
             last_blocks: HashMap::new(),
+            shape_cache: Rc::default(),
             last_bounds: None,
             frame_input_handler_set: false,
             was_focused: false,
@@ -2679,6 +2685,13 @@ impl RenderOnce for MarkdownEditor {
         style.refresh_theme_colors(cx);
 
         let spec = self.state.read(cx).render_spec();
+        self.state
+            .read(cx)
+            .shape_cache
+            .borrow_mut()
+            .retain_blocks(&spec.blocks);
+        // One copy of the document per frame, which every block shares.
+        let source: std::sync::Arc<str> = self.state.read(cx).state.markdown.as_str().into();
         let state = self.state.clone();
         let disabled = self.disabled;
 
@@ -2854,6 +2867,7 @@ impl RenderOnce for MarkdownEditor {
                 prev_containers,
                 next_containers,
                 state.clone(),
+                source.clone(),
                 style.clone(),
             ));
         }

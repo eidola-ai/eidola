@@ -25,7 +25,7 @@ shasum -a 256 "$F"   # must equal the @sha256: in cvm-version
 mkdir -p releases/trust/cvm-releases/v$V && cp "$F" releases/trust/cvm-releases/v$V/
 ```
 
-Then fetch the image the manifest names (`tinfoil-tdx-v<version>.igvm` from `https://images.tinfoil.sh/cvm/`, `+` written `%2B`) and re-measure. Remove a vendored manifest once no deployment names it. Rebuilding the release from source is a separate check, in `docs/contributing/rebuilding-platform-images.md`.
+Then fetch the image the manifest names (`tinfoil-tdx-v<version>.igvm` from `https://images.tinfoil.sh/cvm/`, `+` written `%2B`) and re-measure. A vendored manifest no deployment names fails the gateway's build, so remove it in the change that moves the last deployment off it. Rebuilding the release from source is a separate check, in `docs/contributing/rebuilding-platform-images.md`.
 
 ## The machines: platform endorsements
 
@@ -52,4 +52,9 @@ The release is vendored under `releases/trust/platform-endorsements/<tag>/` (`pl
 just engine-platform-endorsements platform-vX.Y.Z
 ```
 
-It fetches the release's `platform-endorsements.json` and GitHub's attestations for its digest into an empty temporary directory, verifies them exactly as the build does (the provider's `.github/workflows/platform-release.yml` at exactly that tag, on a GitHub-hosted runner, logged in Rekor, about a file with that hash), and writes only what verified, then prints the file's hash and its TDX policies. Review the diff against the release it replaces (floors raised or lowered, machines added or retired), point each deployment's `deployment.json` at the new release and hash, re-measure (`measure-engine-enclaves`), and remove a vendored release no deployment names any more, except the newest, which stays as the baseline the drift check compares against. The scheduled `platform-endorsements-drift` workflow reports when the provider has published a release newer than the newest vendored one, or than one a deployment names.
+It fetches the release's `platform-endorsements.json` and GitHub's attestations for its digest into an empty temporary directory, verifies them exactly as the build does (the provider's `.github/workflows/platform-release.yml` at exactly that tag, on a GitHub-hosted runner, logged in Rekor, about a file with that hash), and writes only what verified, then prints the file's hash and its TDX policies. Review the diff against the release it replaces (floors raised or lowered, machines added or retired), point each deployment's `deployment.json` at the new release and hash, re-measure (`measure-engine-enclaves`), and remove a vendored release no deployment names any more, except the newest, which stays as the baseline the drift check compares against. The gateway's build holds all of this: every TDX deployment names the newest vendored release, with no exception, and no vendored release but the newest is one nothing names. So the order of operations matters when a new release would cut a running deployment off (a machine it retires, a TCB floor its host does not meet):
+
+1. Move that deployment to machines the new release accepts, or retire it: its directory, its pin, and its placement go first.
+2. Then vendor the release and move every remaining deployment to it, in one change.
+
+The scheduled `platform-endorsements-drift` workflow reports when the provider has published a release newer than the newest vendored one, or than one a deployment names.

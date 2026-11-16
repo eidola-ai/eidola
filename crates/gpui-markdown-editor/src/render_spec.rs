@@ -468,6 +468,56 @@ impl InlineStyle {
         self
     }
 
+    /// How many flags an `InlineStyle` has: the length of [`Self::flags`].
+    pub const FLAGS: usize = 8;
+
+    /// Every flag, in one fixed order that [`Self::from_flags`] reads back.
+    pub fn flags(&self) -> [bool; Self::FLAGS] {
+        let InlineStyle {
+            bold,
+            italic,
+            strikethrough,
+            dimmed,
+            code,
+            link,
+            table_header,
+            emphasis_dots,
+        } = *self;
+        [
+            bold,
+            italic,
+            strikethrough,
+            dimmed,
+            code,
+            link,
+            table_header,
+            emphasis_dots,
+        ]
+    }
+
+    pub fn from_flags(flags: [bool; Self::FLAGS]) -> Self {
+        let [
+            bold,
+            italic,
+            strikethrough,
+            dimmed,
+            code,
+            link,
+            table_header,
+            emphasis_dots,
+        ] = flags;
+        InlineStyle {
+            bold,
+            italic,
+            strikethrough,
+            dimmed,
+            code,
+            link,
+            table_header,
+            emphasis_dots,
+        }
+    }
+
     pub fn is_default(&self) -> bool {
         !self.bold
             && !self.italic

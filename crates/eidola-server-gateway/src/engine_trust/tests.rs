@@ -345,6 +345,131 @@ fn every_committed_deployment_is_pinned() {
     );
 }
 
+impl Tree {
+    /// Every file the tree vendors under the platform release roots.
+    fn vendored(&self) -> Vec<String> {
+        self.files
+            .keys()
+            .filter(|p| {
+                p.starts_with(engine_deployment::deployment::PLATFORM_ENDORSEMENTS_ROOT)
+                    || p.starts_with(engine_deployment::deployment::CVM_RELEASES_ROOT)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn check_vendored(&self) -> Result<(), String> {
+        self.check_vendored_with(&[CONFIG.to_string()])
+    }
+
+    /// As [`Tree::check_vendored`], with `committed` as the deployments.
+    fn check_vendored_with(&self, committed: &[String]) -> Result<(), String> {
+        manifest::require_vendored_releases_named(committed, &self.vendored(), &mut |path| {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| format!("read {path}: no such file"))
+        })
+    }
+
+    /// Vendor platform endorsements release `tag` (its files' bytes do not
+    /// matter to the rule under test).
+    fn vendor_release(&mut self, tag: &str) {
+        let (file, bundle) = engine_deployment::deployment::platform_endorsement_files(tag);
+        self.files.insert(file, b"{}".to_vec());
+        self.files.insert(bundle, b"{}".to_vec());
+    }
+}
+
+#[track_caller]
+fn vendored_refused(tree: &Tree, expected: &str) {
+    match tree.check_vendored() {
+        Ok(()) => panic!("accepted, but should have been refused with {expected:?}"),
+        Err(e) => assert!(e.contains(expected), "refused for another reason: {e}"),
+    }
+}
+
+/// The fixture vendors exactly what its deployment names.
+#[test]
+fn the_fixture_vendors_what_its_deployment_names() {
+    let tree = Tree::fixture();
+    assert_eq!(tree.vendored().len(), 3, "{:?}", tree.vendored());
+    tree.check_vendored().unwrap();
+}
+
+/// A TDX deployment names the newest vendored release, with no exception:
+/// vendoring a newer one moves every deployment in the same change.
+#[test]
+fn a_deployment_names_the_newest_vendored_release() {
+    let mut tree = Tree::fixture();
+    tree.vendor_release("platform-v0.1.12");
+    vendored_refused(
+        &tree,
+        "names platform-v0.1.11, but the newest vendored release is platform-v0.1.12",
+    );
+
+    // Ordered by version, not by text: an older release is an orphan, and
+    // the deployment still names the newest.
+    let mut tree = Tree::fixture();
+    tree.vendor_release("platform-v0.1.9");
+    vendored_refused(
+        &tree,
+        "platform-v0.1.9/attestation.sigstore.json is vendored, but no committed deployment",
+    );
+
+    // A deployment staying behind cannot say why: the sidecar has no such
+    // member.
+    let mut tree = Tree::fixture();
+    let mut sidecar = tree.sidecar();
+    sidecar["tdx"]["platform_endorsements"]["hold"] = "a reason".into();
+    tree.set_sidecar(sidecar);
+    refused(&tree, "unknown field `hold`");
+}
+
+/// Nothing is vendored that no deployment names, except the newest
+/// endorsements release, which stays as the drift baseline.
+#[test]
+fn an_orphaned_vendored_file_is_refused() {
+    // The newest release stays while nothing names it.
+    let mut tree = Tree::fixture();
+    tree.files
+        .retain(|path, _| !path.starts_with(engine_deployment::deployment::CVM_RELEASES_ROOT));
+    tree.check_vendored_with(&[]).unwrap();
+    tree.vendor_release("platform-v0.1.10");
+    let err = tree.check_vendored_with(&[]).unwrap_err();
+    assert!(err.contains("platform-v0.1.10/"), "{err}");
+
+    // An older release nothing names.
+    let mut tree = Tree::fixture();
+    tree.vendor_release("platform-v0.1.10");
+    vendored_refused(
+        &tree,
+        "releases/trust/platform-endorsements/platform-v0.1.10/attestation.sigstore.json is \
+         vendored, but no committed deployment names it",
+    );
+
+    // A stray file in a named release, and a directory that is no release.
+    for stray in [
+        "releases/trust/platform-endorsements/platform-v0.1.11/notes.md",
+        "releases/trust/platform-endorsements/latest/platform-endorsements.json",
+        "releases/trust/platform-endorsements/README.md",
+    ] {
+        let mut tree = Tree::fixture();
+        tree.files.insert(stray.to_string(), Vec::new());
+        vendored_refused(&tree, &format!("{stray} is vendored"));
+    }
+
+    // A release manifest no config pins.
+    for stray in [
+        "releases/trust/cvm-releases/v0.15.2/tinfoil-inference-v0.15.2+gpu-manifest.json",
+        "releases/trust/cvm-releases/v0.15.3-rc.1/tinfoil-inference-v0.15.3-rc.1-manifest.json",
+    ] {
+        let mut tree = Tree::fixture();
+        tree.files.insert(stray.to_string(), Vec::new());
+        vendored_refused(&tree, &format!("{stray} is vendored"));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // One mutation per rule
 // ---------------------------------------------------------------------------

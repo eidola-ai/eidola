@@ -1,55 +1,57 @@
 //! Update *notification* flow — "a verified newer release exists; here's
 //! the door to it."
 //!
-//! This module answers one question on launch and every ~6 hours: **is
-//! there a newer release of Eidola, and can this binary prove it's real?**
-//! It never downloads or installs anything — v1's ceiling is "verified
-//! update available → open the release page in the browser." (The full
-//! self-update *install* pipeline — `release.json`, human attestations,
-//! template equality — lives in [`crate::updater`] and remains the path a
-//! future in-app install will take.)
+//! This module answers one question at launch and about once an hour after:
+//! **is there a newer release of Eidola, and can this binary prove it's
+//! real?** It never downloads or installs anything; installing is
+//! [`crate::updater`]'s job.
 //!
-//! ## Source of truth
+//! ## What "verified" means here
 //!
-//! Only the GitHub release **marked `latest`** counts. That marker is
-//! applied by the release officer's tooling *after* the human attestation
-//! is signed and uploaded (see `.github/workflows/tinfoil-build.yml` — CI
-//! deliberately does not mark its release `latest`), so it is the
-//! human-attested signal. A `v*` release that exists but isn't `latest` is
-//! simply not an update yet. The GitHub `releases/latest` API endpoint
-//! returns exactly the release carrying that marker (drafts and
-//! prereleases never qualify), and returns 404 when no release carries it
-//! — which this module maps to "up to date", not an error.
+//! Exactly what it means to the installer. A release is announced only after
+//! [`crate::updater::verify_release`] accepts it: CI's signature over
+//! `artifact-manifest.json`, under the pinned workflow identity and bound to
+//! this release's tag, **and** at least `MIN_HUMAN_ATTESTATIONS` independent
+//! human attestations, each signed by a pinned attestant key, logged in
+//! Rekor, re-rendered character for character from the pinned templates, and
+//! naming the sha256 of that same manifest. A release that passes CI's
+//! check alone is `Unverifiable`. CI is one party that can be compromised,
+//! and the attestation exists for that case (`docs/releases.md`).
 //!
-//! Per release, CI publishes two assets exactly for this verifier:
-//! `artifact-manifest.json` and `artifact-manifest.json.sigstore` (a
-//! `cosign sign-blob` Sigstore bundle, Fulcio keyless under the
-//! `tinfoil-build.yml` workflow's OIDC identity).
+//! All of it is anchored in the trust root compiled into this build
+//! ([`crate::trust_root`]): the Sigstore roots, the CI identity and issuer,
+//! the attestant keys, the threshold, the templates, and the schemas this
+//! build reads. No trust anchor is fetched from the network.
 //!
-//! ## Verification anchor
+//! ## Where releases are found
 //!
-//! All verification is anchored **exclusively** in the embedded trust root
-//! ([`crate::trust_root`]): the pinned Sigstore `TrustedRoot` snapshot
-//! (Fulcio CAs + Rekor keys), the pinned CI identity pattern + OIDC
-//! issuer, and the schema versions this build was built against. No trust
-//! anchor is ever fetched from the network. The cryptographic work is
-//! [`crate::updater::ci_sigstore::verify_ci_signature_with`] — full Fulcio
-//! chain walk, identity match, ECDSA signature over the manifest hash,
-//! Rekor SET + Merkle inclusion proof.
+//! `<releases>/latest/download/release.json`, where `<releases>` is the
+//! trust root's `UPDATE_RELEASES_URL` (or the `update_feed` override in
+//! dev). That is the `release.json` of the GitHub release marked `latest`.
+//! The marker is a pointer, not evidence. Anyone who can edit the release
+//! listing can move it, and that changes only *which* release goes through
+//! the checks above. A 404 means nothing is marked latest, or the latest
+//! release has no `release.json`. Neither is an update, and no client
+//! check can tell either one from a withheld release.
 //!
-//! On top of the bundle verification, the Fulcio cert's SAN identity is
-//! required to end in `@refs/tags/<tag>` for the *same tag* the release
-//! claims — so an authentic old manifest can't be replayed under a newer
-//! tag to fake an update.
+//! These are GitHub's download redirects, not its REST API. The API allows
+//! sixty unauthenticated requests an hour per address, shared by every
+//! client behind one NAT. The redirects have no such limit.
+//!
+//! **The version is read before anything is verified**
+//! ([`crate::updater::gate_release`]). A release that is not newer is not
+//! judged at all, so a current release this build cannot parse never turns
+//! into a warning just by being current. Once a release claims to be newer,
+//! every failure to verify it is a security state.
 //!
 //! ## Failure-mode matrix (product decisions — encoded in [`UpdateCheckResult`])
 //!
 //! | State | Meaning | Behavior |
 //! |---|---|---|
-//! | [`UpdateCheckResult::CheckFailed`] | Network/API failure — not a security signal | Quiet. "Couldn't check (offline?)" in the Updates window; retry next cycle. Never alarms. A standing `Unverifiable`/`ClaimsChanged` state is **not** overwritten by a later `CheckFailed` (see [`UpdateState::absorb`]). |
+//! | [`UpdateCheckResult::CheckFailed`] | Nothing could be fetched (offline, a server error, a rate limit), or the `release.json` found was unreadable before it claimed any version — not a security signal | Quiet. "Couldn't check (offline?)" in the Updates window; retry next cycle. Never alarms. A standing `Unverifiable`/`ClaimsChanged` state is **not** overwritten by a later `CheckFailed` (see [`UpdateState::absorb`]). |
 //! | [`UpdateCheckResult::UpToDate`] | No newer `latest` release | Includes "no release is marked latest" (HTTP 404) and "latest is older/equal". |
-//! | [`UpdateCheckResult::UpdateAvailable`] | `latest` verifies, version > ours | "Eidola vX.Y.Z is available — cryptographically verified." One action: open the release page. |
-//! | [`UpdateCheckResult::Unverifiable`] | `latest` fails cryptographic verification (missing/bad bundle, wrong identity, manifest hash mismatch, tag binding mismatch) | **Possible fake / channel compromise.** Hard, visible security state — never silent, never offers the artifact. `reason` states exactly what failed. Persists until a later check finds a verifiable `latest`. |
+//! | [`UpdateCheckResult::UpdateAvailable`] | `latest` is newer and passes every check `crate::updater::verify_release` makes | "Eidola vX.Y.Z is available", with who attested it. One action: open the release page. |
+//! | [`UpdateCheckResult::Unverifiable`] | A newer `latest` fails verification: a missing or bad signature, the wrong identity, CI's identity bound to another tag, a missing, untrusted, malformed or unbound human attestation, too few of them, or an index that does not hold to its schema or continue from the installed commit | **Possible fake / channel compromise.** Hard, visible security state — never silent, never offers the artifact. `reason` states exactly what failed. Persists until a later check finds a verifiable `latest`. |
 //! | [`UpdateCheckResult::ClaimsChanged`] | Verifies cryptographically, but the attested claims differ structurally from what this build expects | **Authentic, but the threat model changed.** Surfaces a side-by-side of expected vs attested claims; default NOT trusted. An explicit "treat as update" action ([`crate::AppCore::accept_changed_claims`]) records the user's choice. |
 //!
 //! ## Expected claims — the concrete set
@@ -62,23 +64,25 @@
 //!
 //! | Claim key | Expected value | Derivation |
 //! |---|---|---|
-//! | `manifest.schema_version` | `2 or 3 or 4` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shapes this module's parser understands; a jump outside the set is a release-gated trust event (`docs/trust-root.md`) |
+//! | `manifest.schema_version` | `2 or 3 or 4 or 5` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shapes this module's parser understands; a jump outside the set is a release-gated trust event (`docs/trust-root.md`) |
 //! | `enclave.cvm_version` | `platform release with its manifest pinned (VERSION@sha256)` | the embedded trust root pins the paired server's SEV-SNP launch identity in the IGVM launch model (`trust_root::SERVER_SNP_MEASUREMENT` and friends), which is the launch of one release image |
 //! | `enclave.igvm_sha256` | `SEV-SNP IGVM image hash (32-byte hex)` | ditto: the image the digest is computed over |
 //! | `enclave.sev_snp.measurement` | `SEV-SNP launch measurement (48-byte hex)` | ditto, `trust_root::SERVER_SNP_MEASUREMENT` |
 //! | `enclave.sev_snp.host_data` | `SEV-SNP HOST_DATA, the config hash (32-byte hex)` | ditto, `trust_root::SERVER_SNP_HOST_DATA`: what binds the server's config, since the digest is the same for every deployment of an image |
 //! | `enclave.sev_snp.guest_policy` | `SEV-SNP guest policy (0x-prefixed hex)` | ditto, `trust_root::SERVER_SNP_GUEST_POLICY` |
 //! | `artifacts.eidola-cli` | `oci (linux/amd64)` | [`EXPECTED_ARTIFACTS`] — the artifact set every accepted schema records |
-//! | `artifacts.eidola-cli-macos-universal` | `nix (darwin/universal)` | ditto |
 //! | `artifacts.eidola-gui-macos-universal` | `nix (darwin/universal)` | ditto |
 //! | `artifacts.eidola-postgres` | `oci (linux/amd64)` | ditto |
 //! | `artifacts.eidola-server` | `oci (linux/amd64)` | ditto |
 //! | `artifacts.eidola-gui-linux-amd64` | `nix (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`] — the Linux Nix installable's schema-2 key. Schema 3 records it as `…-nix-amd64` instead, so a manifest declaring 3 must *not* carry it |
+//! | `artifacts.eidola-cli-macos-universal` | `nix (darwin/universal) or absent` | [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4`] — the standalone macOS CLI archive, recorded through schema 4. Every GUI payload carries the CLI built beside it, so schema 5 records no separate macOS CLI and a manifest declaring 5 must *not* carry it |
 //! | `artifacts.eidola-gui-linux-deb-amd64` | `file (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] — the Debian package a user installs with `apt install ./…`; the `.deb` itself is the hashed byte stream |
 //! | `artifacts.eidola-gui-linux-deb-arm64` | `file (linux/arm64) or absent` | ditto, 64-bit ARM |
 //! | `artifacts.eidola-gui-linux-nix-amd64` | `nix (linux/amd64) or absent` | ditto — the Linux Nix installable under the name schema 3 gives it |
 //! | `artifacts.eidola-gui-macos-universal-zip` | `file (darwin/universal) or absent` | ditto — the macOS unsigned shipping zip |
 //! | `artifacts.eidola-server-engine` | `oci (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_4`] — the inference node's image, the one every Eidola-hosted engine deployment pins by digest |
+//! | `artifacts.eidola-cli-linux-static-amd64` | `file (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_5`] — the static Linux CLI binary, the one file of the `eidola-cli` image, published on its own so a host binary needs no container runtime |
+//! | `artifacts.eidola-cli-linux-static-arm64` | `file (linux/arm64) or absent` | ditto, 64-bit ARM: the same client cross-compiled for `aarch64-unknown-linux-musl` by StageX's toolchain, taken out of the image that build produces |
 //!
 //! The `or absent` rows are the schema-conditional half: absent from the
 //! older manifests this build also accepts, required of any manifest
@@ -107,7 +111,11 @@
 //! because schema 3 renames the Linux Nix installable's key rather than
 //! adding to it. A rename is two schema-conditional rows, one arriving and
 //! one retiring, so that each spelling is expected exactly under the schema
-//! that records it.
+//! that records it. Schema 5 moves the command-line client the same way
+//! without a rename: the standalone macOS CLI archive, which every GUI
+//! payload makes redundant, retires, and the static Linux CLI arrives as a
+//! file of its own for each architecture — one retiring row and two
+//! arriving rows, each held to the schema a manifest declares.
 //!
 //! That two-sided tolerance is the shape of every manifest schema rotation:
 //! a build **accepts** the new schema one release before any release
@@ -121,11 +129,10 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 use crate::trust_root;
-use crate::updater::ci_sigstore;
+use crate::updater;
 
 /// `artifact-manifest.json` `schema_version` values this build can parse
 /// structurally. Distinct from `trust_root::SUPPORTED_RELEASE_SCHEMA_VERSIONS`
@@ -133,7 +140,7 @@ use crate::updater::ci_sigstore;
 /// manifest shape [`attested_claims`] walks. A version outside this set is a
 /// *claims change* (authentic but unintelligible to this build), not a
 /// verification failure.
-pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4];
+pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4, 5];
 
 /// The schema the current artifact set was introduced at:
 /// [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] rows become required at it, and
@@ -145,12 +152,16 @@ const ARTIFACT_SET_SCHEMA: u64 = 3;
 /// [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_4`] rows become required at it.
 const ENGINE_IMAGE_SCHEMA: u64 = 4;
 
+/// The schema the command-line client's artifact set takes its current shape
+/// at: [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_5`] rows become required at it, and
+/// [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4`] rows retire at it.
+const CLI_ARTIFACT_SET_SCHEMA: u64 = 5;
+
 /// The artifact entries every accepted `artifact-manifest.json` records, as
 /// `(name, type, platform)`. Structure only — digests / narHashes /
 /// archiveSha256 are values and legitimately change every release.
 pub const EXPECTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     ("eidola-cli", "oci", "linux/amd64"),
-    ("eidola-cli-macos-universal", "nix", "darwin/universal"),
     ("eidola-gui-macos-universal", "nix", "darwin/universal"),
     ("eidola-postgres", "oci", "linux/amd64"),
     // The gateway image (`ghcr.io/eidola-ai/eidola-server-gateway`). The key
@@ -212,6 +223,39 @@ pub const EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2: &[(&str, &str, &str)] =
 pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_4: &[(&str, &str, &str)] =
     &[("eidola-server-engine", "oci", "linux/amd64")];
 
+/// Artifact entries schema 5 adds: the static Linux CLI, published as the
+/// one file it is, for each architecture. The amd64 binary is the one the
+/// `eidola-cli` image carries; the arm64 binary is the same client
+/// cross-compiled by the same StageX toolchain into an image of its own
+/// that is never published (`oci/eidola-cli-arm64/Containerfile`). Each is
+/// extracted from its image and hashed (`scripts/artifact-manifest.sh
+/// extract-cli --arch …`), so a user installing a host binary needs neither
+/// a container runtime nor a registry. `type: "file"` for the reason the
+/// `.deb` is: the download *is* the byte stream its hash covers. The keys
+/// say `static` because the CLI also ships inside every Linux GUI payload,
+/// and an unqualified `eidola-cli-linux-<arch>` would imply it ships once.
+///
+/// The same tolerance as [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`], two schemas
+/// later.
+pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_5: &[(&str, &str, &str)] = &[
+    ("eidola-cli-linux-static-amd64", "file", "linux/amd64"),
+    ("eidola-cli-linux-static-arm64", "file", "linux/arm64"),
+];
+
+/// Artifact entries schema 5 *retires*: the standalone macOS CLI archive.
+/// Every GUI payload carries the CLI built from the same source as the app
+/// (`Contents/MacOS/eidola-cli` in the macOS `.app`), so a separate macOS
+/// build is a further copy of the same client that could only drift from
+/// it.
+///
+/// The same two-sided reading as [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`]: a
+/// manifest declaring schema 2, 3 or 4 without this row has dropped an
+/// artifact, one declaring 5 with it has recorded an artifact its schema
+/// does not have, and the row leaves the expected set once 4 leaves
+/// [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`].
+pub const EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4: &[(&str, &str, &str)] =
+    &[("eidola-cli-macos-universal", "nix", "darwin/universal")];
+
 /// One slice of the artifact set, as `(name, type, platform)` rows.
 type ArtifactRows = &'static [(&'static str, &'static str, &'static str)];
 
@@ -221,14 +265,32 @@ type ArtifactRows = &'static [(&'static str, &'static str, &'static str)];
 const ARRIVING_ARTIFACTS: &[(u64, ArtifactRows)] = &[
     (ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_3),
     (ENGINE_IMAGE_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_4),
+    (CLI_ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_5),
 ];
 
 /// Every retiring slice, with the first schema that no longer records it.
-const RETIRING_ARTIFACTS: &[(u64, ArtifactRows)] =
-    &[(ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2)];
+const RETIRING_ARTIFACTS: &[(u64, ArtifactRows)] = &[
+    (ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2),
+    (CLI_ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4),
+];
 
-/// How often the background poll re-checks while the app is running.
-pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+/// How often, on average, the background poll re-checks while the app is
+/// running.
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The wait before the next background check: [`POLL_INTERVAL`], moved by up
+/// to a quarter of it either way, drawn fresh each time.
+///
+/// Every request to the releases host reveals that an Eidola client is
+/// running at an address. A fixed hour would also let that host line the
+/// requests up into a launch time and a run length per address. Drawn
+/// waits don't, and the jitter keeps clients that start together from
+/// staying in step.
+pub fn next_poll_delay(rng: &mut impl rand_core::RngCore) -> std::time::Duration {
+    let base = POLL_INTERVAL.as_millis() as u64;
+    let spread = base / 2;
+    std::time::Duration::from_millis(base - spread / 2 + rng.next_u64() % (spread + 1))
+}
 
 // ---------------------------------------------------------------------------
 // Result types — the typed mirror of the failure-mode matrix
@@ -268,8 +330,9 @@ pub enum UpdateCheckResult {
     CheckFailed { message: String },
 }
 
-/// A release whose `artifact-manifest.json` Sigstore bundle verified
-/// against the embedded trust root.
+/// A release that passed every check [`crate::updater::verify_release`]
+/// makes — CI's signature bound to its tag, and the human attestations the
+/// embedded policy requires.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedRelease {
     /// Semver, without the leading `v`.
@@ -277,13 +340,20 @@ pub struct VerifiedRelease {
     /// The git tag (e.g. `v0.0.9`), cross-checked against the Fulcio
     /// cert's `@refs/tags/…` identity suffix.
     pub tag: String,
-    /// The GitHub release page — the only artifact-adjacent link v1 offers.
+    /// The commit the release was built from, as its attestations name it.
+    pub git_commit: String,
+    /// The release page, derived from the releases location and the tag.
     pub release_url: Option<String>,
+    /// When the release says it was cut (`release.json`'s `released_at`).
     pub published_at: Option<String>,
-    /// The Fulcio cert SAN identity the bundle verified under.
+    /// The Fulcio cert SAN identity CI's manifest signature verified under.
     pub ci_identity: String,
-    /// Rekor transparency-log index, for independent lookup.
+    /// Rekor transparency-log index of CI's manifest signature, for
+    /// independent lookup.
     pub rekor_log_index: u64,
+    /// Every human attestation that verified, in the order the release
+    /// lists them.
+    pub attestants: Vec<ReleaseAttestant>,
     /// Hex sha256 of the verified manifest bytes — the durable handle an
     /// accepted claims-change is recorded against.
     pub manifest_sha256: String,
@@ -291,6 +361,17 @@ pub struct VerifiedRelease {
     /// the user explicitly chose "treat as update" for this exact
     /// manifest (matched by version + manifest hash).
     pub claims_accepted: bool,
+}
+
+/// Who attested a release, as their verified attestation states it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseAttestant {
+    /// The attestant's name, from the signed preamble.
+    pub name: String,
+    /// The jurisdiction whose perjury laws they signed under.
+    pub jurisdiction: String,
+    /// Rekor log index of their signature, for independent lookup.
+    pub rekor_log_index: u64,
 }
 
 /// One structural claim — `key` identifies it, `value` describes its
@@ -341,13 +422,39 @@ pub struct AcceptedClaims {
 // Persisted state — last check + accepted claims choice
 // ---------------------------------------------------------------------------
 
+/// The rules a persisted verdict was reached under. A verdict is only as
+/// good as the checks behind it, so state written under any other rules is
+/// discarded on load ([`load_state`]) rather than shown, held against a
+/// later failure, or promoted by an acceptance. Raise this whenever what
+/// "verified" means for a release changes.
+///
+/// `1`: CI's signature bound to the release's tag, **and** the human
+/// attestations the embedded policy requires ([`crate::updater::verify_release`]).
+/// State with no stamp predates that and holds verdicts reached on CI's
+/// signature alone.
+pub const VERDICT_RULES: u32 = 1;
+
 /// On-disk update-check state (`<data_dir>/update-state.json`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateState {
+    /// The [`VERDICT_RULES`] `last` and `accepted` were reached under;
+    /// absent (0) in state written before the stamp existed.
+    #[serde(default)]
+    pub verdict_rules: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<UpdateCheckSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted: Option<AcceptedClaims>,
+}
+
+impl Default for UpdateState {
+    fn default() -> Self {
+        Self {
+            verdict_rules: VERDICT_RULES,
+            last: None,
+            accepted: None,
+        }
+    }
 }
 
 impl UpdateState {
@@ -374,12 +481,17 @@ pub fn state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("update-state.json")
 }
 
-/// Load persisted state; missing or corrupt files yield the default.
+/// Load persisted state. Missing or corrupt files, and state reached under
+/// rules other than [`VERDICT_RULES`], yield the default: the next check
+/// reaches a fresh verdict, and nothing is shown or accepted before it.
 pub fn load_state(data_dir: &Path) -> UpdateState {
     let Ok(bytes) = std::fs::read(state_path(data_dir)) else {
         return UpdateState::default();
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    match serde_json::from_slice::<UpdateState>(&bytes) {
+        Ok(state) if state.verdict_rules == VERDICT_RULES => state,
+        _ => UpdateState::default(),
+    }
 }
 
 /// Persist the state, creating the data dir as needed.
@@ -405,15 +517,14 @@ pub fn save_state(data_dir: &Path, state: &UpdateState) -> Result<(), AppError> 
 /// rows (the crypto still runs for real — only the pins move).
 #[derive(Debug, Clone)]
 pub struct CheckContext {
-    /// Full URL of the latest-release endpoint (GitHub `releases/latest`
-    /// shape). Resolved from `Config::update_feed_url()`.
-    pub feed_url: String,
+    /// The releases location (`<url>/latest/download/release.json` is the
+    /// latest release's index). Resolved from
+    /// `Config::update_releases_url()`.
+    pub releases_url: String,
     /// The running binary's semver.
     pub installed_version: String,
-    /// Fulcio SAN identity glob the bundle must match.
-    pub ci_identity_pattern: String,
-    /// OIDC issuer the Fulcio cert must record.
-    pub ci_issuer: String,
+    /// The trust pins every check runs against.
+    pub pins: updater::ReleasePins,
     /// The expected structural claim set (see module docs).
     pub expected_claims: Vec<Claim>,
 }
@@ -480,46 +591,24 @@ pub fn classify(outcome: CheckOutcome, accepted: Option<&AcceptedClaims>) -> Upd
 impl CheckContext {
     /// Production context: every pin from the embedded trust root, claims
     /// from [`expected_claims`].
-    pub fn new(feed_url: impl Into<String>, installed_version: impl Into<String>) -> Self {
+    pub fn new(releases_url: impl Into<String>, installed_version: impl Into<String>) -> Self {
         Self {
-            feed_url: feed_url.into(),
+            releases_url: releases_url.into(),
             installed_version: installed_version.into(),
-            ci_identity_pattern: trust_root::EXPECTED_CI_IDENTITY_PATTERN.to_string(),
-            ci_issuer: trust_root::EXPECTED_CI_ISSUER.to_string(),
+            pins: updater::ReleasePins::embedded(),
             expected_claims: expected_claims(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// GitHub releases/latest — minimal subset we consume
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct GhLatestRelease {
-    tag_name: String,
-    #[serde(default)]
-    html_url: Option<String>,
-    #[serde(default)]
-    published_at: Option<String>,
-    #[serde(default)]
-    assets: Vec<GhAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-// ---------------------------------------------------------------------------
 // The check
 // ---------------------------------------------------------------------------
 
-/// Run one update check. Infallible by design: every failure mode maps to
-/// an [`UpdateCheckResult`] variant per the matrix in the module docs.
 /// Run one check and classify it against `accepted` — [`check_outcome`] and
 /// [`classify`] in one step, for a caller with nothing to reconcile against.
+/// Infallible by design: every failure mode maps to an
+/// [`UpdateCheckResult`] variant per the matrix in the module docs.
 ///
 /// A caller that persists state should use the two halves instead and take
 /// the acceptance from the state it is about to write, since anything read
@@ -534,136 +623,97 @@ pub async fn check_for_update(
 }
 
 pub async fn check_outcome(client: &reqwest::Client, ctx: &CheckContext) -> CheckOutcome {
+    let settled = CheckOutcome::Settled;
+    let fetcher = updater::Fetcher::Network(client.clone());
+
     // ── discover: the release marked `latest` ───────────────────────────
-    let release = match fetch_latest_release(client, &ctx.feed_url).await {
-        Ok(Some(r)) => r,
-        // 404: no release is marked `latest` (the human-attested marker
-        // hasn't been applied to anything). Not an update, not an error.
+    let release_json = match fetcher.fetch_latest_release_json(&ctx.releases_url).await {
+        Ok(Some(bytes)) => bytes,
         Ok(None) => {
-            return CheckOutcome::Settled(UpdateCheckResult::UpToDate {
+            return settled(UpdateCheckResult::UpToDate {
                 latest_version: None,
             });
         }
-        Err(message) => return CheckOutcome::Settled(UpdateCheckResult::CheckFailed { message }),
-    };
-
-    // ── version gate: compare semver against the `latest` tag ───────────
-    let tag = release.tag_name.clone();
-    let version_str = tag.strip_prefix('v').unwrap_or(&tag).to_string();
-    let latest = match semver::Version::parse(&version_str) {
-        Ok(v) => v,
+        // Discovery reached nothing it could read, so nothing claimed an
+        // update. A body over the bound is the one `Rejected` discovery can
+        // produce, and it carries no version either.
         Err(e) => {
-            // A malformed tag is a feed anomaly, not a crypto verdict —
-            // we never reached any signed material.
-            return CheckOutcome::Settled(UpdateCheckResult::CheckFailed {
-                message: format!("latest release tag `{tag}` is not semver: {e}"),
+            return settled(UpdateCheckResult::CheckFailed {
+                message: e.message().to_string(),
             });
         }
     };
-    let installed = match semver::Version::parse(&ctx.installed_version) {
-        Ok(v) => v,
-        Err(e) => {
-            return CheckOutcome::Settled(UpdateCheckResult::CheckFailed {
-                message: format!(
-                    "installed version `{}` is not semver: {e}",
-                    ctx.installed_version
-                ),
+
+    // ── version gate, then the index's own shape ────────────────────────
+    // Continuity is not checked here: no build knows the commit it was
+    // released from (`docs/gaps.md` → First-install downgrade).
+    let release = match updater::gate_release(&release_json, &ctx.installed_version, None) {
+        Ok(updater::ReleaseGate::Newer(release)) => *release,
+        Ok(updater::ReleaseGate::NotNewer { version }) => {
+            return settled(UpdateCheckResult::UpToDate {
+                latest_version: Some(version),
             });
         }
-    };
-    if latest <= installed {
-        return CheckOutcome::Settled(UpdateCheckResult::UpToDate {
-            latest_version: Some(version_str),
-        });
-    }
-
-    // From here on, a newer `latest` exists — every failure is a security
-    // state, never silence.
-    let unverifiable = |reason: String| {
-        CheckOutcome::Settled(UpdateCheckResult::Unverifiable {
-            version: version_str.clone(),
-            tag: tag.clone(),
+        Err(updater::GateError {
+            newer_version: None,
             reason,
-        })
-    };
-
-    // ── fetch the two verifier assets ────────────────────────────────────
-    let manifest_bytes = match fetch_listed_asset(client, &release, "artifact-manifest.json").await
-    {
-        Ok(bytes) => bytes,
-        Err(FetchAssetError::Security(reason)) => return unverifiable(reason),
-        Err(FetchAssetError::Transient(message)) => {
-            return CheckOutcome::Settled(UpdateCheckResult::CheckFailed { message });
+        }) => return settled(UpdateCheckResult::CheckFailed { message: reason }),
+        Err(updater::GateError {
+            newer_version: Some(version),
+            reason,
+        }) => {
+            return settled(UpdateCheckResult::Unverifiable {
+                tag: format!("v{version}"),
+                version,
+                reason,
+            });
         }
     };
-    let bundle_bytes =
-        match fetch_listed_asset(client, &release, "artifact-manifest.json.sigstore").await {
-            Ok(bytes) => bytes,
-            Err(FetchAssetError::Security(reason)) => return unverifiable(reason),
-            Err(FetchAssetError::Transient(message)) => {
-                return CheckOutcome::Settled(UpdateCheckResult::CheckFailed { message });
-            }
-        };
 
-    // ── cryptographic verification, anchored in the embedded trust root ─
-    let trust = match crate::updater::trust::load() {
-        Ok(t) => t,
-        Err(e) => {
-            // The embedded trust root failing to parse is a build defect,
-            // but surfacing it as Unverifiable keeps it loud.
-            return unverifiable(format!("embedded Sigstore trust root failed to load: {e}"));
+    // From here on, a newer release has been claimed — every failure to
+    // verify it is a security state, and only an unreachable file is not.
+    let evidence = match updater::verify_release(&fetcher, &release, &ctx.pins).await {
+        Ok(evidence) => evidence,
+        Err(updater::ReleaseCheckError::Unreachable(message)) => {
+            return settled(UpdateCheckResult::CheckFailed { message });
+        }
+        Err(updater::ReleaseCheckError::Rejected(reason)) => {
+            return settled(UpdateCheckResult::Unverifiable {
+                version: release.version.clone(),
+                tag: release.git_tag.clone(),
+                reason,
+            });
         }
     };
-    let verified = match ci_sigstore::verify_ci_signature_with(
-        &manifest_bytes,
-        &bundle_bytes,
-        &trust,
-        &ctx.ci_identity_pattern,
-        &ctx.ci_issuer,
-    ) {
-        Ok(v) => v,
-        Err(e) => return unverifiable(e.to_string()),
-    };
-
-    // ── tag binding: the identity must be for *this* tag ────────────────
-    // The Fulcio SAN ends in `@refs/tags/<tag>`; requiring it to equal the
-    // release's tag prevents replaying an authentic older manifest under a
-    // newer tag to fabricate an "update".
-    match verified.ci_identity.rsplit_once("@refs/tags/") {
-        Some((_, signed_tag)) if signed_tag == tag => {}
-        Some((_, signed_tag)) => {
-            return unverifiable(format!(
-                "the manifest signature is from the pinned release identity, but for tag \
-                 `{signed_tag}`, not this release's tag `{tag}` — an authentic file appears \
-                 to have been replayed under a different release"
-            ));
-        }
-        None => {
-            return unverifiable(format!(
-                "the signing identity `{}` is not bound to a release tag (`@refs/tags/…`)",
-                verified.ci_identity
-            ));
-        }
-    }
-
-    let manifest_sha256 = hex(&Sha256::digest(&manifest_bytes));
 
     // ── claims: structural comparison against the expected set ──────────
-    let manifest_value: serde_json::Value = match serde_json::from_slice(&manifest_bytes) {
-        Ok(v) => v,
-        Err(_) => serde_json::Value::Null,
-    };
+    let manifest_value: serde_json::Value =
+        serde_json::from_slice(&evidence.manifest_bytes).unwrap_or(serde_json::Value::Null);
     let attested = attested_claims(&manifest_value);
     let deltas = compare_claims(&ctx.expected_claims, &attested);
 
+    let summary = evidence.summary;
     let release = VerifiedRelease {
-        version: version_str.clone(),
-        tag: tag.clone(),
-        release_url: release.html_url.clone(),
-        published_at: release.published_at.clone(),
-        ci_identity: verified.ci_identity,
-        rekor_log_index: verified.rekor_log_index,
-        manifest_sha256,
+        release_url: Some(updater::release_page_url(
+            &ctx.releases_url,
+            &summary.git_tag,
+        )),
+        version: summary.version,
+        tag: summary.git_tag,
+        git_commit: summary.git_commit,
+        published_at: Some(summary.released_at),
+        ci_identity: evidence.ci_identity,
+        rekor_log_index: evidence.ci_rekor_log_index,
+        attestants: summary
+            .attestations
+            .iter()
+            .map(|a| ReleaseAttestant {
+                name: a.attestant_name.clone(),
+                jurisdiction: a.jurisdiction.clone(),
+                rekor_log_index: a.rekor_log_index,
+            })
+            .collect(),
+        manifest_sha256: evidence.manifest_sha256,
         // Not yet knowable here: acceptance is a fact about persisted state,
         // and this function is the half that must not read it. `classify`
         // fills it in.
@@ -678,86 +728,6 @@ pub async fn check_outcome(client: &reqwest::Client, ctx: &CheckContext) -> Chec
             deltas,
         },
     }
-}
-
-/// Fetch and parse the latest-release endpoint. `Ok(None)` = HTTP 404 (no
-/// release marked latest). `Err` = transient network/API failure message.
-async fn fetch_latest_release(
-    client: &reqwest::Client,
-    feed_url: &str,
-) -> Result<Option<GhLatestRelease>, String> {
-    let resp = client
-        .get(feed_url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| format!("GET {feed_url}: {e}"))?;
-    let status = resp.status();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("reading latest-release response: {e}"))?;
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !status.is_success() {
-        return Err(format!("GET {feed_url} → HTTP {status}"));
-    }
-    let release: GhLatestRelease =
-        serde_json::from_slice(&bytes).map_err(|e| format!("parsing latest-release JSON: {e}"))?;
-    Ok(Some(release))
-}
-
-enum FetchAssetError {
-    /// The release should have this file but doesn't (absent from the
-    /// listing, or listed but 404) — a security state for a newer release.
-    Security(String),
-    /// Transport-level or server-side trouble — quiet retry.
-    Transient(String),
-}
-
-async fn fetch_listed_asset(
-    client: &reqwest::Client,
-    release: &GhLatestRelease,
-    name: &str,
-) -> Result<Vec<u8>, FetchAssetError> {
-    let Some(asset) = release.assets.iter().find(|a| a.name == name) else {
-        return Err(FetchAssetError::Security(format!(
-            "the release has no `{name}` asset — the verification material this client \
-             requires is missing"
-        )));
-    };
-    let resp = client
-        .get(&asset.browser_download_url)
-        .header("Accept", "application/octet-stream")
-        .send()
-        .await
-        .map_err(|e| FetchAssetError::Transient(format!("GET {name}: {e}")))?;
-    let status = resp.status();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| FetchAssetError::Transient(format!("reading {name}: {e}")))?;
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(FetchAssetError::Security(format!(
-            "the release lists `{name}` but the file is gone (HTTP 404)"
-        )));
-    }
-    if !status.is_success() {
-        return Err(FetchAssetError::Transient(format!(
-            "{name} returned HTTP {status}"
-        )));
-    }
-    Ok(bytes.to_vec())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 // ---------------------------------------------------------------------------
@@ -799,7 +769,7 @@ fn accepts_schema(supported: &[u32], pred: impl Fn(u64) -> bool) -> bool {
 }
 
 /// The oldest manifest schema this build accepts — the lower bound of the
-/// range [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`] rows are recorded in.
+/// range every retiring row ([`RETIRING_ARTIFACTS`]) is recorded in.
 fn oldest_supported_schema() -> u64 {
     SUPPORTED_MANIFEST_SCHEMA_VERSIONS
         .iter()
@@ -1300,6 +1270,40 @@ pub fn compare_claims(expected: &[Claim], attested: &[Claim]) -> Vec<ClaimDelta>
 mod tests {
     use super::*;
 
+    /// An RNG that always draws the same word, so the delay's arithmetic can
+    /// be read at its ends.
+    struct Fixed(u64);
+
+    impl rand_core::RngCore for Fixed {
+        fn next_u32(&mut self) -> u32 {
+            self.0 as u32
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            dest.fill(0);
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            dest.fill(0);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_poll_delay_stays_within_a_quarter_of_the_interval() {
+        let interval = POLL_INTERVAL.as_millis() as u64;
+        let spread = interval / 2;
+        let shortest = next_poll_delay(&mut Fixed(0)).as_millis() as u64;
+        let longest = next_poll_delay(&mut Fixed(spread)).as_millis() as u64;
+        assert_eq!(shortest, interval - interval / 4);
+        assert_eq!(longest, interval + interval / 4);
+        for word in [1, spread / 2, spread + 1, u64::MAX] {
+            let ms = next_poll_delay(&mut Fixed(word)).as_millis() as u64;
+            assert!((shortest..=longest).contains(&ms), "{word} drew {ms}ms");
+        }
+    }
+
     fn current_manifest() -> serde_json::Value {
         serde_json::json!({
             "artifacts": {
@@ -1352,16 +1356,18 @@ mod tests {
                 "enclave.sev_snp.host_data",
                 "enclave.sev_snp.guest_policy",
                 "artifacts.eidola-cli",
-                "artifacts.eidola-cli-macos-universal",
                 "artifacts.eidola-gui-macos-universal",
                 "artifacts.eidola-postgres",
                 "artifacts.eidola-server",
                 "artifacts.eidola-gui-linux-amd64",
+                "artifacts.eidola-cli-macos-universal",
                 "artifacts.eidola-gui-linux-deb-amd64",
                 "artifacts.eidola-gui-linux-deb-arm64",
                 "artifacts.eidola-gui-linux-nix-amd64",
                 "artifacts.eidola-gui-macos-universal-zip",
                 "artifacts.eidola-server-engine",
+                "artifacts.eidola-cli-linux-static-amd64",
+                "artifacts.eidola-cli-linux-static-arm64",
             ]
         );
     }
@@ -1426,6 +1432,44 @@ mod tests {
             Some("nix (linux/amd64)")
         );
         assert_eq!(value(&only_4, "artifacts.eidola-gui-linux-amd64"), None);
+
+        // The command-line client's boundary, at schema 5: one row retires
+        // and two arrive there, so each tightens from its own side.
+        assert_eq!(
+            value(&only_4, "artifacts.eidola-cli-macos-universal").as_deref(),
+            Some("nix (darwin/universal)")
+        );
+        let four_and_five = expected_claims_for(&[4, 5]);
+        assert_eq!(
+            value(&four_and_five, "artifacts.eidola-cli-macos-universal").as_deref(),
+            Some("nix (darwin/universal) or absent")
+        );
+        let only_5 = expected_claims_for(&[5]);
+        assert_eq!(value(&only_5, "artifacts.eidola-cli-macos-universal"), None);
+        for (key, platform) in [
+            ("artifacts.eidola-cli-linux-static-amd64", "linux/amd64"),
+            ("artifacts.eidola-cli-linux-static-arm64", "linux/arm64"),
+        ] {
+            assert_eq!(value(&only_4, key), None, "{key}");
+            assert_eq!(
+                value(&four_and_five, key).as_deref(),
+                Some(format!("file ({platform}) or absent").as_str()),
+                "{key}"
+            );
+            assert_eq!(
+                value(&only_5, key).as_deref(),
+                Some(format!("file ({platform})").as_str()),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            value(&only_5, "artifacts.eidola-server-engine").as_deref(),
+            Some("oci (linux/amd64)")
+        );
+        assert_eq!(
+            value(&only_5, "artifacts.eidola-cli").as_deref(),
+            Some("oci (linux/amd64)")
+        );
     }
 
     /// A schema-3 manifest — the shape a later release will emit. It adds
@@ -1477,6 +1521,214 @@ mod tests {
         manifest["artifacts"]["eidola-server-engine"] =
             serde_json::json!({"digest": "sha256:dd", "platform": "linux/amd64", "type": "oci"});
         manifest
+    }
+
+    /// A schema-5 manifest: schema 4's shape without the standalone macOS
+    /// CLI archive, and with the static Linux CLI, for each architecture, as
+    /// a file of its own.
+    fn schema_5_manifest() -> serde_json::Value {
+        let mut manifest = schema_4_manifest();
+        manifest["schema_version"] = serde_json::json!(5);
+        let artifacts = manifest["artifacts"].as_object_mut().unwrap();
+        artifacts.remove("eidola-cli-macos-universal");
+        for (key, platform) in [
+            ("eidola-cli-linux-static-amd64", "linux/amd64"),
+            ("eidola-cli-linux-static-arm64", "linux/arm64"),
+        ] {
+            artifacts.insert(
+                key.into(),
+                serde_json::json!({
+                    "platform": platform,
+                    "sha256": format!("sha256:{}", "9".repeat(64)),
+                    "type": "file"
+                }),
+            );
+        }
+        manifest
+    }
+
+    /// The command-line client's rows as a schema-4 and a schema-5 manifest
+    /// record them, for the tests that move one across the boundary.
+    fn macos_cli_row() -> serde_json::Value {
+        schema_4_manifest()["artifacts"]["eidola-cli-macos-universal"].clone()
+    }
+
+    fn static_cli_row(key: &str) -> serde_json::Value {
+        schema_5_manifest()["artifacts"][key].clone()
+    }
+
+    /// The static Linux CLI keys schema 5 adds, one per architecture.
+    fn static_cli_keys() -> impl Iterator<Item = &'static str> {
+        EXPECTED_ARTIFACTS_SINCE_SCHEMA_5
+            .iter()
+            .map(|(key, _, _)| *key)
+    }
+
+    #[test]
+    fn schema_5_adds_a_static_cli_for_each_architecture() {
+        assert_eq!(
+            EXPECTED_ARTIFACTS_SINCE_SCHEMA_5,
+            [
+                ("eidola-cli-linux-static-amd64", "file", "linux/amd64"),
+                ("eidola-cli-linux-static-arm64", "file", "linux/arm64"),
+            ]
+        );
+    }
+
+    #[test]
+    fn schema_5_manifest_with_its_own_rows_is_not_a_claims_change() {
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&schema_5_manifest()));
+        assert!(deltas.is_empty(), "unexpected deltas: {deltas:#?}");
+    }
+
+    #[test]
+    fn schema_5_manifest_missing_a_static_cli_is_a_delta() {
+        // Each architecture's binary is promised on its own: the other one
+        // being present does not cover for it.
+        for key in static_cli_keys() {
+            let mut manifest = schema_5_manifest();
+            manifest["artifacts"].as_object_mut().unwrap().remove(key);
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "{key}: unexpected deltas: {deltas:#?}");
+            assert_eq!(deltas[0].key, format!("artifacts.{key}"));
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some("missing (recorded from schema 5 on)"),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_static_cli_before_schema_5_is_a_delta() {
+        // Emission without the bump, at every older schema this build reads,
+        // for each architecture's binary.
+        for key in static_cli_keys() {
+            for (mut manifest, declared) in [
+                (current_manifest(), 2),
+                (schema_3_manifest(), 3),
+                (schema_4_manifest(), 4),
+            ] {
+                manifest["artifacts"][key] = static_cli_row(key);
+                let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+                assert_eq!(deltas.len(), 1, "{key}, schema {declared}: {deltas:#?}");
+                assert_eq!(deltas[0].key, format!("artifacts.{key}"));
+                assert_eq!(
+                    deltas[0].attested.as_deref(),
+                    Some(
+                        format!("present, but schema {declared} records it only from schema 5 on")
+                            .as_str()
+                    ),
+                    "{key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_static_cli_under_the_other_architecture_is_a_delta() {
+        // The platform is part of the claim: an arm64 key recording an
+        // amd64 binary is not the row schema 5 promises.
+        let mut manifest = schema_5_manifest();
+        manifest["artifacts"]["eidola-cli-linux-static-arm64"]["platform"] =
+            serde_json::json!("linux/amd64");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-cli-linux-static-arm64");
+    }
+
+    #[test]
+    fn the_macos_cli_at_schema_5_is_a_delta() {
+        // Schema 5 retires the row, so a manifest declaring 5 that still
+        // carries it has recorded an artifact its own schema does not have —
+        // and the static Linux CLI beside it does not excuse it.
+        let mut manifest = schema_5_manifest();
+        manifest["artifacts"]["eidola-cli-macos-universal"] = macos_cli_row();
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-cli-macos-universal");
+        assert_eq!(
+            deltas[0].attested.as_deref(),
+            Some("present, but schema 5 records it only through schema 4")
+        );
+    }
+
+    #[test]
+    fn a_manifest_before_schema_5_missing_the_macos_cli_is_a_delta() {
+        // The "or absent" on the expected side covers schema 5 having
+        // retired the row, not an older schema having lost it.
+        for (mut manifest, declared) in [
+            (current_manifest(), 2),
+            (schema_3_manifest(), 3),
+            (schema_4_manifest(), 4),
+        ] {
+            manifest["artifacts"]
+                .as_object_mut()
+                .unwrap()
+                .remove("eidola-cli-macos-universal");
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "schema {declared}: deltas {deltas:#?}");
+            assert_eq!(deltas[0].key, "artifacts.eidola-cli-macos-universal");
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some("missing (recorded through schema 4)"),
+                "schema {declared}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_5_manifest_missing_an_older_arriving_row_is_a_delta() {
+        // Schema 5 is schema 4's set with the CLI rows moved, not instead of
+        // it: every row that arrived earlier is still promised.
+        for (since, rows) in [
+            (3, EXPECTED_ARTIFACTS_SINCE_SCHEMA_3),
+            (4, EXPECTED_ARTIFACTS_SINCE_SCHEMA_4),
+        ] {
+            for (row, _, _) in rows {
+                let mut manifest = schema_5_manifest();
+                manifest["artifacts"].as_object_mut().unwrap().remove(*row);
+                let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+                assert_eq!(deltas.len(), 1, "{row}: unexpected deltas: {deltas:#?}");
+                assert_eq!(
+                    deltas[0].attested.as_deref(),
+                    Some(format!("missing (recorded from schema {since} on)").as_str()),
+                    "{row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_cli_rows_swapped_without_the_bump_are_each_a_delta() {
+        // The whole schema-5 artifact set under schema 4's number: the
+        // retirement and each arrival read as a claim out of shape, so no
+        // part of the rotation can be emitted alone.
+        let mut manifest = schema_5_manifest();
+        manifest["schema_version"] = serde_json::json!(4);
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        let mut got: Vec<(&str, Option<&str>)> = deltas
+            .iter()
+            .map(|d| (d.key.as_str(), d.attested.as_deref()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                (
+                    "artifacts.eidola-cli-linux-static-amd64",
+                    Some("present, but schema 4 records it only from schema 5 on")
+                ),
+                (
+                    "artifacts.eidola-cli-linux-static-arm64",
+                    Some("present, but schema 4 records it only from schema 5 on")
+                ),
+                (
+                    "artifacts.eidola-cli-macos-universal",
+                    Some("missing (recorded through schema 4)")
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1620,21 +1872,21 @@ mod tests {
     }
 
     #[test]
-    fn the_retired_linux_key_gets_no_verdict_below_the_oldest_accepted_schema() {
+    fn retired_keys_get_no_verdict_below_the_oldest_accepted_schema() {
         // A retiring row is bounded on both sides. The captured schema-1
         // release predates the Linux GUI entirely, so neither its absence
-        // nor its presence there says anything about the rename — the only
+        // nor its presence there says anything about the rename — and the
+        // same holds for the macOS CLI row schema 5 retires. The only
         // honest complaint about such a manifest is its schema version, and
-        // piling a row verdict on top would make every captured old release
-        // read as two problems instead of one.
+        // piling row verdicts on top would make every captured old release
+        // read as several problems instead of one.
         for present in [false, true] {
             let mut manifest = current_manifest();
             manifest["schema_version"] = serde_json::json!(1);
             if !present {
-                manifest["artifacts"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("eidola-gui-linux-amd64");
+                let artifacts = manifest["artifacts"].as_object_mut().unwrap();
+                artifacts.remove("eidola-gui-linux-amd64");
+                artifacts.remove("eidola-cli-macos-universal");
             }
             let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
             assert_eq!(deltas.len(), 1, "present={present}: deltas {deltas:#?}");
@@ -1698,11 +1950,14 @@ mod tests {
         // Every `file` row's whole claim is one hash of one published byte
         // stream — the shipping zip and both Debian packages alike — so a
         // hash that isn't one is the row saying nothing.
-        for (row, ty, _) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3 {
+        for (row, ty, _) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3
+            .iter()
+            .chain(EXPECTED_ARTIFACTS_SINCE_SCHEMA_5)
+        {
             if *ty != "file" {
                 continue;
             }
-            let mut manifest = schema_3_manifest();
+            let mut manifest = schema_5_manifest();
             manifest["artifacts"][*row]["sha256"] = serde_json::json!("sha256:nope");
             let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
             assert_eq!(deltas.len(), 1, "{row}: unexpected deltas: {deltas:#?}");
@@ -1736,12 +1991,12 @@ mod tests {
     fn schema_version_jump_is_a_delta() {
         // Built on the newest shape this build knows, so the schema row is
         // the only thing that can differ.
-        let mut manifest = schema_4_manifest();
+        let mut manifest = schema_5_manifest();
         manifest["schema_version"] = serde_json::json!(99);
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].key, "manifest.schema_version");
-        assert_eq!(deltas[0].expected.as_deref(), Some("2 or 3 or 4"));
+        assert_eq!(deltas[0].expected.as_deref(), Some("2 or 3 or 4 or 5"));
         assert_eq!(deltas[0].attested.as_deref(), Some("99"));
     }
 
@@ -1979,6 +2234,89 @@ mod tests {
         assert_eq!(loaded, state);
     }
 
+    /// A standing claims-changed verdict with an acceptance recorded for
+    /// it — the state that can promote itself to an available update.
+    fn state_with_accepted_claims_change() -> UpdateState {
+        let release = VerifiedRelease {
+            version: "9.9.9".into(),
+            tag: "v9.9.9".into(),
+            git_commit: "c".repeat(40),
+            release_url: None,
+            published_at: None,
+            ci_identity: "x".into(),
+            rekor_log_index: 1,
+            attestants: vec![ReleaseAttestant {
+                name: "Ada Example".into(),
+                jurisdiction: "Somewhere".into(),
+                rekor_log_index: 2,
+            }],
+            manifest_sha256: "ab".repeat(32),
+            claims_accepted: false,
+        };
+        UpdateState {
+            last: Some(UpdateCheckSnapshot {
+                checked_at_ms: 1,
+                result: UpdateCheckResult::ClaimsChanged {
+                    release,
+                    comparison: ClaimsComparison {
+                        expected: vec![],
+                        attested: vec![],
+                        deltas: vec![ClaimDelta {
+                            key: "x".into(),
+                            expected: Some("a".into()),
+                            attested: None,
+                        }],
+                    },
+                },
+            }),
+            accepted: Some(AcceptedClaims {
+                version: "9.9.9".into(),
+                manifest_sha256: "ab".repeat(32),
+                accepted_at_ms: 2,
+            }),
+            ..UpdateState::default()
+        }
+    }
+
+    #[test]
+    fn state_reached_under_the_current_rules_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_accepted_claims_change();
+        save_state(dir.path(), &state).unwrap();
+        assert_eq!(load_state(dir.path()), state);
+    }
+
+    /// State written before verdicts required a human attestation holds
+    /// releases CI's signature alone vouched for. None of it may be shown,
+    /// held against a later failure, or promoted by its acceptance.
+    #[test]
+    fn state_from_before_human_attestation_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy = serde_json::to_value(state_with_accepted_claims_change()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("verdict_rules").unwrap();
+        let release = object["last"]["result"]["release"].as_object_mut().unwrap();
+        release.remove("attestants").unwrap();
+        release.remove("git_commit").unwrap();
+        std::fs::write(state_path(dir.path()), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(load_state(dir.path()), UpdateState::default());
+    }
+
+    /// The stamp alone decides it: a release shaped like today's, under
+    /// rules other than today's, is still discarded.
+    #[test]
+    fn state_stamped_with_other_rules_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        for rules in [0, VERDICT_RULES + 1] {
+            let state = UpdateState {
+                verdict_rules: rules,
+                ..state_with_accepted_claims_change()
+            };
+            save_state(dir.path(), &state).unwrap();
+            assert_eq!(load_state(dir.path()), UpdateState::default(), "{rules}");
+        }
+    }
+
     #[test]
     fn load_state_defaults_on_missing_or_corrupt() {
         let dir = tempfile::tempdir().unwrap();
@@ -2028,10 +2366,12 @@ mod tests {
         let release = VerifiedRelease {
             version: "9.9.9".into(),
             tag: "v9.9.9".into(),
+            git_commit: "c".repeat(40),
             release_url: None,
             published_at: None,
             ci_identity: "x".into(),
             rekor_log_index: 1,
+            attestants: vec![],
             manifest_sha256: "ab".repeat(32),
             claims_accepted: false,
         };

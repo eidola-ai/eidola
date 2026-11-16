@@ -23,6 +23,8 @@
 //!   entry alone and writes nothing.
 //! * **The cache doctrine** — a summary appearing changes only the trailing map
 //!   message; every conversation byte above it is untouched.
+//! * **Scheduling** — a post into a space with summaries off leaves no task
+//!   waiting out the debounce; with them on, the debounced pass is waiting.
 //! * **Emissions** — a committed summary emits `Change::Space` (the row in
 //!   `tests/bus.rs`'s exit-point table).
 //!
@@ -40,6 +42,7 @@ use chat_harness::{
 };
 use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::{AppCore, ChatStreamEvent, post_handle};
+use std::time::{Duration, Instant};
 
 const SUMMARY: &str = "They dig into spring tides and settle on the sun-moon alignment.";
 
@@ -300,6 +303,56 @@ fn without_a_utility_model_the_map_stays_structural() {
         assert!(
             !map.contains(SUMMARY),
             "nothing was generated, so nothing is rendered: {map}"
+        );
+    });
+}
+
+/// The runtime's live tasks after a bare post into `space`, against the count
+/// before it: `true` once it is back down within `within`.
+fn post_leaves_no_task(core: &AppCore, space: &str, reply_to: &str, within: Duration) -> bool {
+    let before = core.runtime().metrics().num_alive_tasks();
+    core.runtime()
+        .block_on(core.post_reply(
+            "One more thought.".into(),
+            Some(space.to_string()),
+            Some(reply_to.to_string()),
+        ))
+        .expect("post");
+    let deadline = Instant::now() + within;
+    loop {
+        if core.runtime().metrics().num_alive_tasks() <= before {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A space with summaries off has no pass to debounce, so a post into it leaves
+/// no task waiting out the debounce — the runtime is idle again well within it.
+/// With a utility model set, the same post does leave the debounced pass
+/// waiting, which is what shows this test can see the task at all.
+#[test]
+fn a_post_with_summaries_off_schedules_no_pass() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            summary: SummaryBehavior::Reply(SUMMARY.into()),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let fx = branched_space(&core);
+        assert!(
+            post_leaves_no_task(&core, &fx.space, &fx.branch_tail, Duration::from_secs(5)),
+            "summaries are off, yet a task outlived the post"
+        );
+
+        use_utility_model(&core, &mock, &fx.space, chat_harness::ROUTER_MODEL);
+        assert!(
+            !post_leaves_no_task(&core, &fx.space, &fx.branch_tail, Duration::from_secs(1)),
+            "summaries are on, so the post leaves its debounced pass waiting"
         );
     });
 }

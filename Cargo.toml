@@ -3,6 +3,8 @@
 members = [
     "crates/*",
 ]
+# The pinned dev tools are their own workspace, with their own lockfile.
+exclude = ["crates/devtools"]
 resolver = "2"
 
 [workspace.package]
@@ -75,6 +77,13 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.eidola-engine-cuda]
+opt-level = 3
+
+# The serving core's tests drive the scheduler, paged KV and prefix cache
+# through many requests; `required_prefix` alone took 36 s wall / 88 CPU-s at
+# opt-level 0 and takes 2.4 s at 3 (M4 Max, 4 test threads), for about 4 s
+# more to compile the crate.
+[profile.dev.package.eidola-engine]
 opt-level = 3
 
 [profile.docker-dev]

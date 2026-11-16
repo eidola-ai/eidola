@@ -308,8 +308,7 @@ async fn mock_attesting_client_e2e() {
         return;
     };
 
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ = rustls_rustcrypto::provider().install_default();
     let read_der = |name: &str| {
         let pem = std::fs::read_to_string(format!("{cert_dir}/{name}"))
             .unwrap_or_else(|e| panic!("read {name}: {e}"));
@@ -370,8 +369,7 @@ fn webpki_client() -> reqwest::Client {
 #[tokio::test]
 #[ignore = "requires network access to inference.tinfoil.sh"]
 async fn live_self_contained_document() {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ = rustls_rustcrypto::provider().install_default();
     let resolved =
         tinfoil_verifier::bundle::fetch_well_known(&webpki_client(), LIVE_ATTESTATION_URL)
             .await
@@ -404,8 +402,7 @@ async fn live_self_contained_document() {
 #[tokio::test]
 #[ignore = "requires network access to inference.tinfoil.sh"]
 async fn live_attesting_client() {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ = rustls_rustcrypto::provider().install_default();
     let resolved =
         tinfoil_verifier::bundle::fetch_well_known(&webpki_client(), LIVE_ATTESTATION_URL)
             .await

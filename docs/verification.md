@@ -21,13 +21,13 @@ Attestations and `artifact-manifest.json` live **beside** the installable on the
 
 ## What the manifest records
 
-`artifact-manifest.json` is committed at the git ref, signed by CI, and what the engineer attests they reproduced. `schema_version` is `2`; clients also accept `3`, which adds the macOS unsigned shipping zip and the Debian packages as `file` rows and narrows the Nix Linux installable's key from `eidola-gui-linux-amd64` to `eidola-gui-linux-nix-amd64` (accept-before-emit — see [`releases/README.md`](../releases/README.md#rotating-document-schema-versions)).
+`artifact-manifest.json` is committed at the git ref, signed by CI, and what the engineer attests they reproduced. `schema_version` is `2`; clients also accept `3`, which adds the macOS unsigned shipping zip and the Debian packages as `file` rows and narrows the Nix Linux installable's key from `eidola-gui-linux-amd64` to `eidola-gui-linux-nix-amd64`; `4`, which adds the inference node's image; and `5`, which drops the standalone macOS CLI archive (`eidola-cli-macos-universal` — the macOS `.app` carries the CLI) and adds the static Linux CLI as a `file` row per architecture (`eidola-cli-linux-static-amd64`, `eidola-cli-linux-static-arm64`) (accept-before-emit — see [`releases/README.md`](../releases/README.md#rotating-document-schema-versions)).
 
 | Artifact `type` | Identity of the payload | Identity of the archive | Envelope / installable |
 | --- | --- | --- | --- |
 | `oci` | Layers of the image | `digest` (`sha256:` + hex) — this *is* the archive | Empty. `docker pull` is the installable. |
 | `nix` | `narHash` (Nix SRI of the store-path NAR) — rebuild/debug checkpoint | `archiveSha256` (`sha256:` + hex of the flake-built `.tar.gz`) | macOS: Apple material, hashes in the **human attestation** only. Current Linux Nix GUI: empty envelope. |
-| `file` (schema 3) | — | `sha256` (`sha256:` + hex) of one published file | The `.deb`: empty envelope, so this file *is* the installable. The macOS unsigned shipping zip: the *container* an installable takes, before any envelope. |
+| `file` (schema 3) | — | `sha256` (`sha256:` + hex) of one published file | The `.deb`: empty envelope, so this file *is* the installable. The static Linux CLI (schema 5): the same, an executable with nothing around it. The macOS unsigned shipping zip: the *container* an installable takes, before any envelope. |
 
 Every value in this file is a function of source. Nothing key-dependent may enter it — no signed-artifact hash, no detached-bundle hash, no Team ID, no ticket; those live in the human attestation, which is signed and non-deterministic already. That is enforced rather than remembered: `scripts/check-manifest-determinism.sh` (run by `just check` and by the `Rust checks` workflow) validates the document's envelope and holds each artifact type to an exact field list (so an unrecognized field is rejected whether or not it names a key), rejects any key naming signing material, and asserts over `.github/workflows/artifacts.yml` that no ancestor of the job assembling the manifest is a signing job and that no job computing part of it holds the signing environment.
 
@@ -39,7 +39,7 @@ Anything **copied into** the payload is in both hashes. A store-path *reference*
 
 Nix store paths are **input-addressed**: the path is a function of the derivation's inputs, not of its output bytes. A payload that names a binary by store path therefore binds the *build recipe* but not the *result* — a non-reproducible build, or a compromised builder, yields the same path and so the same `narHash` and `archiveSha256`, while the user's machine resolves whatever bytes its substituter holds for that path. Copying moves the bytes into the measured tree, where a substitution changes the hash.
 
-So every executable that ships is copied: the macOS `.app` copies `llama-server` into `Contents/MacOS/`, and the Linux Nix GUI copies **both** the GUI binary (to `bin/.eidola-gui-wrapped`, kept a sibling of the sidecar) and `llama-server` into `$out/bin`. The only deliberate references left are the ones we have decided *not* to measure — the nixpkgs Mesa ICDs reached via `VK_ADD_DRIVER_FILES`, because the device's GPU stack is pre-trusted.
+So every executable that ships is copied: the macOS `.app` copies `llama-server` and the command-line client (`eidola-cli`) into `Contents/MacOS/`, and the Linux Nix GUI copies the GUI binary (to `bin/.eidola-gui-wrapped`, kept a sibling of the sidecar), the command-line client (`bin/eidola`) and `llama-server` into `$out/bin`. The only deliberate references left are the ones we have decided *not* to measure — the nixpkgs Mesa ICDs reached via `VK_ADD_DRIVER_FILES`, because the device's GPU stack is pre-trusted.
 
 ## Checking a download
 
@@ -53,6 +53,8 @@ Start from a **verified** release (manifest signature + human attestations, [rel
 
 ```bash
 sha256sum eidola-gui-linux-deb-amd64.deb        # `file` row: sha256
+sha256sum eidola-cli-linux-static-amd64         # `file` row: sha256 (schema 5)
+sha256sum eidola-cli-linux-static-arm64         # `file` row: sha256 (schema 5)
 sha256sum eidola-gui-linux-nix-amd64.tar.gz     # `nix` row: archiveSha256
 # macOS: shasum -a 256 eidola-gui-macos-universal.tar.gz
 ```
@@ -67,7 +69,9 @@ nix build .#eidola-gui-linux-nix-archive  # compare archiveSha256
 nix build .#eidola-linux-deb              # compare the .deb's sha256
 ```
 
-The macOS universal attrs (`.#eidola-cli-macos-universal`, `.#eidola-gui-macos-universal`, and their `-archive` variants) work the same way, on a Mac.
+The macOS universal attrs (`.#eidola-gui-macos-universal`, and through manifest schema 4 `.#eidola-cli-macos-universal`, with their `-archive` variants) work the same way, on a Mac.
+
+The static Linux CLI is not a Nix artifact: it is the one file of the `eidola-cli` OCI image, whose digest the same manifest records. `scripts/artifact-manifest.sh extract-cli` takes it out of a build of that image, and refuses unless the image it reads is the recorded digest — so rebuilding the image (`docker buildx bake cli`, as `just update-manifest` does) and extracting the binary reproduces both hashes, and pulling the published image by digest and copying `/eidola` out of it yields the same file. The arm64 binary comes out of an image that is never published: `oci/eidola-cli-arm64/Containerfile` cross-compiles the same client from StageX's x86-64 toolchain, so reproducing it is rebuilding that image (`docker buildx bake cli-arm64`, on any host — every build stage runs on linux/amd64) and extracting with `extract-cli --arch arm64`, which reproduces the binary's hash. Both extractions refuse a file that is not a static ELF executable for its architecture.
 
 **macOS installable (Developer ID zip), once published.** The browser file is not the archive. `codesign` rewrites Mach-Os; the unmodified archive is not a subset of the zip. The first-line check is `shasum` of that zip against the **attested shipped-installable** hash. From attestation schema 2 that value is `apple_shipped_artifact_sha256`, published beside `apple_signature_bundle_sha256` (the detached material), `apple_team_id`, and `apple_signing_identifier` — the last two being what the reconstruction's embedded claims must report. The engineer does not merely assert the relationship: `release-tool attest` runs the reconstruction itself and refuses to offer the `apple_signature_reconstructs` claim unless it holds. Binding it to the git ref is one of:
 
@@ -86,9 +90,9 @@ Linux has two artifacts from one build, and they are installables in different s
 
 **The Debian package** (`eidola-gui-linux-deb-amd64`, `…-arm64`) is the download to hand a Ubuntu or Debian user: `apt install ./eidola-gui-linux-deb-amd64.deb`, which resolves the declared dependencies from the user's own distro repositories. The `.deb` is byte-reproducible, so it needs no archive/envelope indirection — the file a browser downloads *is* the byte stream the manifest hashes, and `sha256sum` on it is the whole check. There is no repository of ours anywhere in that path; updates continue to arrive only through the client's own attestation-verified flow.
 
-Its payload is the same release binary and the same `llama-server` sidecar, with the two pieces of post-link metadata that bind an ELF to the Nix store removed, so the host's own glibc, Wayland, Vulkan loader, and Mesa or proprietary NVIDIA drivers are what load. **Those are outside the payload for the same reason macOS's are: the device's own operating system is pre-trusted.** No new builder or distributor of our bytes appears — the distro supplies the userland it already supplies to everything else on that machine.
+Its payload is the same release binary, the command-line client built beside it (installed as `/usr/bin/eidola`) and the same `llama-server` sidecar, with the two pieces of post-link metadata that bind an ELF to the Nix store removed, so the host's own glibc, Wayland, Vulkan loader, and Mesa or proprietary NVIDIA drivers are what load. **Those are outside the payload for the same reason macOS's are: the device's own operating system is pre-trusted.** No new builder or distributor of our bytes appears — the distro supplies the userland it already supplies to everything else on that machine.
 
-**The Nix archive** (`eidola-gui-linux-nix-amd64`) is *not* a standalone installable. Its archive is a serialization of a Nix store path: the payload contains the real GUI binary and the real sidecar, so the hash means what it should, but the tree is Nix-shaped — `bin/eidola-gui` is a wrapper script with a `/nix/store/…` interpreter, and the GUI binary's `RUNPATH` resolves Wayland, libxkbcommon and the Vulkan loader out of the store. Extracted onto a machine with no Nix store, it will not start.
+**The Nix archive** (`eidola-gui-linux-nix-amd64`) is *not* a standalone installable. Its archive is a serialization of a Nix store path: the payload contains the real GUI binary and the real sidecar, so the hash means what it should, but the tree is Nix-shaped — `bin/eidola-gui` is a launcher script with a `/nix/store/…` interpreter, which starts the binary beside it, and the GUI binary's `RUNPATH` resolves Wayland, libxkbcommon and the Vulkan loader out of the store. Extracted onto a machine with no Nix store, it will not start.
 
 It is the right artifact for NixOS, for `nix profile install`, and for anyone reproducing the build. For it, `archiveSha256` is a verification identity and a Nix installable, not a download that runs by itself.
 
@@ -96,4 +100,4 @@ It is the right artifact for NixOS, for `nix profile install`, and for anyone re
 
 The Nix Linux installable *references* nixpkgs Mesa so a Nix glibc binary can load Vulkan ICDs on a non-Nix host. Those driver bytes are not in the archive. The Debian package needs no such reference and carries no GPU bytes at all: its binary runs on the host's glibc, so the host's Vulkan loader and its Mesa or proprietary NVIDIA drivers load into the ABI they were built for.
 
-Server/CLI Linux images stay OCI: they run in an untrusted environment, so the image is the whole functional closure we can measure.
+Server/CLI Linux images stay OCI: they run in an untrusted environment, so the image is the whole functional closure we can measure. The CLI's image has exactly one file, a static binary, so from manifest schema 5 that file is also published and hashed on its own — the same bytes, for a host that should not need a container runtime to run a client — beside the same client built for 64-bit ARM.

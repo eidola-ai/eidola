@@ -89,6 +89,26 @@ pub fn verify_human_attestation(
     release: &ReleaseIndex,
     trust: &TrustedRoot,
 ) -> Result<VerifiedAttestation, AppError> {
+    verify_human_attestation_with(
+        attestation_bytes,
+        bundle_bytes,
+        release,
+        trust,
+        trust_root::TRUSTED_ATTESTANT_FINGERPRINTS,
+    )
+}
+
+/// [`verify_human_attestation`] against an explicit set of trusted
+/// attestant fingerprints. Production passes the embedded set (through
+/// [`super::ReleasePins::embedded`]); a test passes a throwaway key's, and
+/// everything else — signature, Rekor, templates — runs unchanged.
+pub fn verify_human_attestation_with(
+    attestation_bytes: &[u8],
+    bundle_bytes: &[u8],
+    release: &ReleaseIndex,
+    trust: &TrustedRoot,
+    trusted_fingerprints: &[impl AsRef<str>],
+) -> Result<VerifiedAttestation, AppError> {
     let attestation_sha256: [u8; 32] = Sha256::digest(attestation_bytes).into();
 
     // ── 1. Bundle parse (Sigstore Bundle v0.3) ──────────────────────
@@ -234,9 +254,9 @@ pub fn verify_human_attestation(
     let spki_der = pem_public_key_to_spki_der(&pubkey_pem_bytes)?;
     let fingerprint_bytes = Sha256::digest(&spki_der);
     let fingerprint_hex = hex_encode(fingerprint_bytes.as_slice());
-    if !trust_root::TRUSTED_ATTESTANT_FINGERPRINTS
+    if !trusted_fingerprints
         .iter()
-        .any(|fp| fp.eq_ignore_ascii_case(&fingerprint_hex))
+        .any(|fp| fp.as_ref().eq_ignore_ascii_case(&fingerprint_hex))
     {
         return Err(AppError::Update {
             message: format!(

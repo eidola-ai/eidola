@@ -1,0 +1,274 @@
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
+# check=skip=FromPlatformFlagConstDisallowed
+
+# The toolchain is x86-64 only and the build stages say so with a constant
+# `--platform`, which is the point: they run there whatever the target.
+
+# The static command-line client for 64-bit ARM Linux
+# (`aarch64-unknown-linux-musl`), cross-compiled from StageX's
+# source-bootstrapped toolchain on an x86-64 builder.
+#
+# StageX builds for x86-64 alone: its Rust is musl-hosted and ships a
+# standard library only for `x86_64-unknown-linux-musl`, and there is no
+# aarch64 musl among its packages. Its LLVM targets AArch64, though, so the
+# same rustc, clang and lld build everything here for the other architecture:
+# musl (the release, and the patches, StageX builds its own from), the C
+# runtime start and end files from the compiler-rt source of the LLVM StageX
+# builds, LLVM's libunwind from this rustc's `rust-src`, and the standard
+# library from that same `rust-src`. Every build stage runs on linux/amd64
+# whatever the host, so the bytes do not depend on where the image is built;
+# only the final, empty image is linux/arm64.
+#
+# The image exists to carry the binary out of the build: it is not published,
+# and no manifest row records it. `scripts/artifact-manifest.sh extract-cli
+# --arch arm64` takes `/eidola` out of it, and the manifest records that file
+# (`eidola-cli-linux-static-arm64`).
+
+# ── pinned inputs (StageX sx2026.09.0) ─────────────────────────────────────────
+FROM --platform=linux/amd64 stagex/pallet-rust:sx2026.09.0@sha256:6033fb215dd7c87c885dd7b1c12de42464606dcc0323fc57339318d61f010a30 AS pallet-rust
+FROM --platform=linux/amd64 stagex/core-make:sx2026.09.0@sha256:90dacd49b2b7617676afcd50698dc95295ab8dcdbd29102c18441decad0ccbc7 AS make
+
+# ── toolchain ──────────────────────────────────────────────────────────────────
+# rustc, cargo, clang and lld (x86-64 musl-hosted), with the aarch64 musl
+# sysroot the later stages build at $SYSROOT.
+FROM pallet-rust AS toolchain
+
+# oci/pallet-rust records the Rust this image ships, which
+# rust-toolchain.toml must name (scripts/check-rust-toolchain.sh); the record
+# is held to the image here.
+COPY oci/pallet-rust /pallet-rust
+RUN --network=none <<-'EOF'
+	set -eu
+	recorded="$(sed -n 's/^rust //p' /pallet-rust)"
+	actual="$(rustc --version | cut -d' ' -f2)"
+	if [ "$recorded" != "$actual" ]; then
+		echo "error: oci/pallet-rust records Rust $recorded, but the pinned pallet-rust is $actual" >&2
+		exit 1
+	fi
+	rm /pallet-rust
+EOF
+
+ENV TARGET=aarch64-unknown-linux-musl
+ENV SYSROOT=/opt/aarch64-linux-musl
+ENV SOURCE_DATE_EPOCH=0
+ENV CARGO_INCREMENTAL=0
+ENV ZERO_AR_DATE=1
+# Every C compilation for the target: clang aimed at aarch64 musl, with the
+# sysroot's headers and libraries and nothing of the host's.
+ENV TARGET_CFLAGS="--target=aarch64-unknown-linux-musl --sysroot=/opt/aarch64-linux-musl -O2 -fPIC"
+
+# ── libc ───────────────────────────────────────────────────────────────────────
+# musl, the release and patches StageX's core/musl builds, for aarch64. Only
+# the static library and start files: the binary links nothing at run time.
+# StageX additionally swaps musl's allocator for mimalloc, which it builds
+# for x86-64 only; this one keeps musl's own.
+FROM toolchain AS musl
+
+COPY --from=make / /
+ADD --checksum=sha256:d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a \
+    https://musl.libc.org/releases/musl-1.2.6.tar.gz /build/
+ADD --checksum=sha256:1ee29f64f9ca8e8ad7c349779d661ff6b52126a27575d3586981357a52c406fb \
+    https://codeberg.org/stagex/stagex/raw/commit/d8402d7a61e43f1e53f79e20ac84b3094c2fcd7a/packages/core/musl/CVE-2026-40200.patch /build/patches/
+ADD --checksum=sha256:444fa70e52ca158fb7d4bad560637790bbf8f72e80b82fff840dd66fa83091e3 \
+    https://codeberg.org/stagex/stagex/raw/commit/d8402d7a61e43f1e53f79e20ac84b3094c2fcd7a/packages/core/musl/CVE-2026-6042.patch /build/patches/
+
+WORKDIR /build
+RUN --network=none <<-'EOF'
+	set -eux
+	# The pallet's login profile sets a native toolchain; this build names
+	# its own.
+	unset LDFLAGS LD CPP AS NM CFLAGS
+	export MAKEFLAGS=
+	tar -xzf musl-1.2.6.tar.gz
+	cd musl-1.2.6
+	for patch in $(ls /build/patches | sort); do
+		patch -p1 < /build/patches/$patch
+	done
+	CC="clang --target=aarch64-unknown-linux-musl" AR=llvm-ar RANLIB=llvm-ranlib \
+	CFLAGS="-Wformat -Werror=format-security -fstack-protector-strong -fstack-clash-protection" \
+	./configure \
+		--target=aarch64-linux-musl \
+		--prefix=/usr \
+		--syslibdir=/lib \
+		--disable-shared \
+		--enable-optimize
+	make -j4
+	make DESTDIR=$SYSROOT install
+EOF
+
+# ── runtime ────────────────────────────────────────────────────────────────────
+# The C runtime pieces rustc links a static musl executable with, built as
+# Rust's own bootstrap builds them for its musl targets:
+#   - crtbegin/crtend, from the compiler-rt source of LLVM 22.1.8 — the files
+#     the llvm-project release StageX's core/llvm builds from carries at this
+#     path, hash for hash;
+#   - LLVM's libunwind, from the rust-src this rustc ships (the unwinder the
+#     standard library links statically for a `crt-static` musl target).
+FROM toolchain AS runtime
+
+COPY --from=musl $SYSROOT $SYSROOT
+ADD --checksum=sha256:ad21b03ddb3f66530ef34394cc1819f5156d536c30efba7486a7834120fba93f \
+    https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/compiler-rt/lib/builtins/crtbegin.c /build/crt/
+ADD --checksum=sha256:6d5a61b8f2f6fa541a12ec52aea40b5085e40fcf8626984d318523cb30335d06 \
+    https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/compiler-rt/lib/builtins/crtend.c /build/crt/
+
+RUN --network=none <<-'EOF'
+	set -eux
+	out=/out
+	mkdir -p $out
+
+	cd /build/crt
+	for f in crtbegin crtend; do
+		clang $TARGET_CFLAGS -O3 -std=c11 -DCRT_HAS_INITFINI_ARRAY -DEH_USE_FRAME_REGISTRY \
+			-ffile-prefix-map=/build/crt=crt -c $f.c -o $out/$f.o
+	done
+	# Position-independent already, so the PIE variants are the same objects.
+	cp $out/crtbegin.o $out/crtbeginS.o
+	cp $out/crtend.o $out/crtendS.o
+
+	src=/usr/lib/rustlib/src/rust/src/llvm-project/libunwind
+	obj=/build/libunwind
+	mkdir -p $obj
+	flags="$TARGET_CFLAGS -I$src/include -fstrict-aliasing -funwind-tables -fvisibility=hidden -D_LIBUNWIND_DISABLE_VISIBILITY_ANNOTATIONS -D_LIBUNWIND_IS_NATIVE_ONLY -DNDEBUG -ffile-prefix-map=$src=libunwind"
+	for f in Unwind-sjlj.c UnwindLevel1-gcc-ext.c UnwindLevel1.c; do
+		clang $flags -std=c99 -c $src/src/$f -o $obj/$f.o
+	done
+	for f in UnwindRegistersRestore.S UnwindRegistersSave.S; do
+		clang $flags -c $src/src/$f -o $obj/$f.o
+	done
+	for f in Unwind-EHABI.cpp Unwind-seh.cpp libunwind.cpp; do
+		clang++ $flags -std=c++17 -nostdinc++ -fno-exceptions -fno-rtti -c $src/src/$f -o $obj/$f.o
+	done
+	llvm-ar rcsD $out/libunwind.a $(ls $obj/*.o | sort)
+EOF
+
+# ── std ────────────────────────────────────────────────────────────────────────
+# The standard library for aarch64-unknown-linux-musl, from the rust-src this
+# rustc ships, installed into rustc's sysroot beside the x86-64 one, so the
+# client builds on stable with a plain `--target`. The musl start files,
+# libc, crtbegin/crtend and libunwind go in that target's `self-contained`
+# directory, which is where rustc looks for them when it links a static musl
+# executable, as it does with a standard Rust distribution.
+FROM toolchain AS std
+
+COPY --from=musl $SYSROOT $SYSROOT
+COPY --from=runtime /out /runtime
+
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=clang
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C debuginfo=0 -C target-cpu=generic -C link-arg=--target=aarch64-unknown-linux-musl -C link-arg=--sysroot=/opt/aarch64-linux-musl -C link-arg=-fuse-ld=lld"
+# C dependencies (the `cc` crate) compile for the target with the same clang.
+ENV CC_aarch64_unknown_linux_musl=clang
+ENV CFLAGS_aarch64_unknown_linux_musl="--sysroot=/opt/aarch64-linux-musl"
+ENV CXX_aarch64_unknown_linux_musl=clang++
+ENV CXXFLAGS_aarch64_unknown_linux_musl="--sysroot=/opt/aarch64-linux-musl"
+ENV AR_aarch64_unknown_linux_musl=llvm-ar
+
+RUN --network=none <<-'EOF'
+	set -eux
+	sc=/usr/lib/rustlib/$TARGET/lib/self-contained
+	mkdir -p $sc
+	for f in crt1.o crti.o crtn.o rcrt1.o Scrt1.o libc.a; do
+		install -m 0644 $SYSROOT/usr/lib/$f $sc/$f
+	done
+	for f in crtbegin.o crtbeginS.o crtend.o crtendS.o libunwind.a; do
+		install -m 0644 /runtime/$f $sc/$f
+	done
+EOF
+
+# std's own dependencies, as its committed Cargo.lock pins them.
+WORKDIR /build/std
+RUN <<-'EOF'
+	set -eux
+	mkdir src
+	printf '%s\n' '[package]' 'name = "std-aarch64-musl"' 'version = "0.0.0"' 'edition = "2024"' \
+		'[profile.release]' 'opt-level = 3' 'codegen-units = 1' 'debug = false' 'strip = false' > Cargo.toml
+	echo 'fn main() {}' > src/main.rs
+	RUSTC_BOOTSTRAP=1 cargo fetch -Zbuild-std=std,panic_unwind --target $TARGET
+EOF
+
+# The one step that uses unstable cargo (`-Zbuild-std`); nothing after it does.
+# Every rlib carries bitcode as well as object code (`embed-bitcode`), as a
+# distributed standard library does, so the client's fat LTO reaches into
+# std. Linking the placeholder program is the first static link against the
+# sysroot above.
+RUN --network=none <<-'EOF'
+	set -eux
+	unset LDFLAGS
+	RUSTC_BOOTSTRAP=1 \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="$CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS -C embed-bitcode=yes -C force-unwind-tables=yes" \
+		cargo build --frozen --release --target $TARGET \
+		-Zbuild-std=std,panic_unwind -Zbuild-std-features=backtrace,panic-unwind
+	lib=/usr/lib/rustlib/$TARGET/lib
+	cp target/$TARGET/release/deps/*.rlib $lib/
+	rm $lib/libstd_aarch64_musl-*.rlib 2>/dev/null || true
+	ls $lib
+	rm -rf /build/std
+EOF
+
+# ── fetch ──────────────────────────────────────────────────────────────────────
+# Manifests and stub sources, so the dependency graph is fetched and compiled
+# in a layer that only dependency changes invalidate (as in
+# oci/eidola-cli/Containerfile).
+FROM std AS fetch
+
+ARG CARGO_PROFILE=release
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY --parents crates/*/Cargo.toml ./
+
+RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do \
+      dir="$(dirname "$manifest")/src"; mkdir -p "$dir"; \
+      touch "$dir/lib.rs"; \
+      if grep -q '^\[\[bin\]\]' "$manifest"; then echo 'fn main(){}' > "$dir/main.rs"; fi; \
+    done
+
+# Both targets' graphs: build scripts and proc macros run on the x86-64 host.
+RUN cargo fetch --locked --target ${TARGET} --target x86_64-unknown-linux-musl
+
+RUN --network=none \
+    unset LDFLAGS && \
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-cli
+
+# ── build ──────────────────────────────────────────────────────────────────────
+# Real sources over the stubs, with the trust-root and model-catalog inputs
+# `eidola-app-core/build.rs` compiles in (the same files the x86-64 image's
+# build copies, for the same reasons).
+FROM fetch AS build
+
+ARG CARGO_PROFILE=release
+
+COPY crates/ ./crates/
+COPY releases/ ./releases/
+COPY --parents models* ./
+
+RUN find crates/ -name '*.rs' -exec touch {} +
+
+RUN --network=none \
+    unset LDFLAGS && \
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-cli \
+    && install -D -m 0755 target/${TARGET}/${CARGO_PROFILE}/eidola /out/eidola
+
+# ── assemble ───────────────────────────────────────────────────────────────────
+# The image's root, checked as it is built: one AArch64 executable that asks
+# the system for nothing — no program interpreter, no shared library.
+FROM toolchain AS assemble
+
+COPY --from=build /out/eidola /rootfs/eidola
+
+RUN --network=none <<-'EOF'
+	set -eu
+	fail() { echo "error: $*" >&2; exit 1; }
+	bin=/rootfs/eidola
+	llvm-readelf -h $bin | grep -Eq '^[[:space:]]+Machine:[[:space:]]+AArch64$' \
+		|| fail "the client is not an AArch64 executable"
+	! llvm-readelf -l $bin | grep -q 'INTERP' || fail "the client names a program interpreter"
+	! llvm-readelf -d $bin | grep -q '(NEEDED)' || fail "the client needs a shared library"
+EOF
+
+# ── package ────────────────────────────────────────────────────────────────────
+FROM scratch AS package
+
+COPY --from=assemble /rootfs/ /
+USER 65534:65534
+ENTRYPOINT ["/eidola"]

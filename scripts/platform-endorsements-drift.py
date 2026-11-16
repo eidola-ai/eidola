@@ -8,6 +8,10 @@ release tags, one per line (any tag; only `platform-vX.Y.Z` ones count).
 Exits 1 on drift, 2 when either side lists no platform release at all (a
 check that found nothing to compare must not pass), 0 otherwise. Standard
 library only.
+
+"Behind" means what the gateway's build means by it: a deployment that names
+a release older than the newest one. The build refuses that against the
+newest vendored release; here it is drift against the newest published one.
 """
 
 import json

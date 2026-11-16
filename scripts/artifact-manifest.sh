@@ -10,6 +10,7 @@ Usage:
   scripts/artifact-manifest.sh build-macos [--output PATH] [--artifact-dir DIR]
   scripts/artifact-manifest.sh build-linux-gui [--output PATH] [--artifact-dir DIR]
   scripts/artifact-manifest.sh build-linux-deb [--output PATH] [--artifact-dir DIR]
+  scripts/artifact-manifest.sh extract-cli [--arch amd64|arm64] [--push] [--metadata-file PATH] [--builder NAME] [--ensure-builder] [--output PATH] [--artifact-dir DIR]
   scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations] [--server-enclave-output PATH]
   scripts/artifact-manifest.sh check-complete [--manifest PATH]
   scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--config PATH] [--server-enclave PATH] [--output PATH] [--server-enclave-output PATH] [--verify-attestations]
@@ -25,6 +26,8 @@ Options:
                                setup-buildx-action).
   --targets GROUP              For `build`: bake group to build (default: full manifest).
                                Recognized values: `all` (default), `server`, `cli`,
+                               `cli-arm64` (the image the arm64 static CLI is taken
+                               from; never pushed, so a dev target in either mode),
                                `server-engine` (the inference node's image, with the
                                `engine-kernels` image it is built from, which must be
                                the image its Containerfile pins), `engine-kernels`
@@ -43,10 +46,23 @@ Options:
                                releases/trust/server-enclave.json). Valid for `verify-full`.
   --server-enclave-output PATH Write the computed enclave block (with `schema_version: 2`
                                envelope) to PATH. Valid for `measure` and `verify-full`.
+  --arch ARCH                  For `extract-cli`: the static CLI to take, `amd64`
+                               (default; out of the `cli` image) or `arm64` (out of
+                               the `cli-arm64` image).
   --artifact-dir DIR           Copy the files a release publishes (the Nix installable's
-                               `.tar.gz`, each `.deb`) into DIR, named after the manifest
-                               key that records each one. Valid for `build-macos`,
-                               `build-linux-gui` and `build-linux-deb`.
+                               `.tar.gz`, each `.deb`, each static Linux CLI) into DIR,
+                               named after the manifest key that records each one. Valid
+                               for `build-macos`, `build-linux-gui`, `build-linux-deb` and
+                               `extract-cli`.
+
+`extract-cli` reads the image's digest (`cli` for amd64, `cli-arm64` for
+arm64) from the --metadata-file of the build that produced it, exports that
+image again from the builder's cache, refuses unless the export is the image
+the metadata names, takes the static binary out of its layer, and refuses
+unless that is a static ELF executable for the architecture asked for. Its
+partial records the binary from the schema that records it
+(CLI_ARTIFACT_SET_SCHEMA); below that the binary is still extracted, so the
+path is exercised, and the partial is empty.
   --verify-attestations        Verify the provenance of the CVM release manifest and SEV-SNP
                                IGVM image via Sigstore (requires gh CLI). Fails the command
                                if attestation verification fails.
@@ -98,6 +114,18 @@ ARTIFACT_SET_SCHEMA=3
 # installed client, exactly like a missing one.
 ENGINE_IMAGE_SCHEMA=4
 
+# The schema at which the command-line client's artifact set takes its
+# current shape (the same boundary `CLI_ARTIFACT_SET_SCHEMA` names on the
+# client side). Below it the standalone macOS CLI archive is recorded as
+# `eidola-cli-macos-universal`; from it that row is gone — every GUI payload
+# carries the CLI built beside it — and the static binary the `cli` image
+# carries is recorded as a file of its own, `eidola-cli-linux-static-amd64`,
+# extracted from that image (`extract-cli`), beside its arm64 counterpart
+# `eidola-cli-linux-static-arm64`, extracted from the `cli-arm64` image that
+# exists only to carry it. The `eidola-cli` image row is recorded by every
+# schema, and stays one linux/amd64 image.
+CLI_ARTIFACT_SET_SCHEMA=5
+
 # The node's Containerfile pins the GPU kernel image it copies the kernels
 # from; this is that line. The bake targets build the input from this tree
 # instead (`engine-kernels`), so a build of the node also checks that build
@@ -119,13 +147,17 @@ KERNELS_PIN_PATTERN='^FROM ghcr\.io/eidola-ai/eidola-engine-kernels@sha256:[0-9a
 required_artifact_keys() {
   local keys=(
     eidola-cli
-    eidola-cli-macos-universal
     eidola-gui-macos-universal
     eidola-postgres
     eidola-server
   )
   if records_engine_image; then
     keys+=(eidola-server-engine)
+  fi
+  if records_static_cli; then
+    keys+=("$(static_cli_key amd64)" "$(static_cli_key arm64)")
+  else
+    keys+=(eidola-cli-macos-universal)
   fi
   if records_current_linux_shape; then
     keys+=(
@@ -210,6 +242,8 @@ ARTIFACT_DIR=""
 TARGETS="all"
 PARTIAL_FILES=()
 BUILDX_SET_ARGS=()
+STATIC_CLI_ARCH="amd64"
+
 # Parallel arrays for `print`/`verify` multi-metadata mode. Each --metadata-file
 # occurrence appends to PRINT_METADATA_FILES, each --targets to PRINT_TARGETS_LIST;
 # the two are paired positionally. If TARGETS_LIST is shorter (i.e. fewer
@@ -231,6 +265,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --artifact-dir)
       ARTIFACT_DIR="$2"
+      shift 2
+      ;;
+    --arch)
+      STATIC_CLI_ARCH="$2"
       shift 2
       ;;
     --manifest)
@@ -525,10 +563,15 @@ build_metadata() {
       all)    bake_targets=(ci-server ci-cli ci-postgres ci-engine-kernels ci-server-engine) ;;
       server) bake_targets=(ci-server ci-postgres) ;;
       cli)    bake_targets=(ci-cli) ;;
+      # Never pushed: the dev target, built as the non-push mode builds it.
+      cli-arm64)
+        bake_targets=(cli-arm64)
+        buildx_set_args+=(--set "cli-arm64.output=type=image,push=false,${REPRODUCIBLE_IMAGE_OPTS}")
+        ;;
       server-engine) bake_targets=(ci-engine-kernels ci-server-engine) ;;
       engine-kernels) bake_targets=(ci-engine-kernels) ;;
       *)
-        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, server-engine, engine-kernels)" >&2
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, cli-arm64, server-engine, engine-kernels)" >&2
         exit 1
         ;;
     esac
@@ -537,10 +580,11 @@ build_metadata() {
       all)    bake_targets=(server cli postgres engine-kernels server-engine) ;;
       server) bake_targets=(server postgres) ;;
       cli)    bake_targets=(cli) ;;
+      cli-arm64) bake_targets=(cli-arm64) ;;
       server-engine) bake_targets=(engine-kernels server-engine) ;;
       engine-kernels) bake_targets=(engine-kernels) ;;
       *)
-        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, server-engine, engine-kernels)" >&2
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, cli-arm64, server-engine, engine-kernels)" >&2
         exit 1
         ;;
     esac
@@ -659,6 +703,220 @@ print_oci_manifest() {
   }'
 }
 
+# The output options every recorded image is built with (docker-bake.hcl's
+# `_ci` target, and the `--set` non-push builds add). An export with these
+# options is the same image as the build's, digest for digest.
+REPRODUCIBLE_IMAGE_OPTS="rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true"
+
+# Take the static Linux CLI for STATIC_CLI_ARCH out of the image the
+# preceding build produced, and prove it came from there.
+#
+# amd64 is the `cli` image, whose digest the manifest's `eidola-cli` row
+# records; arm64 is the `cli-arm64` image, cross-compiled by the same StageX
+# toolchain and never published, which exists only to carry its binary. The
+# digest in --metadata-file is that build's. The same target is exported
+# again, from the builder's cache, as an OCI layout with the same output
+# options, and nothing is taken from that export unless its manifest *is*
+# that digest: every blob on the path from the manifest to the binary is
+# hashed against the name it is addressed by, so the bytes written are the
+# file the built image carries, not a second build that happened to agree.
+# The image is `FROM scratch` with the binary as `/eidola`, and exactly one
+# regular file by that name may appear across its layers. That file must be
+# a 64-bit little-endian ELF executable for the architecture asked for, with
+# no program interpreter and no shared library it needs: a binary that ran
+# only on the builder, or only beside a libc, is not the one the row names.
+#
+# Sets STATIC_CLI_SHA256 and, with --artifact-dir, writes the binary there
+# under its manifest key. Extraction does not depend on the emitted schema;
+# only the row does (`print_static_cli_manifest`).
+extract_static_cli() {
+  local -a builder_args buildx_set_args
+  local digest work buildx_set_arg extracted target key
+  builder_args=()
+  buildx_set_args=()
+
+  target="$(static_cli_target "$STATIC_CLI_ARCH")"
+  key="$(static_cli_key "$STATIC_CLI_ARCH")"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "error: extracting the static CLI requires python3" >&2
+    exit 1
+  fi
+  if [[ "$ENSURE_BUILDER" -eq 1 ]]; then
+    ensure_builder
+    builder_args=(--builder "$BUILDER_NAME")
+  fi
+  for buildx_set_arg in ${BUILDX_SET_ARGS[@]+"${BUILDX_SET_ARGS[@]}"}; do
+    buildx_set_args+=(--set "$buildx_set_arg")
+  done
+
+  # The `cli` image is pushed as `ci-cli` in push mode; `cli-arm64` is never
+  # pushed and keeps its own name in either mode.
+  if [[ "$target" == "cli" ]]; then
+    digest="$(metadata_digest "$METADATA_FILE" "$(target_key cli)")"
+  else
+    digest="$(metadata_digest "$METADATA_FILE" "$target")"
+  fi
+  work="$(mktemp -d "${TMPDIR:-/tmp}/eidola-cli-extract.XXXXXX")"
+
+  # The dev target in either mode: for `cli` it is the `ci-cli` target's
+  # build with a different destination, and the digest check below is what
+  # makes that a fact rather than an assumption. Bake refuses to write
+  # outside its working directory unless the destination is granted, and the
+  # grant is exactly that one fresh directory.
+  if ! docker buildx bake "$target" \
+    --allow "fs.write=${work}" \
+    ${builder_args[@]+"${builder_args[@]}"} \
+    ${buildx_set_args[@]+"${buildx_set_args[@]}"} \
+    --set "${target}.output=type=oci,dest=${work}/image.tar,${REPRODUCIBLE_IMAGE_OPTS}"; then
+    rm -rf "$work"
+    echo "error: exporting the ${target} image failed" >&2
+    exit 1
+  fi
+
+  # The extractor announces that it finished, so a crash that printed
+  # nothing cannot be mistaken for success.
+  # shellcheck disable=SC2016 # the extractor is Python source, not shell
+  if ! extracted="$(python3 -I -c '
+import gzip
+import hashlib
+import io
+import json
+import struct
+import sys
+import tarfile
+
+layout_path, want, out_path, arch = sys.argv[1:5]
+
+MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
+LAYER_TYPE = "application/vnd.oci.image.layer.v1.tar+gzip"
+BINARY = "eidola"
+# ELF e_machine for each architecture a static CLI is built for.
+MACHINES = {"amd64": 62, "arm64": 183}
+PT_DYNAMIC, PT_INTERP, DT_NULL, DT_NEEDED = 2, 3, 0, 1
+
+
+def die(message):
+    print("error: {}".format(message), file=sys.stderr)
+    sys.exit(1)
+
+
+with tarfile.open(layout_path, "r:") as layout:
+    def blob(digest):
+        if not digest.startswith("sha256:"):
+            die("unsupported digest {!r}".format(digest))
+        member = layout.extractfile("blobs/sha256/" + digest[len("sha256:"):])
+        if member is None:
+            die("the export has no blob {}".format(digest))
+        data = member.read()
+        got = "sha256:" + hashlib.sha256(data).hexdigest()
+        if got != digest:
+            die("blob {} hashes to {}".format(digest, got))
+        return data
+
+    index = json.loads(layout.extractfile("index.json").read())
+    manifests = index.get("manifests", [])
+    if len(manifests) != 1:
+        die("the export holds {} manifests; the cli image is one".format(len(manifests)))
+    descriptor = manifests[0]
+    if descriptor.get("mediaType") != MANIFEST_TYPE:
+        die("the export is a {}, not an image manifest".format(descriptor.get("mediaType")))
+    if descriptor.get("digest") != want:
+        die(
+            "the exported image is {}, but the build recorded {} — the binary "
+            "would not be the one the manifest row covers".format(
+                descriptor.get("digest"), want
+            )
+        )
+    manifest = json.loads(blob(want))
+
+    found = []
+    for layer in manifest.get("layers", []):
+        if layer.get("mediaType") != LAYER_TYPE:
+            die("unsupported layer type {!r}".format(layer.get("mediaType")))
+        with tarfile.open(fileobj=io.BytesIO(gzip.decompress(blob(layer["digest"]))), mode="r:") as fs:
+            for entry in fs:
+                name = entry.name
+                while name.startswith("./"):
+                    name = name[2:]
+                name = name.lstrip("/")
+                if name == BINARY or name == ".wh." + BINARY:
+                    if not entry.isreg():
+                        die("/{} in layer {} is not a regular file".format(BINARY, layer["digest"]))
+                    found.append(fs.extractfile(entry).read())
+
+if len(found) != 1:
+    die("the image carries /{} {} times; expected exactly once".format(BINARY, len(found)))
+elf = found[0]
+
+
+def check_static(elf):
+    if elf[:4] != b"\x7fELF":
+        die("/{} is not an ELF file".format(BINARY))
+    if elf[4] != 2 or elf[5] != 1:
+        die("/{} is not a 64-bit little-endian ELF".format(BINARY))
+    e_type, e_machine = struct.unpack_from("<HH", elf, 16)
+    if e_machine != MACHINES[arch]:
+        die("/{} is for ELF machine {}, not {} ({})".format(BINARY, e_machine, arch, MACHINES[arch]))
+    if e_type not in (2, 3):
+        die("/{} is not an executable (ELF type {})".format(BINARY, e_type))
+    e_phoff, = struct.unpack_from("<Q", elf, 32)
+    e_phentsize, e_phnum = struct.unpack_from("<HH", elf, 54)
+    for i in range(e_phnum):
+        p_type, _, p_offset, _, _, p_filesz = struct.unpack_from("<IIQQQQ", elf, e_phoff + i * e_phentsize)
+        if p_type == PT_INTERP:
+            die("/{} names a program interpreter; it is not static".format(BINARY))
+        if p_type == PT_DYNAMIC:
+            for at in range(p_offset, p_offset + p_filesz, 16):
+                d_tag, _ = struct.unpack_from("<qQ", elf, at)
+                if d_tag == DT_NULL:
+                    break
+                if d_tag == DT_NEEDED:
+                    die("/{} needs a shared library; it is not static".format(BINARY))
+
+
+if arch not in MACHINES:
+    die("no static CLI is built for {!r}".format(arch))
+check_static(elf)
+with open(out_path, "wb") as handle:
+    handle.write(elf)
+print("@extracted")
+' "${work}/image.tar" "$digest" "${work}/${key}" "$STATIC_CLI_ARCH")" || [[ "$extracted" != *"@extracted"* ]]; then
+    rm -rf "$work"
+    echo "error: the ${STATIC_CLI_ARCH} static CLI could not be taken from the ${target} image ${digest}" >&2
+    exit 1
+  fi
+
+  chmod 0755 "${work}/${key}"
+  STATIC_CLI_SHA256="$(file_sha256_hex "${work}/${key}")"
+  copy_named_artifact "${work}/${key}" "$key"
+  rm -rf "$work"
+  echo "${STATIC_CLI_ARCH} static CLI taken from ${digest}: sha256:${STATIC_CLI_SHA256}" >&2
+}
+
+# The static CLI's partial for STATIC_CLI_ARCH: its `file` row from
+# CLI_ARTIFACT_SET_SCHEMA, an empty artifacts object below it.
+print_static_cli_manifest() {
+  local rows='{}'
+  if [[ -z "${STATIC_CLI_SHA256:-}" ]]; then
+    echo "error: print_static_cli_manifest called before extract_static_cli" >&2
+    return 1
+  fi
+  if records_static_cli; then
+    rows="$(
+      jq -n \
+        --arg key "$(static_cli_key "$STATIC_CLI_ARCH")" \
+        --arg platform "linux/${STATIC_CLI_ARCH}" \
+        --arg sha "sha256:${STATIC_CLI_SHA256}" \
+        '{ ($key): { type: "file", platform: $platform, sha256: $sha } }'
+    )"
+  fi
+  jq -n \
+    --argjson schema "$MANIFEST_SCHEMA_VERSION" \
+    --argjson rows "$rows" \
+    '{ schema_version: $schema, artifacts: $rows }'
+}
+
 # Map `uname -m` to the GOARCH-style arch names used in manifest platform
 # strings ("linux/amd64" etc., matching the OCI entries).
 manifest_arch() {
@@ -680,6 +938,39 @@ records_current_linux_shape() {
 # Does the emitted schema record the inference node's image?
 records_engine_image() {
   ((MANIFEST_SCHEMA_VERSION >= ENGINE_IMAGE_SCHEMA))
+}
+
+# Does the emitted schema record the static Linux CLI as a file of its own —
+# and, the other side of the same boundary, no standalone macOS CLI?
+records_static_cli() {
+  ((MANIFEST_SCHEMA_VERSION >= CLI_ARTIFACT_SET_SCHEMA))
+}
+
+# The manifest key, and so the published asset name, of the static Linux
+# CLI for an architecture.
+static_cli_key() {
+  case "$1" in
+    amd64 | arm64) echo "eidola-cli-linux-static-$1" ;;
+    *)
+      echo "error: no static CLI is built for architecture '$1' (expected amd64 or arm64)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# The bake target whose image carries that architecture's static CLI: the
+# `cli` image for amd64, and for arm64 the `cli-arm64` image, cross-compiled
+# on the same x86-64 toolchain so that `cli` stays the one linux/amd64 image
+# the `eidola-cli` row records.
+static_cli_target() {
+  case "$1" in
+    amd64) echo "cli" ;;
+    arm64) echo "cli-arm64" ;;
+    *)
+      echo "error: no static CLI is built for architecture '$1' (expected amd64 or arm64)" >&2
+      exit 1
+      ;;
+  esac
 }
 
 # Does the emitted schema record this OCI bake target's image? Every target
@@ -1034,26 +1325,32 @@ carry_over_partial() {
   }' "$MANIFEST_FILE" --args "$@"
 }
 
+# The standalone macOS CLI is built only while the emitted schema records
+# it: the GUI `.app` carries the CLI from its own build either way, so from
+# CLI_ARTIFACT_SET_SCHEMA there is nothing for a separate build to measure.
 build_macos_artifacts() {
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "error: macOS artifact builds require a Darwin host" >&2
     exit 1
   fi
 
-  CLI_PATH="$(
-    nix build \
-      '.#eidola-cli-macos-universal' \
-      --no-link \
-      --print-out-paths \
-      --show-trace
-  )"
-  CLI_ARCHIVE_PATH="$(
-    nix build \
-      '.#eidola-cli-macos-universal-archive' \
-      --no-link \
-      --print-out-paths \
-      --show-trace
-  )"
+  if ! records_static_cli; then
+    CLI_PATH="$(
+      nix build \
+        '.#eidola-cli-macos-universal' \
+        --no-link \
+        --print-out-paths \
+        --show-trace
+    )"
+    CLI_ARCHIVE_PATH="$(
+      nix build \
+        '.#eidola-cli-macos-universal-archive' \
+        --no-link \
+        --print-out-paths \
+        --show-trace
+    )"
+    copy_named_artifact "$CLI_ARCHIVE_PATH" "eidola-cli-macos-universal.tar.gz"
+  fi
 
   GUI_PATH="$(
     nix build \
@@ -1070,7 +1367,6 @@ build_macos_artifacts() {
       --show-trace
   )"
 
-  copy_named_artifact "$CLI_ARCHIVE_PATH" "eidola-cli-macos-universal.tar.gz"
   copy_named_artifact "$GUI_ARCHIVE_PATH" "eidola-gui-macos-universal.tar.gz"
 }
 
@@ -1110,40 +1406,51 @@ file_sha256() {
 }
 
 print_macos_manifest() {
-  local cli_hash gui_hash cli_archive gui_archive
+  local gui_hash gui_archive cli_row='{}'
 
-  if [[ -z "${CLI_PATH:-}" || -z "${GUI_PATH:-}" || -z "${CLI_ARCHIVE_PATH:-}" || -z "${GUI_ARCHIVE_PATH:-}" ]]; then
+  if [[ -z "${GUI_PATH:-}" || -z "${GUI_ARCHIVE_PATH:-}" ]]; then
     echo "error: print_macos_manifest called before build_macos_artifacts" >&2
     return 1
   fi
 
-  cli_hash="$(nix_nar_hash "$CLI_PATH")"
+  if ! records_static_cli; then
+    if [[ -z "${CLI_PATH:-}" || -z "${CLI_ARCHIVE_PATH:-}" ]]; then
+      echo "error: print_macos_manifest called before build_macos_artifacts" >&2
+      return 1
+    fi
+    cli_row="$(
+      jq -n \
+        --arg cli_hash "$(nix_nar_hash "$CLI_PATH")" \
+        --arg cli_archive "$(file_sha256 "$CLI_ARCHIVE_PATH")" \
+        '{
+          "eidola-cli-macos-universal": {
+            type: "nix",
+            platform: "darwin/universal",
+            narHash: $cli_hash,
+            archiveSha256: $cli_archive
+          }
+        }'
+    )"
+  fi
+
   gui_hash="$(nix_nar_hash "$GUI_PATH")"
-  cli_archive="$(file_sha256 "$CLI_ARCHIVE_PATH")"
   gui_archive="$(file_sha256 "$GUI_ARCHIVE_PATH")"
 
   jq -n \
     --argjson schema "$MANIFEST_SCHEMA_VERSION" \
-    --arg cli_hash "$cli_hash" \
     --arg gui_hash "$gui_hash" \
-    --arg cli_archive "$cli_archive" \
     --arg gui_archive "$gui_archive" \
+    --argjson cli_row "$cli_row" \
     '{
       schema_version: $schema,
-      artifacts: {
-        "eidola-cli-macos-universal": {
-          type: "nix",
-          platform: "darwin/universal",
-          narHash: $cli_hash,
-          archiveSha256: $cli_archive
-        },
+      artifacts: ({
         "eidola-gui-macos-universal": {
           type: "nix",
           platform: "darwin/universal",
           narHash: $gui_hash,
           archiveSha256: $gui_archive
         }
-      }
+      } + $cli_row)
     }'
 }
 
@@ -1320,9 +1627,10 @@ verify_oci_manifest() {
 #            measurement, so they can be built first.
 #   Phase 2: stamp the new gateway digest into `tinfoil-config.yml`, recompute
 #            the enclave block, and write `releases/trust/server-enclave.json`.
-#   Phase 3: build the cli OCI image plus the current host's native desktop
-#            artifacts — the macOS universal CLI + GUI .app on Darwin, the
-#            Linux GUI on Linux. All of these consume the freshly-written
+#   Phase 3: build the cli OCI image, take the static Linux CLI out of it,
+#            and build the current host's native desktop artifacts — the
+#            macOS GUI .app (and, below CLI_ARTIFACT_SET_SCHEMA, the macOS
+#            universal CLI) on Darwin, the Linux GUI on Linux. All of these consume the freshly-written
 #            `server-enclave.json` via `eidola-app-core/build.rs`, so they
 #            have to come after phase 2. The *other* platform's desktop
 #            entries are carried over from the committed manifest (no single
@@ -1337,9 +1645,9 @@ verify_oci_manifest() {
 # recorded in the very file the cli build was COPYing into its build context),
 # so `just update-manifest` converges in a single run.
 update_manifest() {
-  local server_oci_partial cli_oci_partial macos_partial linux_gui_partial actual_manifest
-  local server_oci_partial_file cli_oci_partial_file macos_partial_file linux_gui_partial_file
-  local server_metadata cli_metadata engine_metadata original_metadata original_targets host_os
+  local server_oci_partial cli_oci_partial static_cli_partial static_cli_arm64_partial macos_partial linux_gui_partial actual_manifest
+  local server_oci_partial_file cli_oci_partial_file static_cli_partial_file static_cli_arm64_partial_file macos_partial_file linux_gui_partial_file
+  local server_metadata cli_metadata cli_arm64_metadata engine_metadata original_metadata original_targets original_arch host_os
 
   if [[ -z "$OUTPUT_FILE" ]]; then
     OUTPUT_FILE="$REPO_ROOT/artifact-manifest.json"
@@ -1347,8 +1655,10 @@ update_manifest() {
 
   original_metadata="$METADATA_FILE"
   original_targets="$TARGETS"
+  original_arch="$STATIC_CLI_ARCH"
   server_metadata="${TMPDIR:-/tmp}/bake-metadata-server.json"
   cli_metadata="${TMPDIR:-/tmp}/bake-metadata-cli.json"
+  cli_arm64_metadata="${TMPDIR:-/tmp}/bake-metadata-cli-arm64.json"
 
   # ── Phase 1: build server + postgres ────────────────────────────────────
   METADATA_FILE="$server_metadata"
@@ -1373,6 +1683,19 @@ update_manifest() {
   METADATA_FILE="$cli_metadata"
   TARGETS="cli"
   build_metadata
+  STATIC_CLI_ARCH="amd64"
+  extract_static_cli
+  static_cli_partial="$(print_static_cli_manifest)"
+  # The arm64 static CLI, from the same server-enclave.json. Every build
+  # stage of its image runs on linux/amd64, so any host that builds the
+  # `cli` image builds this one too, and neither static CLI is ever carried
+  # over from the committed manifest.
+  METADATA_FILE="$cli_arm64_metadata"
+  TARGETS="cli-arm64"
+  build_metadata
+  STATIC_CLI_ARCH="arm64"
+  extract_static_cli
+  static_cli_arm64_partial="$(print_static_cli_manifest)"
 
   host_os="$(uname -s)"
   if [[ "$host_os" == "Darwin" ]]; then
@@ -1394,10 +1717,11 @@ update_manifest() {
     if [[ "$(manifest_arch)" == "amd64" ]]; then
       other_arch="arm64"
     fi
-    macos_partial="$(
-      carry_over_partial "eidola-cli-macos-" "eidola-gui-macos-" \
-        "$(linux_deb_key "$other_arch")"
-    )"
+    local -a carried=("eidola-gui-macos-" "$(linux_deb_key "$other_arch")")
+    if ! records_static_cli; then
+      carried+=("eidola-cli-macos-")
+    fi
+    macos_partial="$(carry_over_partial "${carried[@]}")"
     echo "note: darwin narHash/archiveSha256 and the ${other_arch} .deb carried over from committed manifest (not buildable on this host); CI verifies them" >&2
   fi
 
@@ -1420,13 +1744,15 @@ update_manifest() {
 
   server_oci_partial_file="$(write_temp_file "$server_oci_partial")"
   cli_oci_partial_file="$(write_temp_file "$cli_oci_partial")"
+  static_cli_partial_file="$(write_temp_file "$static_cli_partial")"
+  static_cli_arm64_partial_file="$(write_temp_file "$static_cli_arm64_partial")"
   engine_oci_partial_file="$(write_temp_file "$engine_oci_partial")"
   macos_partial_file="$(write_temp_file "$macos_partial")"
   linux_gui_partial_file="$(write_temp_file "$linux_gui_partial")"
-  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$engine_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file")
+  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$static_cli_partial_file" "$static_cli_arm64_partial_file" "$engine_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file")
 
   actual_manifest="$(merge_partials)"
-  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$engine_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
+  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$static_cli_partial_file" "$static_cli_arm64_partial_file" "$engine_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
 
   # Nothing is written until the composition is whole. A short manifest is
   # not a smaller version of a good one — every installed client reads the
@@ -1441,6 +1767,7 @@ update_manifest() {
   # Restore globals so subsequent commands behave predictably.
   METADATA_FILE="$original_metadata"
   TARGETS="$original_targets"
+  STATIC_CLI_ARCH="$original_arch"
 }
 
 case "$COMMAND" in
@@ -1464,6 +1791,10 @@ case "$COMMAND" in
   build-linux-deb)
     build_linux_deb_artifact
     write_output "$(print_linux_deb_manifest)"
+    ;;
+  extract-cli)
+    extract_static_cli
+    write_output "$(print_static_cli_manifest)"
     ;;
   measure)
     enclave_json="$(compute_measurements)"

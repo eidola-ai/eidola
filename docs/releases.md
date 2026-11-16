@@ -45,17 +45,17 @@ These claims are recorded verbatim in the attestation document, hashed into the 
 
 ## How the client verifies a release
 
-When the user runs `eidola update`, the client:
+Before the client tells anyone that an update exists, and again before it installs one, it:
 
-1. **Downloads** the release index, manifest, and attestation bundles from the published source.
-2. **Verifies CI's manifest signature** against the pinned Fulcio identity pattern and the embedded Sigstore trusted root.
+1. **Downloads** the release index of the release marked latest, then the manifest and the attestation bundles it names. None of these locations is trusted, and the marker is only a pointer: whoever can edit the release listing can change which release is checked, and nothing more.
+2. **Verifies CI's manifest signature** against the pinned Fulcio identity pattern and the embedded Sigstore trusted root, and requires that signature to be bound to this release's own tag.
 3. **Verifies each human attestation**: cosign signature against the pinned attestant fingerprint, Sigstore bundle integrity, Rekor inclusion proof.
 4. **Counts independent attestations** and fails if fewer than `MIN_HUMAN_ATTESTATIONS` (pinned in the *current* client) have verified.
 5. **Re-renders each claim** from the pinned template and checks character equality with the attestation's recorded claim text.
 6. **Checks continuity**: the new release's `previous_release.git_commit` must equal the currently-installed `git_commit`.
 7. **Surfaces the verified prose** to the user before approving the install.
 
-If any step fails, the update is rejected. There is no override prompt.
+If any step fails, the update is rejected. There is no override prompt. A release that CI signed and that no trusted attestant has attested is never announced as an update. The client reports it as unverifiable, because a release pipeline that has been compromised can produce exactly that.
 
 ## Why each piece is necessary
 

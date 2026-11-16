@@ -21,7 +21,7 @@ jobs:
     name: Advisory audit
     runs-on: ubuntu-24.04
     # Generous for a COLD-cache run: cargo-deny's dep tree builds at
-    # opt-level 2 (root Cargo.toml dev profile). Warm runs are minutes.
+    # opt-level 2 (crates/devtools dev profile). Warm runs are minutes.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -41,11 +41,17 @@ jobs:
         # daily run keeps it warm. Schedule and dispatch both run on the
         # default branch, so saving here never thrashes per-PR.
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: crates/devtools -> target
 
       - name: Audit advisories
-        # cargo-deny is pinned by the crates/devtools anchor and built from
-        # the lockfile — the same binary the rust-checks gate and local `just
-        # check` use.
+        # cargo-deny is pinned by the crates/devtools workspace and built
+        # from its lockfile — the same binary the rust-checks gate and local
+        # `just check` use. Both lockfiles are audited: the product's and
+        # the tools' own; either failing fails the run.
         run: |
-          cargo build --quiet -p cargo-deny
-          ./target/debug/cargo-deny check advisories
+          cargo build --quiet --manifest-path crates/devtools/Cargo.toml -p cargo-deny
+          status=0
+          ./crates/devtools/target/debug/cargo-deny check advisories || status=1
+          ./crates/devtools/target/debug/cargo-deny --manifest-path crates/devtools/Cargo.toml check advisories || status=1
+          exit "$status"

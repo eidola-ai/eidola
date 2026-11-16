@@ -9,7 +9,10 @@
 //! position math survives delimiters being literally removed from the
 //! shaped string.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
@@ -50,6 +53,8 @@ pub struct BlockElement {
     /// after this one. `None` at doc end.
     next_containers: Option<Vec<Container>>,
     editor: Entity<MarkdownEditorState>,
+    /// The whole document, shared by every block of the frame.
+    source: Arc<str>,
     style: MarkdownStyle,
 }
 
@@ -63,6 +68,7 @@ impl BlockElement {
         prev_containers: Option<Vec<Container>>,
         next_containers: Option<Vec<Container>>,
         editor: Entity<MarkdownEditorState>,
+        source: Arc<str>,
         style: MarkdownStyle,
     ) -> Self {
         Self {
@@ -73,6 +79,7 @@ impl BlockElement {
             prev_containers,
             next_containers,
             editor,
+            source,
             style,
         }
     }
@@ -100,7 +107,7 @@ impl IntoElement for BlockElement {
 /// (source offsets, the caret) and [`emphasis_dot_bounds`] (display
 /// indices, the dots) both come through here.
 fn downstream_row_position(
-    line: &WrappedLine,
+    line: &(impl LinePositions + ?Sized),
     display_index: usize,
     upper: Point<Pixels>,
     row_stride: Pixels,
@@ -109,7 +116,7 @@ fn downstream_row_position(
         return upper;
     }
     let k = (upper.y / row_stride).round() as i64; // upper-affinity row index
-    let last_row = line.wrap_boundaries().len() as i64; // rows are 0..=last_row
+    let last_row = line.wrap_count() as i64; // rows are 0..=last_row
     if k < 0 || k >= last_row {
         return upper; // already on the last row
     }
@@ -129,6 +136,212 @@ fn downstream_row_position(
         point(px(0.0), row_stride * ((k + 1) as f32))
     } else {
         upper
+    }
+}
+
+/// The position queries the decoration and caret geometry asks of a
+/// shaped line, answered either by gpui directly or by a [`LineGlyphs`]
+/// index built over the same layout. Both answer identically; the index
+/// answers in logarithmic time where gpui walks the line's glyphs.
+trait LinePositions {
+    fn position_for_index(&self, index: usize, row_stride: Pixels) -> Option<Point<Pixels>>;
+    fn closest_index_for_position(
+        &self,
+        position: Point<Pixels>,
+        row_stride: Pixels,
+    ) -> Result<usize, usize>;
+    /// The number of soft wraps; the line has one more row than this.
+    fn wrap_count(&self) -> usize;
+    fn width(&self) -> Pixels;
+}
+
+impl LinePositions for WrappedLine {
+    fn position_for_index(&self, index: usize, row_stride: Pixels) -> Option<Point<Pixels>> {
+        gpui::WrappedLineLayout::position_for_index(self, index, row_stride)
+    }
+    fn closest_index_for_position(
+        &self,
+        position: Point<Pixels>,
+        row_stride: Pixels,
+    ) -> Result<usize, usize> {
+        gpui::WrappedLineLayout::closest_index_for_position(self, position, row_stride)
+    }
+    fn wrap_count(&self) -> usize {
+        self.wrap_boundaries().len()
+    }
+    fn width(&self) -> Pixels {
+        gpui::WrappedLineLayout::width(self)
+    }
+}
+
+/// One shaped line's glyphs, flattened and searchable.
+///
+/// gpui's `position_for_index` and `closest_index_for_position` walk every
+/// glyph before the one they answer for, so a line asked about once per
+/// inline-code chip or emphasized character costs chips × glyphs. This
+/// reproduces both answers from one pass over the glyphs: "the first glyph
+/// in shaping order whose index (or x) reaches the target" is a binary
+/// search over the running maximum of that field, which is the same glyph
+/// whatever order the shaper emitted them in.
+struct LineGlyphs<'a> {
+    line: &'a WrappedLine,
+    /// Each glyph's text index and x, in shaping order.
+    index: Vec<usize>,
+    x: Vec<Pixels>,
+    /// Running maxima of `index` and `x`.
+    max_index: Vec<usize>,
+    max_x: Vec<Pixels>,
+    /// The text index and x of the glyph each soft wrap breaks before.
+    wraps: SmallVec<[(usize, Pixels); 4]>,
+    /// Whether the row ends ascend, so a row can be found by search.
+    wraps_sorted: bool,
+}
+
+impl<'a> LineGlyphs<'a> {
+    fn new(line: &'a WrappedLine) -> Self {
+        let count = line.runs().iter().map(|r| r.glyphs.len()).sum();
+        let mut index = Vec::with_capacity(count);
+        let mut x = Vec::with_capacity(count);
+        let mut max_index = Vec::with_capacity(count);
+        let mut max_x = Vec::with_capacity(count);
+        for glyph in line.runs().iter().flat_map(|r| r.glyphs.iter()) {
+            index.push(glyph.index);
+            x.push(glyph.position.x);
+            max_index.push(
+                max_index
+                    .last()
+                    .map_or(glyph.index, |&m: &usize| m.max(glyph.index)),
+            );
+            max_x.push(
+                max_x
+                    .last()
+                    .map_or(glyph.position.x, |&m: &Pixels| m.max(glyph.position.x)),
+            );
+        }
+        let runs = line.runs();
+        let wraps: SmallVec<[(usize, Pixels); 4]> = line
+            .wrap_boundaries()
+            .iter()
+            .map(|b| {
+                let glyph = &runs[b.run_ix].glyphs[b.glyph_ix];
+                (glyph.index, glyph.position.x)
+            })
+            .collect();
+        let wraps_sorted = wraps.windows(2).all(|w| w[0].0 <= w[1].0);
+        Self {
+            line,
+            index,
+            x,
+            max_index,
+            max_x,
+            wraps,
+            wraps_sorted,
+        }
+    }
+
+    fn unwrapped_width(&self) -> Pixels {
+        self.line.unwrapped_layout.width
+    }
+
+    /// gpui's `LineLayout::x_for_index`.
+    fn x_for_index(&self, target: usize) -> Pixels {
+        let p = self.max_index.partition_point(|&m| m < target);
+        self.x
+            .get(p)
+            .copied()
+            .unwrap_or_else(|| self.unwrapped_width())
+    }
+
+    /// gpui's `LineLayout::closest_index_for_x`.
+    fn closest_index_for_x(&self, target: Pixels) -> usize {
+        let p = self.max_x.partition_point(|&m| m < target);
+        if let Some(&glyph_x) = self.x.get(p) {
+            let (prev_index, prev_x) = match p.checked_sub(1) {
+                Some(q) => (self.index[q], self.x[q]),
+                None => (0, px(0.)),
+            };
+            return if glyph_x - target < target - prev_x {
+                self.index[p]
+            } else {
+                prev_index
+            };
+        }
+        let len = self.line.unwrapped_layout.len;
+        if len == 1 {
+            return if target > self.unwrapped_width() / 2. {
+                1
+            } else {
+                0
+            };
+        }
+        len
+    }
+}
+
+impl LinePositions for LineGlyphs<'_> {
+    /// gpui's `WrappedLineLayout::position_for_index`.
+    fn position_for_index(&self, index: usize, row_stride: Pixels) -> Option<Point<Pixels>> {
+        let len = self.line.len();
+        let end_of = |row: usize| self.wraps.get(row).map_or(len, |w| w.0);
+        let row = if self.wraps_sorted && len >= self.wraps.last().map_or(0, |w| w.0) {
+            let row = self.wraps.partition_point(|w| w.0 < index);
+            (index <= end_of(row)).then_some(row)?
+        } else {
+            let mut start = 0;
+            let mut found = None;
+            for row in 0..=self.wraps.len() {
+                let end = end_of(row);
+                if index < start {
+                    break;
+                } else if index > end {
+                    start = end;
+                } else {
+                    found = Some(row);
+                    break;
+                }
+            }
+            found?
+        };
+        let start = row.checked_sub(1).map_or(0, end_of);
+        let x = self.x_for_index(index) - self.x_for_index(start);
+        Some(point(x, row_stride * (row as f32)))
+    }
+
+    /// gpui's `WrappedLineLayout::closest_index_for_position`.
+    fn closest_index_for_position(
+        &self,
+        position: Point<Pixels>,
+        row_stride: Pixels,
+    ) -> Result<usize, usize> {
+        let row = (position.y / row_stride) as usize;
+        let (start_index, start_x) = if row > 0 {
+            let Some(&w) = self.wraps.get(row - 1) else {
+                return Err(0);
+            };
+            w
+        } else {
+            (0, Pixels::ZERO)
+        };
+        let (end_index, end_x) = match self.wraps.get(row) {
+            Some(&w) => w,
+            None => (self.line.unwrapped_layout.len, self.unwrapped_width()),
+        };
+        let x = position.x + start_x;
+        if x < start_x {
+            Err(start_index)
+        } else if x >= end_x {
+            Err(end_index)
+        } else {
+            Ok(self.closest_index_for_x(x))
+        }
+    }
+
+    fn wrap_count(&self) -> usize {
+        self.wraps.len()
+    }
+
+    fn width(&self) -> Pixels {
+        self.line.width()
     }
 }
 
@@ -225,7 +438,7 @@ impl LaidOutLine {
         let display = self.display_offset_for_source(source_offset);
         self.line
             .position_for_index(display, self.row_stride)
-            .unwrap_or_else(|| end_of_line_position(&self.line, self.row_stride))
+            .unwrap_or_else(|| end_of_line_position(&*self.line, self.row_stride))
     }
 
     /// Like [`Self::local_position_for_source_offset`], but when `downstream` is
@@ -246,7 +459,7 @@ impl LaidOutLine {
             return upper;
         }
         downstream_row_position(
-            &self.line,
+            &*self.line,
             self.display_offset_for_source(source_offset),
             upper,
             self.row_stride,
@@ -769,8 +982,11 @@ fn compute_image_row_extra(
 ///
 /// The last row has no boundary after it; it ends at the line's own
 /// width, which for the last row is the honest value.
-fn wrap_row_right_edges(line: &WrappedLine, row_stride: Pixels) -> SmallVec<[Pixels; 4]> {
-    let rows = line.wrap_boundaries().len() + 1;
+fn wrap_row_right_edges(
+    line: &(impl LinePositions + ?Sized),
+    row_stride: Pixels,
+) -> SmallVec<[Pixels; 4]> {
+    let rows = line.wrap_count() + 1;
     let mut out: SmallVec<[Pixels; 4]> = SmallVec::with_capacity(rows);
     if row_stride > px(0.) {
         for k in 0..rows - 1 {
@@ -809,8 +1025,8 @@ fn wrap_row_right_edges(line: &WrappedLine, row_stride: Pixels) -> SmallVec<[Pix
 /// wash that treated the unanswerable end as a failure would discard
 /// every quad of a span whose *start* resolved perfectly well, losing a
 /// whole decoration to a partial answer.
-fn end_of_line_position(line: &WrappedLine, row_stride: Pixels) -> Point<Pixels> {
-    let last_row = line.wrap_boundaries().len();
+fn end_of_line_position(line: &(impl LinePositions + ?Sized), row_stride: Pixels) -> Point<Pixels> {
+    let last_row = line.wrap_count();
     point(line.width(), row_stride * (last_row as f32))
 }
 
@@ -845,16 +1061,17 @@ fn run_background_bounds(
     origin: Point<Pixels>,
     row_stride: Pixels,
     row_height: Pixels,
-    block: &RenderBlock,
+    index: &BlockIndex,
     style: &MarkdownStyle,
 ) -> Vec<Bounds<Pixels>> {
     let mut out = Vec::new();
     let len = line.text.len();
+    let mut glyphs: Option<LineGlyphs> = None;
     let mut i = 0usize;
     while i < len {
         let color = display_to_source
             .get(i)
-            .map(|&src| run_background_color(&effective_inline_style(src, block), style));
+            .map(|&src| run_background_color(&index.style_at(src), style));
         let Some(Some(color)) = color else {
             i += 1;
             continue;
@@ -864,13 +1081,14 @@ fn run_background_bounds(
         while j < len {
             let next = display_to_source
                 .get(j)
-                .map(|&src| run_background_color(&effective_inline_style(src, block), style));
+                .map(|&src| run_background_color(&index.style_at(src), style));
             if next != Some(Some(color)) {
                 break;
             }
             j += 1;
         }
-        push_row_spanning_bounds(line, i, j, origin, row_stride, row_height, &mut out);
+        let glyphs = glyphs.get_or_insert_with(|| LineGlyphs::new(line));
+        push_row_spanning_bounds(glyphs, i, j, origin, row_stride, row_height, &mut out);
         i = j;
     }
     out
@@ -879,7 +1097,7 @@ fn run_background_bounds(
 /// Emit one quad per visual row covered by the display range `lo..hi`.
 #[allow(clippy::too_many_arguments)]
 fn push_row_spanning_bounds(
-    line: &WrappedLine,
+    line: &(impl LinePositions + ?Sized),
     lo: usize,
     hi: usize,
     origin: Point<Pixels>,
@@ -897,8 +1115,6 @@ fn push_row_spanning_bounds(
     // one that *ends* there ends at the upper row's edge, which is what
     // gpui's unbiased answer already gives.
     let start = downstream_row_position(line, lo, start_upper, row_stride);
-    let right_edges = wrap_row_right_edges(line, row_stride);
-    let row_right = |row: usize| origin.x + right_edges.get(row).copied().unwrap_or(line.width());
     if start.y == end.y {
         out.push(Bounds::from_corners(
             point(origin.x + start.x, origin.y + start.y),
@@ -906,6 +1122,11 @@ fn push_row_spanning_bounds(
         ));
         return;
     }
+    // Only a span crossing a wrap needs the rows' right edges, and they
+    // cost a walk of the whole line per row: a single-row span, which is
+    // nearly every inline-code chip, never pays for them.
+    let right_edges = wrap_row_right_edges(line, row_stride);
+    let row_right = |row: usize| origin.x + right_edges.get(row).copied().unwrap_or(line.width());
     let first_row = (f32::from(start.y) / f32::from(row_stride)).round() as usize;
     let last_row = (f32::from(end.y) / f32::from(row_stride)).round() as usize;
     out.push(Bounds::from_corners(
@@ -950,20 +1171,21 @@ fn emphasis_dot_bounds(
     origin: Point<Pixels>,
     row_stride: Pixels,
     row_height: Pixels,
-    block: &RenderBlock,
+    index: &BlockIndex,
     style: &MarkdownStyle,
     font_size: Pixels,
     body_ascent: Pixels,
     body_descent: Pixels,
 ) -> Vec<Bounds<Pixels>> {
     let mut out = Vec::new();
-    if block.inlines.iter().all(|run| !run.style.emphasis_dots) {
+    if !index.any_emphasis_dots() {
         return out;
     }
     let diameter = (font_size * style.emphasis_dot_size_factor).max(px(1.5));
     let radius = diameter / 2.0;
     let half_leading = ((row_height - body_ascent - body_descent) / 2.0).max(px(0.0));
     let drop = font_size * style.emphasis_dot_baseline_offset_factor;
+    let mut glyphs: Option<LineGlyphs> = None;
     for (i, ch) in line.text.char_indices() {
         if !crate::cjk::takes_emphasis_dot(ch) {
             continue;
@@ -971,16 +1193,17 @@ fn emphasis_dot_bounds(
         let Some(&src) = display_to_source.get(i) else {
             continue;
         };
-        if !effective_inline_style(src, block).emphasis_dots {
+        if !index.style_at(src).emphasis_dots {
             continue;
         }
-        let Some(upper) = line.position_for_index(i, row_stride) else {
+        let glyphs = &*glyphs.get_or_insert_with(|| LineGlyphs::new(line));
+        let Some(upper) = glyphs.position_for_index(i, row_stride) else {
             continue;
         };
         // A character that *opens* a wrap row is a boundary index, which
         // gpui resolves to the row above — the dot would land at the
         // previous row's right edge, past the wrap width.
-        let lead = downstream_row_position(line, i, upper, row_stride);
+        let lead = downstream_row_position(glyphs, i, upper, row_stride);
         // A character that *ends* its wrap row has no trailing edge on
         // the same row; a CJK glyph is an em square, so its own font
         // size is the honest width to center within.
@@ -990,7 +1213,7 @@ fn emphasis_dot_bounds(
         // index is *at or after* the one asked for, so a selector that
         // shaped into its base's cluster (no glyph of its own) is
         // skipped and the base still measures its own advance.
-        let advance = match line.position_for_index(i + ch.len_utf8(), row_stride) {
+        let advance = match glyphs.position_for_index(i + ch.len_utf8(), row_stride) {
             Some(trail) if trail.y == lead.y => trail.x - lead.x,
             _ => font_size,
         };
@@ -1122,12 +1345,13 @@ fn measure_pad_advance(
 fn min_content_width(
     range: &Range<usize>,
     block: &RenderBlock,
+    index: &BlockIndex,
     source: &str,
     style: &MarkdownStyle,
     font_size: Pixels,
     window: &mut Window,
 ) -> Pixels {
-    let (display, map) = build_display_line(source, range, block);
+    let (display, map) = build_display_line(source, range, block, index);
     if display.is_empty() {
         return px(0.0);
     }
@@ -1147,7 +1371,7 @@ fn min_content_width(
         let token_map = &map[start..=i];
         // `build_runs_for_line` expects `map.len() == text.len() + 1`.
         debug_assert_eq!(token_map.len(), token.len() + 1);
-        let runs = build_runs_for_line(token, token_map, block, style);
+        let runs = build_runs_for_line(token, token_map, block, index, style);
         let w = window
             .text_system()
             .shape_text(
@@ -1173,6 +1397,7 @@ fn min_content_width(
 /// `| ` / ` | ` / ` |` bytes, single-row, positioned in the gutter
 /// between column boxes). Origins are relative to the table's
 /// content origin; prepaint re-bases them into window coordinates.
+#[derive(Clone)]
 struct TablePiece {
     line: Arc<WrappedLine>,
     rel_origin: Point<Pixels>,
@@ -1182,6 +1407,7 @@ struct TablePiece {
 }
 
 /// The box-model layout of one table.
+#[derive(Clone)]
 struct TableLayoutOut {
     pieces: Vec<TablePiece>,
     size: Size<Pixels>,
@@ -1236,6 +1462,7 @@ fn layout_table(
     let edit = *edit_mode;
     let cursor_row = *cursor_row;
     let line_height = font_size * style.line_height.0;
+    let index = BlockIndex::new(block);
 
     use crate::syntax::TableAlignment;
     use crate::table::RowKind;
@@ -1289,8 +1516,8 @@ fn layout_table(
                        wrap: Option<Pixels>,
                        window: &mut Window|
      -> Option<(Arc<WrappedLine>, Vec<usize>)> {
-        let (display, map) = build_display_line(source, range, block);
-        let runs = build_runs_for_line(&display, &map, block, style);
+        let (display, map) = build_display_line(source, range, block, &index);
+        let runs = build_runs_for_line(&display, &map, block, &index, style);
         let line = window
             .text_system()
             .shape_text(SharedString::from(display), font_size, &runs, wrap, None)
@@ -1323,7 +1550,7 @@ fn layout_table(
             if unwrapped.width() > max_w[k] {
                 max_w[k] = unwrapped.width();
             }
-            let atom_w = min_content_width(cell, block, source, style, font_size, window);
+            let atom_w = min_content_width(cell, block, &index, source, style, font_size, window);
             if atom_w > min_w[k] {
                 min_w[k] = atom_w;
             }
@@ -1795,6 +2022,7 @@ fn layout_embed(
                 if let Some(t) = layout_table(block, content, font_size, style, inner_w, window) {
                     let (body_ascent, body_descent) =
                         body_metrics_for_block(&block.kind, style, font_size, window);
+                    let index = BlockIndex::new(block);
                     for piece in t.pieces {
                         let rel_origin =
                             point(indent + piece.rel_origin.x, block_top + piece.rel_origin.y);
@@ -1810,7 +2038,7 @@ fn layout_embed(
                             rel_origin,
                             line_height,
                             line_height,
-                            block,
+                            &index,
                             style,
                             font_size,
                             body_ascent,
@@ -1822,7 +2050,7 @@ fn layout_embed(
                             rel_origin,
                             line_height,
                             line_height,
-                            block,
+                            &index,
                             style,
                         ));
                         out.pieces.push(EmbedPiece {
@@ -1907,6 +2135,7 @@ fn layout_embed(
                     let text_left = indent + pad;
                     y += pad;
                     let shaped = shape_block_lines(content, &b, style, font_size, wrap_w, window);
+                    let index = BlockIndex::new(&b);
                     let mut advanced = false;
                     for sl in shaped {
                         // Fence rows are hidden in readonly render but still
@@ -1957,7 +2186,7 @@ fn layout_embed(
                             point(text_left, row_y),
                             row_stride,
                             line_height,
-                            &b,
+                            &index,
                             style,
                             font_size,
                             body_ascent,
@@ -1969,7 +2198,7 @@ fn layout_embed(
                             point(text_left, row_y),
                             row_stride,
                             line_height,
-                            &b,
+                            &index,
                             style,
                         ));
                         out.pieces.push(EmbedPiece {
@@ -2121,7 +2350,7 @@ impl Element for BlockElement {
         let is_table = is_table_block(&self.block.kind);
         let container_indent = containers_left_indent(&self.block.containers, &self.style, window);
 
-        let source = self.editor.read(cx).state.markdown.clone();
+        let source = self.source.clone();
         let image_base = self.editor.read(cx).image_base_dir.clone();
         style.size.width = relative(1.0).into();
 
@@ -2177,6 +2406,7 @@ impl Element for BlockElement {
 
         let block_clone = self.block.clone();
         let style_clone = self.style.clone();
+        let shape_cache = self.editor.read(cx).shape_cache.clone();
         let id = window.request_measured_layout(
             style,
             move |known_dimensions, available_space, window, _cx| {
@@ -2319,7 +2549,8 @@ impl Element for BlockElement {
                 // it must run against the same inner width prepaint
                 // will use so the two phases agree.
                 if is_table
-                    && let Some(layout) = layout_table(
+                    && let Some(layout) = layout_table_cached(
+                        &shape_cache,
                         &augmented_block,
                         &source,
                         font_size,
@@ -2327,6 +2558,7 @@ impl Element for BlockElement {
                         inner_w,
                         window,
                     )
+                    .as_ref()
                 {
                     let content_h = inner_pad * 2. + layout.size.height.max(line_height);
                     let h = extra_above + spacing_above + content_h + spacing_below + extra_below;
@@ -2337,7 +2569,8 @@ impl Element for BlockElement {
                 }
                 let (body_ascent, body_descent) =
                     body_metrics_for_block(&block_clone.kind, &style_clone, font_size, window);
-                let lines = shape_block_lines(
+                let lines = shape_block_lines_cached(
+                    &shape_cache,
                     &source,
                     &augmented_block,
                     &style_clone,
@@ -2432,12 +2665,12 @@ impl Element for BlockElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let image_base = self.editor.read(cx).image_base_dir.clone();
-        let (selection, source, scroll_offset, caret_downstream, highlight_layers) = {
+        let source = self.source.clone();
+        let (selection, scroll_offset, caret_downstream, highlight_layers) = {
             let editor = self.editor.read(cx);
             let scroll = editor.code_block_scroll(self.block_index);
             (
                 editor.state.selection,
-                editor.state.markdown.clone(),
                 scroll,
                 editor.caret_downstream(),
                 editor.highlight_layers().merged_by_layer(),
@@ -2541,22 +2774,32 @@ impl Element for BlockElement {
         // Tables take the box-model layout (rows of independently
         // wrapped cell boxes — see `layout_table`) instead of the
         // per-source-line shape pass.
+        let shape_cache = self.editor.read(cx).shape_cache.clone();
         let table_layout = if is_table {
-            layout_table(
+            Option::clone(&layout_table_cached(
+                &shape_cache,
                 &augmented_block,
                 &source,
                 font_size,
                 &style,
                 block_width,
                 window,
-            )
+            ))
         } else {
             None
         };
         let shaped = if table_layout.is_some() {
             Vec::new()
         } else {
-            shape_block_lines(&source, &augmented_block, &style, font_size, wrap_w, window)
+            Vec::clone(&shape_block_lines_cached(
+                &shape_cache,
+                &source,
+                &augmented_block,
+                &style,
+                font_size,
+                wrap_w,
+                window,
+            ))
         };
 
         let mut lines: Vec<LaidOutLine> = Vec::new();
@@ -3065,324 +3308,291 @@ impl Element for BlockElement {
         }
 
         let code_block_paint = prepaint.code_block_paint;
+        let embed_paint = prepaint.embed_paint.take();
 
-        // Per-level blockquote borders. Painted *first*, so any
-        // code-block bg or content paints over them only inside the
-        // already-indented content area (the bg is `block_left` to
-        // `block_left + block_width`, which starts to the right of
-        // every border bar). Each container that's a blockquote
-        // contributes one bar at `bounds.origin.x +
-        // blockquote_border_inset + i * blockquote_indent`. The bar
-        // spans this leaf's full vertical bounds, which now include
-        // both `spacing_above` and `spacing_below` (each half a
-        // paragraph_gap) — so the bar reads as symmetric around the
-        // content rows. When two consecutive leaves share the same
-        // blockquote their bars still meet flush at the leaf boundary
-        // (`spacing_below` of leaf 1 ends exactly where `spacing_above`
-        // of leaf 2 begins).
-        // The bar's vertical extent is the layout box minus any
-        // container-boundary extras: extras are pure inter-block
-        // breathing room and shouldn't be covered by the bar (the bar
-        // marks the quoted region, the extras sit outside it). For
-        // consecutive blockquoted leaves with the same chain both
-        // extras are zero, so bars meet flush at the leaf boundary.
-        // Per-level bar extents.
-        //
-        // The block as a whole reserves `extra_above` / `extra_below`
-        // breathing room at any container-boundary transition. But
-        // when nesting changes — e.g. block A `[outer]` → block B
-        // `[outer, inner]` — the *outer* level is shared between A
-        // and B, so the outer bar should stay continuous through the
-        // extras while the *inner* bar stops at them. Each level's
-        // bar therefore computes its own top / bottom against
-        // whether the matching ancestry is present in the immediate
-        // neighbor: shared at level L → bar paints flush to the
-        // layout box on that side; not shared → bar pulls back by
-        // the extra so the boundary breathes.
-        let extra_above = container_boundary_extra(
-            &self.block.containers,
-            self.prev_containers.as_deref(),
-            &self.style,
-        );
-        let extra_below = container_boundary_extra(
-            &self.block.containers,
-            self.next_containers.as_deref(),
-            &self.style,
-        );
-        for (level, container) in self.block.containers.iter().enumerate() {
-            match container {
-                Container::BlockQuote { .. } => {
-                    let above_continues = level_shared_with_neighbor(
-                        level,
-                        &self.block.containers,
-                        self.prev_containers.as_deref(),
-                    );
-                    let below_continues = level_shared_with_neighbor(
-                        level,
-                        &self.block.containers,
-                        self.next_containers.as_deref(),
-                    );
-                    let bar_top = bounds.origin.y
-                        + if above_continues {
-                            px(0.0)
-                        } else {
-                            extra_above
-                        };
-                    let bar_bottom = bounds.origin.y + bounds.size.height
-                        - if below_continues {
-                            px(0.0)
-                        } else {
-                            extra_below
-                        };
-                    let bar_height = (bar_bottom - bar_top).max(px(0.0));
-                    let left = bounds.origin.x
-                        + container_x_at_level(&self.block.containers, level, &self.style, window)
-                        + self.style.blockquote_border_inset;
-                    let bar = Bounds::new(
-                        point(left, bar_top),
-                        size(self.style.blockquote_border_width, bar_height),
-                    );
-                    window.paint_quad(fill(bar, self.style.blockquote_border_color));
-                }
-                Container::ListItem { .. } => {
-                    // List items have no left-edge chrome of their
-                    // own — their visual cue is the marker glyph
-                    // shaped into the line, plus the cumulative
-                    // `list_indent` already applied by the
-                    // container chain.
-                }
-            }
-        }
-
-        // Overlay container markers (cursor-inside `>` glyphs) on top
-        // of their level's border bar. Painted *after* the bars and
-        // *before* content text so the glyph reads on top of the bar
-        // but doesn't compete with body shaping. Because the marker
-        // bytes were also pushed into `hidden_ranges`, the shaped
-        // line itself starts at `block_left` regardless of whether
-        // overlays are present — the user gets the raw `>` they typed
-        // without any horizontal shift in the content's position.
-        paint_marker_overlays(
-            &self.block.marker_overlays,
-            &self.block.containers,
-            &self.block.kind,
-            &prepaint.laid_out.lines,
-            bounds.origin.x,
-            &self.style,
-            window,
-            cx,
-        );
-
-        // Layered backgrounds for code blocks:
-        //
-        // 1. Outer rounded fill (`code_block_background`) — full
-        //    block. The rounded corners are visible only at the
-        //    fence rows, where this bg is uncovered.
-        // 2. Inner content strip (`code_block_content_background`) —
-        //    full-width band between the fence rows, no rounding.
-        //    This is what reads as the "code area".
-        if let Some(cb) = &code_block_paint {
-            window.paint_quad(quad(
-                cb.bg_bounds,
-                self.style.code_block_radius,
-                self.style.code_block_background,
-                Edges::default(),
-                gpui::transparent_black(),
-                BorderStyle::default(),
-            ));
-            if cb.content_strip.size.height > px(0.0) {
-                window.paint_quad(fill(
-                    cb.content_strip,
-                    self.style.code_block_content_background,
-                ));
-            }
-        }
-
-        // Thematic break: paint a thin horizontal rule centered on
-        // the block's content row. The shaped line (`---` etc.)
-        // continues to live in `lines`, but its source bytes are
-        // hidden when the cursor is outside the construct (the
-        // common case) so the user only sees the rule. When the
-        // cursor is on the line the source dims into view in the
-        // delimiter color so the user can see what they typed.
-        if matches!(self.block.kind, BlockKind::ThematicBreak) {
-            let indent = containers_left_indent(&self.block.containers, &self.style, window);
-            paint_thematic_break(
-                window,
-                &prepaint.laid_out.lines,
-                bounds.origin.x + indent,
-                (bounds.size.width - indent).max(px(1.0)),
+        // Only a block inside the clip is drawn. Every block still records
+        // its geometry below: hit-testing, caret motion and the host's
+        // scroll-into-view all ask about rows that are off screen.
+        if window.content_mask().bounds.intersects(&bounds) {
+            // Per-level blockquote borders. Painted *first*, so any
+            // code-block bg or content paints over them only inside the
+            // already-indented content area (the bg is `block_left` to
+            // `block_left + block_width`, which starts to the right of
+            // every border bar). Each container that's a blockquote
+            // contributes one bar at `bounds.origin.x +
+            // blockquote_border_inset + i * blockquote_indent`. The bar
+            // spans this leaf's full vertical bounds, which now include
+            // both `spacing_above` and `spacing_below` (each half a
+            // paragraph_gap) — so the bar reads as symmetric around the
+            // content rows. When two consecutive leaves share the same
+            // blockquote their bars still meet flush at the leaf boundary
+            // (`spacing_below` of leaf 1 ends exactly where `spacing_above`
+            // of leaf 2 begins).
+            // The bar's vertical extent is the layout box minus any
+            // container-boundary extras: extras are pure inter-block
+            // breathing room and shouldn't be covered by the bar (the bar
+            // marks the quoted region, the extras sit outside it). For
+            // consecutive blockquoted leaves with the same chain both
+            // extras are zero, so bars meet flush at the leaf boundary.
+            // Per-level bar extents.
+            //
+            // The block as a whole reserves `extra_above` / `extra_below`
+            // breathing room at any container-boundary transition. But
+            // when nesting changes — e.g. block A `[outer]` → block B
+            // `[outer, inner]` — the *outer* level is shared between A
+            // and B, so the outer bar should stay continuous through the
+            // extras while the *inner* bar stops at them. Each level's
+            // bar therefore computes its own top / bottom against
+            // whether the matching ancestry is present in the immediate
+            // neighbor: shared at level L → bar paints flush to the
+            // layout box on that side; not shared → bar pulls back by
+            // the extra so the boundary breathes.
+            let extra_above = container_boundary_extra(
+                &self.block.containers,
+                self.prev_containers.as_deref(),
                 &self.style,
             );
-        }
+            let extra_below = container_boundary_extra(
+                &self.block.containers,
+                self.next_containers.as_deref(),
+                &self.style,
+            );
+            for (level, container) in self.block.containers.iter().enumerate() {
+                match container {
+                    Container::BlockQuote { .. } => {
+                        let above_continues = level_shared_with_neighbor(
+                            level,
+                            &self.block.containers,
+                            self.prev_containers.as_deref(),
+                        );
+                        let below_continues = level_shared_with_neighbor(
+                            level,
+                            &self.block.containers,
+                            self.next_containers.as_deref(),
+                        );
+                        let bar_top = bounds.origin.y
+                            + if above_continues {
+                                px(0.0)
+                            } else {
+                                extra_above
+                            };
+                        let bar_bottom = bounds.origin.y + bounds.size.height
+                            - if below_continues {
+                                px(0.0)
+                            } else {
+                                extra_below
+                            };
+                        let bar_height = (bar_bottom - bar_top).max(px(0.0));
+                        let left = bounds.origin.x
+                            + container_x_at_level(
+                                &self.block.containers,
+                                level,
+                                &self.style,
+                                window,
+                            )
+                            + self.style.blockquote_border_inset;
+                        let bar = Bounds::new(
+                            point(left, bar_top),
+                            size(self.style.blockquote_border_width, bar_height),
+                        );
+                        window.paint_quad(fill(bar, self.style.blockquote_border_color));
+                    }
+                    Container::ListItem { .. } => {
+                        // List items have no left-edge chrome of their
+                        // own — their visual cue is the marker glyph
+                        // shaped into the line, plus the cumulative
+                        // `list_indent` already applied by the
+                        // container chain.
+                    }
+                }
+            }
 
-        // Display math (display mode): paint typeset math via the
-        // RaTeX adapter. KaTeX fonts register lazily here on first
-        // paint — hosting apps may also call
-        // `crate::math::register_katex_fonts` at app init.
-        if let Some(math_paint) = prepaint.math_paint.take() {
-            let _ = crate::math::register_katex_fonts(&window.text_system().clone());
-            math_paint.layout.paint(
-                math_paint.origin,
-                math_paint.em_px,
-                self.style.text_color,
+            // Overlay container markers (cursor-inside `>` glyphs) on top
+            // of their level's border bar. Painted *after* the bars and
+            // *before* content text so the glyph reads on top of the bar
+            // but doesn't compete with body shaping. Because the marker
+            // bytes were also pushed into `hidden_ranges`, the shaped
+            // line itself starts at `block_left` regardless of whether
+            // overlays are present — the user gets the raw `>` they typed
+            // without any horizontal shift in the content's position.
+            paint_marker_overlays(
+                &self.block.marker_overlays,
+                &self.block.containers,
+                &self.block.kind,
+                &prepaint.laid_out.lines,
+                bounds.origin.x,
+                &self.style,
                 window,
                 cx,
             );
-        }
 
-        // Block image (display mode): paint the loaded image at the
-        // pre-computed bounds. Loading / failed states leave
-        // `image_paint == None` and the regular shape path renders
-        // the source bytes (or a placeholder row from the empty-
-        // block fallback) underneath.
-        if let Some(image_paint) = prepaint.image_paint.take() {
-            crate::image::paint(image_paint.image, image_paint.bounds, window);
-        }
-
-        // Embed block: the quote chrome + the mapped markdown's shaped
-        // pieces, clipped to the block bounds (an over-wide embedded code
-        // line or table never leaks outside the container). Painted before
-        // the regular line pass — the marker's own shaped line is empty, so
-        // ordering only matters vs. the caret, which paints last.
-        let mut embed_content: Option<EmbedContentGeometry> = None;
-        if let Some(ep) = prepaint.embed_paint.take() {
-            if ep.selected {
-                window.paint_quad(fill(ep.bounds, self.style.selection_color));
-            }
-            window.paint_quad(fill(ep.bar, self.style.blockquote_border_color));
-            let mask = ContentMask { bounds: ep.bounds };
-            window.with_content_mask(Some(mask), |window| {
-                for panel in &ep.code_panels {
-                    window.paint_quad(quad(
-                        *panel,
-                        self.style.code_block_radius,
+            // Layered backgrounds for code blocks:
+            //
+            // 1. Outer rounded fill (`code_block_background`) — full
+            //    block. The rounded corners are visible only at the
+            //    fence rows, where this bg is uncovered.
+            // 2. Inner content strip (`code_block_content_background`) —
+            //    full-width band between the fence rows, no rounding.
+            //    This is what reads as the "code area".
+            if let Some(cb) = &code_block_paint {
+                window.paint_quad(quad(
+                    cb.bg_bounds,
+                    self.style.code_block_radius,
+                    self.style.code_block_background,
+                    Edges::default(),
+                    gpui::transparent_black(),
+                    BorderStyle::default(),
+                ));
+                if cb.content_strip.size.height > px(0.0) {
+                    window.paint_quad(fill(
+                        cb.content_strip,
                         self.style.code_block_content_background,
-                        Edges::default(),
-                        gpui::transparent_black(),
-                        BorderStyle::default(),
                     ));
                 }
-                for bar in &ep.bars {
-                    window.paint_quad(fill(*bar, self.style.blockquote_border_color));
+            }
+
+            // Thematic break: paint a thin horizontal rule centered on
+            // the block's content row. The shaped line (`---` etc.)
+            // continues to live in `lines`, but its source bytes are
+            // hidden when the cursor is outside the construct (the
+            // common case) so the user only sees the rule. When the
+            // cursor is on the line the source dims into view in the
+            // delimiter color so the user can see what they typed.
+            if matches!(self.block.kind, BlockKind::ThematicBreak) {
+                let indent = containers_left_indent(&self.block.containers, &self.style, window);
+                paint_thematic_break(
+                    window,
+                    &prepaint.laid_out.lines,
+                    bounds.origin.x + indent,
+                    (bounds.size.width - indent).max(px(1.0)),
+                    &self.style,
+                );
+            }
+
+            // Display math (display mode): paint typeset math via the
+            // RaTeX adapter. KaTeX fonts register lazily here on first
+            // paint — hosting apps may also call
+            // `crate::math::register_katex_fonts` at app init.
+            if let Some(math_paint) = prepaint.math_paint.take() {
+                let _ = crate::math::register_katex_fonts(&window.text_system().clone());
+                math_paint.layout.paint(
+                    math_paint.origin,
+                    math_paint.em_px,
+                    self.style.text_color,
+                    window,
+                    cx,
+                );
+            }
+
+            // Block image (display mode): paint the loaded image at the
+            // pre-computed bounds. Loading / failed states leave
+            // `image_paint == None` and the regular shape path renders
+            // the source bytes (or a placeholder row from the empty-
+            // block fallback) underneath.
+            if let Some(image_paint) = prepaint.image_paint.take() {
+                crate::image::paint(image_paint.image, image_paint.bounds, window);
+            }
+
+            // Embed block: the quote chrome + the mapped markdown's shaped
+            // pieces, clipped to the block bounds (an over-wide embedded code
+            // line or table never leaks outside the container). Painted before
+            // the regular line pass — the marker's own shaped line is empty, so
+            // ordering only matters vs. the caret, which paints last.
+            if let Some(ep) = &embed_paint {
+                if ep.selected {
+                    window.paint_quad(fill(ep.bounds, self.style.selection_color));
                 }
-                for (rule, full) in &ep.rules {
-                    let mut color = self.style.table_rule_color;
-                    if !full {
-                        color.a *= 0.45;
+                window.paint_quad(fill(ep.bar, self.style.blockquote_border_color));
+                let mask = ContentMask { bounds: ep.bounds };
+                window.with_content_mask(Some(mask), |window| {
+                    for panel in &ep.code_panels {
+                        window.paint_quad(quad(
+                            *panel,
+                            self.style.code_block_radius,
+                            self.style.code_block_content_background,
+                            Edges::default(),
+                            gpui::transparent_black(),
+                            BorderStyle::default(),
+                        ));
                     }
-                    window.paint_quad(fill(*rule, color));
-                }
-                // Inline-code chips first, then glyphs — the same two-pass
-                // order as the regular content path.
-                for chip in &ep.code_chips {
-                    window.paint_quad(fill(*chip, self.style.inline_code_background));
-                }
-                for piece in &ep.pieces {
-                    let _ = piece.line.paint(
-                        piece.rel_origin,
-                        piece.row_stride,
-                        gpui::TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
-                }
-                if !ep.math.is_empty() {
-                    let _ = crate::math::register_katex_fonts(&window.text_system().clone());
-                }
-                for m in &ep.math {
-                    m.layout
-                        .paint(m.rel_origin, m.em_px, self.style.text_color, window, cx);
-                }
-                for dot in &ep.emphasis_dots {
-                    let radius = dot.size.width / 2.0;
-                    window.paint_quad(
-                        fill(*dot, self.style.emphasis_dot_color)
-                            .corner_radii(Corners::all(radius)),
-                    );
-                }
-            });
-            // Record what was painted (moving, not cloning — `ep` is dropped
-            // here regardless). See `LaidOutBlock::embed_content`.
-            embed_content = Some(EmbedContentGeometry {
-                pieces: ep
-                    .pieces
-                    .into_iter()
-                    .map(|p| (p.line.text.clone(), p.rel_origin))
-                    .collect(),
-                code_panels: ep.code_panels,
-                math_origins: ep.math.into_iter().map(|m| m.rel_origin).collect(),
-                rules: ep.rules.into_iter().map(|(r, _)| r).collect(),
-                bars: ep.bars,
-            });
-        }
-
-        let cursor_quad = prepaint.cursor_quad.take();
-        let selection_quads = std::mem::take(&mut prepaint.selection_quads);
-        let highlight_quads = std::mem::take(&mut prepaint.highlight_quads);
-        let focused = focus_handle.is_focused(window);
-
-        // Split paint into delimiter and content phases. Fence-row
-        // text and the cursor / selection quads attached to fence
-        // rows paint *outside* the content mask so they stay visible
-        // regardless of horizontal scroll (fences are pinned in x).
-        // Content text and content-row cursor / selection paint
-        // *inside* the mask so long lines clip at the visible band's
-        // right edge. Non-code blocks have `code_block_paint == None`
-        // and skip the mask entirely.
-        if let Some(cb) = &code_block_paint {
-            let (delim_hl, content_hl): (Vec<_>, Vec<_>) =
-                highlight_quads.into_iter().partition(|t| t.is_delimiter);
-            let (delim_sel, content_sel): (Vec<_>, Vec<_>) =
-                selection_quads.into_iter().partition(|t| t.is_delimiter);
-            let (cursor_for_delim, cursor_for_content) = match cursor_quad {
-                Some(tq) if tq.is_delimiter => (Some(tq), None),
-                Some(tq) => (None, Some(tq)),
-                None => (None, None),
-            };
-
-            // Phase 1: delimiter lines + their cursor / selection,
-            // unmasked.
-            for tq in delim_hl {
-                window.paint_quad(tq.quad);
-            }
-            for tq in delim_sel {
-                window.paint_quad(tq.quad);
-            }
-            for laid in &prepaint.laid_out.lines {
-                if laid.is_delimiter {
-                    let _ = laid.line.paint(
-                        laid.paint_origin(),
-                        laid.row_stride,
-                        gpui::TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
-                }
-            }
-            if focused
-                && !disabled
-                && let Some(tq) = cursor_for_delim
-            {
-                window.paint_quad(tq.quad);
+                    for bar in &ep.bars {
+                        window.paint_quad(fill(*bar, self.style.blockquote_border_color));
+                    }
+                    for (rule, full) in &ep.rules {
+                        let mut color = self.style.table_rule_color;
+                        if !full {
+                            color.a *= 0.45;
+                        }
+                        window.paint_quad(fill(*rule, color));
+                    }
+                    // Inline-code chips first, then glyphs — the same two-pass
+                    // order as the regular content path.
+                    for chip in &ep.code_chips {
+                        window.paint_quad(fill(*chip, self.style.inline_code_background));
+                    }
+                    for piece in &ep.pieces {
+                        let _ = piece.line.paint(
+                            piece.rel_origin,
+                            piece.row_stride,
+                            gpui::TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                    if !ep.math.is_empty() {
+                        let _ = crate::math::register_katex_fonts(&window.text_system().clone());
+                    }
+                    for m in &ep.math {
+                        m.layout
+                            .paint(m.rel_origin, m.em_px, self.style.text_color, window, cx);
+                    }
+                    for dot in &ep.emphasis_dots {
+                        let radius = dot.size.width / 2.0;
+                        window.paint_quad(
+                            fill(*dot, self.style.emphasis_dot_color)
+                                .corner_radii(Corners::all(radius)),
+                        );
+                    }
+                });
+                // Record what was painted (moving, not cloning — `ep` is dropped
+                // here regardless). See `LaidOutBlock::embed_content`.
             }
 
-            // Phase 2: content lines + their cursor / selection,
-            // masked to the content strip.
-            let mask = ContentMask {
-                bounds: cb.content_clip,
-            };
-            window.with_content_mask(Some(mask), |window| {
-                for tq in content_hl {
+            let cursor_quad = prepaint.cursor_quad.take();
+            let selection_quads = std::mem::take(&mut prepaint.selection_quads);
+            let highlight_quads = std::mem::take(&mut prepaint.highlight_quads);
+            let focused = focus_handle.is_focused(window);
+
+            // Split paint into delimiter and content phases. Fence-row
+            // text and the cursor / selection quads attached to fence
+            // rows paint *outside* the content mask so they stay visible
+            // regardless of horizontal scroll (fences are pinned in x).
+            // Content text and content-row cursor / selection paint
+            // *inside* the mask so long lines clip at the visible band's
+            // right edge. Non-code blocks have `code_block_paint == None`
+            // and skip the mask entirely.
+            if let Some(cb) = &code_block_paint {
+                let (delim_hl, content_hl): (Vec<_>, Vec<_>) =
+                    highlight_quads.into_iter().partition(|t| t.is_delimiter);
+                let (delim_sel, content_sel): (Vec<_>, Vec<_>) =
+                    selection_quads.into_iter().partition(|t| t.is_delimiter);
+                let (cursor_for_delim, cursor_for_content) = match cursor_quad {
+                    Some(tq) if tq.is_delimiter => (Some(tq), None),
+                    Some(tq) => (None, Some(tq)),
+                    None => (None, None),
+                };
+
+                // Phase 1: delimiter lines + their cursor / selection,
+                // unmasked.
+                for tq in delim_hl {
                     window.paint_quad(tq.quad);
                 }
-                for tq in content_sel {
+                for tq in delim_sel {
                     window.paint_quad(tq.quad);
                 }
                 for laid in &prepaint.laid_out.lines {
-                    if !laid.is_delimiter {
+                    if laid.is_delimiter {
                         let _ = laid.line.paint(
                             laid.paint_origin(),
                             laid.row_stride,
@@ -3395,142 +3605,187 @@ impl Element for BlockElement {
                 }
                 if focused
                     && !disabled
-                    && let Some(tq) = cursor_for_content
+                    && let Some(tq) = cursor_for_delim
                 {
                     window.paint_quad(tq.quad);
                 }
-            });
-        } else {
-            // Non-code blocks: no fence split. Tables additionally
-            // clip to their visible band when wider than the content
-            // area (they never soft-wrap — the same horizontal-scroll
-            // treatment as code blocks, minus the background chrome)
-            // and paint their hairline rules under everything.
-            let table_mask = prepaint.table_paint.as_ref().and_then(|tp| {
-                (tp.content_width > tp.visible_width).then_some(ContentMask { bounds: tp.clip })
-            });
-            let table_rules: Vec<(Bounds<Pixels>, bool)> = prepaint
-                .table_paint
-                .as_ref()
-                .map(|tp| {
-                    tp.rules
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| (*r, i == 0))
-                        .collect()
-                })
-                .unwrap_or_default();
-            window.with_content_mask(table_mask, |window| {
-                // Table rules paint first — chrome under content.
-                for (rule, is_header_rule) in &table_rules {
-                    let mut color = self.style.table_rule_color;
-                    if !is_header_rule {
-                        color.a *= 0.45;
+
+                // Phase 2: content lines + their cursor / selection,
+                // masked to the content strip.
+                let mask = ContentMask {
+                    bounds: cb.content_clip,
+                };
+                window.with_content_mask(Some(mask), |window| {
+                    for tq in content_hl {
+                        window.paint_quad(tq.quad);
                     }
-                    window.paint_quad(fill(*rule, color));
-                }
-                // Inline-code chips paint first so the selection wash and
-                // the glyphs layer on top of them. `WrappedLine::paint`
-                // draws glyphs + underline/strikethrough only, so the
-                // chip needs its own pass either way — and it has to be
-                // ours rather than gpui's, because a row reservation
-                // makes the stride and the fill height differ (see
-                // `run_background_bounds`).
-                for laid in &prepaint.laid_out.lines {
-                    for chip in run_background_bounds(
-                        &laid.line,
-                        &laid.display_to_source,
-                        laid.origin,
-                        laid.row_stride,
-                        laid.row_height,
+                    for tq in content_sel {
+                        window.paint_quad(tq.quad);
+                    }
+                    for laid in &prepaint.laid_out.lines {
+                        if !laid.is_delimiter {
+                            let _ = laid.line.paint(
+                                laid.paint_origin(),
+                                laid.row_stride,
+                                gpui::TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    if focused
+                        && !disabled
+                        && let Some(tq) = cursor_for_content
+                    {
+                        window.paint_quad(tq.quad);
+                    }
+                });
+            } else {
+                // Non-code blocks: no fence split. Tables additionally
+                // clip to their visible band when wider than the content
+                // area (they never soft-wrap — the same horizontal-scroll
+                // treatment as code blocks, minus the background chrome)
+                // and paint their hairline rules under everything.
+                let table_mask = prepaint.table_paint.as_ref().and_then(|tp| {
+                    (tp.content_width > tp.visible_width).then_some(ContentMask { bounds: tp.clip })
+                });
+                let table_rules: Vec<(Bounds<Pixels>, bool)> = prepaint
+                    .table_paint
+                    .as_ref()
+                    .map(|tp| {
+                        tp.rules
+                            .iter()
+                            .enumerate()
+                            .map(|(i, r)| (*r, i == 0))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                window.with_content_mask(table_mask, |window| {
+                    // Table rules paint first — chrome under content.
+                    for (rule, is_header_rule) in &table_rules {
+                        let mut color = self.style.table_rule_color;
+                        if !is_header_rule {
+                            color.a *= 0.45;
+                        }
+                        window.paint_quad(fill(*rule, color));
+                    }
+                    // Inline-code chips paint first so the selection wash and
+                    // the glyphs layer on top of them. `WrappedLine::paint`
+                    // draws glyphs + underline/strikethrough only, so the
+                    // chip needs its own pass either way — and it has to be
+                    // ours rather than gpui's, because a row reservation
+                    // makes the stride and the fill height differ (see
+                    // `run_background_bounds`).
+                    let index = BlockIndex::new(&prepaint.shaped_block);
+                    for laid in &prepaint.laid_out.lines {
+                        for chip in run_background_bounds(
+                            &laid.line,
+                            &laid.display_to_source,
+                            laid.origin,
+                            laid.row_stride,
+                            laid.row_height,
+                            &index,
+                            &self.style,
+                        ) {
+                            window.paint_quad(fill(chip, self.style.inline_code_background));
+                        }
+                    }
+                    for tq in highlight_quads {
+                        window.paint_quad(tq.quad);
+                    }
+                    for tq in selection_quads {
+                        window.paint_quad(tq.quad);
+                    }
+                    for laid in &prepaint.laid_out.lines {
+                        let _ = laid.line.paint(
+                            laid.paint_origin(),
+                            laid.row_stride,
+                            gpui::TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                    // Emphasis dots under emphasized CJK characters, in
+                    // the same over-the-text / under-the-cursor band as
+                    // the overlays below.
+                    paint_emphasis_dots(
+                        &prepaint.laid_out.lines,
                         &prepaint.shaped_block,
                         &self.style,
-                    ) {
-                        window.paint_quad(fill(chip, self.style.inline_code_background));
-                    }
-                }
-                for tq in highlight_quads {
-                    window.paint_quad(tq.quad);
-                }
-                for tq in selection_quads {
-                    window.paint_quad(tq.quad);
-                }
-                for laid in &prepaint.laid_out.lines {
-                    let _ = laid.line.paint(
-                        laid.paint_origin(),
-                        laid.row_stride,
-                        gpui::TextAlign::Left,
-                        None,
+                        window,
+                    );
+                    // Inline math overlays paint *after* the line text (so
+                    // they sit on top of the NBSP placeholders that
+                    // reserved the space) but *before* the cursor (so the
+                    // caret remains visible above the math).
+                    paint_inline_math_overlays(
+                        &prepaint.inline_math,
+                        &prepaint.laid_out.lines,
+                        &self.style,
+                        &self.block.kind,
                         window,
                         cx,
                     );
-                }
-                // Emphasis dots under emphasized CJK characters, in
-                // the same over-the-text / under-the-cursor band as
-                // the overlays below.
-                paint_emphasis_dots(
-                    &prepaint.laid_out.lines,
-                    &prepaint.shaped_block,
+                    // Inline image overlays — same paint ordering as math
+                    // (over the line text, under the cursor). Each spec
+                    // paints exactly where its substitution placed pad
+                    // glyphs in the shaped line.
+                    paint_inline_image_overlays(
+                        &prepaint.inline_images,
+                        &prepaint.laid_out.lines,
+                        window,
+                    );
+                    if focused
+                        && !disabled
+                        && let Some(tq) = cursor_quad
+                    {
+                        window.paint_quad(tq.quad);
+                    }
+                });
+            }
+
+            // Horizontal scrollbar overlay — only when the code block has
+            // overflow. A thin track at the bottom of the bg fill, with a
+            // muted thumb whose size and offset reflect the visible /
+            // total ratio. Painted *outside* the content mask so it stays
+            // visible when the user is scrolled past the right edge of
+            // their content.
+            if let Some(cb) = &code_block_paint
+                && cb.content_width > cb.visible_width
+            {
+                paint_horizontal_scrollbar(window, cb, &self.style);
+            }
+            // Table scrollbar: same overlay as code blocks, tracked along
+            // the block's bottom edge (tables have no fence seam to sit on).
+            if let Some(tp) = &prepaint.table_paint
+                && tp.content_width > tp.visible_width
+            {
+                paint_h_scrollbar_at(
+                    window,
                     &self.style,
-                    window,
+                    tp.clip.bottom() - px(3.0),
+                    tp.clip.left(),
+                    tp.clip.right(),
+                    tp.content_width,
+                    tp.visible_width,
+                    tp.scroll_x,
                 );
-                // Inline math overlays paint *after* the line text (so
-                // they sit on top of the NBSP placeholders that
-                // reserved the space) but *before* the cursor (so the
-                // caret remains visible above the math).
-                paint_inline_math_overlays(
-                    &prepaint.inline_math,
-                    &prepaint.laid_out.lines,
-                    &self.style,
-                    &self.block.kind,
-                    window,
-                    cx,
-                );
-                // Inline image overlays — same paint ordering as math
-                // (over the line text, under the cursor). Each spec
-                // paints exactly where its substitution placed pad
-                // glyphs in the shaped line.
-                paint_inline_image_overlays(
-                    &prepaint.inline_images,
-                    &prepaint.laid_out.lines,
-                    window,
-                );
-                if focused
-                    && !disabled
-                    && let Some(tq) = cursor_quad
-                {
-                    window.paint_quad(tq.quad);
-                }
-            });
+            }
         }
 
-        // Horizontal scrollbar overlay — only when the code block has
-        // overflow. A thin track at the bottom of the bg fill, with a
-        // muted thumb whose size and offset reflect the visible /
-        // total ratio. Painted *outside* the content mask so it stays
-        // visible when the user is scrolled past the right edge of
-        // their content.
-        if let Some(cb) = &code_block_paint
-            && cb.content_width > cb.visible_width
-        {
-            paint_horizontal_scrollbar(window, cb, &self.style);
-        }
-        // Table scrollbar: same overlay as code blocks, tracked along
-        // the block's bottom edge (tables have no fence seam to sit on).
-        if let Some(tp) = &prepaint.table_paint
-            && tp.content_width > tp.visible_width
-        {
-            paint_h_scrollbar_at(
-                window,
-                &self.style,
-                tp.clip.bottom() - px(3.0),
-                tp.clip.left(),
-                tp.clip.right(),
-                tp.content_width,
-                tp.visible_width,
-                tp.scroll_x,
-            );
-        }
+        let embed_content = embed_paint.map(|ep| EmbedContentGeometry {
+            pieces: ep
+                .pieces
+                .into_iter()
+                .map(|p| (p.line.text.clone(), p.rel_origin))
+                .collect(),
+            code_panels: ep.code_panels,
+            math_origins: ep.math.into_iter().map(|m| m.rel_origin).collect(),
+            rules: ep.rules.into_iter().map(|(r, _)| r).collect(),
+            bars: ep.bars,
+        });
 
         // Horizontal scroll-wheel routing for the no-wrap blocks
         // (code + table): one listener over the block's scrollable
@@ -3997,6 +4252,7 @@ fn paint_emphasis_dots(
     }
     let font_size = font_size_for_block(&block.kind, style);
     let (body_ascent, body_descent) = body_metrics_for_block(&block.kind, style, font_size, window);
+    let index = BlockIndex::new(block);
     for line in lines {
         for bounds in emphasis_dot_bounds(
             &line.line,
@@ -4004,7 +4260,7 @@ fn paint_emphasis_dots(
             line.origin,
             line.row_stride,
             line.row_height,
-            block,
+            &index,
             style,
             font_size,
             body_ascent,
@@ -4500,11 +4756,189 @@ fn list_marker_display_text(kind: ListItemKind, cursor_inside: bool) -> String {
 
 // ---------- Shaping ----------
 
+#[derive(Clone)]
 struct ShapedLine {
     line: Arc<WrappedLine>,
     source_range: Range<usize>,
     display_to_source: Vec<usize>,
     is_delimiter: bool,
+}
+
+/// Block layouts kept across frames — [`shape_block_lines`] for text
+/// blocks, [`layout_table`] for tables — so a frame that changed nothing
+/// about a block (a scroll, a caret move in another block, a hover) and
+/// the several measure passes within one frame reuse its layout instead
+/// of rebuilding it.
+///
+/// An entry is reused only when every input the layout reads is equal:
+/// the block, its source text, the font size and heading weight the
+/// style gives it, the width, and the rest of the style, which the cache
+/// holds once and empties itself for whenever a lookup brings a
+/// different one.
+#[derive(Default)]
+pub(crate) struct ShapeCache {
+    style: Option<MarkdownStyle>,
+    /// Entries by block start offset, the newest last.
+    entries: HashMap<usize, Vec<ShapeEntry>>,
+}
+
+struct ShapeEntry {
+    block: RenderBlock,
+    text: String,
+    font_size: Pixels,
+    weight: FontWeight,
+    width: Option<Pixels>,
+    layout: CachedLayout,
+}
+
+#[derive(Clone)]
+enum CachedLayout {
+    Lines(Rc<Vec<ShapedLine>>),
+    Table(Rc<Option<TableLayoutOut>>),
+}
+
+impl ShapeCache {
+    /// How many variants of one block are kept — measured and painted
+    /// blocks can differ (an image block hides its source only once it
+    /// paints), and a resize passes through widths.
+    const PER_BLOCK: usize = 4;
+
+    /// Drop the entries of block starts no longer among the document's
+    /// `blocks`, which an edit leaves behind.
+    pub(crate) fn retain_blocks(&mut self, blocks: &[RenderBlock]) {
+        let starts: std::collections::HashSet<usize> =
+            blocks.iter().map(|b| b.source_range.start).collect();
+        self.entries.retain(|start, _| starts.contains(start));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.values().map(Vec::len).sum()
+    }
+
+    /// The cached layout of `block` with these inputs, laid out by `make`
+    /// and kept when there is none. `is_kind` tells the two kinds of
+    /// layout apart.
+    #[allow(clippy::too_many_arguments)]
+    fn get_or_make(
+        cache: &RefCell<Self>,
+        source: &str,
+        block: &RenderBlock,
+        style: &MarkdownStyle,
+        font_size: Pixels,
+        width: Option<Pixels>,
+        is_kind: fn(&CachedLayout) -> bool,
+        make: impl FnOnce() -> CachedLayout,
+    ) -> CachedLayout {
+        let text = source.get(block.source_range.clone()).unwrap_or_default();
+        let weight = base_weight_for_block(&block.kind, style);
+        {
+            let mut cache = cache.borrow_mut();
+            if !cache
+                .style
+                .as_ref()
+                .is_some_and(|s| s.eq_ignoring_heading_fns(style))
+            {
+                cache.entries.clear();
+                cache.style = Some(style.clone());
+            }
+        }
+        let hit = cache
+            .borrow()
+            .entries
+            .get(&block.source_range.start)
+            .and_then(|variants| {
+                variants
+                    .iter()
+                    .find(|e| {
+                        is_kind(&e.layout)
+                            && e.font_size == font_size
+                            && e.weight == weight
+                            && e.width == width
+                            && e.text == text
+                            && e.block == *block
+                    })
+                    .map(|e| e.layout.clone())
+            });
+        if let Some(layout) = hit {
+            return layout;
+        }
+        let layout = make();
+        let mut cache = cache.borrow_mut();
+        let variants = cache.entries.entry(block.source_range.start).or_default();
+        if variants.len() == Self::PER_BLOCK {
+            variants.remove(0);
+        }
+        variants.push(ShapeEntry {
+            block: block.clone(),
+            text: text.to_string(),
+            font_size,
+            weight,
+            width,
+            layout: layout.clone(),
+        });
+        layout
+    }
+}
+
+/// [`shape_block_lines`] through `cache`.
+fn shape_block_lines_cached(
+    cache: &RefCell<ShapeCache>,
+    source: &str,
+    block: &RenderBlock,
+    style: &MarkdownStyle,
+    font_size: Pixels,
+    wrap_width: Option<Pixels>,
+    window: &mut Window,
+) -> Rc<Vec<ShapedLine>> {
+    let layout = ShapeCache::get_or_make(
+        cache,
+        source,
+        block,
+        style,
+        font_size,
+        wrap_width,
+        |l| matches!(l, CachedLayout::Lines(_)),
+        || {
+            CachedLayout::Lines(Rc::new(shape_block_lines(
+                source, block, style, font_size, wrap_width, window,
+            )))
+        },
+    );
+    match layout {
+        CachedLayout::Lines(lines) => lines,
+        CachedLayout::Table(_) => unreachable!("matched by kind"),
+    }
+}
+
+/// [`layout_table`] through `cache`.
+fn layout_table_cached(
+    cache: &RefCell<ShapeCache>,
+    block: &RenderBlock,
+    source: &str,
+    font_size: Pixels,
+    style: &MarkdownStyle,
+    avail_w: Pixels,
+    window: &mut Window,
+) -> Rc<Option<TableLayoutOut>> {
+    let layout = ShapeCache::get_or_make(
+        cache,
+        source,
+        block,
+        style,
+        font_size,
+        Some(avail_w),
+        |l| matches!(l, CachedLayout::Table(_)),
+        || {
+            CachedLayout::Table(Rc::new(layout_table(
+                block, source, font_size, style, avail_w, window,
+            )))
+        },
+    );
+    match layout {
+        CachedLayout::Table(table) => table,
+        CachedLayout::Lines(_) => unreachable!("matched by kind"),
+    }
 }
 
 /// Total inner-content height contributed by a list of shaped lines:
@@ -4590,6 +5024,7 @@ fn shape_block_lines(
     };
     let mut out = Vec::new();
     let mut cursor = block.source_range.start;
+    let index = BlockIndex::new(block);
 
     // Synthetic empty paragraphs from `inject_empty_paragraphs` cover a
     // pair of `\n`s in the pairs model — the whole pair is one visible
@@ -4623,7 +5058,7 @@ fn shape_block_lines(
         let line_source_range = cursor..raw_end;
 
         let (display_text, display_to_source) =
-            build_display_line(source, &logical_source_range, block);
+            build_display_line(source, &logical_source_range, block, &index);
 
         // Code-block fence detection: the line's *full* logical
         // content is covered by either a hidden range (cursor
@@ -4661,7 +5096,7 @@ fn shape_block_lines(
             continue;
         }
 
-        let runs = build_runs_for_line(&display_text, &display_to_source, block, style);
+        let runs = build_runs_for_line(&display_text, &display_to_source, block, &index, style);
 
         let shared = SharedString::from(display_text);
         let mut shaped_vec = window
@@ -4747,6 +5182,7 @@ fn build_display_line(
     source: &str,
     line: &Range<usize>,
     block: &RenderBlock,
+    index: &BlockIndex,
 ) -> (String, Vec<usize>) {
     let mut display = String::new();
     let mut map: Vec<usize> = Vec::new();
@@ -4760,11 +5196,7 @@ fn build_display_line(
         // maps to `source_range.start` so a click on the substituted
         // glyph (e.g. a bullet) lands at the start of the original
         // marker bytes.
-        if let Some(sub) = block
-            .substitutions
-            .iter()
-            .find(|s| s.source_range.start == pos && s.source_range.end <= line.end)
-        {
+        if let Some(sub) = index.substitution_at(block, pos, line.end) {
             for _ in 0..sub.display.len() {
                 map.push(sub.source_range.start);
             }
@@ -4773,30 +5205,17 @@ fn build_display_line(
             continue;
         }
 
-        // Find the *furthest* hidden-range end that covers `pos`.
-        // Multiple hidden ranges can overlap on the same byte — the
-        // common case is a blockquote `> ` whose trailing space is
-        // also the leading space of a code-block closing fence's
-        // indent run. The previous `r.start == pos` predicate would
-        // pick whichever range happened to start at `pos`, advance to
-        // its end, then fail to skip the overlapping tail bytes of
-        // the longer range. Finding the maximum `r.end` over all
-        // ranges that cover `pos` skips the entire union in one step.
+        // Several hidden ranges can cover the same byte — a blockquote
+        // `> ` whose trailing space is also the leading space of a
+        // code-block closing fence's indent run — so the skip goes to
+        // the end of their whole union, not of whichever range starts
+        // here.
         //
-        // The filter intentionally does *not* require `r.end <= line.end`:
-        // a `BlockKind::DisplayMath` in display mode pushes one hide
-        // covering the entire math source range (multiple lines), so
-        // `r.end` extends past every individual shaped line's `line.end`.
-        // We clamp `pos = end.min(line.end)` below so the advance never
-        // walks past the current line — the cross-line span just means
-        // every line this range covers contributes zero display bytes.
-        let cover_end = block
-            .hidden_ranges
-            .iter()
-            .filter(|r| r.start <= pos && pos < r.end)
-            .map(|r| r.end)
-            .max();
-        if let Some(end) = cover_end {
+        // A span may extend past `line.end`: a `BlockKind::DisplayMath`
+        // in display mode hides its entire multi-line source range. The
+        // jump clamps to `line.end`, so every line such a span covers
+        // contributes zero display bytes.
+        if let Some(end) = index.hidden_end_at(pos) {
             let mut jump = end.min(line.end);
             // A substitution whose start lies strictly inside the
             // covered span must still get its chance to apply. This
@@ -4808,12 +5227,8 @@ fn build_display_line(
             // skip the substitution entirely — the alignment pads
             // vanish exactly on styled cells. Clamp the jump to the
             // earliest in-span substitution start instead.
-            if let Some(sub_start) = block
-                .substitutions
-                .iter()
-                .filter(|s| s.source_range.start > pos && s.source_range.start < jump)
-                .map(|s| s.source_range.start)
-                .min()
+            if let Some(sub_start) = index.next_substitution_after(pos)
+                && sub_start < jump
             {
                 jump = sub_start;
             }
@@ -4840,6 +5255,7 @@ fn build_runs_for_line(
     display_text: &str,
     display_to_source: &[usize],
     block: &RenderBlock,
+    index: &BlockIndex,
     style: &MarkdownStyle,
 ) -> SmallVec<[TextRun; 8]> {
     let mut runs: SmallVec<[TextRun; 8]> = SmallVec::new();
@@ -4855,11 +5271,11 @@ fn build_runs_for_line(
     let mut i = 0usize;
     while i < len {
         let here_src = display_to_source[i];
-        let here_style = effective_inline_style(here_src, block);
+        let here_style = index.style_at(here_src);
         let mut j = i + 1;
         while j < len {
             let next_src = display_to_source[j];
-            if effective_inline_style(next_src, block) != here_style {
+            if index.style_at(next_src) != here_style {
                 break;
             }
             j += 1;
@@ -4941,6 +5357,8 @@ fn build_runs_for_line(
     runs
 }
 
+/// The merged style of every inline run covering `src_offset`.
+#[cfg(test)]
 fn effective_inline_style(src_offset: usize, block: &RenderBlock) -> InlineStyle {
     let mut acc = InlineStyle::default();
     for run in &block.inlines {
@@ -4949,6 +5367,144 @@ fn effective_inline_style(src_offset: usize, block: &RenderBlock) -> InlineStyle
         }
     }
     acc
+}
+
+/// The lookups the per-line builders make into one block — which
+/// substitution starts at an offset, which hidden span covers it, and
+/// the merged inline style there — built once per block, so laying out
+/// a line costs its own length rather than its length times everything
+/// the block holds.
+pub(crate) struct BlockIndex {
+    /// `(start, k)` for each `block.substitutions[k]`, sorted, so the
+    /// first one listed wins a shared start.
+    subs: Vec<(usize, usize)>,
+    /// The union of the block's hidden ranges as sorted, disjoint spans;
+    /// ranges that overlap or touch join one span. Skipping to the end of
+    /// the span that covers an offset is the same as repeatedly skipping
+    /// to the furthest end of the ranges covering it.
+    hidden: Vec<Range<usize>>,
+    styles: InlineStyleMap,
+}
+
+impl BlockIndex {
+    pub(crate) fn new(block: &RenderBlock) -> Self {
+        let mut subs: Vec<(usize, usize)> = block
+            .substitutions
+            .iter()
+            .enumerate()
+            .map(|(k, s)| (s.source_range.start, k))
+            .collect();
+        subs.sort_unstable();
+        let mut ranges: Vec<Range<usize>> = block
+            .hidden_ranges
+            .iter()
+            .filter(|r| r.start < r.end)
+            .cloned()
+            .collect();
+        ranges.sort_unstable_by_key(|r| r.start);
+        let mut hidden: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            match hidden.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => hidden.push(r),
+            }
+        }
+        Self {
+            subs,
+            hidden,
+            styles: InlineStyleMap::new(&block.inlines),
+        }
+    }
+
+    /// The first substitution starting at `pos` that ends by `limit`.
+    fn substitution_at<'b>(
+        &self,
+        block: &'b RenderBlock,
+        pos: usize,
+        limit: usize,
+    ) -> Option<&'b Substitution> {
+        let first = self.subs.partition_point(|&(start, _)| start < pos);
+        self.subs[first..]
+            .iter()
+            .take_while(|&&(start, _)| start == pos)
+            .map(|&(_, k)| &block.substitutions[k])
+            .find(|s| s.source_range.end <= limit)
+    }
+
+    /// The start of the first substitution after `pos`.
+    fn next_substitution_after(&self, pos: usize) -> Option<usize> {
+        let after = self.subs.partition_point(|&(start, _)| start <= pos);
+        self.subs.get(after).map(|&(start, _)| start)
+    }
+
+    /// The end of the hidden span covering `pos`, if one does.
+    fn hidden_end_at(&self, pos: usize) -> Option<usize> {
+        let covering = self.hidden.partition_point(|r| r.start <= pos);
+        let span = &self.hidden[covering.checked_sub(1)?];
+        (pos < span.end).then_some(span.end)
+    }
+
+    /// The merged style of every inline run covering `src_offset`.
+    fn style_at(&self, src_offset: usize) -> InlineStyle {
+        self.styles.at(src_offset)
+    }
+
+    fn any_emphasis_dots(&self) -> bool {
+        self.styles.styles.iter().any(|s| s.emphasis_dots)
+    }
+}
+
+/// Merged inline styles as the segments on which they are constant: the
+/// answer `effective_inline_style` gives for any offset, in O(log runs).
+/// Merging is a union of flags, so the style at an offset is a count,
+/// per flag, of the runs covering it.
+struct InlineStyleMap {
+    /// Segment `k` covers `starts[k]..starts[k + 1]` (the last one, every
+    /// offset after) and has style `styles[k]`. `starts[0]` is 0.
+    starts: Vec<usize>,
+    styles: Vec<InlineStyle>,
+}
+
+impl InlineStyleMap {
+    fn new(runs: &[InlineRun]) -> Self {
+        // (offset, -1 closes a run / +1 opens one, the run's flags).
+        let mut events: Vec<(usize, i32, [bool; InlineStyle::FLAGS])> = Vec::new();
+        for run in runs {
+            let r = &run.source_range;
+            if r.start < r.end {
+                let flags = run.style.flags();
+                events.push((r.start, 1, flags));
+                events.push((r.end, -1, flags));
+            }
+        }
+        events.sort_unstable_by_key(|&(at, delta, _)| (at, delta));
+        let mut counts = [0i32; InlineStyle::FLAGS];
+        let mut starts = vec![0];
+        let mut styles = Vec::new();
+        let mut k = 0;
+        loop {
+            let at = *starts.last().expect("seeded with 0");
+            while let Some(&(_, delta, flags)) = events.get(k).filter(|e| e.0 <= at) {
+                for (count, set) in counts.iter_mut().zip(flags) {
+                    if set {
+                        *count += delta;
+                    }
+                }
+                k += 1;
+            }
+            styles.push(InlineStyle::from_flags(counts.map(|c| c > 0)));
+            match events.get(k) {
+                Some(&(next, _, _)) => starts.push(next),
+                None => break,
+            }
+        }
+        Self { starts, styles }
+    }
+
+    fn at(&self, src_offset: usize) -> InlineStyle {
+        let k = self.starts.partition_point(|&s| s <= src_offset);
+        self.styles[k - 1].clone()
+    }
 }
 
 fn base_font_for_block(kind: &BlockKind, style: &MarkdownStyle) -> gpui::Font {
@@ -5131,7 +5687,7 @@ fn paint_selection_for_line(
     // Per-row right edges, not the configured wrap width — see
     // `wrap_row_right_edges`. The wash hugs the text on every row it
     // crosses, the way the inline-code chip does.
-    let right_edges = wrap_row_right_edges(&line.line, row_stride);
+    let right_edges = wrap_row_right_edges(&*line.line, row_stride);
     let row_right = |row: usize| {
         line.origin.x
             + right_edges
@@ -5434,7 +5990,7 @@ mod tests {
                 point(px(0.0), px(0.0)),
                 row_height,
                 row_height,
-                block,
+                &BlockIndex::new(block),
                 &style,
                 font_size,
                 ascent,
@@ -5490,7 +6046,7 @@ mod tests {
                     point(px(0.0), px(0.0)),
                     line_height,
                     line_height,
-                    block,
+                    &BlockIndex::new(block),
                     &style,
                     font_size,
                     body_ascent,
@@ -5536,7 +6092,13 @@ mod tests {
                 window,
             );
             let sl = shaped.into_iter().next().expect("a shaped line");
-            let runs = build_runs_for_line(&sl.line.text, &sl.display_to_source, block, &style);
+            let runs = build_runs_for_line(
+                &sl.line.text,
+                &sl.display_to_source,
+                block,
+                &BlockIndex::new(block),
+                &style,
+            );
             let mut out = Vec::new();
             let mut at = 0usize;
             for run in runs {
@@ -5741,7 +6303,7 @@ mod tests {
                         point(px(0.0), px(0.0)),
                         line_height,
                         line_height,
-                        block,
+                        &BlockIndex::new(block),
                         style,
                         font_size,
                         a,
@@ -5786,7 +6348,7 @@ mod tests {
                 point(px(0.0), px(0.0)),
                 line_height,
                 line_height,
-                block,
+                &BlockIndex::new(block),
                 style,
                 font_size,
                 a,
@@ -5869,7 +6431,7 @@ mod tests {
                     point(px(0.0), px(0.0)),
                     line_height,
                     line_height,
-                    b,
+                    &BlockIndex::new(b),
                     style,
                 )
                 .len()
@@ -5921,7 +6483,7 @@ mod tests {
                 point(px(0.0), px(0.0)),
                 stride,
                 line_height,
-                &augmented,
+                &BlockIndex::new(&augmented),
                 style,
             );
             (chips, line_height, stride)
@@ -5971,12 +6533,77 @@ mod tests {
                 point(px(0.0), px(0.0)),
                 line_height,
                 line_height,
-                block,
+                &BlockIndex::new(block),
                 style,
             );
-            let edges = wrap_row_right_edges(&sl.line, line_height).to_vec();
+            let edges = wrap_row_right_edges(&*sl.line, line_height).to_vec();
             (chips, edges)
         })
+    }
+
+    #[gpui::test]
+    fn the_glyph_index_answers_every_position_query_as_gpui_does(cx: &mut TestAppContext) {
+        let docs = [
+            "`alpha beta gamma delta epsilon zeta` tail with `more code` and words",
+            "plain prose that wraps over several rows at a narrow width, again and again",
+            "混合 **着重** text 中文字符 with `代码` and emoji 🎉👩‍👩‍👧 then more 汉字汉字汉字",
+            "עברית mixed with English and العربية too, wrapping across rows",
+            "x",
+            "trailing spaces   ",
+        ];
+        for src in docs {
+            let state = EditorState {
+                markdown: src.into(),
+                selection: Selection::Cursor(src.len()),
+                ..Default::default()
+            };
+            let tree = parse(src);
+            let blocks = render(&state, &tree).blocks;
+            with_style(cx, |window, style| {
+                let block = blocks
+                    .iter()
+                    .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                    .expect("paragraph");
+                let font_size = font_size_for_block(&block.kind, style);
+                let stride = font_size * style.line_height.0;
+                for wrap_w in [None, Some(px(60.0)), Some(px(150.0))] {
+                    let shaped = shape_block_lines(src, block, style, font_size, wrap_w, window);
+                    for sl in &shaped {
+                        let line: &WrappedLine = &sl.line;
+                        let glyphs = LineGlyphs::new(line);
+                        assert_eq!(glyphs.wrap_count(), LinePositions::wrap_count(line));
+                        assert_eq!(LinePositions::width(&glyphs), LinePositions::width(line));
+                        for i in 0..=line.text.len() + 2 {
+                            assert_eq!(
+                                LinePositions::position_for_index(&glyphs, i, stride),
+                                LinePositions::position_for_index(line, i, stride),
+                                "{src:?} at {wrap_w:?}: position of index {i}"
+                            );
+                        }
+                        let rows = glyphs.wrap_count() + 2;
+                        let right = f32::from(line.unwrapped_layout.width) + 20.0;
+                        let mut y = -0.5f32;
+                        while y < rows as f32 {
+                            let mut x = -5.0f32;
+                            while x < right {
+                                let p = point(px(x), stride * y);
+                                assert_eq!(
+                                    LinePositions::closest_index_for_position(&glyphs, p, stride),
+                                    LinePositions::closest_index_for_position(line, p, stride),
+                                    "{src:?} at {wrap_w:?}: index closest to {p:?}"
+                                );
+                                x += 1.7;
+                            }
+                            y += 0.25;
+                        }
+                        assert_eq!(
+                            wrap_row_right_edges(&glyphs, stride),
+                            wrap_row_right_edges(line, stride)
+                        );
+                    }
+                }
+            });
+        }
     }
 
     #[gpui::test]
@@ -6053,7 +6680,7 @@ mod tests {
 
             let mut out = Vec::new();
             push_row_spanning_bounds(
-                &sl.line,
+                &*sl.line,
                 0,
                 unanswerable,
                 point(px(0.0), px(0.0)),
@@ -6068,7 +6695,7 @@ mod tests {
             let last = out.last().expect("a quad");
             assert_eq!(
                 last.origin.x + last.size.width,
-                end_of_line_position(&sl.line, line_height).x,
+                end_of_line_position(&*sl.line, line_height).x,
                 "the end falls back to the caret's end-of-line rule"
             );
         });
@@ -6109,7 +6736,7 @@ mod tests {
                 display_to_source: sl.display_to_source,
                 is_delimiter: sl.is_delimiter,
             };
-            let edges = wrap_row_right_edges(&laid.line, line_height).to_vec();
+            let edges = wrap_row_right_edges(&*laid.line, line_height).to_vec();
             let mut out = Vec::new();
             paint_selection_for_line(
                 &laid,
@@ -6685,5 +7312,343 @@ mod tests {
             tall[0],
             short[0],
         );
+    }
+
+    /// `build_display_line` as a walk over every substitution and hidden
+    /// range at every byte: the rule the indexed version must reproduce.
+    fn build_display_line_per_byte(
+        source: &str,
+        line: &Range<usize>,
+        block: &RenderBlock,
+    ) -> (String, Vec<usize>) {
+        let mut display = String::new();
+        let mut map: Vec<usize> = Vec::new();
+
+        let mut pos = line.start;
+        while pos < line.end {
+            if let Some(sub) = block
+                .substitutions
+                .iter()
+                .find(|s| s.source_range.start == pos && s.source_range.end <= line.end)
+            {
+                for _ in 0..sub.display.len() {
+                    map.push(sub.source_range.start);
+                }
+                display.push_str(&sub.display);
+                pos = sub.source_range.end;
+                continue;
+            }
+
+            let cover_end = block
+                .hidden_ranges
+                .iter()
+                .filter(|r| r.start <= pos && pos < r.end)
+                .map(|r| r.end)
+                .max();
+            if let Some(end) = cover_end {
+                let mut jump = end.min(line.end);
+                if let Some(sub_start) = block
+                    .substitutions
+                    .iter()
+                    .filter(|s| s.source_range.start > pos && s.source_range.start < jump)
+                    .map(|s| s.source_range.start)
+                    .min()
+                {
+                    jump = sub_start;
+                }
+                pos = jump;
+                continue;
+            }
+            let ch = source[pos..line.end]
+                .chars()
+                .next()
+                .expect("non-empty remainder");
+            let ch_len = ch.len_utf8();
+            for _ in 0..ch_len {
+                map.push(pos);
+            }
+            display.push(ch);
+            pos += ch_len;
+        }
+        map.push(line.end);
+        debug_assert_eq!(map.len(), display.len() + 1);
+        (display, map)
+    }
+
+    /// Source covering every construct that hides, substitutes or styles
+    /// bytes: delimiters, escapes and entities, links and images, inline
+    /// code and math, CJK emphasis, tables with styled cells, a fenced
+    /// block inside a quote, display math, lists and hard breaks.
+    const DISPLAY_CORPUS: &str = "\
+# Heading with **bold** and `code`
+
+Plain *italic* and ***both*** with ~~strike~~, \\*escaped\\* &amp; &copy; and \
+[a link](https://example.com/a&amp;b) beside ![alt *text*](img.png).  
+Hard break above; `code with \\* inside` and $x^2 + \\$y$ math.
+
+强调**加粗**与*斜体中文*混排 *mixed 中文 text*.
+
+| Left | **Bold** | `code` |
+|:-----|:--------:|-------:|
+| a *b* | ~~c~~ | `d` |
+| &amp; | [e](f) | \\| |
+
+> Quoted **text**
+> ```rust
+> let x = 1;
+> ```
+> - nested *item*
+
+1. one
+   - two **2**
+     - three `3`
+
+$$
+\\frac{a}{b}
+$$
+
+***
+";
+
+    /// Every block of `src` rendered editable and read-only, with the
+    /// cursor at every `step`-th byte that is a char boundary.
+    fn rendered_blocks(src: &str, step: usize) -> Vec<RenderBlock> {
+        let tree = parse(src);
+        let mut out = Vec::new();
+        for cursor in (0..=src.len())
+            .step_by(step)
+            .filter(|&c| src.is_char_boundary(c))
+        {
+            let state = EditorState {
+                markdown: src.into(),
+                selection: Selection::Cursor(cursor),
+                ..Default::default()
+            };
+            out.extend(render(&state, &tree).blocks);
+            out.extend(crate::render::render_readonly(&state, &tree).blocks);
+        }
+        out
+    }
+
+    /// Each source line of `block`, as `shape_block_lines` splits it.
+    fn block_lines(src: &str, block: &RenderBlock) -> Vec<Range<usize>> {
+        let mut cursor = block.source_range.start;
+        let mut out = Vec::new();
+        for raw in src[block.source_range.clone()].split_inclusive('\n') {
+            let end = cursor + raw.len() - usize::from(raw.ends_with('\n'));
+            out.push(cursor..end);
+            cursor += raw.len();
+        }
+        out
+    }
+
+    #[test]
+    fn indexed_display_lines_match_the_per_byte_walk() {
+        let src = DISPLAY_CORPUS;
+        let mut checked = 0;
+        for block in rendered_blocks(src, 3) {
+            // The block as rendered, and again with extra hidden ranges
+            // overlapping, nesting in and touching the ones it has, and
+            // reaching past its lines — shapes the render pipeline merges
+            // away but `build_display_line` promises to handle.
+            let mut perturbed = block.clone();
+            for (k, h) in block.hidden_ranges.iter().enumerate() {
+                let extra = match k % 4 {
+                    0 => h.start + 1..h.end + 2,
+                    1 => h.start..h.start + 1,
+                    2 => h.end..h.end + 1,
+                    _ => h.start.saturating_sub(1)..h.end + 40,
+                };
+                let mut start = extra.start;
+                while !src.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let mut end = extra.end.min(src.len());
+                while !src.is_char_boundary(end) {
+                    end += 1;
+                }
+                perturbed.hidden_ranges.push(start..end);
+            }
+            perturbed.hidden_ranges.reverse();
+            for b in [&block, &perturbed] {
+                for line in block_lines(src, b) {
+                    assert_eq!(
+                        build_display_line(src, &line, b, &BlockIndex::new(b)),
+                        build_display_line_per_byte(src, &line, b),
+                        "line {line:?} of {:?}",
+                        &src[line.clone()],
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000, "only {checked} lines checked");
+    }
+
+    #[test]
+    fn the_inline_style_map_matches_every_covering_run() {
+        let src = DISPLAY_CORPUS;
+        let mut checked = 0;
+        for block in rendered_blocks(src, 3) {
+            let map = InlineStyleMap::new(&block.inlines);
+            for line in block_lines(src, &block) {
+                for offset in line.start..=line.end {
+                    assert_eq!(
+                        map.at(offset),
+                        effective_inline_style(offset, &block),
+                        "offset {offset} of line {line:?}",
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10_000, "only {checked} offsets checked");
+    }
+
+    /// Lay `src` out through a fresh `ShapeCache`, then call `check` with
+    /// a window, the cache, the source's blocks (cursor at offset 0) and
+    /// the style.
+    fn with_shape_cache(
+        cx: &mut TestAppContext,
+        src: &str,
+        check: impl FnOnce(&mut Window, &RefCell<ShapeCache>, &[RenderBlock], &MarkdownStyle),
+    ) {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+            ..Default::default()
+        };
+        let blocks = render(&state, &parse(src)).blocks;
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            check(
+                window,
+                &RefCell::new(ShapeCache::default()),
+                &blocks,
+                &style,
+            );
+        })
+        .unwrap();
+    }
+
+    fn lines_via(
+        cache: &RefCell<ShapeCache>,
+        src: &str,
+        block: &RenderBlock,
+        style: &MarkdownStyle,
+        wrap: Option<Pixels>,
+        window: &mut Window,
+    ) -> Rc<Vec<ShapedLine>> {
+        let font_size = font_size_for_block(&block.kind, style);
+        shape_block_lines_cached(cache, src, block, style, font_size, wrap, window)
+    }
+
+    #[gpui::test]
+    fn the_shape_cache_reuses_lines_while_nothing_changes(cx: &mut TestAppContext) {
+        let src = "# Title\n\nA *paragraph* with `code`.\n";
+        with_shape_cache(cx, src, |window, cache, blocks, style| {
+            let wrap = Some(px(400.0));
+            for block in blocks {
+                let first = lines_via(cache, src, block, style, wrap, window);
+                // A fresh clone of every input — equal, not identical.
+                let again = lines_via(cache, src, &block.clone(), &style.clone(), wrap, window);
+                assert!(Rc::ptr_eq(&first, &again), "block {:?}", block.kind);
+            }
+            // Heading functions built afresh, as a host may each frame,
+            // but answering the same: the same layout.
+            let built = |style: &MarkdownStyle| {
+                style
+                    .clone()
+                    .heading_font_size(|_, base| base * 2.0)
+                    .heading_weight(|_| FontWeight::BOLD)
+            };
+            let heading = &blocks[0];
+            let first = lines_via(cache, src, heading, &built(style), wrap, window);
+            let again = lines_via(cache, src, heading, &built(style), wrap, window);
+            assert!(Rc::ptr_eq(&first, &again));
+        });
+    }
+
+    #[gpui::test]
+    fn the_shape_cache_misses_on_every_input_it_reads(cx: &mut TestAppContext) {
+        let src = "# Title\n\nA *paragraph* with `code`.\n";
+        let edited = "# Title\n\nA *paragraph* with `kode`.\n";
+        with_shape_cache(cx, src, |window, cache, blocks, style| {
+            let wrap = Some(px(400.0));
+            let heading = &blocks[0];
+            let para = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("a paragraph");
+            let base = lines_via(cache, src, para, style, wrap, window);
+            let misses = |other: &Rc<Vec<ShapedLine>>| !Rc::ptr_eq(&base, other);
+
+            // The block's text.
+            let text = lines_via(cache, edited, para, style, wrap, window);
+            assert!(misses(&text));
+            assert!(text[0].line.text.contains("kode"));
+            // The block itself: the caret inside reveals the delimiters.
+            let revealed = render(
+                &EditorState {
+                    markdown: src.into(),
+                    selection: Selection::Cursor(para.source_range.start + 3),
+                    ..Default::default()
+                },
+                &parse(src),
+            )
+            .blocks
+            .into_iter()
+            .find(|b| b.source_range == para.source_range)
+            .expect("the same paragraph");
+            assert_ne!(&revealed, para);
+            assert!(misses(&lines_via(
+                cache, src, &revealed, style, wrap, window
+            )));
+            // The wrap width.
+            assert!(misses(&lines_via(
+                cache,
+                src,
+                para,
+                style,
+                Some(px(300.0)),
+                window
+            )));
+            // Any other style field — a color the runs carry.
+            let mut recolored = style.clone();
+            recolored.text_color = gpui::red();
+            let colored = lines_via(cache, src, para, &recolored, wrap, window);
+            assert!(misses(&colored));
+            // The size a heading function gives the block.
+            let base_heading = lines_via(cache, src, heading, &recolored, wrap, window);
+            let bigger = recolored.clone().heading_font_size(|_, base| base * 3.0);
+            let font_size = font_size_for_block(&heading.kind, &bigger);
+            let resized =
+                shape_block_lines_cached(cache, src, heading, &bigger, font_size, wrap, window);
+            assert!(!Rc::ptr_eq(&base_heading, &resized));
+            // The weight a heading function gives the block.
+            let base_heading = lines_via(cache, src, heading, &bigger, wrap, window);
+            let lighter = bigger.clone().heading_weight(|_| FontWeight::THIN);
+            let reweighted = lines_via(cache, src, heading, &lighter, wrap, window);
+            assert!(!Rc::ptr_eq(&base_heading, &reweighted));
+        });
+    }
+
+    #[gpui::test]
+    fn the_shape_cache_forgets_blocks_the_document_no_longer_has(cx: &mut TestAppContext) {
+        let src = "one\n\ntwo\n\nthree\n";
+        with_shape_cache(cx, src, |window, cache, blocks, style| {
+            for block in blocks {
+                lines_via(cache, src, block, style, None, window);
+            }
+            let laid_out = cache.borrow().len();
+            assert_eq!(laid_out, blocks.len());
+            cache.borrow_mut().retain_blocks(&blocks[..1]);
+            assert_eq!(cache.borrow().len(), 1);
+        });
     }
 }

@@ -68,7 +68,7 @@ pub struct TrustConstants {
     #[allow(dead_code)]
     pub supported_attestation_schema_versions: Vec<u32>,
     #[allow(dead_code)]
-    pub update_discovery_url: String,
+    pub update_releases_url: String,
     #[allow(dead_code)]
     pub server_url_template: String,
     #[allow(dead_code)]
@@ -81,8 +81,8 @@ pub struct TrustConstants {
 
 /// Top-level shape of `release.json` — a pure URL index pointing at the
 /// signed artifacts the verifier downloads. The verifier deserializes
-/// this from the bytes fetched at `UPDATE_DISCOVERY_URL`'s `release.json`
-/// asset; the release-tool serializes the same shape when generating the
+/// this from the `release.json` asset of the release marked latest under
+/// `UPDATE_RELEASES_URL`; the release-tool serializes the same shape when generating the
 /// file.
 ///
 /// Policy (threshold, allowed identities, allowed schema versions) is

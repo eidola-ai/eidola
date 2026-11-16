@@ -8,6 +8,7 @@ pub mod agents_settings;
 pub mod backends_settings;
 pub mod bridge;
 pub mod chrome;
+pub mod cli_link;
 pub mod focus;
 pub mod general;
 pub mod i18n;

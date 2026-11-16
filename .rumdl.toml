@@ -1,7 +1,7 @@
 # Configuration for rumdl — the markdown linter. The upstream binary is
-# pinned via the `crates/devtools/` anchor crate (package `eidola-devtools`)
+# pinned by the `crates/devtools/` workspace (package `eidola-devtools`) and
 # on PATH via direnv (.envrc), run by `just check` locally; CI emulates
-# that by building rumdl and prepending target/debug to PATH.
+# that by building rumdl and prepending crates/devtools/target/debug to PATH.
 #
 # rule reference: https://rumdl.dev/
 

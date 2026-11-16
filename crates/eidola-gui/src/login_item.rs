@@ -76,28 +76,18 @@ impl LoginItemState {
     pub fn is_settable(self) -> bool {
         !matches!(self, Self::Unsupported)
     }
+}
 
-    /// The muted line under the toggle.
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::Off => "Eidola stays out of the way until you open it.",
-            // Not "ready in the menu bar": `mainAppService` launches the
-            // ordinary windowed app (see the module docs). Say what happens.
-            Self::On => "Eidola opens with your session.",
-            Self::NeedsApproval => {
-                "Turned on, but macOS is waiting for you — allow Eidola in System Settings → \
-                 General → Login Items."
-            }
-            #[cfg(target_os = "macos")]
-            Self::Unsupported => {
-                "Unavailable — this needs macOS 13 or later, and an installed, signed app."
-            }
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => {
-                "Unavailable here — on Linux, `eidola service install` enables the user service."
-            }
-        }
-    }
+/// Why a register/unregister did not happen. The words are the pane's
+/// (`general::login_item_refusal_copy`), except the system's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginItemRefusal {
+    /// `SMAppService` is missing — a system older than macOS 13.
+    TooOld,
+    /// Not a platform with login items.
+    NotHere,
+    /// macOS refused, in its own (already localized) words.
+    System(String),
 }
 
 /// Map the raw `SMAppServiceStatus` value. Split out as a pure function so
@@ -158,19 +148,16 @@ pub fn state() -> LoginItemState {
     LoginItemState::Unsupported
 }
 
-/// Turn the login item on or off. Returns the system's own message on
+/// Turn the login item on or off. Carries the system's own message on
 /// refusal — a login item can be declined for reasons we must not guess at
 /// (an unsigned bundle, a user-level denial), and inventing copy for them
 /// would be worse than quoting macOS.
 #[cfg(target_os = "macos")]
-pub fn set(enabled: bool) -> Result<(), String> {
+pub fn set(enabled: bool) -> Result<(), LoginItemRefusal> {
     if !service_management_is_available() {
         // Both entry points are guarded, not just `state`: the switch is
         // inert while `Unsupported`, but a caller is a caller.
-        return Err(
-            "Opening at login needs macOS 13 or later — this Mac's system software is older."
-                .to_string(),
-        );
+        return Err(LoginItemRefusal::TooOld);
     }
     // SAFETY: as above; both calls are the documented register/unregister
     // pair and return their failure through the `NSError` out-parameter,
@@ -184,13 +171,13 @@ pub fn set(enabled: bool) -> Result<(), String> {
             service.unregisterAndReturnError()
         }
     };
-    result.map_err(|e| e.localizedDescription().to_string())
+    result.map_err(|e| LoginItemRefusal::System(e.localizedDescription().to_string()))
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn set(enabled: bool) -> Result<(), String> {
+pub fn set(enabled: bool) -> Result<(), LoginItemRefusal> {
     let _ = enabled;
-    Err("Opening at login is not available on this platform.".to_string())
+    Err(LoginItemRefusal::NotHere)
 }
 
 #[cfg(test)]

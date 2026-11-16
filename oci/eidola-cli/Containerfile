@@ -55,14 +55,15 @@ ARG CARGO_PROFILE=release
 
 COPY crates/ ./crates/
 
-# Trust-root build inputs: `eidola-app-core/build.rs` reads
-# `releases/trust/server-enclave.json` + sibling pinned-trust JSON from the
-# workspace root to generate the embedded trust constants. We intentionally do
-# NOT copy `artifact-manifest.json` here — it records this very image's digest
-# and would create a circular cache dependency. The fetch stage doesn't need
-# these (build scripts aren't compiled with stub sources), so they're only
-# required here at the real build.
-COPY releases/ ./releases/
+# Trust-root build inputs: exactly the files `eidola-app-core/build.rs` reads
+# from `releases/` to generate the embedded trust constants (the templates
+# file is also `eidola-attestation`'s). Nothing else there is copied: the
+# engine pins and vendored platform material are the gateway's inputs, which
+# the client covers through the gateway measurement in `server-enclave.json`,
+# and `artifact-manifest.json` records this very image's digest. The fetch
+# stage doesn't need these (build scripts aren't compiled with stub sources),
+# so they're only required here at the real build.
+COPY --parents releases/trust/server-enclave.json releases/trust/trust-constants.json releases/trust/sigstore-trusted-root.json releases/schema/attestation-templates.json ./
 # The model catalog, which `eidola-app-core/build.rs` also compiles in (the
 # same files the gateway serves from). A glob, so a tree without the
 # directory still builds; the build script then sees no rows.

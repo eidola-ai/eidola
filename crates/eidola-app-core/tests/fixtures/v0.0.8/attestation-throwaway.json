@@ -1,0 +1,71 @@
+{
+  "schema_version": 2,
+  "release_version": "0.0.8",
+  "git_commit": "bb7773fafbaa90d40e7c7634ff7f690b54dd9be9",
+  "previous_release_git_commit": "7ba323817820a04948ffc70e78955201c96c733f",
+  "artifact_manifest_sha256": "446faede06a77c8912259222020cfa5636438d50a616621ea344480b7eec257a",
+  "privacy_guarantees_doc_sha256": "8d4b0a097f94636dae7cc0496e09f18dc1a2b00b0a5ba70100305e7e9e05151d",
+  "attestant": {
+    "id": "throwaway",
+    "name": "Throwaway Test Key",
+    "key_fingerprint_sha256": "9f2103792a8007816eb963d1b284d139ac3cf69f3d6ab7cb93878bb654d70915",
+    "jurisdiction": "the Test Jurisdiction"
+  },
+  "attested_at": "2026-11-15T00:00:00Z",
+  "apple_shipped_artifact_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+  "apple_signature_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+  "apple_team_id": null,
+  "apple_signing_identifier": "ai.eidola.Eidola",
+  "attestant_statement": "I, Throwaway Test Key, holder of the private key with fingerprint sha256:9f2103792a8007816eb963d1b284d139ac3cf69f3d6ab7cb93878bb654d70915, affirm under penalty of perjury under the laws of the jurisdiction of the Test Jurisdiction that the following claims are true and correct to the best of my knowledge.",
+  "claims": {
+    "no_compelled_subversion": {
+      "statement": "I am not currently subject to any legal order, technical capability notice, or other form of legal compulsion that has caused, or that requires me to cause, this release to: (a) weaken any privacy or security guarantee published in docs/privacy-guarantees.md; (b) introduce or preserve any backdoor, covert surveillance mechanism, or covert data path; or (c) misrepresent any of these properties to users."
+    },
+    "no_gag_preventing_attestation": {
+      "statement": "I am not currently subject to any gag order, nondisclosure obligation, or other restriction that prevents me from truthfully making any claim in this attestation."
+    },
+    "no_coercion": {
+      "statement": "I have not been threatened or coerced by any party to alter the content of this release, to falsify any claim in this attestation, or to conceal any material fact about the privacy or security properties of this release."
+    },
+    "signing_freely": {
+      "statement": "I am signing this attestation of my own volition, using a signing key whose private component exists only on hardware under my exclusive physical control."
+    },
+    "manifest_reproduced": {
+      "statement": "I have personally reproduced artifact-manifest.json (sha256 446faede06a77c8912259222020cfa5636438d50a616621ea344480b7eec257a) from git commit bb7773fafbaa90d40e7c7634ff7f690b54dd9be9 on hardware under my exclusive physical control, and confirmed bit-for-bit equality with the CI-produced manifest.",
+      "fields": {
+        "artifact_manifest_sha256": "446faede06a77c8912259222020cfa5636438d50a616621ea344480b7eec257a",
+        "git_commit": "bb7773fafbaa90d40e7c7634ff7f690b54dd9be9"
+      }
+    },
+    "apple_signature_reconstructs": {
+      "statement": "I have personally verified that applying the published detached signature bundle (sha256 4444444444444444444444444444444444444444444444444444444444444444) to the reproducible unsigned build recorded in artifact-manifest.json (sha256 446faede06a77c8912259222020cfa5636438d50a616621ea344480b7eec257a) yields exactly the shipped signed artifact (sha256 3333333333333333333333333333333333333333333333333333333333333333).",
+      "fields": {
+        "apple_signature_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "artifact_manifest_sha256": "446faede06a77c8912259222020cfa5636438d50a616621ea344480b7eec257a",
+        "apple_shipped_artifact_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+      }
+    },
+    "diff_reviewed": {
+      "statement": "I have personally inspected the source-level diff between git commit 7ba323817820a04948ffc70e78955201c96c733f (the prior release) and git commit bb7773fafbaa90d40e7c7634ff7f690b54dd9be9 (this release).",
+      "fields": {
+        "previous_release_git_commit": "7ba323817820a04948ffc70e78955201c96c733f",
+        "git_commit": "bb7773fafbaa90d40e7c7634ff7f690b54dd9be9"
+      }
+    },
+    "privacy_guarantees_not_weakened": {
+      "statement": "docs/privacy-guarantees.md (sha256 8d4b0a097f94636dae7cc0496e09f18dc1a2b00b0a5ba70100305e7e9e05151d) at the time of this release does not weaken, narrow, or remove any privacy or security guarantee that was stated in the version of docs/privacy-guarantees.md in effect at the prior release.",
+      "fields": {
+        "privacy_guarantees_doc_sha256": "8d4b0a097f94636dae7cc0496e09f18dc1a2b00b0a5ba70100305e7e9e05151d"
+      }
+    },
+    "code_delivers_guarantees": {
+      "statement": "Based on the review described above, I am not aware of any change in this release that causes the code to fail to deliver the privacy and security guarantees stated in docs/privacy-guarantees.md (sha256 8d4b0a097f94636dae7cc0496e09f18dc1a2b00b0a5ba70100305e7e9e05151d).",
+      "fields": {
+        "privacy_guarantees_doc_sha256": "8d4b0a097f94636dae7cc0496e09f18dc1a2b00b0a5ba70100305e7e9e05151d"
+      }
+    },
+    "no_known_backdoor": {
+      "statement": "Based on the review described above, I am not aware of any backdoor, covert surveillance mechanism, or data path in this release that transmits user data to any party in a manner not described in docs/privacy-guarantees.md or the user-facing documentation it references."
+    }
+  }
+}

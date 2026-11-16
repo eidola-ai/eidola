@@ -91,21 +91,18 @@ async fn fixtures_fetcher_no_update_when_version_not_newer() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn fixtures_fetcher_errors_when_release_json_missing() {
+async fn fixtures_fetcher_finds_no_update_when_release_json_missing() {
     let dir = tempfile::tempdir().unwrap();
-    // Deliberately do not write release.json.
+    // Deliberately do not write release.json: the fixtures counterpart of
+    // nothing being marked latest, which is not an update and not an error.
 
     let fetcher = Fetcher::fixtures(dir.path());
     let opts = VerifyOptions::default();
 
-    let err = updater::check_for_update_with(&fetcher, opts, "0.0.1", None)
+    let summary = updater::check_for_update_with(&fetcher, opts, "0.0.1", None)
         .await
-        .expect_err("missing release.json should fail at the discover stage");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("release.json"),
-        "expected discover-stage error mentioning release.json, got: {msg}"
-    );
+        .expect("a missing release.json is no release, not a failure");
+    assert!(summary.is_none());
 }
 
 // ---------------------------------------------------------------------------
