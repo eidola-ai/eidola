@@ -80,6 +80,7 @@
 //! | `artifacts.eidola-gui-macos-universal-zip` | `file (darwin/universal) or absent` | ditto — the macOS unsigned shipping zip |
 //! | `artifacts.eidola-server-engine` | `oci (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_4`] — the inference node's image, the one every Eidola-hosted engine deployment pins by digest |
 //! | `artifacts.eidola-cli-linux-static-amd64` | `file (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_5`] — the static Linux CLI binary, the one file of the `eidola-cli` image, published on its own so a host binary needs no container runtime |
+//! | `artifacts.eidola-cli-linux-static-arm64` | `file (linux/arm64) or absent` | ditto, 64-bit ARM: the same client cross-compiled for `aarch64-unknown-linux-musl` by StageX's toolchain, taken out of the image that build produces |
 //!
 //! The `or absent` rows are the schema-conditional half: absent from the
 //! older manifests this build also accepts, required of any manifest
@@ -111,8 +112,8 @@
 //! that records it. Schema 5 moves the command-line client the same way
 //! without a rename: the standalone macOS CLI archive, which every GUI
 //! payload makes redundant, retires, and the static Linux CLI arrives as a
-//! file of its own — one retiring row and one arriving row, each held to
-//! the schema a manifest declares.
+//! file of its own for each architecture — one retiring row and two
+//! arriving rows, each held to the schema a manifest declares.
 //!
 //! That two-sided tolerance is the shape of every manifest schema rotation:
 //! a build **accepts** the new schema one release before any release
@@ -222,18 +223,23 @@ pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_4: &[(&str, &str, &str)] =
     &[("eidola-server-engine", "oci", "linux/amd64")];
 
 /// Artifact entries schema 5 adds: the static Linux CLI, published as the
-/// one file it is. It is the binary the `eidola-cli` image carries,
-/// extracted from that image and hashed (`scripts/artifact-manifest.sh
-/// extract-cli`), so a user installing a host binary needs neither a
-/// container runtime nor a registry. `type: "file"` for the reason the
-/// `.deb` is: the download *is* the byte stream its hash covers. The key
-/// says `static` because the CLI also ships inside every Linux GUI payload,
-/// and an unqualified `eidola-cli-linux-amd64` would imply it ships once.
+/// one file it is, for each architecture. The amd64 binary is the one the
+/// `eidola-cli` image carries; the arm64 binary is the same client
+/// cross-compiled by the same StageX toolchain into an image of its own
+/// that is never published (`oci/eidola-cli-arm64/Containerfile`). Each is
+/// extracted from its image and hashed (`scripts/artifact-manifest.sh
+/// extract-cli --arch …`), so a user installing a host binary needs neither
+/// a container runtime nor a registry. `type: "file"` for the reason the
+/// `.deb` is: the download *is* the byte stream its hash covers. The keys
+/// say `static` because the CLI also ships inside every Linux GUI payload,
+/// and an unqualified `eidola-cli-linux-<arch>` would imply it ships once.
 ///
 /// The same tolerance as [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`], two schemas
 /// later.
-pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_5: &[(&str, &str, &str)] =
-    &[("eidola-cli-linux-static-amd64", "file", "linux/amd64")];
+pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_5: &[(&str, &str, &str)] = &[
+    ("eidola-cli-linux-static-amd64", "file", "linux/amd64"),
+    ("eidola-cli-linux-static-arm64", "file", "linux/arm64"),
+];
 
 /// Artifact entries schema 5 *retires*: the standalone macOS CLI archive.
 /// Every GUI payload carries the CLI built from the same source as the app
@@ -1403,6 +1409,7 @@ mod tests {
                 "artifacts.eidola-gui-macos-universal-zip",
                 "artifacts.eidola-server-engine",
                 "artifacts.eidola-cli-linux-static-amd64",
+                "artifacts.eidola-cli-linux-static-arm64",
             ]
         );
     }
@@ -1469,30 +1476,34 @@ mod tests {
         assert_eq!(value(&only_4, "artifacts.eidola-gui-linux-amd64"), None);
 
         // The command-line client's boundary, at schema 5: one row retires
-        // and one arrives there, so each tightens from its own side.
+        // and two arrive there, so each tightens from its own side.
         assert_eq!(
             value(&only_4, "artifacts.eidola-cli-macos-universal").as_deref(),
             Some("nix (darwin/universal)")
-        );
-        assert_eq!(
-            value(&only_4, "artifacts.eidola-cli-linux-static-amd64"),
-            None
         );
         let four_and_five = expected_claims_for(&[4, 5]);
         assert_eq!(
             value(&four_and_five, "artifacts.eidola-cli-macos-universal").as_deref(),
             Some("nix (darwin/universal) or absent")
         );
-        assert_eq!(
-            value(&four_and_five, "artifacts.eidola-cli-linux-static-amd64").as_deref(),
-            Some("file (linux/amd64) or absent")
-        );
         let only_5 = expected_claims_for(&[5]);
         assert_eq!(value(&only_5, "artifacts.eidola-cli-macos-universal"), None);
-        assert_eq!(
-            value(&only_5, "artifacts.eidola-cli-linux-static-amd64").as_deref(),
-            Some("file (linux/amd64)")
-        );
+        for (key, platform) in [
+            ("artifacts.eidola-cli-linux-static-amd64", "linux/amd64"),
+            ("artifacts.eidola-cli-linux-static-arm64", "linux/arm64"),
+        ] {
+            assert_eq!(value(&only_4, key), None, "{key}");
+            assert_eq!(
+                value(&four_and_five, key).as_deref(),
+                Some(format!("file ({platform}) or absent").as_str()),
+                "{key}"
+            );
+            assert_eq!(
+                value(&only_5, key).as_deref(),
+                Some(format!("file ({platform})").as_str()),
+                "{key}"
+            );
+        }
         assert_eq!(
             value(&only_5, "artifacts.eidola-server-engine").as_deref(),
             Some("oci (linux/amd64)")
@@ -1555,32 +1566,55 @@ mod tests {
     }
 
     /// A schema-5 manifest: schema 4's shape without the standalone macOS
-    /// CLI archive, and with the static Linux CLI as a file of its own.
+    /// CLI archive, and with the static Linux CLI, for each architecture, as
+    /// a file of its own.
     fn schema_5_manifest() -> serde_json::Value {
         let mut manifest = schema_4_manifest();
         manifest["schema_version"] = serde_json::json!(5);
         let artifacts = manifest["artifacts"].as_object_mut().unwrap();
         artifacts.remove("eidola-cli-macos-universal");
-        artifacts.insert(
-            "eidola-cli-linux-static-amd64".into(),
-            serde_json::json!({
-                "platform": "linux/amd64",
-                "sha256": format!("sha256:{}", "9".repeat(64)),
-                "type": "file"
-            }),
-        );
+        for (key, platform) in [
+            ("eidola-cli-linux-static-amd64", "linux/amd64"),
+            ("eidola-cli-linux-static-arm64", "linux/arm64"),
+        ] {
+            artifacts.insert(
+                key.into(),
+                serde_json::json!({
+                    "platform": platform,
+                    "sha256": format!("sha256:{}", "9".repeat(64)),
+                    "type": "file"
+                }),
+            );
+        }
         manifest
     }
 
-    /// The command-line client's two rows as a schema-4 and a schema-5
-    /// manifest record them, for the tests that move one across the
-    /// boundary.
+    /// The command-line client's rows as a schema-4 and a schema-5 manifest
+    /// record them, for the tests that move one across the boundary.
     fn macos_cli_row() -> serde_json::Value {
         schema_4_manifest()["artifacts"]["eidola-cli-macos-universal"].clone()
     }
 
-    fn static_cli_row() -> serde_json::Value {
-        schema_5_manifest()["artifacts"]["eidola-cli-linux-static-amd64"].clone()
+    fn static_cli_row(key: &str) -> serde_json::Value {
+        schema_5_manifest()["artifacts"][key].clone()
+    }
+
+    /// The static Linux CLI keys schema 5 adds, one per architecture.
+    fn static_cli_keys() -> impl Iterator<Item = &'static str> {
+        EXPECTED_ARTIFACTS_SINCE_SCHEMA_5
+            .iter()
+            .map(|(key, _, _)| *key)
+    }
+
+    #[test]
+    fn schema_5_adds_a_static_cli_for_each_architecture() {
+        assert_eq!(
+            EXPECTED_ARTIFACTS_SINCE_SCHEMA_5,
+            [
+                ("eidola-cli-linux-static-amd64", "file", "linux/amd64"),
+                ("eidola-cli-linux-static-arm64", "file", "linux/arm64"),
+            ]
+        );
     }
 
     #[test]
@@ -1590,41 +1624,59 @@ mod tests {
     }
 
     #[test]
-    fn schema_5_manifest_missing_the_static_cli_is_a_delta() {
-        let mut manifest = schema_5_manifest();
-        manifest["artifacts"]
-            .as_object_mut()
-            .unwrap()
-            .remove("eidola-cli-linux-static-amd64");
-        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
-        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
-        assert_eq!(deltas[0].key, "artifacts.eidola-cli-linux-static-amd64");
-        assert_eq!(
-            deltas[0].attested.as_deref(),
-            Some("missing (recorded from schema 5 on)")
-        );
+    fn schema_5_manifest_missing_a_static_cli_is_a_delta() {
+        // Each architecture's binary is promised on its own: the other one
+        // being present does not cover for it.
+        for key in static_cli_keys() {
+            let mut manifest = schema_5_manifest();
+            manifest["artifacts"].as_object_mut().unwrap().remove(key);
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "{key}: unexpected deltas: {deltas:#?}");
+            assert_eq!(deltas[0].key, format!("artifacts.{key}"));
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some("missing (recorded from schema 5 on)"),
+                "{key}"
+            );
+        }
     }
 
     #[test]
-    fn the_static_cli_before_schema_5_is_a_delta() {
-        // Emission without the bump, at every older schema this build reads.
-        for (mut manifest, declared) in [
-            (current_manifest(), 2),
-            (schema_3_manifest(), 3),
-            (schema_4_manifest(), 4),
-        ] {
-            manifest["artifacts"]["eidola-cli-linux-static-amd64"] = static_cli_row();
-            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
-            assert_eq!(deltas.len(), 1, "schema {declared}: deltas {deltas:#?}");
-            assert_eq!(deltas[0].key, "artifacts.eidola-cli-linux-static-amd64");
-            assert_eq!(
-                deltas[0].attested.as_deref(),
-                Some(
-                    format!("present, but schema {declared} records it only from schema 5 on")
-                        .as_str()
-                )
-            );
+    fn a_static_cli_before_schema_5_is_a_delta() {
+        // Emission without the bump, at every older schema this build reads,
+        // for each architecture's binary.
+        for key in static_cli_keys() {
+            for (mut manifest, declared) in [
+                (current_manifest(), 2),
+                (schema_3_manifest(), 3),
+                (schema_4_manifest(), 4),
+            ] {
+                manifest["artifacts"][key] = static_cli_row(key);
+                let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+                assert_eq!(deltas.len(), 1, "{key}, schema {declared}: {deltas:#?}");
+                assert_eq!(deltas[0].key, format!("artifacts.{key}"));
+                assert_eq!(
+                    deltas[0].attested.as_deref(),
+                    Some(
+                        format!("present, but schema {declared} records it only from schema 5 on")
+                            .as_str()
+                    ),
+                    "{key}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_static_cli_under_the_other_architecture_is_a_delta() {
+        // The platform is part of the claim: an arm64 key recording an
+        // amd64 binary is not the row schema 5 promises.
+        let mut manifest = schema_5_manifest();
+        manifest["artifacts"]["eidola-cli-linux-static-arm64"]["platform"] =
+            serde_json::json!("linux/amd64");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-cli-linux-static-arm64");
     }
 
     #[test]
@@ -1690,10 +1742,10 @@ mod tests {
     }
 
     #[test]
-    fn the_cli_rows_swapped_without_the_bump_are_two_deltas() {
+    fn the_cli_rows_swapped_without_the_bump_are_each_a_delta() {
         // The whole schema-5 artifact set under schema 4's number: the
-        // retirement and the arrival each read as a claim out of shape, so
-        // neither half of the rotation can be emitted alone.
+        // retirement and each arrival read as a claim out of shape, so no
+        // part of the rotation can be emitted alone.
         let mut manifest = schema_5_manifest();
         manifest["schema_version"] = serde_json::json!(4);
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
@@ -1707,6 +1759,10 @@ mod tests {
             [
                 (
                     "artifacts.eidola-cli-linux-static-amd64",
+                    Some("present, but schema 4 records it only from schema 5 on")
+                ),
+                (
+                    "artifacts.eidola-cli-linux-static-arm64",
                     Some("present, but schema 4 records it only from schema 5 on")
                 ),
                 (

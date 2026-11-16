@@ -1065,6 +1065,13 @@ fn workspace_manifest() -> serde_json::Value {
     serde_json::from_slice(WORKSPACE_MANIFEST).expect("the committed manifest is JSON")
 }
 
+/// The static Linux CLI rows schema 5 adds, one per architecture, as
+/// `(key, platform)`.
+const STATIC_CLI_ROWS: [(&str, &str); 2] = [
+    ("eidola-cli-linux-static-amd64", "linux/amd64"),
+    ("eidola-cli-linux-static-arm64", "linux/arm64"),
+];
+
 fn cli_deltas(manifest: &serde_json::Value) -> Vec<(String, Option<String>)> {
     compare_claims(&expected_claims(), &attested_claims(manifest))
         .into_iter()
@@ -1125,6 +1132,12 @@ fn this_build_tolerates_both_sides_of_the_cli_rotation() {
         value("artifacts.eidola-cli-linux-static-amd64"),
         Some("file (linux/amd64) or absent")
     );
+    assert_eq!(
+        value("artifacts.eidola-cli-linux-static-arm64"),
+        Some("file (linux/arm64) or absent")
+    );
+    // The image row keeps its meaning: one linux/amd64 image, whatever
+    // other architectures the static binary is published for.
     assert_eq!(value("artifacts.eidola-cli"), Some("oci (linux/amd64)"));
 }
 
@@ -1153,21 +1166,23 @@ fn the_committed_manifest_is_held_to_its_own_cli_rows() {
             )]
         );
 
-        let mut early = manifest.clone();
-        early["artifacts"]["eidola-cli-linux-static-amd64"] = serde_json::json!({
-            "platform": "linux/amd64",
-            "sha256": format!("sha256:{}", "9".repeat(64)),
-            "type": "file"
-        });
-        assert_eq!(
-            cli_deltas(&early),
-            [(
-                "artifacts.eidola-cli-linux-static-amd64".to_string(),
-                Some(format!(
-                    "present, but schema {declared} records it only from schema 5 on"
-                ))
-            )]
-        );
+        for (key, platform) in STATIC_CLI_ROWS {
+            let mut early = manifest.clone();
+            early["artifacts"][key] = serde_json::json!({
+                "platform": platform,
+                "sha256": format!("sha256:{}", "9".repeat(64)),
+                "type": "file"
+            });
+            assert_eq!(
+                cli_deltas(&early),
+                [(
+                    format!("artifacts.{key}"),
+                    Some(format!(
+                        "present, but schema {declared} records it only from schema 5 on"
+                    ))
+                )]
+            );
+        }
     } else {
         let mut kept = manifest.clone();
         kept["artifacts"]["eidola-cli-macos-universal"] = serde_json::json!({
@@ -1186,17 +1201,16 @@ fn the_committed_manifest_is_held_to_its_own_cli_rows() {
             )]
         );
 
-        let mut dropped = manifest.clone();
-        dropped["artifacts"]
-            .as_object_mut()
-            .unwrap()
-            .remove("eidola-cli-linux-static-amd64");
-        assert_eq!(
-            cli_deltas(&dropped),
-            [(
-                "artifacts.eidola-cli-linux-static-amd64".to_string(),
-                Some("missing (recorded from schema 5 on)".to_string())
-            )]
-        );
+        for (key, _) in STATIC_CLI_ROWS {
+            let mut dropped = manifest.clone();
+            dropped["artifacts"].as_object_mut().unwrap().remove(key);
+            assert_eq!(
+                cli_deltas(&dropped),
+                [(
+                    format!("artifacts.{key}"),
+                    Some("missing (recorded from schema 5 on)".to_string())
+                )]
+            );
+        }
     }
 }
