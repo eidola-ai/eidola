@@ -1,7 +1,8 @@
 //! Verify the CI-side Sigstore bundle attached to `artifact-manifest.json`.
 //!
-//! The bundle is produced by `cosign sign-blob --bundle` in
-//! `.github/workflows/tinfoil-build.yml`. It carries:
+//! The bundle is produced by `cosign sign-blob --bundle` in the release's
+//! signing job, the workflow `trust_root::EXPECTED_CI_IDENTITY_PATTERN`
+//! names. It carries:
 //!
 //! - A Fulcio leaf certificate (Fulcio keyless, OIDC-bound). The cert's
 //!   SAN extension records the GitHub Actions workflow URL + tag ref; the

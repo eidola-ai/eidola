@@ -170,6 +170,13 @@ jobs:
         # Bash + python3, no toolchain.
         run: ./scripts/test-release-assets.sh
 
+      - name: Test the release signing-identity guard
+        # Deliberately ungated: the guard runs only on a real `v*` tag,
+        # where a mistake in it either signs a release the previous
+        # release's clients reject or stops a correct one. Bash, git and
+        # python3, no toolchain.
+        run: ./scripts/test-check-signing-identity.sh
+
       - name: Test the weights-hash recompute script
         # Deliberately ungated: scripts/weights-hash.py is what a user runs
         # to check a model's weights hash without our code, and a change to

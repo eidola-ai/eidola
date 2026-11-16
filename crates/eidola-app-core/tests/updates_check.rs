@@ -19,10 +19,12 @@
 //! and a human attestation over that same manifest signed by a throwaway
 //! key and logged in the public Rekor (`tests/fixtures/v0.0.8/`). Both
 //! verify against the *embedded* Sigstore trust root, so no trust anchor
-//! is stubbed. The one pin a test context moves by default is the set of
-//! trusted attestant keys, to the throwaway key's fingerprint. Rows that
-//! need a different pin (wrong identity, changed expected claims, a higher
-//! threshold) move that pin in `CheckContext`, never the crypto.
+//! is stubbed. A test context moves two pins by default: the trusted
+//! attestant keys, to the throwaway key's fingerprint, and the CI identity,
+//! to the workflow that signed v0.0.8 (the embedded pin names the workflow
+//! that signs releases since). Rows that need a different pin (wrong
+//! identity, changed expected claims, a higher threshold) move that pin in
+//! `CheckContext`, never the crypto.
 
 use eidola_app_core::updates::{
     AcceptedClaims, CheckContext, Claim, ReleaseAttestant, UpdateCheckResult, UpdateCheckSnapshot,
@@ -43,6 +45,11 @@ const FIXTURE_ATTESTATION_BUNDLE: &[u8] =
 /// `sha256(SPKI DER)` of the throwaway key.
 const THROWAWAY_FINGERPRINT: &str =
     "9f2103792a8007816eb963d1b284d139ac3cf69f3d6ab7cb93878bb654d70915";
+
+/// The workflow identity v0.0.8's manifest was signed under, as clients of
+/// that era pinned it.
+const FIXTURE_CI_IDENTITY_PATTERN: &str =
+    "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*";
 
 /// The tag the fixture bundle's Fulcio identity is bound to
 /// (`…tinfoil-build.yml@refs/tags/v0.0.8`).
@@ -215,6 +222,7 @@ fn ctx(server: &MockServer, installed: &str) -> CheckContext {
     let mut ctx = CheckContext::new(server.uri(), installed);
     ctx.expected_claims = fixture_expected_claims();
     ctx.pins.trusted_attestant_fingerprints = vec![THROWAWAY_FINGERPRINT.to_string()];
+    ctx.pins.ci_identity_pattern = FIXTURE_CI_IDENTITY_PATTERN.into();
     ctx
 }
 
@@ -539,6 +547,23 @@ async fn tampered_bundle_signature_is_unverifiable() {
     };
 }
 
+/// The rotation away from the workflow that signed v0.0.8 is real: under
+/// this build's embedded pin, a genuine signature from that workflow is
+/// refused, so nothing it can still mint verifies as a release.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signature_from_the_retired_signing_workflow_is_unverifiable() {
+    let server = MockServer::start().await;
+    mount_release(&server, FIXTURE_TAG, FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
+
+    let mut ctx = ctx(&server, OLD_INSTALLED);
+    ctx.pins.ci_identity_pattern =
+        eidola_app_core::updater::ReleasePins::embedded().ci_identity_pattern;
+    assert_ne!(ctx.pins.ci_identity_pattern, FIXTURE_CI_IDENTITY_PATTERN);
+
+    let result = check_for_update(&http_client(), &ctx, None).await;
+    assert_unverifiable(&result, "not from the pinned release identity");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wrong_identity_is_unverifiable() {
     // The fixture bundle is genuinely signed — but if the embedded pin
@@ -616,7 +641,8 @@ async fn an_attestation_by_a_key_this_build_does_not_trust_is_unverifiable() {
 
     // The embedded set, which does not hold the throwaway key.
     let mut ctx = ctx(&server, OLD_INSTALLED);
-    ctx.pins = eidola_app_core::updater::ReleasePins::embedded();
+    ctx.pins.trusted_attestant_fingerprints =
+        eidola_app_core::updater::ReleasePins::embedded().trusted_attestant_fingerprints;
 
     let result = check_for_update(&http_client(), &ctx, None).await;
     assert_unverifiable(&result, THROWAWAY_FINGERPRINT);

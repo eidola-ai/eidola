@@ -4,7 +4,7 @@
     "0b3679b9da063e57d6985fdc00695500b995fa1ec2412cef2caef8e033a7678e"
   ],
   "min_human_attestations": 1,
-  "expected_ci_identity_pattern": "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*",
+  "expected_ci_identity_pattern": "https://github.com/eidola-ai/eidola/.github/workflows/sign-release.yml@refs/tags/v*",
   "expected_ci_issuer": "https://token.actions.githubusercontent.com",
   "supported_release_schema_versions": [1, 2],
   "supported_attestation_schema_versions": [1, 2],

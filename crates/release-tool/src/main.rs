@@ -47,6 +47,7 @@ mod attest;
 mod manifest;
 mod pkcs11;
 mod preflight;
+mod previous;
 mod provenance;
 mod trust;
 mod verify;

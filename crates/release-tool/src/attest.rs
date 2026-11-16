@@ -133,7 +133,15 @@ pub fn run(args: Args) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("tag `{}` must start with `v`", args.tag))?
         .to_string();
     let git_commit = git_rev_parse(&args.workspace_root, &args.tag)?;
-    let prev_tag = previous_release_tag(&args.workspace_root, &args.tag)?;
+    let prev_tag = crate::previous::previous_release_tag(&args.workspace_root, &args.tag)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no release precedes `{}` — `previous_release` in attestation cannot be \
+                 populated. (If this is the first release ever, manually edit the \
+                 attestation skeleton or change the templates.)",
+                args.tag
+            )
+        })?;
     let previous_release_git_commit = git_rev_parse(&args.workspace_root, &prev_tag)?;
 
     // Render from the templates the verifying clients actually pin: the
@@ -191,7 +199,7 @@ pub fn run(args: Args) -> Result<()> {
     // tag does not contain — and unlike the artifact manifest, nothing
     // downstream cross-checks this hash (the doc is not a release asset),
     // so the divergence would never be caught.
-    let privacy_guarantees_doc_sha256 = match git_show_bytes(
+    let privacy_guarantees_doc_sha256 = match crate::previous::git_show(
         &args.workspace_root,
         &args.tag,
         "docs/privacy-guarantees.md",
@@ -530,7 +538,9 @@ pub fn run(args: Args) -> Result<()> {
         "git_tag": args.tag,
         "released_at": attested_at,
         "previous_release": {
-            "version": previous_release_version(&args.workspace_root, &args.tag)?,
+            "version": prev_tag
+                .strip_prefix('v')
+                .ok_or_else(|| anyhow::anyhow!("prior tag `{prev_tag}` does not start with `v`"))?,
             "git_commit": previous_release_git_commit,
         },
         "artifact_manifest": {
@@ -712,22 +722,6 @@ fn read_rekor_log_index(bundle_path: &Path) -> Result<u64> {
         .with_context(|| format!("parsing bundle logIndex `{log_index_str}` as u64"))
 }
 
-/// The exact bytes of `path` as committed at `refname` (via `git show`).
-fn git_show_bytes(workspace_root: &Path, refname: &str, path: &str) -> Result<Vec<u8>> {
-    let out = Command::new("git")
-        .current_dir(workspace_root)
-        .args(["show", &format!("{refname}:{path}")])
-        .output()
-        .context("running `git show <ref>:<path>`")?;
-    if !out.status.success() {
-        bail!(
-            "`git show {refname}:{path}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(out.stdout)
-}
-
 fn git_rev_parse(workspace_root: &Path, refname: &str) -> Result<String> {
     let out = Command::new("git")
         .current_dir(workspace_root)
@@ -741,14 +735,6 @@ fn git_rev_parse(workspace_root: &Path, refname: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
-}
-
-fn previous_release_version(workspace_root: &Path, tag: &str) -> Result<String> {
-    let prev = previous_release_tag(workspace_root, tag)?;
-    Ok(prev
-        .strip_prefix('v')
-        .ok_or_else(|| anyhow::anyhow!("prior tag `{prev}` does not start with `v`"))?
-        .to_string())
 }
 
 /// Load the attestation templates as committed at `tag` (via `git show`).
@@ -778,23 +764,6 @@ fn templates_at_tag(workspace_root: &Path, tag: &str) -> Result<eidola_attestati
         "no attestation templates found at `{tag}` (tried {CANDIDATE_PATHS:?}). \
          If this transition is deliberate, supply --templates explicitly."
     )
-}
-
-fn previous_release_tag(workspace_root: &Path, tag: &str) -> Result<String> {
-    let out = Command::new("git")
-        .current_dir(workspace_root)
-        .args(["describe", "--tags", "--abbrev=0", &format!("{tag}^")])
-        .output()
-        .context("running `git describe --tags --abbrev=0 <tag>^`")?;
-    if !out.status.success() {
-        bail!(
-            "no previous tag reachable from `{tag}` — `previous_release` in attestation \
-             cannot be populated. (If this is the first release ever, manually edit the \
-             attestation skeleton or change the templates.)\n{}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
 fn print_quoted(s: &str) {

@@ -426,7 +426,11 @@ pub struct AcceptedClaims {
 /// good as the checks behind it, so state written under any other rules is
 /// discarded on load ([`load_state`]) rather than shown, held against a
 /// later failure, or promoted by an acceptance. Raise this whenever what
-/// "verified" means for a release changes.
+/// "verified" means for a release changes. A change to what it is judged
+/// *against* (the CI identity, the attestant keys, the threshold, the
+/// templates, the Sigstore roots) needs no edit here: the state is also
+/// stamped with [`crate::trust_root::RELEASE_TRUST_SHA256`], which every
+/// such change moves.
 ///
 /// `1`: CI's signature bound to the release's tag, **and** the human
 /// attestations the embedded policy requires ([`crate::updater::verify_release`]).
@@ -441,6 +445,10 @@ pub struct UpdateState {
     /// absent (0) in state written before the stamp existed.
     #[serde(default)]
     pub verdict_rules: u32,
+    /// The [`crate::trust_root::RELEASE_TRUST_SHA256`] of the build that
+    /// reached them: the pins they were judged against.
+    #[serde(default)]
+    pub release_trust_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<UpdateCheckSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -451,6 +459,7 @@ impl Default for UpdateState {
     fn default() -> Self {
         Self {
             verdict_rules: VERDICT_RULES,
+            release_trust_sha256: crate::trust_root::RELEASE_TRUST_SHA256.to_string(),
             last: None,
             accepted: None,
         }
@@ -482,14 +491,21 @@ pub fn state_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Load persisted state. Missing or corrupt files, and state reached under
-/// rules other than [`VERDICT_RULES`], yield the default: the next check
-/// reaches a fresh verdict, and nothing is shown or accepted before it.
+/// rules other than [`VERDICT_RULES`] or against another build's pins
+/// ([`crate::trust_root::RELEASE_TRUST_SHA256`]), yield the default: the
+/// next check reaches a fresh verdict, and nothing is shown or accepted
+/// before it.
 pub fn load_state(data_dir: &Path) -> UpdateState {
     let Ok(bytes) = std::fs::read(state_path(data_dir)) else {
         return UpdateState::default();
     };
     match serde_json::from_slice::<UpdateState>(&bytes) {
-        Ok(state) if state.verdict_rules == VERDICT_RULES => state,
+        Ok(state)
+            if state.verdict_rules == VERDICT_RULES
+                && state.release_trust_sha256 == crate::trust_root::RELEASE_TRUST_SHA256 =>
+        {
+            state
+        }
         _ => UpdateState::default(),
     }
 }
@@ -2300,6 +2316,22 @@ mod tests {
         release.remove("git_commit").unwrap();
         std::fs::write(state_path(dir.path()), serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert_eq!(load_state(dir.path()), UpdateState::default());
+    }
+
+    /// A verdict reached against other pins is discarded too: a build that
+    /// moves the CI identity, an attestant key or the threshold must not
+    /// show a release its predecessor verified under the old ones.
+    #[test]
+    fn state_judged_against_other_pins_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        for stamp in [String::new(), "0".repeat(64)] {
+            let state = UpdateState {
+                release_trust_sha256: stamp.clone(),
+                ..state_with_accepted_claims_change()
+            };
+            save_state(dir.path(), &state).unwrap();
+            assert_eq!(load_state(dir.path()), UpdateState::default(), "{stamp:?}");
+        }
     }
 
     /// The stamp alone decides it: a release shaped like today's, under

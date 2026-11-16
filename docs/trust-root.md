@@ -17,7 +17,7 @@ Generated into the client at compile time by `crates/eidola-app-core/build.rs`, 
 | `SERVER_CVM_VERSION` / `SERVER_IGVM_SHA256` | `releases/trust/server-enclave.json` → `cvm_version`, `igvm_sha256` | The platform release (with its manifest pin) and the image the digest was computed from. The gateway is pinned on SEV-SNP only; TDX presentations of it are refused ([gaps.md](gaps.md#tdx-acceptance)) |
 | `TRUSTED_ATTESTANT_FINGERPRINTS` | `releases/trust/trust-constants.json` | `sha256(PKIX SubjectPublicKeyInfo DER)` in hex, for each authorized human-attestant key |
 | `MIN_HUMAN_ATTESTATIONS` | `releases/trust/trust-constants.json` | Minimum independently-verified human attestations a release must carry. Pinned here, not in `release.json`, so a forged index cannot lower it |
-| `EXPECTED_CI_IDENTITY_PATTERN` | `releases/trust/trust-constants.json` | Fulcio cert SAN pattern the release-signing workflow's OIDC identity must match |
+| `EXPECTED_CI_IDENTITY_PATTERN` | `releases/trust/trust-constants.json` | Fulcio cert SAN pattern the release-signing workflow's OIDC identity must match: a workflow that only signs, so that nothing else a release runs can mint it |
 | `EXPECTED_CI_ISSUER` | `releases/trust/trust-constants.json` | OIDC issuer (`https://token.actions.githubusercontent.com`) |
 | `SUPPORTED_RELEASE_SCHEMA_VERSIONS` | `releases/trust/trust-constants.json` | Integer `schema_version` values of `release.json` this client will parse |
 | `SUPPORTED_ATTESTATION_SCHEMA_VERSIONS` | `releases/trust/trust-constants.json` | Integer `schema_version` values of `attestation.json` this client will parse |

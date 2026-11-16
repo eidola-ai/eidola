@@ -8421,6 +8421,7 @@ dependencies = [
  "rpassword",
  "rustls",
  "rustls-rustcrypto",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
