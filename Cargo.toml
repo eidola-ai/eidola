@@ -65,11 +65,16 @@ opt-level = 2
 # their tests run real (if tiny) model forwards, and unoptimized they dominate
 # `cargo test` — the CPU executor's suite alone took 6 min wall / ~2,900 CPU-s
 # at opt-level 0, and the model + CPU executor suites together take 18 s at 3
-# (M4 Max). Their tests still run under debug assertions.
+# (M4 Max). The CUDA executor's host-side tests run the same reference
+# numerics (its DeepSeek host suite, `tests/ds_host.rs`, took about 20 min on
+# CI at opt-level 0, 85 s at 3). Their tests still run under debug assertions.
 [profile.dev.package.eidola-engine-model]
 opt-level = 3
 
 [profile.dev.package.eidola-engine-cpu]
+opt-level = 3
+
+[profile.dev.package.eidola-engine-cuda]
 opt-level = 3
 
 [profile.docker-dev]
