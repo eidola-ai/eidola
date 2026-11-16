@@ -199,16 +199,20 @@ fn parse_block(body: &str, schemas: &ToolSchemas) -> Option<Vec<(String, String)
             let end = parameter.find(PARAMETER_CLOSE)?;
             let after = &parameter[end + PARAMETER_CLOSE.len()..];
             let parameter = parameter[..end].strip_prefix(" name=\"")?;
-            let (key, is_string, value) =
-                parameter
-                    .match_indices("\" string=\"")
-                    .find_map(|(at, marker)| {
-                        let after = &parameter[at + marker.len()..];
-                        let flag = [("true\">", true), ("false\">", false)]
-                            .into_iter()
-                            .find(|(flag, _)| after.starts_with(flag))?;
-                        Some((&parameter[..at], flag.1, &after[flag.0.len()..]))
-                    })?;
+            // Every start of the marker, overlapping ones included: in a name
+            // ending in `" string=` the marker the encoder wrote begins at the
+            // name's own last quote.
+            const MARKER: &str = "\" string=\"";
+            let (key, is_string, value) = parameter
+                .char_indices()
+                .filter(|(at, _)| parameter[*at..].starts_with(MARKER))
+                .find_map(|(at, _)| {
+                    let after = &parameter[at + MARKER.len()..];
+                    let flag = [("true\">", true), ("false\">", false)]
+                        .into_iter()
+                        .find(|(flag, _)| after.starts_with(flag))?;
+                    Some((&parameter[..at], flag.1, &after[flag.0.len()..]))
+                })?;
             if !names.insert(key) {
                 return None;
             }
