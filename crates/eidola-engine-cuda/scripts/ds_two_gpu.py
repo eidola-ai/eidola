@@ -310,8 +310,7 @@ def node_chat(base: str, token: str, weights: str, model: str, body: dict) -> di
     with post(f"{base}/v1/chat/completions", body, headers) as resp:
         for event, data, at in sse_events(resp):
             if event == "error":
-                out["error"] = data
-                break
+                raise SystemExit(f"the node answered with an error: {data}")
             if data.strip() == "[DONE]":
                 break
             chunk = json.loads(data)
@@ -329,6 +328,8 @@ def node_chat(base: str, token: str, weights: str, model: str, body: dict) -> di
                     out["continuable"] = choice.get("continuable")
             if chunk.get("usage") and not chunk.get("choices"):
                 out["usage"] = chunk["usage"]
+    if out["finish_reason"] is None or out["usage"] is None:
+        raise SystemExit("the node's stream ended without a finish reason and usage")
     end = time.time()
     out["seconds"] = end - began
     out["first_delta_seconds"] = None if first is None else first - began

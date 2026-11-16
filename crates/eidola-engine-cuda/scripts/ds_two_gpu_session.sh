@@ -425,9 +425,11 @@ vllm_serve() {
         --max-model-len 8192 --max-num-seqs 64 --max-num-batched-tokens 8192
         "$@"
     )
-    printf '%q ' vllm "${args[@]}" > "$dir/command.$attempt.txt"
-    if [ -n "$DRY_RUN" ]; then x env VLLM_ENGINE_READY_TIMEOUT_S=3600 vllm "${args[@]}"; return 0; fi
-    setsid env VLLM_ENGINE_READY_TIMEOUT_S=3600 vllm "${args[@]}" > "$dir/server.$attempt.log" 2>&1 < /dev/null &
+    # vLLM's CLI from the interpreter it was installed and checked in.
+    local vllm=("$VLLM_PY" -m vllm.entrypoints.cli.main)
+    printf '%q ' "${vllm[@]}" "${args[@]}" > "$dir/command.$attempt.txt"
+    if [ -n "$DRY_RUN" ]; then x env VLLM_ENGINE_READY_TIMEOUT_S=3600 "${vllm[@]}" "${args[@]}"; return 0; fi
+    setsid env VLLM_ENGINE_READY_TIMEOUT_S=3600 "${vllm[@]}" "${args[@]}" > "$dir/server.$attempt.log" 2>&1 < /dev/null &
     echo $! > "$dir/server.pid"
     local began=$SECONDS
     while [ $((SECONDS - began)) -lt $((VLLM_READY_MINUTES * 60)) ]; do

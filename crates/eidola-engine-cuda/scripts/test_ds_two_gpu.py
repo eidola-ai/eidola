@@ -309,5 +309,24 @@ class Summary(unittest.TestCase):
         self.assertIn("90.0 out tok/s", text)
 
 
+class NodeFailures(unittest.TestCase):
+    """A request the node fails is a failed step, never a recorded answer."""
+
+    def run_stream(self, chunks):
+        s = Server(lambda m, path, b: (200, "text/event-stream", chunks))
+        try:
+            with self.assertRaises(SystemExit):
+                t.node_chat(s.base, "tok", "ab" * 32, "m", {"messages": [{"role": "user", "content": "q"}]})
+        finally:
+            s.close()
+
+    def test_an_error_event_fails_the_request(self):
+        start = sse([{"choices": [{"delta": {"role": "assistant"}}]}])
+        self.run_stream(start + [b'event: error\ndata: {"error": {"message": "engine stopped"}}\n\n'])
+
+    def test_a_stream_without_a_finish_reason_and_usage_fails_the_request(self):
+        self.run_stream(sse([{"choices": [{"delta": {"content": "partial"}}]}, "[DONE]"]))
+
+
 if __name__ == "__main__":
     unittest.main()
