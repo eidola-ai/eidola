@@ -1,4 +1,10 @@
-//! The CUDA executor for the MiMo-V2.6 engine.
+//! The CUDA executors of the engine, one module per architecture: [`mimo`]
+//! (MiMo-V2.6 on one GPU) and [`deepseek`] (DeepSeek-V4.1 on two).
+//!
+//! The root modules are what both share: opening a device ([`device`]),
+//! loading kernel images ([`module`]), launch arguments ([`launch`]), BF16 on
+//! the host ([`bf16`]), the device sampler ([`sampler`]), the idle-KV cipher
+//! ([`kv_cipher`]) and the RMSNorm smoke kernel ([`ops`]).
 //!
 //! Host code is Rust over the CUDA driver API (`cudarc`, loaded at run time);
 //! there is no CUDA runtime library and no runtime compilation. Every kernel
@@ -11,35 +17,41 @@
 //! [`narrow`], which refuses one that does not fit, and the crate's lints
 //! (`Cargo.toml`, every target) hold every other conversion to that.
 
-pub mod attention;
 pub mod bf16;
+pub mod deepseek;
 pub mod device;
-pub mod draft;
-pub mod ds;
-pub mod engine_ops;
-pub mod executor;
-pub mod gemm;
-pub mod graph;
-pub mod kv;
 pub mod kv_cipher;
 pub mod launch;
-pub mod model;
+pub mod mimo;
 pub mod module;
-pub mod moe_gemm;
 pub mod ops;
 pub mod sampler;
-pub mod support;
-pub mod tma;
-pub mod weights;
 
 use std::fmt;
 
 pub use device::{DeviceInfo, Gpu, ImageArch};
-pub use draft::MtpHidden;
-pub use executor::{CudaExecutor, CudaExecutorConfig, DecodeStats, DraftRecord, KvBlocks};
-pub use graph::{CudaGraphs, DecodePath};
 pub use module::{ImageSource, Kernel, KernelDir, KernelModule};
-pub use support::{Unsupported, check_device, check_supported};
+
+/// A configuration field the kernels cannot run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unsupported {
+    /// The field, e.g. `layers[3].attention.head_dim_qk`.
+    pub field: String,
+    pub found: String,
+    pub required: String,
+}
+
+impl fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} is {}, the kernels require {}",
+            self.field, self.found, self.required
+        )
+    }
+}
+
+impl std::error::Error for Unsupported {}
 
 /// A CUDA executor failure.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -28,7 +28,7 @@ fn setup() -> Option<(Gpu, KernelDir)> {
 /// launches clusters (DeepGEMM's instances and the router).
 #[test]
 fn every_entry_and_contract_resolves() {
-    use eidola_engine_cuda::support::REQUIRED_SMEM_PER_BLOCK;
+    use eidola_engine_cuda::mimo::support::REQUIRED_SMEM_PER_BLOCK;
     let Some((gpu, dir)) = setup() else { return };
     let exact = gpu.image_arch().unwrap();
     for source in [
@@ -182,9 +182,9 @@ fn check_rmsnorm(out: &[u16], x: &[u16], w: &[u16], rows: usize, hidden: usize) 
 #[test]
 fn launches_from_another_thread() {
     use eidola_engine::executor::Maintenance;
-    use eidola_engine_cuda::gemm::{Gemm, GemmArgs, GemmKind};
-    use eidola_engine_cuda::kv::{GroupGeometry, KvLayout, KvStore};
     use eidola_engine_cuda::launch::dptr;
+    use eidola_engine_cuda::mimo::gemm::{Gemm, GemmArgs, GemmKind};
+    use eidola_engine_cuda::mimo::kv::{GroupGeometry, KvLayout, KvStore};
 
     let Some((gpu, dir)) = setup() else { return };
     let module = KernelModule::load(&gpu, &dir, "rmsnorm").unwrap();

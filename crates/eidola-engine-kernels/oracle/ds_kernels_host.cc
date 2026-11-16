@@ -1,7 +1,7 @@
 // Host check of the DeepSeek scalar kernels' bodies: `csrc/ds_ops.cuh`,
 // compiled for the host and run thread by thread over each kernel's launch
 // grid, against the digests the Rust reference emits
-// (`eidola-engine-cuda`'s `tests/ds_cases`, which documents the file format
+// (`eidola-engine-cuda`'s `tests/deepseek_cases`, which documents the file format
 // and draws every case's inputs; `make` here repeats its draws).
 //
 // Dev-only: never a build input of the kernels or of anything shipped. It
@@ -13,7 +13,7 @@
 //   c++ -std=c++17 -O2 -ffp-contract=off -I csrc oracle/ds_kernels_host.cc -o ds_kernels_host
 //   ./ds_kernels_host tests/data/ds_ops.vectors tests/data/ds_gemm_ref.vectors
 //
-// `tests/ds_kernels_host.rs` runs exactly that. Exit status 0 means every
+// `tests/deepseek_kernels_host.rs` runs exactly that. Exit status 0 means every
 // record matched.
 
 #include <algorithm>

@@ -14,7 +14,7 @@
 //   c++ -std=c++17 -O2 -ffp-contract=off -I csrc oracle/ds_gemm_tc_host.cc -o ds_gemm_tc_host
 //   ./ds_gemm_tc_host
 //
-// `tests/ds_gemm_tc_host.rs` runs exactly that. It prints one line per
+// `tests/deepseek_gemm_tc_host.rs` runs exactly that. It prints one line per
 // check and exits 0 when every banded output equals the reference.
 
 #include <algorithm>
