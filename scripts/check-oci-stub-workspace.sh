@@ -57,7 +57,8 @@ for containerfile in oci/*/Containerfile; do
     status=1
     continue
   fi
-  image="$(awk '/^FROM /{print $2; exit}' "$containerfile")"
+  # The first `FROM`'s image, past a `--platform=` flag if it has one.
+  image="$(awk '/^FROM /{i = 2; if ($2 ~ /^--platform=/) i = 3; print $i; exit}' "$containerfile")"
 
   work="$(mktemp -d)"
   cp Cargo.toml Cargo.lock rust-toolchain.toml "$work/"

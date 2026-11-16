@@ -409,16 +409,13 @@ fn render_update_available(
             div()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child("Cryptographically verified against this build's embedded trust root."),
+                .child("Verified against this build's embedded trust root."),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(SharedString::from(format!(
-                    "Signed by the pinned release workflow · Rekor #{}",
-                    release.rekor_log_index
-                ))),
+                .child(SharedString::from(attested_by_line(release))),
         );
     if release.claims_accepted {
         col = col.child(div().text_xs().text_color(theme.muted_foreground).child(
@@ -439,6 +436,18 @@ fn render_update_available(
                     .label("View Release…")
                     .tab_stop(false),
             ),
+    )
+}
+
+/// Who vouched for a verified release, in the order it lists them, and the
+/// workflow that built it. A release with no attestation never reaches this
+/// view, because it does not verify.
+fn attested_by_line(release: &VerifiedRelease) -> String {
+    let names: Vec<&str> = release.attestants.iter().map(|a| a.name.as_str()).collect();
+    format!(
+        "Attested by {} · built and signed by the release workflow · Rekor #{}",
+        names.join(", "),
+        release.rekor_log_index
     )
 }
 

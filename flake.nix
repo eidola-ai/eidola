@@ -94,8 +94,11 @@
             # Explicit path
             [ pattern ];
 
-        # Get all workspace member paths (e.g., ["crates/foo", "crates/bar"])
-        workspaceMemberPaths = builtins.concatMap expandMemberPattern memberPatterns;
+        # Get all workspace member paths (e.g., ["crates/foo", "crates/bar"]),
+        # less `workspace.exclude` (the dev tools' own workspace).
+        workspaceMemberPaths = builtins.filter (
+          p: !(builtins.elem p (workspaceCargoToml.workspace.exclude or [ ]))
+        ) (builtins.concatMap expandMemberPattern memberPatterns);
 
         # Map from Cargo package name to its path
         cratePaths = builtins.listToAttrs (
@@ -193,50 +196,70 @@
           let
             matchingCrate = getCrateForPath relPath;
             # Both `eidola-app-core/build.rs` and `eidola-server-gateway/build.rs`
-            # consume pinned trust data from `releases/`:
-            #   * eidola-app-core → all of `releases/trust/*.json` +
-            #     `releases/schema/*.json` (client trust root)
-            #   * eidola-server-gateway → `releases/trust/engine-enclaves.json`
-            #     (the engine pins), the platform endorsements and Sigstore
-            #     trusted root their machine policy is re-derived from, and the
-            #     platform release manifests their MRTD is checked against
-            # Included only when either crate is built, so unrelated crates
-            # do not cache-bust on every manifest regeneration.
+            # consume pinned trust data from `releases/`, each exactly the
+            # files it reads, so nothing else there moves its sources:
+            #   * eidola-app-core → the files `appCoreTrustInputs` names (the
+            #     client trust root); not the engine pins, the vendored
+            #     platform material or the Linux desktop files
+            #   * eidola-server-gateway → the files `gatewayTrustInputs` names:
+            #     the engine pins, the Sigstore trusted root, and the two
+            #     vendored platform release trees, whole, because its build
+            #     walks them and refuses a file nothing names; not the client
+            #     trust root, which is a function of the gateway's own image
+            # The workspace checks take all of `releases/`: they run every
+            # crate's tests, release tooling's among them.
             # `artifact-manifest.json` (at the root, not under `releases/`)
             # is deliberately excluded — it records the eidola-cli narHash
             # itself, so including it would create a self-reference that
             # prevents the build from reaching a fixed point.
-            isTrustRootPath = relPath == "/releases" || pkgs.lib.hasPrefix "/releases/" relPath;
-            # The vendored platform endorsements, from which the gateway's
-            # build re-derives each engine pin's machine policy. Only the
-            # gateway reads them, so app-core-only packages leave them out
-            # and do not rebuild when a new release is vendored.
-            isPlatformEndorsementsPath =
-              relPath == "/releases/trust/platform-endorsements"
-              || pkgs.lib.hasPrefix "/releases/trust/platform-endorsements/" relPath;
-            # The vendored platform release manifests, likewise the gateway's
-            # alone.
-            isCvmReleasesPath =
-              relPath == "/releases/trust/cvm-releases"
-              || pkgs.lib.hasPrefix "/releases/trust/cvm-releases/" relPath;
+            isReleasesPath = relPath == "/releases" || pkgs.lib.hasPrefix "/releases/" relPath;
+            # What app-core's build reads (its `build.rs`, and
+            # eidola-attestation's `include_str!` of the templates), with the
+            # directories that hold them.
+            appCoreTrustInputs = [
+              "/releases"
+              "/releases/trust"
+              "/releases/trust/server-enclave.json"
+              "/releases/trust/trust-constants.json"
+              "/releases/trust/sigstore-trusted-root.json"
+              "/releases/schema"
+              "/releases/schema/attestation-templates.json"
+            ];
+            # What the gateway's build reads, with the directories that hold
+            # it.
+            gatewayTrustInputs = [
+              "/releases"
+              "/releases/trust"
+              "/releases/trust/engine-enclaves.json"
+              "/releases/trust/sigstore-trusted-root.json"
+            ];
+            isVendoredPlatformPath = pkgs.lib.any (
+              root: relPath == root || pkgs.lib.hasPrefix "${root}/" relPath
+            ) [ "/releases/trust/platform-endorsements" "/releases/trust/cvm-releases" ];
+            # Markdown under `deploy/engine/` and `models/` is for people:
+            # neither build reads it, and the OCI build context
+            # (`.dockerignore`) drops it too, so both builds see one tree.
+            isMarkdown = type == "regular" && pkgs.lib.hasSuffix ".md" relPath;
             # `eidola-server-gateway/build.rs` also checks every engine pin in
             # `releases/trust/engine-enclaves.json` against the committed
-            # deployment configs it names.
+            # deployment configs it names, and every deployment directory
+            # against the pins.
             isEngineDeployPath =
-              relPath == "/deploy"
-              || relPath == "/deploy/engine"
-              || pkgs.lib.hasPrefix "/deploy/engine/" relPath;
+              !isMarkdown
+              && (
+                relPath == "/deploy"
+                || relPath == "/deploy/engine"
+                || pkgs.lib.hasPrefix "/deploy/engine/" relPath
+              );
             # ... and compiles in the model catalog, one file per set of
             # weights under `models/`, bound to those pins by weights hash.
-            isModelCatalogPath = relPath == "/models" || pkgs.lib.hasPrefix "/models/" relPath;
+            isModelCatalogPath =
+              !isMarkdown && (relPath == "/models" || pkgs.lib.hasPrefix "/models/" relPath);
           in
-          (
-            crateInSet "eidola-app-core"
-            && isTrustRootPath
-            && !isPlatformEndorsementsPath
-            && !isCvmReleasesPath
-          )
-          || (crateInSet "eidola-server-gateway" && isTrustRootPath)
+          (crateInSet "eidola-app-core" && builtins.elem relPath appCoreTrustInputs)
+          || (crateInSet "eidola-server-gateway" && builtins.elem relPath gatewayTrustInputs)
+          || (crateInSet "eidola-server-gateway" && isVendoredPlatformPath)
+          || (wholeWorkspace && isReleasesPath)
           || (crateInSet "eidola-server-gateway" && isEngineDeployPath)
           || (crateInSet "eidola-server-gateway" && isModelCatalogPath)
           # app-core compiles the same catalog in, to tell a user what a model
@@ -334,17 +357,21 @@
                   } relPath path type
                 then
                   true
+                # Inside a crate being built, crane's filter (which handles
+                # .rs, Cargo.toml, etc.).
+                else if matchingCrate != null then
+                  craneLib.filterCargoSources path type
                 # Keep only root-level files that affect Cargo resolution/builds.
                 # This avoids generated files like artifact-manifest.json from
                 # perturbing package hashes for unrelated Nix builds.
                 else if type == "regular" && builtins.match "/[^/]+" relPath != null then
                   builtins.hasAttr baseName rootBuildFiles
-                # Keep directories that are parents of crate paths
-                else if type == "directory" && isParentOfCrate relPath then
-                  true
-                # For everything else, use crane's filter (which handles .rs, Cargo.toml, etc.)
+                # Outside the crates, only the directories that lead to them.
+                # Crane's filter would keep every directory in the tree and
+                # every `.toml` file (`www/docs-nav.toml`, the dev tools'
+                # `crates/devtools/`), none of which a package build reads.
                 else
-                  craneLib.filterCargoSources path type;
+                  type == "directory" && isParentOfCrate relPath;
             };
 
             # Generate a Cargo.toml with only the relevant members listed
@@ -1274,6 +1301,19 @@ with open(path, "wb") as f:
                 # ad-hoc signature as the main binary; no explicit sign call.
                 cp ${llamaServer}/bin/llama-server "$APP/Contents/MacOS/llama-server"
                 chmod u+w "$APP/Contents/MacOS/llama-server"
+
+                # The command-line client, from the very build this app is,
+                # so the `eidola` a user runs beside the app can never be a
+                # different version of it. Named `eidola-cli` rather than
+                # `eidola` because the default APFS volume is
+                # case-insensitive: `eidola` and the main binary `Eidola`
+                # would be one file. Users reach it through a link on PATH
+                # named `eidola`. It is the universal CLI derivation's own
+                # output (LC_UUID already zeroed), copied rather than
+                # referenced, and the postFixup signing pass (re-)signs it
+                # like every other Mach-O in $out.
+                cp ${eidolaCliMacosUniversal}/bin/eidola "$APP/Contents/MacOS/eidola-cli"
+                chmod u+w "$APP/Contents/MacOS/eidola-cli"
               '';
 
               installPhase = ''
@@ -1476,7 +1516,11 @@ with open(path, "wb") as f:
         # convention) so it stays a *sibling* of llama-server in $out/bin.
         # app-core resolves the engine from the running executable, which
         # after exec is the copy, so the sibling rule holds on its own;
-        # EIDOLA_LLAMA_SERVER is set anyway as an explicit pin.
+        # EIDOLA_LLAMA_SERVER is set anyway as an explicit pin. The launcher
+        # reaches both relative to itself, so nothing in the payload spells
+        # its own store path and the payload's hash is a function of the
+        # bytes it carries and the store paths it references (the shell,
+        # coreutils' `readlink`, Mesa), never of the build's other inputs.
         #
         # Mesa stays a reference — the one deliberate exception, because
         # the device's GPU stack is pre-trusted. The host's own ICD
@@ -1495,24 +1539,77 @@ with open(path, "wb") as f:
         # our payload entirely. VK_ADD_DRIVER_FILES is *additive* and set
         # only as a default, so a NixOS host's /run/opengl-driver drivers
         # coexist and a user can override outright.
+        # The command-line client every Linux GUI payload carries beside the
+        # app, built exactly as the GUI is — the same glibc target, the same
+        # release profile — so the Nix payload takes it as built and the .deb
+        # takes it through the same host-generic patch (`eidolaCliLinuxFdo`).
+        # Not the static musl target the standalone CLI image uses: a
+        # dependency links `-ldl`, which only that image's musl supplies, and
+        # a payload that is glibc for its app is no worse for being glibc for
+        # its client.
+        eidolaCliLinux =
+          if !pkgs.stdenv.isLinux then
+            null
+          else
+            mkPackage {
+              pname = "eidola-cli";
+              rustTarget =
+                {
+                  "x86_64-linux" = "x86_64-unknown-linux-gnu";
+                  "aarch64-linux" = "aarch64-unknown-linux-gnu";
+                }
+                .${system};
+              nixCrossSystem = null;
+              # The workspace-wide `checks.tests` target runs its tests.
+              doCheck = false;
+            };
+
         eidolaGuiLinuxNix =
           if eidolaGuiLinux == null then
             null
           else
-            pkgs.runCommand "eidola-gui-linux-nix"
-              {
-                nativeBuildInputs = [ pkgs.makeWrapper ];
-              }
-              ''
+            pkgs.runCommand "eidola-gui-linux-nix" { } ''
                 mkdir -p $out/bin $out/share/applications
                 cp ${eidolaGuiLinux}/bin/eidola-gui "$out/bin/.eidola-gui-wrapped"
                 chmod u+w "$out/bin/.eidola-gui-wrapped"
                 cp ${llamaServer}/bin/llama-server "$out/bin/llama-server"
                 chmod u+w "$out/bin/llama-server"
+                # The command-line client from the same build, beside the app
+                # and the sidecar (its engine rule is the same sibling rule).
+                cp ${eidolaCliLinux}/bin/eidola "$out/bin/eidola"
+                chmod 555 "$out/bin/eidola"
                 icds=$(ls ${pkgs.mesa}/share/vulkan/icd.d/*.json | tr '\n' ':')
-                makeWrapper "$out/bin/.eidola-gui-wrapped" $out/bin/eidola-gui \
-                  --set-default VK_ADD_DRIVER_FILES "''${icds%:}" \
-                  --set-default EIDOLA_LLAMA_SERVER "$out/bin/llama-server"
+                # The launcher. It finds the binary and the sidecar beside
+                # itself and never names $out: $out is input-addressed, so a
+                # launcher that spelled it would move this payload's hash
+                # with every input of the build, a test file included, while
+                # the bytes it launches stayed the same. `readlink -f` follows
+                # every link on the way to the launcher's own file, so a
+                # linked directory (a profile's `bin`), a profile that links
+                # file by file and a lone link to this one file all arrive at
+                # the payload's own `bin`. bash cannot follow a linked file
+                # by itself, hence the reference to coreutils.
+                cat > $out/bin/eidola-gui <<'LAUNCHER'
+                #! @shell@ -e
+                self=$(@readlink@ -f -- "''${BASH_SOURCE[0]}")
+                here=''${self%/*}
+                if [ ! -x "$here/.eidola-gui-wrapped" ]; then
+                  echo "eidola-gui: no .eidola-gui-wrapped beside this launcher in $here" >&2
+                  exit 127
+                fi
+                export VK_ADD_DRIVER_FILES=''${VK_ADD_DRIVER_FILES-'@icds@'}
+                export EIDOLA_LLAMA_SERVER=''${EIDOLA_LLAMA_SERVER-"$here/llama-server"}
+                exec "$here/.eidola-gui-wrapped" "$@"
+                LAUNCHER
+                substituteInPlace $out/bin/eidola-gui \
+                  --replace-fail '@shell@' '${pkgs.runtimeShell}' \
+                  --replace-fail '@readlink@' '${pkgs.coreutils}/bin/readlink' \
+                  --replace-fail '@icds@' "''${icds%:}"
+                chmod 555 $out/bin/eidola-gui
+                if grep -rqF "$out" $out/bin; then
+                  echo "something in bin/ names the payload's own output path" >&2
+                  exit 1
+                fi
                 # Desktop entry — basename matches the Wayland app_id the
                 # binary sets (lib.rs APP_ID), which is what lets the shell
                 # resolve our windows to this entry. Strip the comment header
@@ -1577,6 +1674,14 @@ with open(path, "wb") as f:
                 patchelf --set-interpreter ${fdoInterpreter} $out/bin/eidola-gui
                 ${assertGlibcFloor "$out/bin/eidola-gui"}
                 chmod a-w $out/bin/eidola-gui
+
+                # The command-line client, through the same two patches.
+                cp ${eidolaCliLinux}/bin/eidola $out/bin/eidola
+                chmod u+w $out/bin/eidola
+                patchelf --remove-rpath $out/bin/eidola
+                patchelf --set-interpreter ${fdoInterpreter} $out/bin/eidola
+                ${assertGlibcFloor "$out/bin/eidola"}
+                chmod a-w $out/bin/eidola
               '';
 
         # Debian dependencies, grouped by how each one is discovered, because
@@ -1650,8 +1755,8 @@ with open(path, "wb") as f:
 
         # The installed tree, exactly as it lands on the host.
         #
-        # Both executables sit in /usr/libexec/eidola and /usr/bin/eidola-gui
-        # is a symlink to the GUI. That layout is not cosmetic: app-core
+        # Every executable sits in /usr/libexec/eidola; /usr/bin/eidola-gui and
+        # /usr/bin/eidola are symlinks to the GUI and the CLI. That layout is not cosmetic: app-core
         # resolves the inference engine as a `llama-server` sibling of the
         # running executable, and /proc/self/exe reports the symlink's target,
         # so a launch through /usr/bin lands in /usr/libexec/eidola and finds
@@ -1672,8 +1777,11 @@ with open(path, "wb") as f:
                   $out/usr/libexec/eidola/eidola-gui
                 install -Dm755 ${llamaServer}/bin/llama-server \
                   $out/usr/libexec/eidola/llama-server
+                install -Dm755 ${eidolaGuiLinuxFdo}/bin/eidola \
+                  $out/usr/libexec/eidola/eidola
                 mkdir -p $out/usr/bin
                 ln -s ../libexec/eidola/eidola-gui $out/usr/bin/eidola-gui
+                ln -s ../libexec/eidola/eidola $out/usr/bin/eidola
 
                 # Desktop entry — see the Nix installable above for why the
                 # comment header is stripped and why the basename is fixed.
@@ -1730,6 +1838,8 @@ with open(path, "wb") as f:
 
                 ${assertDebNeededCovered "$tree/usr/libexec/eidola/eidola-gui"}
                 ${assertGlibcFloor "$tree/usr/libexec/eidola/eidola-gui"}
+                ${assertDebNeededCovered "$tree/usr/libexec/eidola/eidola"}
+                ${assertGlibcFloor "$tree/usr/libexec/eidola/eidola"}
                 ${assertFullyStatic "$tree/usr/libexec/eidola/llama-server"}
 
                 tarFlags="--format=gnu --sort=name --mtime=@0 \

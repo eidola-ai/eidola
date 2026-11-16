@@ -224,7 +224,7 @@ jobs:
     # runs on every PR, so bumping a timeout over there fails here at once
     # rather than at release time. GitHub stops a hosted job at 360
     # minutes, which is the ceiling this has to stay under.
-    timeout-minutes: 330
+    timeout-minutes: 340
     permissions:
       contents: write # attach assets to the tag's release
       actions: read # read the artifact workflow's run for this tag

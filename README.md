@@ -30,7 +30,7 @@ To sign, add the appropriate entry to `CLA-SIGNERS.txt` in a commit to this repo
 
 The Rust toolchain version is pinned in `rust-toolchain.toml` (the Rust of the pinned StageX release that builds the server images) and installed automatically by rustup. On first `cd` into the repo, `direnv` builds the pinned Rust-based dev tools (including `just` itself) from `crates/devtools/` and puts them on `PATH`, so `rustup` + `direnv` is the whole setup — no separate `just` install. Run `just` to see all available recipes.
 
-All Rust workspace packages live under `crates/`, including the code generation binary `generate-openapi` and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. `crates/devtools/` is an anchor crate that version-pins upstream Rust-based dev tools — `just`, the [rumdl](https://rumdl.dev/) markdown linter, and [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) — in `Cargo.lock`; `.envrc` builds them and direnv exposes them on `PATH`. `just check` runs rumdl and cargo-deny, and `just lint-md-fix` applies auto-fixes.
+All Rust workspace packages live under `crates/`, including the code generation binary `generate-openapi` and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. `crates/devtools/` is its own small workspace, excluded from the main one, that version-pins upstream Rust-based dev tools — `just`, the [rumdl](https://rumdl.dev/) markdown linter, and [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) — in its own `Cargo.lock`; `.envrc` builds them and direnv exposes them on `PATH`. `just check` runs rumdl and cargo-deny, and `just lint-md-fix` applies auto-fixes.
 
 ### Server
 
@@ -74,6 +74,14 @@ Both modes expose the same endpoints externally: postgres on `localhost:5432`, t
 When billing is enabled, its receiver also listens on `http://localhost:8081`; its worker has no HTTP listener. Both roles use `eidola-billing:dev` (`docker buildx bake billing`) with separate commands and credentials. They can also run through `just run billing serve-webhooks` and `just run billing work`. The [billing playbook](crates/eidola-billing-cli/README.md) describes these processes and private support commands. This repository supplies the image and development wiring; production placement, TLS and credential provisioning are operator configuration.
 
 ### CLI
+
+Every desktop install carries the `eidola` command-line client from the same build as the app, so the two never drift apart. The Debian package installs it as `/usr/bin/eidola`, and the Linux Nix payload has it at `bin/eidola`. On macOS it is `Eidola.app/Contents/MacOS/eidola-cli` (the name differs because the default macOS volume is case-insensitive and `eidola` would collide with the app's own `Eidola`). To put it on your `PATH`, open **Settings → General → Command line** and choose **Install**: the app links `/usr/local/bin/eidola` to the copy of Eidola you are running (asking for an administrator's password when that directory is not yours to write), shows whether the link is installed, and offers to update it when the app has moved. It never replaces an `eidola` that some other program put there. To do the same by hand, link it onto your `PATH` as `eidola` (any directory on it will do):
+
+```bash
+ln -s /Applications/Eidola.app/Contents/MacOS/eidola-cli /usr/local/bin/eidola
+```
+
+With the app running, the CLI asks it to do the work over a local socket. Without it, each command opens the local profile itself, one at a time: a command started while another holds the profile waits for it (up to ten minutes; `--lock-wait` changes that).
 
 To run the CLI against a local development stack:
 

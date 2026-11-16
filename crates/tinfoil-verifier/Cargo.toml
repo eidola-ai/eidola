@@ -19,7 +19,7 @@ sev = { version = "8", default-features = false, features = ["snp", "crypto_noss
 # `serde_json/preserve_order`, which would change `serde_json::Value` key
 # order for every crate linked into the same binary. Without `report` there
 # is no PCS fetcher and no `ring`.
-dcap-qvl = { version = "=0.6.6", default-features = false, features = ["rustcrypto", "default-x509"] }
+dcap-qvl = { version = "=0.7.1", default-features = false, features = ["rustcrypto", "default-x509"] }
 
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
 x509-cert = "0.2"
@@ -86,16 +86,24 @@ spki = { version = "0.7", optional = true }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"], optional = true }
 p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"], optional = true }
 signature = { version = "2", optional = true }
+# The platform release tag grammar (`eidola_common::platform_release`), the
+# one parser a sidecar's tag, a vendored release's directory and the tag an
+# attestation must be signed at are all read with. Only with
+# `platform-endorsements`; that feature's users (`measure-enclave`, the
+# gateway's build and tests) depend on `eidola-common` themselves.
+eidola-common = { path = "../eidola-common", optional = true }
 
 # Logging
 tracing = "0.1"
 
 [features]
-platform-endorsements = ["dep:const-oid", "dep:spki", "dep:p256", "dep:p384", "dep:signature"]
+platform-endorsements = ["dep:eidola-common", "dep:const-oid", "dep:spki", "dep:p256", "dep:p384", "dep:signature"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-rustls = { version = "0.23", features = ["ring"] }
+# The live and mock-shim tests install the RustCrypto provider, as production
+# callers do.
+rustls-rustcrypto = "0.0.2-alpha"
 # Live integration tests pull in WebPKI roots so they can talk to
 # inference.tinfoil.sh. Production callers (eidola-server-gateway) bring their
 # own.

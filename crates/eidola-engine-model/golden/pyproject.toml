@@ -6,12 +6,16 @@ requires-python = "==3.12.*"
 dependencies = [
     "numpy==2.3.4",
     "safetensors==0.8.0",
-    "torch==2.9.1",
+    "torch==2.13.0",
     "transformers==5.19.0",
 ]
 
 [tool.uv]
 package = false
+# torch asks for setuptools without an upper bound, and the resolver settles
+# on a release older than the fix for GHSA-h35f-9h28-mq5c unless it is told
+# where the floor is.
+constraint-dependencies = ["setuptools>=84.1.0"]
 
 # The generator runs torch on CPU only. Torch comes from PyTorch's CPU-only
 # index, whose wheels carry no CUDA runtime, so no `nvidia-*` or `triton`

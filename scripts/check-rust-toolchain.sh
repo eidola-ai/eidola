@@ -39,13 +39,17 @@ printf '%s\n' "$rust" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
 printf '%s\n' "$image" | grep -Eq '^stagex/pallet-rust:[^@[:space:]]+@sha256:[0-9a-f]{64}$' \
   || fail "$record: \`image\` is not a tag and digest pin: $image"
 
+# A pin may name its platform (`FROM --platform=linux/amd64 stagex/…`), as
+# a cross-compiling Containerfile does; the flag is read past, not a way
+# around the check.
 found=0
 for containerfile in "$root"/oci/*/Containerfile; do
-  while read -r from ref _; do
+  while read -r ref; do
     found=$((found + 1))
     [ "$ref" = "$image" ] \
       || fail "${containerfile#"$root/"} pins $ref, but oci/pallet-rust records $image"
-  done < <(grep -E '^FROM[[:space:]]+stagex/pallet-rust[:@]' "$containerfile" || true)
+  done < <(grep -E '^FROM[[:space:]]+(--platform=[^[:space:]]+[[:space:]]+)?stagex/pallet-rust[:@]' "$containerfile" \
+    | sed -E 's/^FROM[[:space:]]+(--platform=[^[:space:]]+[[:space:]]+)?([^[:space:]]+).*/\2/' || true)
 done
 [ "$found" -gt 0 ] || fail "no Containerfile pins stagex/pallet-rust; this check matched nothing"
 

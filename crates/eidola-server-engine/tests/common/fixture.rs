@@ -170,7 +170,7 @@ pub fn write_dev_model(out: &Path) -> std::io::Result<()> {
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(tiny.join("config.json"))?)?;
     config["vocab_size"] = WIDE_VOCAB.into();
-    std::fs::write(out.join("config.json"), serde_json::to_vec_pretty(&config)?)?;
+    std::fs::write(out.join("config.json"), canonical_json(&config, true))?;
 
     // model.safetensors: every tensor copied, the two vocabulary matrices widened.
     let file = widened_safetensors(&tiny.join("model.safetensors"), &WIDENED, WIDE_VOCAB)?;
@@ -198,7 +198,7 @@ pub fn write_deepseek_dev_model(out: &Path) -> std::io::Result<()> {
     config["text_config"]["vocab_size"] = DEEPSEEK_VOCAB.into();
     config["image_token_id"] = DEEPSEEK_IMAGE_TOKEN.into();
     config["text_config"]["engram_compressed_vocab_size"] = DEEPSEEK_COMPRESSED_VOCAB.into();
-    std::fs::write(out.join("config.json"), serde_json::to_vec_pretty(&config)?)?;
+    std::fs::write(out.join("config.json"), canonical_json(&config, true))?;
 
     let file = widened_safetensors(
         &tiny.join("model.safetensors"),
@@ -272,8 +272,8 @@ fn widened_safetensors(path: &Path, widened: &[&str], rows_to: usize) -> std::io
             }),
         );
     }
-    let mut header_bytes = serde_json::to_vec(&serde_json::Value::Object(new_header))?;
-    while header_bytes.len() % 8 != 0 {
+    let mut header_bytes = canonical_json(&serde_json::Value::Object(new_header), false);
+    while !header_bytes.len().is_multiple_of(8) {
         header_bytes.push(b' ');
     }
     let mut file = Vec::with_capacity(8 + header_bytes.len() + new_data.len());
@@ -281,6 +281,48 @@ fn widened_safetensors(path: &Path, widened: &[&str], rows_to: usize) -> std::io
     file.extend_from_slice(&header_bytes);
     file.extend_from_slice(&new_data);
     Ok(file)
+}
+
+/// `value` serialized with every object's keys sorted, at every depth.
+///
+/// `serde_json::Map` keeps insertion order when anything else in the build enables
+/// serde_json's `preserve_order` feature, and sorts otherwise; a `Value` serialized as is
+/// would make the dev model's bytes, and its weights hash, depend on what else was built.
+pub fn canonical_json(value: &serde_json::Value, pretty: bool) -> Vec<u8> {
+    if pretty {
+        serde_json::to_vec_pretty(&SortedKeys(value))
+    } else {
+        serde_json::to_vec(&SortedKeys(value))
+    }
+    .expect("a JSON value serializes")
+}
+
+struct SortedKeys<'a>(&'a serde_json::Value);
+
+impl serde::Serialize for SortedKeys<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        use serde_json::Value;
+        match self.0 {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut out = serializer.serialize_map(Some(keys.len()))?;
+                for key in keys {
+                    out.serialize_entry(key, &SortedKeys(&map[key]))?;
+                }
+                out.end()
+            }
+            Value::Array(items) => {
+                let mut out = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    out.serialize_element(&SortedKeys(item))?;
+                }
+                out.end()
+            }
+            other => other.serialize(serializer),
+        }
+    }
 }
 
 /// The weights hash of `dir`, computed independently of the crate: `sha256sum`-style

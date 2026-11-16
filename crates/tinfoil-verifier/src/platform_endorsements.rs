@@ -48,34 +48,6 @@ pub const FILE_NAME: &str = "platform-endorsements.json";
 /// The in-toto Statement type the attestation uses.
 const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
 
-/// Whether `tag` is a platform release tag: `platform-vX.Y.Z`, each number
-/// decimal without a leading zero (the pattern the release workflow itself
-/// enforces, `PLATFORM_TAG_PATTERN`).
-pub fn is_release_tag(tag: &str) -> bool {
-    let Some(version) = tag.strip_prefix("platform-v") else {
-        return false;
-    };
-    let parts: Vec<&str> = version.split('.').collect();
-    parts.len() == 3
-        && parts.iter().all(|p| {
-            !p.is_empty()
-                && p.bytes().all(|b| b.is_ascii_digit())
-                && (p.len() == 1 || !p.starts_with('0'))
-                && p.len() <= 9
-        })
-}
-
-/// A release tag's `(major, minor, patch)`, for ordering releases.
-pub fn release_version(tag: &str) -> Option<(u32, u32, u32)> {
-    if !is_release_tag(tag) {
-        return None;
-    }
-    let mut parts = tag["platform-v".len()..]
-        .split('.')
-        .map(|p| p.parse::<u32>().ok());
-    Some((parts.next()??, parts.next()??, parts.next()??))
-}
-
 /// The PCK certificate platform flags a pin states, which the endorsements
 /// do not carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +80,7 @@ pub fn verify(
     expected_sha256: &str,
 ) -> Result<VerifiedEndorsements, Error> {
     let fail = |message: String| Error::PlatformEndorsements(format!("{tag}: {message}"));
-    if !is_release_tag(tag) {
+    if !eidola_common::platform_release::is_tag(tag) {
         return Err(fail("not a platform-vX.Y.Z release tag".into()));
     }
     let sha256 = hex::encode(Sha256::digest(file));

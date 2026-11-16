@@ -8,7 +8,8 @@
 # on every PR:
 #
 #   * the happy path publishes exactly the rows the table covers, under
-#     the names derived from their manifest keys;
+#     the names derived from their manifest keys — each architecture's
+#     static Linux CLI under its bare key;
 #   * a file whose bytes changed after measurement is rejected — the one
 #     failure the whole cross-workflow seam exists to catch;
 #   * a recorded artifact with no file is rejected, because a signed
@@ -64,15 +65,19 @@ make_case() {
   printf 'nix archive bytes\n' > "$case_dir/dir/eidola-gui-linux-nix-amd64.tar.gz"
   printf 'amd64 debian package bytes\n' > "$case_dir/dir/eidola-gui-linux-deb-amd64.deb"
   printf 'arm64 debian package bytes\n' > "$case_dir/dir/eidola-gui-linux-deb-arm64.deb"
+  printf 'static cli bytes\n' > "$case_dir/dir/eidola-cli-linux-static-amd64"
+  printf 'arm64 static cli bytes\n' > "$case_dir/dir/eidola-cli-linux-static-arm64"
   python3 - "$case_dir" "$(sha_of "$case_dir/dir/eidola-gui-linux-nix-amd64.tar.gz")" \
     "$(sha_of "$case_dir/dir/eidola-gui-linux-deb-amd64.deb")" \
-    "$(sha_of "$case_dir/dir/eidola-gui-linux-deb-arm64.deb")" <<'PY'
+    "$(sha_of "$case_dir/dir/eidola-gui-linux-deb-arm64.deb")" \
+    "$(sha_of "$case_dir/dir/eidola-cli-linux-static-amd64")" \
+    "$(sha_of "$case_dir/dir/eidola-cli-linux-static-arm64")" <<'PY'
 import json
 import sys
 
-case_dir, nix_sha, amd_sha, arm_sha = sys.argv[1:5]
+case_dir, nix_sha, amd_sha, arm_sha, cli_sha, cli_arm_sha = sys.argv[1:7]
 manifest = {
-    "schema_version": 3,
+    "schema_version": 5,
     "enclave": {},
     "artifacts": {
         # Pulled by digest, never downloaded — must not be looked for.
@@ -96,6 +101,16 @@ manifest = {
             "type": "file",
             "platform": "linux/arm64",
             "sha256": arm_sha,
+        },
+        "eidola-cli-linux-static-amd64": {
+            "type": "file",
+            "platform": "linux/amd64",
+            "sha256": cli_sha,
+        },
+        "eidola-cli-linux-static-arm64": {
+            "type": "file",
+            "platform": "linux/arm64",
+            "sha256": cli_arm_sha,
         },
         # Recorded, deliberately not published — and deliberately absent
         # from the directory, so a rule that merely tolerated it would not
@@ -121,7 +136,9 @@ run_case() {
 echo "── happy path: exactly the publishable rows, named after their keys ──"
 make_case "$TMP_ROOT/ok"
 if run_case "$TMP_ROOT/ok"; then
-  expected="eidola-gui-linux-deb-amd64.deb
+  expected="eidola-cli-linux-static-amd64
+eidola-cli-linux-static-arm64
+eidola-gui-linux-deb-amd64.deb
 eidola-gui-linux-deb-arm64.deb
 eidola-gui-linux-nix-amd64.tar.gz"
   actual="$(sed 's|.*/||' "$TMP_ROOT/ok/stdout" | sort)"
@@ -145,6 +162,60 @@ else
     note "rejected, naming the mismatch"
   else
     fail "rejected, but not for the hash mismatch:"$'\n'"$(cat "$TMP_ROOT/tampered/stderr")"
+  fi
+fi
+
+echo "── a static binary that changed after it was measured is rejected ──"
+make_case "$TMP_ROOT/tampered-cli"
+printf 'static cli bytes (tampered)\n' \
+  > "$TMP_ROOT/tampered-cli/dir/eidola-cli-linux-static-amd64"
+if run_case "$TMP_ROOT/tampered-cli"; then
+  fail "a static binary whose bytes no longer match its recorded hash was published"
+else
+  if grep -q "eidola-cli-linux-static-amd64: eidola-cli-linux-static-amd64 hashes to" \
+    "$TMP_ROOT/tampered-cli/stderr"; then
+    note "rejected, naming the mismatch"
+  else
+    fail "rejected, but not for the hash mismatch:"$'\n'"$(cat "$TMP_ROOT/tampered-cli/stderr")"
+  fi
+fi
+
+echo "── static binaries published under each other's names are rejected ──"
+# Two architectures, two keys: the amd64 binary under the arm64 name (and
+# the reverse) is not the file either row covers, though both are files the
+# release did measure.
+make_case "$TMP_ROOT/swapped-cli"
+mv "$TMP_ROOT/swapped-cli/dir/eidola-cli-linux-static-amd64" "$TMP_ROOT/swapped-cli/amd64"
+mv "$TMP_ROOT/swapped-cli/dir/eidola-cli-linux-static-arm64" \
+  "$TMP_ROOT/swapped-cli/dir/eidola-cli-linux-static-amd64"
+mv "$TMP_ROOT/swapped-cli/amd64" "$TMP_ROOT/swapped-cli/dir/eidola-cli-linux-static-arm64"
+if run_case "$TMP_ROOT/swapped-cli"; then
+  fail "static binaries under each other's names were published"
+else
+  if grep -q "eidola-cli-linux-static-amd64: eidola-cli-linux-static-amd64 hashes to" \
+    "$TMP_ROOT/swapped-cli/stderr" \
+    && grep -q "eidola-cli-linux-static-arm64: eidola-cli-linux-static-arm64 hashes to" \
+      "$TMP_ROOT/swapped-cli/stderr"; then
+    note "rejected, naming both mismatches"
+  else
+    fail "rejected, but not for both mismatches:"$'\n'"$(cat "$TMP_ROOT/swapped-cli/stderr")"
+  fi
+fi
+
+echo "── a static binary published under another name is not found ──"
+# The asset name is the key itself. A file carrying an extension (or any
+# other name) is not the one the row covers, however its bytes hash.
+make_case "$TMP_ROOT/renamed-cli"
+mv "$TMP_ROOT/renamed-cli/dir/eidola-cli-linux-static-amd64" \
+  "$TMP_ROOT/renamed-cli/dir/eidola-cli-linux-static-amd64.bin"
+if run_case "$TMP_ROOT/renamed-cli"; then
+  fail "a static binary under a name its key does not give was accepted"
+else
+  if grep -q "eidola-cli-linux-static-amd64: the manifest records this artifact" \
+    "$TMP_ROOT/renamed-cli/stderr"; then
+    note "rejected, naming the row"
+  else
+    fail "rejected, but not for the missing file:"$'\n'"$(cat "$TMP_ROOT/renamed-cli/stderr")"
   fi
 fi
 
@@ -242,7 +313,7 @@ fi
 echo "── a publisher timeout GitHub will not honor is rejected ──"
 # Patience beyond the hosted-runner limit is a promise nobody keeps, so it
 # must not be the way the check above gets satisfied.
-sed 's/^    timeout-minutes: 330$/    timeout-minutes: 3000/' \
+sed 's/^    timeout-minutes: 340$/    timeout-minutes: 3000/' \
   "$RELEASE_WORKFLOW" > "$TMP_ROOT/release-overlong.yml"
 if cmp -s "$RELEASE_WORKFLOW" "$TMP_ROOT/release-overlong.yml"; then
   fail "the fixture edit changed nothing — the publisher timeout moved"

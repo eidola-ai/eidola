@@ -51,6 +51,21 @@ updates:
       - dependency-name: "ed25519-dalek"
         update-types: ["version-update:semver-major"]
 
+  # The pinned Rust dev tools (rumdl, just, cargo-deny) are their own
+  # workspace with their own lockfile.
+  - package-ecosystem: "cargo"
+    directory: "/crates/devtools"
+    target-branch: "next"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      "Dev Tools (Minor/Patch)":
+        update-types:
+          - "minor"
+          - "patch"
+
   # No `rust-toolchain` ecosystem: rust-toolchain.toml names the Rust of the
   # pinned StageX release (the compiler that builds the release images), and
   # it moves only together with that release, never on its own

@@ -183,6 +183,13 @@ jobs:
         # wrong. python3 (3.11+) stdlib, no toolchain.
         run: ./scripts/test-weights-hash.sh
 
+      - name: Test the platform endorsements drift script
+        # Deliberately ungated: scripts/platform-endorsements-drift.py runs
+        # only on a schedule against the default branch, so a change to it
+        # is otherwise first exercised by a scheduled run. python3 stdlib, no
+        # toolchain.
+        run: ./scripts/test-platform-endorsements-drift.sh
+
       - name: Check legal document versioning
         # The published legal documents (www/pages/terms.md, privacy.md)
         # are accepted by the SHA-256 of their exact bytes, ordered by a
@@ -289,6 +296,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/deepseek-v41-flash' || github.base_ref == 'deepseek-v41-flash' }}
           cache-on-failure: true
+          # The pinned dev tools are their own workspace with their own
+          # target directory; rust-cache keeps only the dependencies of the
+          # workspaces listed here.
+          workspaces: |
+            . -> target
+            crates/devtools -> target
 
       - name: Check formatting
         if: steps.scope.outputs.rust == 'true'
@@ -303,15 +316,15 @@ jobs:
 
       - name: Markdown lint
         if: steps.scope.outputs.markdown == 'true'
-        # rumdl is pinned by the crates/devtools anchor crate and, locally,
-        # is on PATH via direnv (.envrc). CI deliberately doesn't install
+        # rumdl is pinned by the crates/devtools workspace and, locally, is
+        # on PATH via direnv (.envrc). CI deliberately doesn't install
         # direnv (no apt in the build chain); instead it emulates .envrc —
-        # build the one tool it needs and prepend target/debug to PATH — so
-        # the `rumdl` invocation matches the local one without compiling the
-        # rest of the pinned toolset (e.g. just).
+        # build the one tool it needs and prepend its target/debug to PATH —
+        # so the `rumdl` invocation matches the local one without compiling
+        # the rest of the pinned toolset (e.g. just).
         run: |
-          cargo build --quiet -p rumdl
-          export PATH="$PWD/target/debug:$PATH"
+          cargo build --quiet --manifest-path crates/devtools/Cargo.toml -p rumdl
+          export PATH="$PWD/crates/devtools/target/debug:$PATH"
           rumdl check .
 
       - name: Run tests
@@ -320,8 +333,42 @@ jobs:
 
       - name: Test billing transactions and recovery with PostgreSQL
         if: steps.scope.outputs.rust == 'true'
+        # Runs the test executables "Run tests" already built, rather than
+        # `cargo test -p <crate>`: cargo resolves features over the selected
+        # packages only, so each `-p` build compiled its own variant of
+        # roughly 350 shared dependencies (tokio, serde, hyper, rustls, …),
+        # some three times over, on every cold run and into the cache.
+        # Listing the workspace build's executables with the same arguments
+        # compiles nothing; the step fails if it ever does, so the two steps
+        # cannot drift apart unnoticed. The listing runs before the database
+        # environment is exported, which therefore cannot reach a build.
         run: |
           set -euo pipefail
+          artifacts="$RUNNER_TEMP/test-artifacts.json"
+          cargo test --no-run --message-format=json > "$artifacts"
+          rebuilt="$(jq -r 'select(.reason == "compiler-artifact" and .fresh == false) | .target.name' "$artifacts")"
+          if [ -n "$rebuilt" ]; then
+            echo "::error::listing the workspace test build compiled units \"Run tests\" should already have built; its cargo arguments and this step's have drifted apart:"
+            echo "$rebuilt"
+            exit 1
+          fi
+          # Each package's test executables, as "<package dir><TAB><executable>".
+          tests="$RUNNER_TEMP/billing-tests.tsv"
+          : > "$tests"
+          for package in eidola-billing eidola-billing-cli eidola-server-gateway; do
+            id="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg name "$package" '.packages[] | select(.name == $name) | .id')"
+            jq -r --arg id "$id" \
+              'select(.reason == "compiler-artifact" and .package_id == $id and .profile.test and .executable != null)
+               | "\(.manifest_path | rtrimstr("/Cargo.toml"))\t\(.executable)"' \
+              "$artifacts" > "$tests.part"
+            if [ ! -s "$tests.part" ]; then
+              echo "::error::the workspace test build produced no test executable for $package"
+              exit 1
+            fi
+            cat "$tests.part" >> "$tests"
+          done
+
           trap 'docker rm -f eidola-billing-tests >/dev/null 2>&1 || true' EXIT
           # Docker picks a free host port: a fixed one can already be taken,
           # by anything on the runner that was handed it as an ephemeral port.
@@ -340,9 +387,12 @@ jobs:
           published="$(docker port eidola-billing-tests 5432/tcp)"
           export DATABASE_URL="postgres://billing_test@${published}/billing_test?sslmode=disable"
           export BILLING_TEST_DATABASE_URL="${DATABASE_URL}"
-          cargo test -p eidola-billing -- --ignored --test-threads=1
-          cargo test -p eidola-billing-cli -- --ignored --test-threads=1
-          cargo test -p eidola-server-gateway -- --ignored --test-threads=1
+          # Each executable runs from its package's directory, as cargo runs it.
+          while IFS=$'\t' read -r dir executable; do
+            echo "::group::$executable"
+            (cd "$dir" && "$executable" --ignored --test-threads=1 < /dev/null)
+            echo "::endgroup::"
+          done < "$tests"
 
       - name: Check OCI stub-source resolution
         # The image builds resolve the workspace from manifests plus stub
@@ -393,8 +443,11 @@ jobs:
         # advisories publish on their own clock, so gating PRs on them fails
         # work that didn't introduce anything — the scheduled advisories
         # workflow covers those. cargo-deny is pinned by the crates/devtools
-        # anchor and built from the lockfile, same as rumdl above.
+        # workspace and built from its lockfile, same as rumdl above. That
+        # workspace's own graph is checked for licenses and sources; the
+        # bans describe what the product builds (the tools need `ring`).
         if: steps.scope.outputs.rust == 'true'
         run: |
-          cargo build --quiet -p cargo-deny
-          ./target/debug/cargo-deny check licenses bans sources
+          cargo build --quiet --manifest-path crates/devtools/Cargo.toml -p cargo-deny
+          ./crates/devtools/target/debug/cargo-deny check licenses bans sources
+          ./crates/devtools/target/debug/cargo-deny --manifest-path crates/devtools/Cargo.toml check licenses sources

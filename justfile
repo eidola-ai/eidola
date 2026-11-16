@@ -49,7 +49,8 @@ build system:
         cargo build -p eidola-cli
         ;;
       gui)
-        cargo build -p eidola-gui
+        # The CLI is part of the app's payload on every platform.
+        cargo build -p eidola-gui -p eidola-cli
         # On macOS, also assemble a proper .app bundle. AppKit needs an
         # Info.plist alongside the binary to treat the process as a real
         # app (vs. a command-line tool); otherwise menu key-equivalent
@@ -214,6 +215,7 @@ check:
     cargo fmt --check
     rumdl check .
     cargo-deny check licenses bans sources
+    cargo-deny --manifest-path crates/devtools/Cargo.toml check licenses sources
     ./scripts/check-manifest-determinism.sh
     ./scripts/check-rust-toolchain.sh
     ./scripts/test-check-rust-toolchain.sh
@@ -221,6 +223,7 @@ check:
     ./scripts/artifact-manifest.sh check-complete
     ./scripts/test-release-assets.sh
     ./scripts/test-weights-hash.sh
+    ./scripts/test-platform-endorsements-drift.sh
 
 # Apply auto-fixable markdown formatting via rumdl
 format:

@@ -23,7 +23,8 @@ fn dirs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
 }
 
 /// The single-opener path is unchanged: construction succeeds and leaves the
-/// lockfile next to the database, stamped with this process's pid.
+/// lockfile next to the database, stamped with this process's pid and the
+/// kind of holder it is.
 #[test]
 fn a_single_open_succeeds_and_stamps_the_lockfile() {
     let (_dir, config_dir, data_dir) = dirs();
@@ -39,11 +40,50 @@ fn a_single_open_succeeds_and_stamps_the_lockfile() {
     let recorded = std::fs::read_to_string(&lock_path).expect("read lockfile");
     assert_eq!(
         recorded.trim(),
-        std::process::id().to_string(),
-        "the holder writes its own pid so the next contender can name it"
+        format!("{} app", std::process::id()),
+        "the holder writes its own pid so the next contender can name it, \
+         and says it is the app"
     );
+    assert_eq!(db::lock_holder(&data_dir), Some(db::LockHolder::App));
 
     drop(core);
+}
+
+/// A one-shot command says so in the lockfile, and a contender refused while
+/// it holds the profile is told that waiting will end — the record the CLI's
+/// lock wait and the GUI's startup both decide on.
+#[test]
+fn a_command_holder_says_it_is_one() {
+    let (_dir, config_dir, data_dir) = dirs();
+
+    let _held = AppCore::new_for_command(config_dir.clone(), data_dir.clone()).expect("first open");
+    assert_eq!(db::lock_holder(&data_dir), Some(db::LockHolder::Command));
+
+    let err = match AppCore::new(config_dir, data_dir) {
+        Ok(_) => panic!("a command holds the profile as exclusively as the app does"),
+        Err(e) => e,
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("`eidola` command"),
+        "the refusal names what holds it: {rendered}"
+    );
+    assert!(
+        rendered.contains("Wait for it to finish"),
+        "and that it will let go: {rendered}"
+    );
+}
+
+/// A record that does not say what holds it is `None`, never a guess — a
+/// contender treats an unknown holder as one that will not let go.
+#[test]
+fn a_record_without_a_holder_kind_names_none() {
+    let (_dir, _config_dir, data_dir) = dirs();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join(db::LOCK_FILE_NAME), "1234").unwrap();
+    assert_eq!(db::lock_holder(&data_dir), None);
+    std::fs::write(data_dir.join(db::LOCK_FILE_NAME), "1234 daemon").unwrap();
+    assert_eq!(db::lock_holder(&data_dir), None);
 }
 
 /// The contention case: a second open on the same data dir is refused with the
@@ -138,12 +178,12 @@ fn a_leftover_lockfile_with_a_stale_pid_does_not_wedge_the_lock() {
 fn an_unparseable_pid_still_refuses_but_reports_no_pid() {
     let (_dir, _config_dir, data_dir) = dirs();
 
-    let held = db::DbLock::acquire(&data_dir).expect("acquire");
+    let held = db::DbLock::acquire(&data_dir, db::LockHolder::App).expect("acquire");
     // Overwrite the stamped pid behind the holder's back (a holder killed
     // mid-write leaves the same observable state).
     std::fs::write(held.path(), "not-a-pid").unwrap();
 
-    match db::DbLock::acquire(&data_dir) {
+    match db::DbLock::acquire(&data_dir, db::LockHolder::App) {
         Err(AppError::DatabaseInUse { pid, message }) => {
             assert_eq!(pid, None, "an unparseable pid is reported honestly as none");
             assert!(

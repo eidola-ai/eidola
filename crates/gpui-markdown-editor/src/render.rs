@@ -402,7 +402,7 @@ fn collect_verbatim_ranges(tree: &[SyntaxNode]) -> Vec<Range<usize>> {
         walk(node, &mut out);
     }
     out.sort_by_key(|r| r.start);
-    // Merge overlaps so the linear-probe in `escapes::scan` stays O(n).
+    // Merge overlaps: `escapes::scan` walks these as sorted and disjoint.
     let mut merged: Vec<Range<usize>> = Vec::with_capacity(out.len());
     for r in out {
         if let Some(last) = merged.last_mut()

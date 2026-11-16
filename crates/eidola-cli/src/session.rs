@@ -16,6 +16,10 @@
 //!   socket to ask instead. It arrives two ways — no socket plus
 //!   [`AppError::DatabaseInUse`], and a socket that accepted a connection and
 //!   never greeted it — and both say the same actionable thing.
+//! - **The profile is held by another `eidola` command** ⇒ wait for it to
+//!   let go, bounded by `--lock-wait` and announced once — commands with no
+//!   app running take turns rather than failing. The lockfile says what holds
+//!   the profile ([`LockHolder`]); only a command is waited on this way.
 //! - **It answers, for another profile** ⇒ refuse, in the handshake, before a
 //!   verb is dispatched at it. A profile is *both* roots and the socket is
 //!   found through the data one alone, so an app reached this way has not yet
@@ -50,6 +54,7 @@
 use std::path::PathBuf;
 
 use eidola_app_core::backends::BackendInfo;
+use eidola_app_core::db::{self, LockHolder};
 use eidola_app_core::error::AppError;
 use eidola_app_core::ipc::{
     AccountCheckoutResult, AccountPricesResult, BackendModelsResult, Call, DefaultModelResult,
@@ -91,6 +96,18 @@ enum Mode {
 /// a machine with no app running never reaches here.
 const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a command waits, by default, for **another `eidola` command**
+/// that holds the profile to finish with it (`--lock-wait` overrides it).
+///
+/// The local database has one writer, so two commands run against a profile
+/// no app is serving take turns: the second waits for the first rather than
+/// failing, which is what lets a script run commands side by side. Ten
+/// minutes is sized against the longest ordinary command — an agentic chat
+/// turn with tools — times a handful queued behind it, while still ending a
+/// wait on a command that will never finish (`eidola model load` holds the
+/// profile until it is stopped) in a stated failure that names it.
+pub const DEFAULT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// The gap before the second look, doubling up to [`MAX_RETRY_GAP`]. Small
 /// first, because most of this race is decided in milliseconds and a command
 /// that could have run immediately should.
@@ -123,6 +140,11 @@ pub enum Startup {
     OtherProfile { ours: PathBuf, theirs: PathBuf },
     /// The conversation with the running app failed before it began.
     Dial(Failure),
+    /// Another `eidola` command held the profile for the whole of the wait.
+    Busy {
+        pid: Option<u32>,
+        waited: std::time::Duration,
+    },
 }
 
 impl std::fmt::Display for Startup {
@@ -148,6 +170,17 @@ impl std::fmt::Display for Startup {
                 ours.display()
             ),
             Startup::Dial(e) => write!(f, "{e}"),
+            Startup::Busy { pid, waited } => {
+                write!(f, "another `eidola` command")?;
+                if let Some(pid) = pid {
+                    write!(f, " (pid {pid})")?;
+                }
+                write!(
+                    f,
+                    " still holds this profile after waiting {}s",
+                    waited.as_secs()
+                )
+            }
         }
     }
 }
@@ -168,119 +201,136 @@ pub fn unanswered(e: AppError) -> Startup {
 }
 
 impl Session {
-    /// Choose who answers, following the selection rule.
+    /// [`Session::open_waiting`] with the default lock wait and no notice —
+    /// the shape most tests want.
+    #[cfg(test)]
     pub fn open(
         config_dir: PathBuf,
         data_dir: PathBuf,
         embedded: bool,
     ) -> Result<Session, Startup> {
+        Self::open_waiting(
+            config_dir,
+            data_dir,
+            embedded,
+            DEFAULT_LOCK_WAIT,
+            &mut |_| {},
+        )
+    }
+
+    /// Choose who answers, following the selection rule.
+    ///
+    /// One loop, because every branch of the rule can be waiting on the same
+    /// two things — a socket appearing, or the lock coming free — and each
+    /// look is the full question again:
+    ///
+    /// 1. **Dial** (skipped under `--embedded`). An answer for this profile
+    ///    is client mode; a refusal is final.
+    /// 2. **Open the profile here.** Success is embedded mode.
+    /// 3. **Refused because it is held**, and the lockfile says by whom:
+    ///    - an `eidola` **command** ([`LockHolder::Command`]) lets go when its
+    ///      command ends, so wait for it — up to `lock_wait`, announced once
+    ///      through `on_wait` with the holder's pid, and ending in
+    ///      [`Startup::Busy`] rather than an unbounded wait;
+    ///    - **the app**, or a holder that has not said, holds the profile for
+    ///      its whole life and is expected to *serve* it: wait only
+    ///      [`STARTUP_GRACE`] for its listener, then report
+    ///      [`Startup::NotAccepting`] naming it.
+    ///
+    /// A command's wait can end in client mode: an app started meanwhile
+    /// takes the lock the moment the command lets go and binds its socket a
+    /// moment later, and the next look's dial finds it. Under `--embedded`
+    /// a held-by-the-app profile is refused at once, as it always was —
+    /// `--embedded` forces the mode, not the lock.
+    pub fn open_waiting(
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        embedded: bool,
+        lock_wait: std::time::Duration,
+        on_wait: &mut dyn FnMut(Option<u32>),
+    ) -> Result<Session, Startup> {
         let config_path = config_dir.join("config.toml");
-        if embedded {
-            return AppCore::new(config_dir, data_dir)
-                .map(|core| Session::from_core(core, config_path))
-                .map_err(Startup::Core);
-        }
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(e) => {
-                return Err(Startup::Core(AppError::Internal {
-                    message: format!("could not start a runtime: {e}"),
-                }));
+        let runtime = if embedded {
+            None
+        } else {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => Some(runtime),
+                Err(e) => {
+                    return Err(Startup::Core(AppError::Internal {
+                        message: format!("could not start a runtime: {e}"),
+                    }));
+                }
             }
         };
-        let client_mode = |runtime, client, config_path| Session {
-            mode: Mode::Client {
-                runtime,
-                client: tokio::sync::Mutex::new(client),
-            },
-            config_path,
-        };
-        match Self::dial(&runtime, &config_dir, &data_dir) {
-            Ok(client) => Ok(client_mode(runtime, client, config_path)),
-            Err(Dial::NoListener) => {
-                // Nothing to ask, so open the profile here — which is also how
-                // we learn whether anything is holding it.
-                match AppCore::new(config_dir.clone(), data_dir.clone()) {
-                    Ok(core) => {
-                        drop(runtime);
-                        Ok(Session::from_core(core, config_path))
+
+        let started = std::time::Instant::now();
+        let mut gap = FIRST_RETRY;
+        // When the current run of "held by something that should be serving"
+        // began. Reset whenever the holder turns out to be a command, so an
+        // app that takes over from one gets its whole startup grace.
+        let mut app_held_since: Option<std::time::Instant> = None;
+        let mut announced = false;
+        loop {
+            if let Some(dialer) = &runtime {
+                match Self::dial(dialer, &config_dir, &data_dir) {
+                    Ok(client) => {
+                        return Ok(Session {
+                            mode: Mode::Client {
+                                runtime: runtime.expect("dialled through it"),
+                                client: tokio::sync::Mutex::new(client),
+                            },
+                            config_path,
+                        });
                     }
-                    // **Someone took the lock between that dial and this
-                    // open**, and starting the app is exactly how that
-                    // happens: the app takes the profile *well* before it
-                    // binds its socket, and a command launched alongside it
-                    // can arrive anywhere in between. So look again — and
-                    // keep looking for a bounded moment, because here, unlike
-                    // the cold-start path above, a holder is known to exist
-                    // and a listener is expected of it.
-                    Err(e) if matches!(e, AppError::DatabaseInUse { .. }) => {
-                        match Self::await_listener(&runtime, &config_dir, &data_dir) {
-                            Ok(client) => Ok(client_mode(runtime, client, config_path)),
+                    Err(Dial::NoListener) => {}
+                    Err(Dial::NotAccepting) => return Err(Startup::NotAccepting { pid: None }),
+                    // Refused during the handshake, so no verb was ever
+                    // dispatched at it: the app answering is not serving this
+                    // command's profile.
+                    Err(Dial::OtherProfile { ours, theirs }) => {
+                        return Err(Startup::OtherProfile { ours, theirs });
+                    }
+                    Err(Dial::Failed(e)) => return Err(Startup::Dial(e)),
+                }
+            }
+            match AppCore::new_for_command(config_dir.clone(), data_dir.clone()) {
+                Ok(core) => return Ok(Session::from_core(core, config_path)),
+                Err(AppError::DatabaseInUse { pid, message }) => {
+                    if db::lock_holder(&data_dir) == Some(LockHolder::Command) {
+                        app_held_since = None;
+                        if started.elapsed() + gap > lock_wait {
+                            return Err(Startup::Busy {
+                                pid,
+                                waited: lock_wait,
+                            });
+                        }
+                        if !announced {
+                            announced = true;
+                            on_wait(pid);
+                        }
+                    } else {
+                        let e = AppError::DatabaseInUse { pid, message };
+                        if embedded {
+                            return Err(Startup::Core(e));
+                        }
+                        let since = *app_held_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() + gap >= STARTUP_GRACE {
                             // The grace ran out with nothing serving it. The
                             // holder is an Eidola older than the socket, or
                             // one whose listener stopped — which is what
                             // `unanswered` says, naming the process holding
                             // the lock.
-                            Err(Dial::NoListener | Dial::NotAccepting) => Err(unanswered(e)),
-                            Err(Dial::OtherProfile { ours, theirs }) => {
-                                Err(Startup::OtherProfile { ours, theirs })
-                            }
-                            Err(Dial::Failed(e)) => Err(Startup::Dial(e)),
+                            return Err(unanswered(e));
                         }
                     }
-                    Err(other) => Err(unanswered(other)),
                 }
+                Err(other) => return Err(unanswered(other)),
             }
-            Err(Dial::NotAccepting) => Err(Startup::NotAccepting { pid: None }),
-            // Refused during the handshake, so no verb was ever dispatched at
-            // it: the app answering is not serving this command's profile.
-            Err(Dial::OtherProfile { ours, theirs }) => Err(Startup::OtherProfile { ours, theirs }),
-            Err(Dial::Failed(e)) => Err(Startup::Dial(e)),
-        }
-    }
-
-    /// Dial until a lock holder's listener appears, or until
-    /// [`STARTUP_GRACE`] runs out.
-    ///
-    /// **Only ever called when the profile is held**, which is what makes
-    /// waiting honest rather than hopeful: something already owns the
-    /// profile, and if it is an Eidola of this build a listener is coming.
-    /// The gap it is waiting out is not a few syscalls — the app takes the
-    /// lock, opens and validates the database, starts the sub-space driver,
-    /// launches its window system, builds its stores and kicks off its
-    /// startup refreshes, and only then binds. A single immediate look lands
-    /// inside that gap far more often than not, and reports that a starting
-    /// app is refusing to serve.
-    ///
-    /// **Never a silent *unbounded* wait**, which is the rule the selection
-    /// logic actually keeps: the ceiling is stated, short, and ends in the
-    /// same refusal — naming the holder — that an app which never binds has
-    /// always earned. Only an absent socket is worth another look; a socket
-    /// that accepted and never greeted has already spent
-    /// [`crate::client::HANDSHAKE_TIMEOUT`] proving it is not being served,
-    /// and a mismatched profile or a broken conversation is an answer, not a
-    /// wait.
-    fn await_listener(
-        runtime: &tokio::runtime::Runtime,
-        config_dir: &std::path::Path,
-        data_dir: &std::path::Path,
-    ) -> Result<Client, Dial> {
-        let deadline = std::time::Instant::now() + STARTUP_GRACE;
-        let mut wait = FIRST_RETRY;
-        loop {
-            match Self::dial(runtime, config_dir, data_dir) {
-                Err(Dial::NoListener) => {}
-                other => return other,
-            }
-            let now = std::time::Instant::now();
-            if now + wait >= deadline {
-                return Err(Dial::NoListener);
-            }
-            std::thread::sleep(wait);
-            wait = (wait * 2).min(MAX_RETRY_GAP);
+            std::thread::sleep(gap);
+            gap = (gap * 2).min(MAX_RETRY_GAP);
         }
     }
 
@@ -1183,6 +1233,162 @@ mod tests {
             "and did not wait past it"
         );
         drop(holder);
+    }
+
+    /// Hold the profile as a one-shot command would, from another thread,
+    /// for `hold`, signalling once the lock is taken.
+    fn command_holder(
+        dir: &std::path::Path,
+        hold: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let dir = dir.to_path_buf();
+        let (taken, wait) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let lock = db::DbLock::acquire(&dir, LockHolder::Command).expect("the command's open");
+            taken.send(()).expect("signal");
+            std::thread::sleep(hold);
+            drop(lock);
+        });
+        wait.recv().expect("the holder took the lock");
+        holder
+    }
+
+    #[test]
+    fn a_command_holding_the_profile_is_waited_for() {
+        // Two commands against a profile no app is serving take turns: the
+        // second opens the profile as soon as the first lets go, rather than
+        // failing — and says once, naming the holder, that it is waiting.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hold = std::time::Duration::from_millis(400);
+        let holder = command_holder(dir.path(), hold);
+        let started = std::time::Instant::now();
+        let mut notices = Vec::new();
+        let session = Session::open_waiting(
+            dir.path().into(),
+            dir.path().into(),
+            false,
+            std::time::Duration::from_secs(30),
+            &mut |pid| notices.push(pid),
+        )
+        .expect("the profile comes free inside the wait");
+        assert!(
+            !session.is_client(),
+            "nothing is serving, so it is opened here"
+        );
+        assert!(
+            started.elapsed() >= hold - std::time::Duration::from_millis(50),
+            "it waited for the holder rather than racing it"
+        );
+        assert_eq!(
+            notices,
+            vec![Some(std::process::id())],
+            "the wait is announced exactly once, naming the holder"
+        );
+        drop(session);
+        holder.join().expect("the holder ends");
+    }
+
+    #[test]
+    fn a_command_that_never_lets_go_ends_the_wait_as_busy() {
+        // The wait is bounded and ends in a stated refusal naming the holder,
+        // never a silent hang: `eidola model load` holds the profile until it
+        // is stopped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let holder = command_holder(dir.path(), std::time::Duration::from_secs(3));
+        let limit = std::time::Duration::from_millis(400);
+        let started = std::time::Instant::now();
+        match Session::open_waiting(
+            dir.path().into(),
+            dir.path().into(),
+            false,
+            limit,
+            &mut |_| {},
+        ) {
+            Err(Startup::Busy { pid, waited }) => {
+                assert_eq!(pid, Some(std::process::id()));
+                assert_eq!(waited, limit);
+            }
+            other => panic!(
+                "a holder outlasting the wait is Busy: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(
+            started.elapsed() < limit + MAX_RETRY_GAP,
+            "and the wait stops at its ceiling, not past it"
+        );
+        let rendered = Startup::Busy {
+            pid: Some(4242),
+            waited: limit,
+        }
+        .to_string();
+        assert!(
+            rendered.contains("`eidola` command (pid 4242)"),
+            "{rendered}"
+        );
+        holder.join().expect("the holder ends");
+    }
+
+    #[test]
+    fn a_zero_lock_wait_refuses_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let holder = command_holder(dir.path(), std::time::Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        let mut notices = 0;
+        match Session::open_waiting(
+            dir.path().into(),
+            dir.path().into(),
+            false,
+            std::time::Duration::ZERO,
+            &mut |_| notices += 1,
+        ) {
+            Err(Startup::Busy { .. }) => {}
+            other => panic!("--lock-wait 0 refuses: {:?}", other.map(|_| ())),
+        }
+        assert!(started.elapsed() < MAX_RETRY_GAP, "without sleeping first");
+        assert_eq!(notices, 0, "and announces no wait it is not going to do");
+        holder.join().expect("the holder ends");
+    }
+
+    #[test]
+    fn embedded_mode_waits_for_a_command_too() {
+        // `--embedded` forces the mode, not the lock — and taking turns with
+        // another command is the lock's business, so it waits the same way.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let holder = command_holder(dir.path(), std::time::Duration::from_millis(300));
+        let session = Session::open_waiting(
+            dir.path().into(),
+            dir.path().into(),
+            true,
+            std::time::Duration::from_secs(30),
+            &mut |_| {},
+        )
+        .expect("the profile comes free");
+        assert!(session.local("`eidola configure`").is_ok());
+        drop(session);
+        holder.join().expect("the holder ends");
+    }
+
+    #[test]
+    fn embedded_mode_still_refuses_an_app_holder_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let holder = AppCore::new(dir.path().into(), dir.path().into()).expect("the app's open");
+        let started = std::time::Instant::now();
+        match Session::open(dir.path().into(), dir.path().into(), true) {
+            Err(Startup::Core(AppError::DatabaseInUse { .. })) => {}
+            other => panic!("an app holder is not waited on: {:?}", other.map(|_| ())),
+        }
+        assert!(started.elapsed() < MAX_RETRY_GAP);
+        drop(holder);
+    }
+
+    #[test]
+    fn a_command_opens_the_profile_as_a_command() {
+        // What lets the *next* command wait for this one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = Session::open(dir.path().into(), dir.path().into(), false).expect("embedded");
+        assert_eq!(db::lock_holder(dir.path()), Some(LockHolder::Command));
+        drop(session);
     }
 
     #[test]

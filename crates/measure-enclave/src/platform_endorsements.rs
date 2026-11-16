@@ -144,7 +144,7 @@ pub fn vendor(
     attestations: &[u8],
 ) -> Result<Vendored> {
     ensure!(
-        platform_endorsements::is_release_tag(tag),
+        eidola_common::platform_release::is_tag(tag),
         "{tag:?} is not a platform-vX.Y.Z release tag"
     );
     let read =
@@ -197,7 +197,7 @@ pub fn newest_vendored(workspace: &std::path::Path) -> Result<Option<String>> {
     for entry in std::fs::read_dir(&root).with_context(|| format!("listing {}", root.display()))? {
         let name = entry?.file_name();
         let name = name.to_str().context("a non-UTF-8 name")?;
-        let Some(version) = platform_endorsements::release_version(name) else {
+        let Some(version) = eidola_common::platform_release::version(name) else {
             bail!(
                 "{} holds {name:?}, which is not a release tag",
                 root.display()
@@ -528,35 +528,6 @@ pub(crate) mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("none of the 2 attestations"), "{err}");
-    }
-
-    #[test]
-    fn release_tags_follow_the_release_workflows_pattern() {
-        for good in ["platform-v0.1.11", "platform-v1.0.0", "platform-v10.20.30"] {
-            assert!(platform_endorsements::is_release_tag(good), "{good}");
-            assert!(
-                eidola_common::engine_deployment::deployment::is_platform_release_tag(good),
-                "{good}"
-            );
-        }
-        for bad in [
-            "platform-v0.1",
-            "platform-v0.01.1",
-            "v0.1.11",
-            "platform-v0.1.11-rc1",
-            "platform-v0.1.11/..",
-            "platform-v.1.1",
-        ] {
-            assert!(!platform_endorsements::is_release_tag(bad), "{bad}");
-            assert!(
-                !eidola_common::engine_deployment::deployment::is_platform_release_tag(bad),
-                "{bad}"
-            );
-        }
-        assert!(
-            platform_endorsements::release_version("platform-v0.1.11")
-                < platform_endorsements::release_version("platform-v0.2.0")
-        );
     }
 
     /// Every release under the vendored tree verifies as its tag, and there
