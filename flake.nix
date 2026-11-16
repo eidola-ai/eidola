@@ -196,22 +196,23 @@
           let
             matchingCrate = getCrateForPath relPath;
             # Both `eidola-app-core/build.rs` and `eidola-server-gateway/build.rs`
-            # consume pinned trust data from `releases/`:
-            #   * eidola-app-core → exactly the files `appCoreTrustInputs`
-            #     names (the client trust root), so nothing else under
-            #     `releases/` (the engine pins, vendored platform material,
-            #     Linux desktop files) moves the client's narHash
-            #   * eidola-server-gateway → `releases/trust/engine-enclaves.json`
-            #     (the engine pins), the platform endorsements and Sigstore
-            #     trusted root their machine policy is re-derived from, and the
-            #     platform release manifests their MRTD is checked against
-            # Included only when either crate is built, so unrelated crates
-            # do not cache-bust on every manifest regeneration.
+            # consume pinned trust data from `releases/`, each exactly the
+            # files it reads, so nothing else there moves its sources:
+            #   * eidola-app-core → the files `appCoreTrustInputs` names (the
+            #     client trust root); not the engine pins, the vendored
+            #     platform material or the Linux desktop files
+            #   * eidola-server-gateway → the files `gatewayTrustInputs` names:
+            #     the engine pins, the Sigstore trusted root, and the two
+            #     vendored platform release trees, whole, because its build
+            #     walks them and refuses a file nothing names; not the client
+            #     trust root, which is a function of the gateway's own image
+            # The workspace checks take all of `releases/`: they run every
+            # crate's tests, release tooling's among them.
             # `artifact-manifest.json` (at the root, not under `releases/`)
             # is deliberately excluded — it records the eidola-cli narHash
             # itself, so including it would create a self-reference that
             # prevents the build from reaching a fixed point.
-            isTrustRootPath = relPath == "/releases" || pkgs.lib.hasPrefix "/releases/" relPath;
+            isReleasesPath = relPath == "/releases" || pkgs.lib.hasPrefix "/releases/" relPath;
             # What app-core's build reads (its `build.rs`, and
             # eidola-attestation's `include_str!` of the templates), with the
             # directories that hold them.
@@ -224,19 +225,41 @@
               "/releases/schema"
               "/releases/schema/attestation-templates.json"
             ];
+            # What the gateway's build reads, with the directories that hold
+            # it.
+            gatewayTrustInputs = [
+              "/releases"
+              "/releases/trust"
+              "/releases/trust/engine-enclaves.json"
+              "/releases/trust/sigstore-trusted-root.json"
+            ];
+            isVendoredPlatformPath = pkgs.lib.any (
+              root: relPath == root || pkgs.lib.hasPrefix "${root}/" relPath
+            ) [ "/releases/trust/platform-endorsements" "/releases/trust/cvm-releases" ];
+            # Markdown under `deploy/engine/` and `models/` is for people:
+            # neither build reads it, and the OCI build context
+            # (`.dockerignore`) drops it too, so both builds see one tree.
+            isMarkdown = type == "regular" && pkgs.lib.hasSuffix ".md" relPath;
             # `eidola-server-gateway/build.rs` also checks every engine pin in
             # `releases/trust/engine-enclaves.json` against the committed
-            # deployment configs it names.
+            # deployment configs it names, and every deployment directory
+            # against the pins.
             isEngineDeployPath =
-              relPath == "/deploy"
-              || relPath == "/deploy/engine"
-              || pkgs.lib.hasPrefix "/deploy/engine/" relPath;
+              !isMarkdown
+              && (
+                relPath == "/deploy"
+                || relPath == "/deploy/engine"
+                || pkgs.lib.hasPrefix "/deploy/engine/" relPath
+              );
             # ... and compiles in the model catalog, one file per set of
             # weights under `models/`, bound to those pins by weights hash.
-            isModelCatalogPath = relPath == "/models" || pkgs.lib.hasPrefix "/models/" relPath;
+            isModelCatalogPath =
+              !isMarkdown && (relPath == "/models" || pkgs.lib.hasPrefix "/models/" relPath);
           in
           (crateInSet "eidola-app-core" && builtins.elem relPath appCoreTrustInputs)
-          || (crateInSet "eidola-server-gateway" && isTrustRootPath)
+          || (crateInSet "eidola-server-gateway" && builtins.elem relPath gatewayTrustInputs)
+          || (crateInSet "eidola-server-gateway" && isVendoredPlatformPath)
+          || (wholeWorkspace && isReleasesPath)
           || (crateInSet "eidola-server-gateway" && isEngineDeployPath)
           || (crateInSet "eidola-server-gateway" && isModelCatalogPath)
           # app-core compiles the same catalog in, to tell a user what a model
@@ -334,23 +357,21 @@
                   } relPath path type
                 then
                   true
-                # Nothing else under `releases/` is a build input: without
-                # this, crane's filter below keeps every directory there, so
-                # vendoring a release would still add an (empty) directory to
-                # a source that does not read it.
-                else if pkgs.lib.hasPrefix "/releases/" relPath then
-                  false
+                # Inside a crate being built, crane's filter (which handles
+                # .rs, Cargo.toml, etc.).
+                else if matchingCrate != null then
+                  craneLib.filterCargoSources path type
                 # Keep only root-level files that affect Cargo resolution/builds.
                 # This avoids generated files like artifact-manifest.json from
                 # perturbing package hashes for unrelated Nix builds.
                 else if type == "regular" && builtins.match "/[^/]+" relPath != null then
                   builtins.hasAttr baseName rootBuildFiles
-                # Keep directories that are parents of crate paths
-                else if type == "directory" && isParentOfCrate relPath then
-                  true
-                # For everything else, use crane's filter (which handles .rs, Cargo.toml, etc.)
+                # Outside the crates, only the directories that lead to them.
+                # Crane's filter would keep every directory in the tree and
+                # every `.toml` file (`www/docs-nav.toml`, the dev tools'
+                # `crates/devtools/`), none of which a package build reads.
                 else
-                  craneLib.filterCargoSources path type;
+                  type == "directory" && isParentOfCrate relPath;
             };
 
             # Generate a Cargo.toml with only the relevant members listed

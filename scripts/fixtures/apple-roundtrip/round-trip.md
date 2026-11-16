@@ -356,6 +356,8 @@ Two things follow:
 - The planned `scripts/fixtures/manifest-determinism/` tree will do the same thing again.
 - The durable fix is one filter rule — exclude `scripts/` (and any other non-source top-level tree) from `filteredSrc` outright. It is a small change with a wide blast radius (it moves the filtered source hash for *every* Nix build, so it costs one rebuild to adopt), and it is not this change's to make. Worth doing once, deliberately, rather than paying a cache miss per fixture directory.
 
+The filter has since taken that rule: outside the crates a package builds, `filteredSrc` keeps only the files `keepNonCargoInput` names, `Cargo.lock`, `rust-toolchain.toml` and the directories leading to the crates, so a new directory elsewhere no longer reaches a package source.
+
 ### 5.5 Still unknown, and still needing a certificate
 
 Open before this measurement and still open; nothing here settles them:
