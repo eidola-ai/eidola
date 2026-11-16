@@ -328,5 +328,33 @@ class NodeFailures(unittest.TestCase):
         self.run_stream(sse([{"choices": [{"delta": {"content": "partial"}}]}, "[DONE]"]))
 
 
+class YardstickFailures(unittest.TestCase):
+    """A failed or short yardstick request fails the benchmark, never counts as tokens."""
+
+    def run_stream(self, chunks):
+        s = Server(lambda m, path, b: (200, "text/event-stream", chunks))
+        try:
+            with self.assertRaises(SystemExit):
+                t.stream_completion(s.base, "m", [1, 2, 3], 4)
+        finally:
+            s.close()
+
+    def test_an_error_payload_fails_the_request(self):
+        self.run_stream(sse([{"choices": [{"text": "a"}]}, {"error": {"message": "out of memory"}}]))
+
+    def test_a_stream_without_usage_fails_the_request(self):
+        self.run_stream(sse([{"choices": [{"text": "a"}]}, "[DONE]"]))
+
+    def test_a_short_output_fails_the_request(self):
+        self.run_stream(sse([{"choices": [{"text": "a"}]}, {"choices": [], "usage": {"completion_tokens": 2}}, "[DONE]"]))
+
+    def test_a_whole_output_is_measured(self):
+        s = Server(lambda m, path, b: (200, "text/event-stream", sse([{"choices": [{"text": "a"}]}, {"choices": [], "usage": {"completion_tokens": 4}}, "[DONE]"])))
+        try:
+            self.assertEqual(t.stream_completion(s.base, "m", [1, 2, 3], 4)["tokens"], 4)
+        finally:
+            s.close()
+
+
 if __name__ == "__main__":
     unittest.main()

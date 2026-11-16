@@ -466,14 +466,21 @@ def stream_completion(base: str, model: str, prompt: list, out_len: int) -> dict
     tokens = None
     body = {"model": model, "prompt": prompt, "max_tokens": out_len, "temperature": 0.0, "ignore_eos": True, "stream": True, "stream_options": {"include_usage": True}}
     with post(f"{base}/v1/completions", body) as resp:
-        for _, data, at in sse_events(resp):
+        for event, data, at in sse_events(resp):
+            if event == "error":
+                raise SystemExit(f"the yardstick answered with an error: {data}")
             if data.strip() == "[DONE]":
                 break
             chunk = json.loads(data)
+            if "error" in chunk:
+                raise SystemExit(f"the yardstick answered with an error: {data}")
             if any(c.get("text") for c in chunk.get("choices", [])) and first is None:
                 first = at
             if chunk.get("usage"):
                 tokens = chunk["usage"].get("completion_tokens")
+    # A fixed-length benchmark counts only requests that produced their whole output.
+    if tokens != out_len:
+        raise SystemExit(f"a yardstick request produced {tokens} of {out_len} tokens")
     end = time.time()
     decode = (tokens - 1) / (end - first) if tokens and tokens > 1 and first and end > first else None
     return {"tokens": tokens, "submitted": began, "ttft_seconds": None if first is None else first - began, "seconds": end - began, "decode_tokens_per_second": decode}
