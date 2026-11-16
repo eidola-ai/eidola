@@ -21,7 +21,7 @@
 //!
 //! A response cut off by `length` keeps the calls already completed; a call
 //! whose closing tag never arrived is given out as content (see
-//! [`crate::mimo::tool_call`] and [`crate::deepseek::output`]).
+//! [`crate::tool_call::xml`] and [`crate::deepseek::output`]).
 
 use std::ops::Range;
 
@@ -29,10 +29,9 @@ use crate::ChatFormat;
 use crate::args::ToolSchemas;
 use crate::deepseek::output::{DsmlParser, ReasoningSplitter};
 use crate::error::ChatError;
-use crate::mimo::reasoning::ReasoningParser;
-use crate::mimo::tool_call::ToolCallParser;
-use crate::reasoning::ReasoningDelta;
+use crate::reasoning::{ReasoningDelta, ReasoningParser};
 use crate::tokenizer::{Detokenizer, Tokenizer};
+use crate::tool_call::xml::ToolCallParser;
 use crate::tool_call::{CallIdSource, ToolCall, ToolCallDelta};
 
 /// Why the engine stopped generating.

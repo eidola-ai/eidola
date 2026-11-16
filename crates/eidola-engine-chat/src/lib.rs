@@ -34,6 +34,7 @@ pub mod args;
 pub mod deepseek;
 pub mod error;
 pub mod format;
+mod jinja;
 pub mod json;
 pub mod mimo;
 pub mod output;
