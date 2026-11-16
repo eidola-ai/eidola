@@ -1,6 +1,6 @@
 # eidola-engine
 
-The serving core of Eidola's purpose-built inference engine: the executor seam, paged KV manager, salted prefix cache, scheduler, speculative-decoding control flow, and the CPU reference sampler. It knows nothing about weights, numerics, tokenizers, or HTTP; it speaks token ids to an [`Executor`](src/executor.rs) and events to its caller. Two model shapes are expressed at the seam: MiMo-V2.6, which the CPU and CUDA executors run, and DeepSeek-V4.1 (*Window chain*, below), which so far only the mock runs. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
+The serving core of Eidola's purpose-built inference engine: the executor seam, paged KV manager, salted prefix cache, scheduler, speculative-decoding control flow, and the CPU reference sampler. It knows nothing about weights, numerics, tokenizers, or HTTP; it speaks token ids to an [`Executor`](src/executor.rs) and events to its caller. Two model shapes are expressed at the seam, MiMo-V2.6 and DeepSeek-V4.1 (*Window chain*, below), and the mock, CPU and CUDA executors run both. Each architecture's state, its code across every crate and its outstanding work are in [`architectures/`](architectures/README.md). AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
 
 | Module | Contents |
 |---|---|
