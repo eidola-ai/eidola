@@ -59,8 +59,9 @@ fn long_sequences_run_through_small_window_pools() {
 
 /// Six concurrent keyed sequences of 150-250 positions whose windows do not fit at once
 /// (17 window blocks: two sequences' live windows and the blocks after them): the window
-/// pools preempt and shed as any pool does, in whole prompts and in chunks that cut
-/// triangles, and every row, every hit and every output is still the dense oracle's.
+/// pools preempt and shed as any pool does, and take idle windows back from running
+/// chains, in whole prompts and in chunks that cut triangles, and every row, every hit
+/// and every output is still the dense oracle's.
 #[test]
 fn window_pressure_preempts_and_resumes_exactly() {
     for (spec_on, chunk) in [(false, 64), (true, 64), (true, 11)] {
@@ -77,6 +78,10 @@ fn window_pressure_preempts_and_resumes_exactly() {
         }
         h.run();
         let stats = h.eng.stats();
+        // Windows were taken back from running chains, and the harness's checks after
+        // every step (every free block's bytes zero or its zero queued, every idle block
+        // ciphertext) held for them as for any freed block.
+        assert!(h.eng.kv().stripped_windows() > 0);
         assert!(
             stats.preemptions > 0,
             "the window pools must force preemption"

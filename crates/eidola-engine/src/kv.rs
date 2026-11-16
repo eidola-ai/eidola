@@ -2118,6 +2118,146 @@ mod tests {
         assert_eq!(kv.lookup(&lineage(3), &tokens, 0), 0);
     }
 
+    /// `spec` with its sliding groups' pools set to `blocks`, the null block among them.
+    fn small_windows(mut spec: ModelSpec, blocks: u32) -> ModelSpec {
+        for g in &mut spec.kv_groups {
+            if g.attention != AttentionKind::Full {
+                g.num_blocks = blocks;
+            }
+        }
+        spec
+    }
+
+    /// A window block taken back from an entry a running sequence's chain keeps is freed
+    /// as any other block is: its zero is queued (and the seam runs maintenance before the
+    /// table update that hands it on, and before any forward writes it), the encryption
+    /// its idleness had queued is dropped, no crypt of it is queued under the old entry's
+    /// key, the entry holds it no more (so no later hit or promotion maps, decrypts or
+    /// demotes it), and its next owner maps it as a fresh block. With and without a host
+    /// tier.
+    #[test]
+    fn a_stripped_window_is_zeroed_and_leaves_its_entry() {
+        // Block 4, windows 3: a point's window is one block. Three allocatable blocks in
+        // each sliding group.
+        let base = small_windows(mimo_like_spec(32, 4, 3, 3, 64, 4, 0), 4);
+        for spec in [base.clone(), crate::mock::with_host_tier(base, 16)] {
+            let mut kv = KvManager::new(&spec, CachePolicy::default());
+            let first: Vec<u32> = (0..9).collect();
+            kv.admit(1, salt(), true, &first, 9, 0);
+            assert!(kv.allocate(1, 9));
+            kv.commit(1, 9, &first, 0);
+            kv.release(1, Release::Finish, 0);
+            kv.take_pending();
+            // The regeneration and continuation point (boundary 8) holds one block per
+            // sliding group: block 1's window.
+            let held: Vec<(u32, u32)> =
+                kv.cache_blocks().into_iter().filter(|b| b.0 != 0).collect();
+            assert_eq!(held.len(), 2, "{held:?}");
+
+            // A continuation hits there, maps the window, and slides past it: the window
+            // is idle again, held by an entry on the running chain.
+            let mut cont = first[..8].to_vec();
+            cont.extend(100..112);
+            assert_eq!(kv.admit(2, salt(), true, &cont, 20, 0), Some(8));
+            // The step that decrypts the hit's window runs.
+            kv.take_pending();
+            assert!(kv.allocate(2, 12));
+            kv.commit(2, 12, &cont, 0);
+            for &(g, b) in &held {
+                assert!(kv.idle_blocks().contains(&(g, b)));
+                assert_eq!(kv.pending_crypts().get(&(g, b)), Some(&true));
+            }
+            // Two more blocks each, one free: nothing unreferenced to evict, so the
+            // idle window is taken back.
+            assert!(kv.allocate(2, 20));
+            assert_eq!(kv.stripped_windows(), 2);
+            kv.check_invariants();
+            let PendingWork {
+                maintenance,
+                table_updates,
+                ..
+            } = kv.take_pending();
+            for &(g, b) in &held {
+                let zero = maintenance.iter().any(|m| {
+                    matches!(*m, Maintenance::Zero { group, block } if (group, block) == (g, b))
+                });
+                assert!(zero, "group {g}: stripped block {b} not zeroed");
+                let crypt = maintenance.iter().any(|m| match *m {
+                    Maintenance::Encrypt { group, block, .. }
+                    | Maintenance::Decrypt { group, block, .. } => (group, block) == (g, b),
+                    _ => false,
+                });
+                assert!(!crypt, "group {g}: stripped block {b} still under a crypt");
+                assert!(!maintenance.iter().any(|m| matches!(
+                    *m,
+                    Maintenance::Demote { group, block, .. } if (group, block) == (g, b)
+                )));
+                // Handed to the running sequence, after the maintenance that zeroes it.
+                assert!(
+                    table_updates
+                        .iter()
+                        .any(|t| (t.group, t.block) == (g, b) && t.slot == kv.slot(2)),
+                    "group {g}: block {b} not reused"
+                );
+                assert!(!kv.cache_blocks().contains(&(g, b)));
+                assert!(!kv.idle_blocks().contains(&(g, b)));
+            }
+            // The point it completed is no hit any more: nothing will map, decrypt or
+            // promote that block for the old entry.
+            assert_eq!(kv.lookup(&salt(), &first, 0), 0);
+            kv.release(2, Release::Finish, 0);
+            kv.take_pending();
+            kv.check_invariants();
+        }
+    }
+
+    /// An admission promoting a demoted window back for its hit protects its chain: with
+    /// the sliding pools full and nothing unreferenced left, the idle window blocks of
+    /// that chain (which the hit is about to map) are never taken back to make room for
+    /// the promotion. The hit shortens instead, and the chain keeps its blocks.
+    #[test]
+    fn a_promoting_admission_never_strips_its_own_chain() {
+        // Block 4, windows 6: boundary 8's window is blocks 0 and 1, two entries.
+        let spec = crate::mock::with_host_tier(
+            small_windows(mimo_like_spec(32, 4, 6, 6, 64, 4, 0), 4),
+            16,
+        );
+        let mut kv = KvManager::new(&spec, CachePolicy::default());
+        let first: Vec<u32> = (0..9).collect();
+        kv.admit(1, salt(), true, &first, 9, 0);
+        assert!(kv.allocate(1, 9));
+        kv.commit(1, 9, &first, 0);
+        kv.release(1, Release::Finish, 0);
+        kv.take_pending();
+        assert_eq!(kv.lookup(&salt(), &first, 0), 8);
+        // Another lineage's sequence takes the last free window block and one more: the
+        // least recently used entry, block 0's, is demoted whole.
+        let other: Vec<u32> = (200..205).collect();
+        kv.admit(2, lineage(3), true, &other, 5, 0);
+        assert!(kv.allocate(2, 8));
+        assert_eq!(kv.tier_stats().demoted_entries, 1);
+        kv.take_pending();
+        let on_device: Vec<(u32, u32)> =
+            kv.cache_blocks().into_iter().filter(|b| b.0 != 0).collect();
+        assert_eq!(on_device.len(), 2, "{on_device:?}");
+        assert_eq!(kv.free_blocks(1), 0);
+
+        // The regeneration hits at 8: block 0's windows must come back from the host, the
+        // sliding pools are full, and the only idle window blocks are block 1's, the
+        // hit's own. They stay; the hit cannot be promoted and shortens to nothing.
+        assert_eq!(kv.admit(3, salt(), true, &first, 9, 0), Some(0));
+        assert_eq!(kv.stripped_windows(), 0);
+        for b in &on_device {
+            assert!(kv.cache_blocks().contains(b), "{b:?} taken from the chain");
+        }
+        kv.check_invariants();
+        kv.release(3, Release::Finish, 0);
+        kv.release(2, Release::Finish, 0);
+        kv.take_pending();
+        kv.check_invariants();
+        assert_eq!(kv.lookup(&salt(), &first, 0), 8);
+    }
+
     #[test]
     fn allocation_failure_leaves_no_trace() {
         let spec = mimo_like_spec(32, 4, 6, 6, 5, 4, 0);
