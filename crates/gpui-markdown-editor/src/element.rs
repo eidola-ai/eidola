@@ -50,6 +50,8 @@ pub struct BlockElement {
     /// after this one. `None` at doc end.
     next_containers: Option<Vec<Container>>,
     editor: Entity<MarkdownEditorState>,
+    /// The whole document, shared by every block of the frame.
+    source: Arc<str>,
     style: MarkdownStyle,
 }
 
@@ -63,6 +65,7 @@ impl BlockElement {
         prev_containers: Option<Vec<Container>>,
         next_containers: Option<Vec<Container>>,
         editor: Entity<MarkdownEditorState>,
+        source: Arc<str>,
         style: MarkdownStyle,
     ) -> Self {
         Self {
@@ -73,6 +76,7 @@ impl BlockElement {
             prev_containers,
             next_containers,
             editor,
+            source,
             style,
         }
     }
@@ -2128,7 +2132,7 @@ impl Element for BlockElement {
         let is_table = is_table_block(&self.block.kind);
         let container_indent = containers_left_indent(&self.block.containers, &self.style, window);
 
-        let source = self.editor.read(cx).state.markdown.clone();
+        let source = self.source.clone();
         let image_base = self.editor.read(cx).image_base_dir.clone();
         style.size.width = relative(1.0).into();
 
@@ -2439,12 +2443,12 @@ impl Element for BlockElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let image_base = self.editor.read(cx).image_base_dir.clone();
-        let (selection, source, scroll_offset, caret_downstream, highlight_layers) = {
+        let source = self.source.clone();
+        let (selection, scroll_offset, caret_downstream, highlight_layers) = {
             let editor = self.editor.read(cx);
             let scroll = editor.code_block_scroll(self.block_index);
             (
                 editor.state.selection,
-                editor.state.markdown.clone(),
                 scroll,
                 editor.caret_downstream(),
                 editor.highlight_layers().merged_by_layer(),

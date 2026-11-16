@@ -2679,6 +2679,8 @@ impl RenderOnce for MarkdownEditor {
         style.refresh_theme_colors(cx);
 
         let spec = self.state.read(cx).render_spec();
+        // One copy of the document per frame, which every block shares.
+        let source: std::sync::Arc<str> = self.state.read(cx).state.markdown.as_str().into();
         let state = self.state.clone();
         let disabled = self.disabled;
 
@@ -2854,6 +2856,7 @@ impl RenderOnce for MarkdownEditor {
                 prev_containers,
                 next_containers,
                 state.clone(),
+                source.clone(),
                 style.clone(),
             ));
         }
