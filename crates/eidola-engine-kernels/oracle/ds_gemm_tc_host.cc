@@ -383,7 +383,7 @@ void tile_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
 // then each thread's ordered sum.
 template <bool kFp4, bool kBanded>
 void split_pass(const dstc::Pass& p, Adder adder, Rng& rng) {
-  constexpr uint32_t kPer = dstc::kSplitPerWarp, kChunk = dstc::kSplitChunk;
+  constexpr uint32_t kPer = dstc::split_per_warp(kBanded), kChunk = dstc::kSplitWarps * kPer;
   const uint32_t kb = p.k / 32;
   const uint32_t nt0 = dstc::ntile_first(p), nt1 = dstc::ntile_last(p);
   auto c = std::make_unique<dstc::SplitContributions>();

@@ -329,17 +329,17 @@ __device__ __forceinline__ void tile_pass(Stage<C> (&s)[2], const Pass& p) {
 }
 
 // A warp's operands of the chunk from block `c0`.
-template <bool kFp4>
+template <bool kFp4, uint32_t kPer>
 __device__ __forceinline__ void split_load(const dstc::SplitRows& r, uint32_t kb, uint32_t first,
-                                           dstc::SplitOperands (&o)[dstc::kSplitPerWarp]) {
+                                           dstc::SplitOperands (&o)[kPer]) {
 #pragma unroll
-  for (uint32_t j = 0; j < dstc::kSplitPerWarp; ++j) {
+  for (uint32_t j = 0; j < kPer; ++j) {
     if (first + j < kb) dstc::split_operands<kFp4>(r, first + j, &o[j]);
   }
 }
 
 // One pass over K in the split block. Each chunk: every warp computes the
-// contributions of its `kSplitPerWarp` consecutive blocks from operands it
+// contributions of its `split_per_warp` consecutive blocks from operands it
 // loaded into registers, the next chunk's operands are loaded while thread
 // `t` adds output `t / 8`'s contributions to row `t % 8` in ascending block
 // order.
@@ -347,7 +347,7 @@ template <bool kFp4, bool kBanded>
 __device__ __forceinline__ void split_pass(dstc::SplitContributions& c, const Pass& p) {
   constexpr uint32_t kSums = dstc::kSplitFeatures * dstc::kSplitTokens;
   static_assert(kSums <= dstc::kSplitThreads, "a thread per output and row");
-  constexpr uint32_t kPer = dstc::kSplitPerWarp, kChunk = dstc::kSplitChunk;
+  constexpr uint32_t kPer = dstc::split_per_warp(kBanded), kChunk = dstc::kSplitWarps * kPer;
   const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
   const uint32_t kb = p.k / 32;
   const uint32_t nt0 = dstc::ntile_first(p), nt1 = dstc::ntile_last(p);
@@ -362,7 +362,7 @@ __device__ __forceinline__ void split_pass(dstc::SplitContributions& c, const Pa
   asm volatile("" : "+l"(mine), "+l"(sum_from));
   constexpr uint32_t kBlockStride = dstc::kSplitFeatures * dstc::kSplitTokens;
   dstc::SplitOperands o[kPer];
-  split_load<kFp4>(rows, kb, warp * kPer, o);
+  split_load<kFp4, kPer>(rows, kb, warp * kPer, o);
   for (uint32_t c0 = 0; c0 < kb; c0 += kChunk) {
 #pragma unroll
     for (uint32_t j = 0; j < kPer; ++j) {
@@ -379,7 +379,7 @@ __device__ __forceinline__ void split_pass(dstc::SplitContributions& c, const Pa
       }
     }
     __syncthreads();
-    if (c0 + kChunk < kb) split_load<kFp4>(rows, kb, c0 + kChunk + warp * kPer, o);
+    if (c0 + kChunk < kb) split_load<kFp4, kPer>(rows, kb, c0 + kChunk + warp * kPer, o);
     const uint32_t n = kb - c0 < kChunk ? kb - c0 : kChunk;
     if (sums) {
       for (uint32_t b = 0; b < n; ++b) acc = acc + sum_from[b * kBlockStride];
@@ -435,25 +435,25 @@ __device__ __forceinline__ void lin4_split(const DsLin4Params& p) {
 
 }  // namespace
 
-#define DS_GEMM_TC_ENTRY(NAME, BODY, PARAMS, THREADS)                                 \
-  extern "C" __global__ void __launch_bounds__(THREADS)                               \
+#define DS_GEMM_TC_ENTRY(NAME, BODY, PARAMS, THREADS, MIN_BLOCKS)                     \
+  extern "C" __global__ void __launch_bounds__(THREADS, MIN_BLOCKS)                   \
       NAME(const __grid_constant__ PARAMS p) {                                        \
     BODY(p);                                                                          \
   }                                                                                   \
   EIDOLA_KERNEL_META(NAME, THREADS, 1, 1, 0, 1, 1, 1, sizeof(PARAMS))
 
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_s8, (lin8_split<true>), DsLin8Params, dstc::kSplitThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t8, (lin8_tile<8, true>), DsLin8Params, kThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t32, (lin8_tile<32, true>), DsLin8Params, kThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_s8, (lin8_split<false>), DsLin8Params, dstc::kSplitThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t8, (lin8_tile<8, false>), DsLin8Params, kThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t32, (lin8_tile<32, false>), DsLin8Params, kThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_s8, (lin4_split<true>), DsLin4Params, dstc::kSplitThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t8, (lin4_tile<8, true>), DsLin4Params, kThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t32, (lin4_tile<32, true>), DsLin4Params, kThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_s8, (lin4_split<false>), DsLin4Params, dstc::kSplitThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t8, (lin4_tile<8, false>), DsLin4Params, kThreads);
-DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t32, (lin4_tile<32, false>), DsLin4Params, kThreads);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_s8, (lin8_split<true>), DsLin8Params, dstc::kSplitThreads, dstc::kSplitMinBlocks);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t8, (lin8_tile<8, true>), DsLin8Params, kThreads, 1);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_banded_t32, (lin8_tile<32, true>), DsLin8Params, kThreads, 1);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_s8, (lin8_split<false>), DsLin8Params, dstc::kSplitThreads, dstc::kSplitMinBlocks);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t8, (lin8_tile<8, false>), DsLin8Params, kThreads, 1);
+DS_GEMM_TC_ENTRY(eidola_ds_lin8_tolerance_t32, (lin8_tile<32, false>), DsLin8Params, kThreads, 1);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_s8, (lin4_split<true>), DsLin4Params, dstc::kSplitThreads, dstc::kSplitMinBlocks);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t8, (lin4_tile<8, true>), DsLin4Params, kThreads, 1);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_banded_t32, (lin4_tile<32, true>), DsLin4Params, kThreads, 1);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_s8, (lin4_split<false>), DsLin4Params, dstc::kSplitThreads, dstc::kSplitMinBlocks);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t8, (lin4_tile<8, false>), DsLin4Params, kThreads, 1);
+DS_GEMM_TC_ENTRY(eidola_ds_lin4_tolerance_t32, (lin4_tile<32, false>), DsLin4Params, kThreads, 1);
 
 // ---- the probe ----
 

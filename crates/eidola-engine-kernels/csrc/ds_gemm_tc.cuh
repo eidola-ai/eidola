@@ -98,8 +98,8 @@ struct Cfg {
 template <bool kFp4, uint32_t kTokens>
 using TileCfg = Cfg<kFp4, kTokens == 8 ? 1 : 2, kTokens / 8, kWarps, 4, 2>;
 // The split block (`_s8`): 8 rows by 16 outputs, `kSplitThreads` threads
-// whose `kSplitWarps` warps share out K in chunks of `kSplitChunk` blocks,
-// each warp `kSplitPerWarp` consecutive blocks of a chunk. A warp reads its
+// whose `kSplitWarps` warps share out K in chunks, each warp
+// `split_per_warp` consecutive blocks of a chunk. A warp reads its
 // operands straight from global memory into registers (no staging: at these
 // row counts the product is a stream of the weights, and staging costs more
 // instructions than it saves) and writes each block's contribution
@@ -107,9 +107,16 @@ using TileCfg = Cfg<kFp4, kTokens == 8 ? 1 : 2, kTokens / 8, kWarps, 4, 2>;
 // `t < 128` adds output `t / 8`'s contributions to row `t % 8` in ascending
 // block order.
 constexpr uint32_t kSplitThreads = 256;
+// Blocks an SM must hold at once (the registers are held to it): a decode
+// GEMM's 320 or so blocks then run in one wave.
+constexpr uint32_t kSplitMinBlocks = 3;
 constexpr uint32_t kSplitWarps = kSplitThreads / 32;
 constexpr uint32_t kSplitPerWarp = 4;
 constexpr uint32_t kSplitChunk = kSplitWarps * kSplitPerWarp;
+// The banded form takes 2 blocks a warp per chunk: its band arithmetic needs
+// the registers that would hold the other two blocks' operands (it is bound
+// by that arithmetic, not by the loads in flight).
+DSTC_FN constexpr uint32_t split_per_warp(bool banded) { return banded ? 2u : kSplitPerWarp; }
 constexpr uint32_t kSplitFeatures = 16;
 constexpr uint32_t kSplitTokens = 8;
 
@@ -501,9 +508,15 @@ DSTC_FN void store(const Pass& p, uint32_t f, uint32_t r, float acc) {
 // operands in few registers. A row past `n` or outside the pass reads a row
 // that exists (its outputs are not stored): no branch per element.
 struct SplitOperands {
-  uint32_t w[4];  // FP8: [row][half] words; FP4: [row] 32 bits = two halves' 16 bits
+  // FP8: [row][half] words. FP4: [row][half] 16 bits, each in its own word.
+  uint32_t w[4];
   uint32_t x[2];  // [half]
-  uint32_t scales;  // bytes: weight scale of g, of g + 8, activation scale of 2q, of 2q + 1
+  // Weight scale bytes of outputs g, g + 8; activation scale bytes of rows
+  // 2q, 2q + 1. Kept as loaded, each in its own word: combining loaded values
+  // when they are loaded would wait for the loads there, not where they are
+  // used.
+  uint32_t ws[2];
+  uint32_t xs[2];
 };
 
 DSTC_FN uint32_t clamp_row(uint32_t r, uint32_t lo, uint32_t hi) {
@@ -552,10 +565,10 @@ template <bool kFp4>
 DSTC_FN void split_operands(const SplitRows& r, uint32_t blk, SplitOperands* o) {
   if (kFp4) {
     const uint64_t at = static_cast<uint64_t>(blk) * 16;
-    o->w[0] = load16(r.w0 + at) | load16(r.w0 + at + 8) << 16;
-    o->w[1] = load16(r.w1 + at) | load16(r.w1 + at + 8) << 16;
-    o->w[2] = 0;
-    o->w[3] = 0;
+    o->w[0] = load16(r.w0 + at);
+    o->w[1] = load16(r.w0 + at + 8);
+    o->w[2] = load16(r.w1 + at);
+    o->w[3] = load16(r.w1 + at + 8);
   } else {
     const uint64_t at = static_cast<uint64_t>(blk) * 32;
     o->w[0] = load32(r.w0 + at);
@@ -565,8 +578,10 @@ DSTC_FN void split_operands(const SplitRows& r, uint32_t blk, SplitOperands* o) 
   }
   o->x[0] = load32(r.x + static_cast<uint64_t>(blk) * 32);
   o->x[1] = load32(r.x + static_cast<uint64_t>(blk) * 32 + 16);
-  o->scales = static_cast<uint32_t>(r.ws0[blk]) | static_cast<uint32_t>(r.ws1[blk]) << 8 |
-              static_cast<uint32_t>(r.xs0[blk]) << 16 | static_cast<uint32_t>(r.xs1[blk]) << 24;
+  o->ws[0] = r.ws0[blk];
+  o->ws[1] = r.ws1[blk];
+  o->xs[0] = r.xs0[blk];
+  o->xs[1] = r.xs1[blk];
 }
 
 // The fragments of a lane's loaded operands, as `load_frags` makes them.
@@ -574,8 +589,8 @@ template <bool kFp4>
 DSTC_FN void split_frags(const SplitOperands& o, uint32_t (&a)[1][2][4], uint32_t (&b)[1][2][2]) {
   for (uint32_t h = 0; h < 2; ++h) {
     if (kFp4) {
-      e2m1x4_to_f16(o.w[0] >> (16 * h), &a[0][h][0], &a[0][h][2]);
-      e2m1x4_to_f16(o.w[1] >> (16 * h), &a[0][h][1], &a[0][h][3]);
+      e2m1x4_to_f16(o.w[h], &a[0][h][0], &a[0][h][2]);
+      e2m1x4_to_f16(o.w[2 + h], &a[0][h][1], &a[0][h][3]);
     } else {
       fp8_word(o.w[h], &a[0][h][0], &a[0][h][2]);
       fp8_word(o.w[2 + h], &a[0][h][1], &a[0][h][3]);
@@ -587,9 +602,8 @@ DSTC_FN void split_frags(const SplitOperands& o, uint32_t (&a)[1][2][4], uint32_
 // Element `i`'s contribution from a block's dot product: `(dot · activation
 // scale) · weight scale`, the product `ds::gemm_accumulate` adds.
 DSTC_FN float split_contribution(const SplitOperands& o, uint32_t i, float dot) {
-  const uint8_t ws = static_cast<uint8_t>(o.scales >> (8 * (i >> 1)));
-  const uint8_t xs = static_cast<uint8_t>(o.scales >> (16 + 8 * (i & 1u)));
-  return dot * ds::act_scale_decode(xs) * ds::e8m0_decode(ws);
+  return dot * ds::act_scale_decode(static_cast<uint8_t>(o.xs[i & 1u])) *
+         ds::e8m0_decode(static_cast<uint8_t>(o.ws[i >> 1]));
 }
 
 // ---- lin4's groups ----
