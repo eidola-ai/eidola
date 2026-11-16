@@ -3095,324 +3095,291 @@ impl Element for BlockElement {
         }
 
         let code_block_paint = prepaint.code_block_paint;
+        let embed_paint = prepaint.embed_paint.take();
 
-        // Per-level blockquote borders. Painted *first*, so any
-        // code-block bg or content paints over them only inside the
-        // already-indented content area (the bg is `block_left` to
-        // `block_left + block_width`, which starts to the right of
-        // every border bar). Each container that's a blockquote
-        // contributes one bar at `bounds.origin.x +
-        // blockquote_border_inset + i * blockquote_indent`. The bar
-        // spans this leaf's full vertical bounds, which now include
-        // both `spacing_above` and `spacing_below` (each half a
-        // paragraph_gap) — so the bar reads as symmetric around the
-        // content rows. When two consecutive leaves share the same
-        // blockquote their bars still meet flush at the leaf boundary
-        // (`spacing_below` of leaf 1 ends exactly where `spacing_above`
-        // of leaf 2 begins).
-        // The bar's vertical extent is the layout box minus any
-        // container-boundary extras: extras are pure inter-block
-        // breathing room and shouldn't be covered by the bar (the bar
-        // marks the quoted region, the extras sit outside it). For
-        // consecutive blockquoted leaves with the same chain both
-        // extras are zero, so bars meet flush at the leaf boundary.
-        // Per-level bar extents.
-        //
-        // The block as a whole reserves `extra_above` / `extra_below`
-        // breathing room at any container-boundary transition. But
-        // when nesting changes — e.g. block A `[outer]` → block B
-        // `[outer, inner]` — the *outer* level is shared between A
-        // and B, so the outer bar should stay continuous through the
-        // extras while the *inner* bar stops at them. Each level's
-        // bar therefore computes its own top / bottom against
-        // whether the matching ancestry is present in the immediate
-        // neighbor: shared at level L → bar paints flush to the
-        // layout box on that side; not shared → bar pulls back by
-        // the extra so the boundary breathes.
-        let extra_above = container_boundary_extra(
-            &self.block.containers,
-            self.prev_containers.as_deref(),
-            &self.style,
-        );
-        let extra_below = container_boundary_extra(
-            &self.block.containers,
-            self.next_containers.as_deref(),
-            &self.style,
-        );
-        for (level, container) in self.block.containers.iter().enumerate() {
-            match container {
-                Container::BlockQuote { .. } => {
-                    let above_continues = level_shared_with_neighbor(
-                        level,
-                        &self.block.containers,
-                        self.prev_containers.as_deref(),
-                    );
-                    let below_continues = level_shared_with_neighbor(
-                        level,
-                        &self.block.containers,
-                        self.next_containers.as_deref(),
-                    );
-                    let bar_top = bounds.origin.y
-                        + if above_continues {
-                            px(0.0)
-                        } else {
-                            extra_above
-                        };
-                    let bar_bottom = bounds.origin.y + bounds.size.height
-                        - if below_continues {
-                            px(0.0)
-                        } else {
-                            extra_below
-                        };
-                    let bar_height = (bar_bottom - bar_top).max(px(0.0));
-                    let left = bounds.origin.x
-                        + container_x_at_level(&self.block.containers, level, &self.style, window)
-                        + self.style.blockquote_border_inset;
-                    let bar = Bounds::new(
-                        point(left, bar_top),
-                        size(self.style.blockquote_border_width, bar_height),
-                    );
-                    window.paint_quad(fill(bar, self.style.blockquote_border_color));
-                }
-                Container::ListItem { .. } => {
-                    // List items have no left-edge chrome of their
-                    // own — their visual cue is the marker glyph
-                    // shaped into the line, plus the cumulative
-                    // `list_indent` already applied by the
-                    // container chain.
-                }
-            }
-        }
-
-        // Overlay container markers (cursor-inside `>` glyphs) on top
-        // of their level's border bar. Painted *after* the bars and
-        // *before* content text so the glyph reads on top of the bar
-        // but doesn't compete with body shaping. Because the marker
-        // bytes were also pushed into `hidden_ranges`, the shaped
-        // line itself starts at `block_left` regardless of whether
-        // overlays are present — the user gets the raw `>` they typed
-        // without any horizontal shift in the content's position.
-        paint_marker_overlays(
-            &self.block.marker_overlays,
-            &self.block.containers,
-            &self.block.kind,
-            &prepaint.laid_out.lines,
-            bounds.origin.x,
-            &self.style,
-            window,
-            cx,
-        );
-
-        // Layered backgrounds for code blocks:
-        //
-        // 1. Outer rounded fill (`code_block_background`) — full
-        //    block. The rounded corners are visible only at the
-        //    fence rows, where this bg is uncovered.
-        // 2. Inner content strip (`code_block_content_background`) —
-        //    full-width band between the fence rows, no rounding.
-        //    This is what reads as the "code area".
-        if let Some(cb) = &code_block_paint {
-            window.paint_quad(quad(
-                cb.bg_bounds,
-                self.style.code_block_radius,
-                self.style.code_block_background,
-                Edges::default(),
-                gpui::transparent_black(),
-                BorderStyle::default(),
-            ));
-            if cb.content_strip.size.height > px(0.0) {
-                window.paint_quad(fill(
-                    cb.content_strip,
-                    self.style.code_block_content_background,
-                ));
-            }
-        }
-
-        // Thematic break: paint a thin horizontal rule centered on
-        // the block's content row. The shaped line (`---` etc.)
-        // continues to live in `lines`, but its source bytes are
-        // hidden when the cursor is outside the construct (the
-        // common case) so the user only sees the rule. When the
-        // cursor is on the line the source dims into view in the
-        // delimiter color so the user can see what they typed.
-        if matches!(self.block.kind, BlockKind::ThematicBreak) {
-            let indent = containers_left_indent(&self.block.containers, &self.style, window);
-            paint_thematic_break(
-                window,
-                &prepaint.laid_out.lines,
-                bounds.origin.x + indent,
-                (bounds.size.width - indent).max(px(1.0)),
+        // Only a block inside the clip is drawn. Every block still records
+        // its geometry below: hit-testing, caret motion and the host's
+        // scroll-into-view all ask about rows that are off screen.
+        if window.content_mask().bounds.intersects(&bounds) {
+            // Per-level blockquote borders. Painted *first*, so any
+            // code-block bg or content paints over them only inside the
+            // already-indented content area (the bg is `block_left` to
+            // `block_left + block_width`, which starts to the right of
+            // every border bar). Each container that's a blockquote
+            // contributes one bar at `bounds.origin.x +
+            // blockquote_border_inset + i * blockquote_indent`. The bar
+            // spans this leaf's full vertical bounds, which now include
+            // both `spacing_above` and `spacing_below` (each half a
+            // paragraph_gap) — so the bar reads as symmetric around the
+            // content rows. When two consecutive leaves share the same
+            // blockquote their bars still meet flush at the leaf boundary
+            // (`spacing_below` of leaf 1 ends exactly where `spacing_above`
+            // of leaf 2 begins).
+            // The bar's vertical extent is the layout box minus any
+            // container-boundary extras: extras are pure inter-block
+            // breathing room and shouldn't be covered by the bar (the bar
+            // marks the quoted region, the extras sit outside it). For
+            // consecutive blockquoted leaves with the same chain both
+            // extras are zero, so bars meet flush at the leaf boundary.
+            // Per-level bar extents.
+            //
+            // The block as a whole reserves `extra_above` / `extra_below`
+            // breathing room at any container-boundary transition. But
+            // when nesting changes — e.g. block A `[outer]` → block B
+            // `[outer, inner]` — the *outer* level is shared between A
+            // and B, so the outer bar should stay continuous through the
+            // extras while the *inner* bar stops at them. Each level's
+            // bar therefore computes its own top / bottom against
+            // whether the matching ancestry is present in the immediate
+            // neighbor: shared at level L → bar paints flush to the
+            // layout box on that side; not shared → bar pulls back by
+            // the extra so the boundary breathes.
+            let extra_above = container_boundary_extra(
+                &self.block.containers,
+                self.prev_containers.as_deref(),
                 &self.style,
             );
-        }
+            let extra_below = container_boundary_extra(
+                &self.block.containers,
+                self.next_containers.as_deref(),
+                &self.style,
+            );
+            for (level, container) in self.block.containers.iter().enumerate() {
+                match container {
+                    Container::BlockQuote { .. } => {
+                        let above_continues = level_shared_with_neighbor(
+                            level,
+                            &self.block.containers,
+                            self.prev_containers.as_deref(),
+                        );
+                        let below_continues = level_shared_with_neighbor(
+                            level,
+                            &self.block.containers,
+                            self.next_containers.as_deref(),
+                        );
+                        let bar_top = bounds.origin.y
+                            + if above_continues {
+                                px(0.0)
+                            } else {
+                                extra_above
+                            };
+                        let bar_bottom = bounds.origin.y + bounds.size.height
+                            - if below_continues {
+                                px(0.0)
+                            } else {
+                                extra_below
+                            };
+                        let bar_height = (bar_bottom - bar_top).max(px(0.0));
+                        let left = bounds.origin.x
+                            + container_x_at_level(
+                                &self.block.containers,
+                                level,
+                                &self.style,
+                                window,
+                            )
+                            + self.style.blockquote_border_inset;
+                        let bar = Bounds::new(
+                            point(left, bar_top),
+                            size(self.style.blockquote_border_width, bar_height),
+                        );
+                        window.paint_quad(fill(bar, self.style.blockquote_border_color));
+                    }
+                    Container::ListItem { .. } => {
+                        // List items have no left-edge chrome of their
+                        // own — their visual cue is the marker glyph
+                        // shaped into the line, plus the cumulative
+                        // `list_indent` already applied by the
+                        // container chain.
+                    }
+                }
+            }
 
-        // Display math (display mode): paint typeset math via the
-        // RaTeX adapter. KaTeX fonts register lazily here on first
-        // paint — hosting apps may also call
-        // `crate::math::register_katex_fonts` at app init.
-        if let Some(math_paint) = prepaint.math_paint.take() {
-            let _ = crate::math::register_katex_fonts(&window.text_system().clone());
-            math_paint.layout.paint(
-                math_paint.origin,
-                math_paint.em_px,
-                self.style.text_color,
+            // Overlay container markers (cursor-inside `>` glyphs) on top
+            // of their level's border bar. Painted *after* the bars and
+            // *before* content text so the glyph reads on top of the bar
+            // but doesn't compete with body shaping. Because the marker
+            // bytes were also pushed into `hidden_ranges`, the shaped
+            // line itself starts at `block_left` regardless of whether
+            // overlays are present — the user gets the raw `>` they typed
+            // without any horizontal shift in the content's position.
+            paint_marker_overlays(
+                &self.block.marker_overlays,
+                &self.block.containers,
+                &self.block.kind,
+                &prepaint.laid_out.lines,
+                bounds.origin.x,
+                &self.style,
                 window,
                 cx,
             );
-        }
 
-        // Block image (display mode): paint the loaded image at the
-        // pre-computed bounds. Loading / failed states leave
-        // `image_paint == None` and the regular shape path renders
-        // the source bytes (or a placeholder row from the empty-
-        // block fallback) underneath.
-        if let Some(image_paint) = prepaint.image_paint.take() {
-            crate::image::paint(image_paint.image, image_paint.bounds, window);
-        }
-
-        // Embed block: the quote chrome + the mapped markdown's shaped
-        // pieces, clipped to the block bounds (an over-wide embedded code
-        // line or table never leaks outside the container). Painted before
-        // the regular line pass — the marker's own shaped line is empty, so
-        // ordering only matters vs. the caret, which paints last.
-        let mut embed_content: Option<EmbedContentGeometry> = None;
-        if let Some(ep) = prepaint.embed_paint.take() {
-            if ep.selected {
-                window.paint_quad(fill(ep.bounds, self.style.selection_color));
-            }
-            window.paint_quad(fill(ep.bar, self.style.blockquote_border_color));
-            let mask = ContentMask { bounds: ep.bounds };
-            window.with_content_mask(Some(mask), |window| {
-                for panel in &ep.code_panels {
-                    window.paint_quad(quad(
-                        *panel,
-                        self.style.code_block_radius,
+            // Layered backgrounds for code blocks:
+            //
+            // 1. Outer rounded fill (`code_block_background`) — full
+            //    block. The rounded corners are visible only at the
+            //    fence rows, where this bg is uncovered.
+            // 2. Inner content strip (`code_block_content_background`) —
+            //    full-width band between the fence rows, no rounding.
+            //    This is what reads as the "code area".
+            if let Some(cb) = &code_block_paint {
+                window.paint_quad(quad(
+                    cb.bg_bounds,
+                    self.style.code_block_radius,
+                    self.style.code_block_background,
+                    Edges::default(),
+                    gpui::transparent_black(),
+                    BorderStyle::default(),
+                ));
+                if cb.content_strip.size.height > px(0.0) {
+                    window.paint_quad(fill(
+                        cb.content_strip,
                         self.style.code_block_content_background,
-                        Edges::default(),
-                        gpui::transparent_black(),
-                        BorderStyle::default(),
                     ));
                 }
-                for bar in &ep.bars {
-                    window.paint_quad(fill(*bar, self.style.blockquote_border_color));
+            }
+
+            // Thematic break: paint a thin horizontal rule centered on
+            // the block's content row. The shaped line (`---` etc.)
+            // continues to live in `lines`, but its source bytes are
+            // hidden when the cursor is outside the construct (the
+            // common case) so the user only sees the rule. When the
+            // cursor is on the line the source dims into view in the
+            // delimiter color so the user can see what they typed.
+            if matches!(self.block.kind, BlockKind::ThematicBreak) {
+                let indent = containers_left_indent(&self.block.containers, &self.style, window);
+                paint_thematic_break(
+                    window,
+                    &prepaint.laid_out.lines,
+                    bounds.origin.x + indent,
+                    (bounds.size.width - indent).max(px(1.0)),
+                    &self.style,
+                );
+            }
+
+            // Display math (display mode): paint typeset math via the
+            // RaTeX adapter. KaTeX fonts register lazily here on first
+            // paint — hosting apps may also call
+            // `crate::math::register_katex_fonts` at app init.
+            if let Some(math_paint) = prepaint.math_paint.take() {
+                let _ = crate::math::register_katex_fonts(&window.text_system().clone());
+                math_paint.layout.paint(
+                    math_paint.origin,
+                    math_paint.em_px,
+                    self.style.text_color,
+                    window,
+                    cx,
+                );
+            }
+
+            // Block image (display mode): paint the loaded image at the
+            // pre-computed bounds. Loading / failed states leave
+            // `image_paint == None` and the regular shape path renders
+            // the source bytes (or a placeholder row from the empty-
+            // block fallback) underneath.
+            if let Some(image_paint) = prepaint.image_paint.take() {
+                crate::image::paint(image_paint.image, image_paint.bounds, window);
+            }
+
+            // Embed block: the quote chrome + the mapped markdown's shaped
+            // pieces, clipped to the block bounds (an over-wide embedded code
+            // line or table never leaks outside the container). Painted before
+            // the regular line pass — the marker's own shaped line is empty, so
+            // ordering only matters vs. the caret, which paints last.
+            if let Some(ep) = &embed_paint {
+                if ep.selected {
+                    window.paint_quad(fill(ep.bounds, self.style.selection_color));
                 }
-                for (rule, full) in &ep.rules {
-                    let mut color = self.style.table_rule_color;
-                    if !full {
-                        color.a *= 0.45;
+                window.paint_quad(fill(ep.bar, self.style.blockquote_border_color));
+                let mask = ContentMask { bounds: ep.bounds };
+                window.with_content_mask(Some(mask), |window| {
+                    for panel in &ep.code_panels {
+                        window.paint_quad(quad(
+                            *panel,
+                            self.style.code_block_radius,
+                            self.style.code_block_content_background,
+                            Edges::default(),
+                            gpui::transparent_black(),
+                            BorderStyle::default(),
+                        ));
                     }
-                    window.paint_quad(fill(*rule, color));
-                }
-                // Inline-code chips first, then glyphs — the same two-pass
-                // order as the regular content path.
-                for chip in &ep.code_chips {
-                    window.paint_quad(fill(*chip, self.style.inline_code_background));
-                }
-                for piece in &ep.pieces {
-                    let _ = piece.line.paint(
-                        piece.rel_origin,
-                        piece.row_stride,
-                        gpui::TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
-                }
-                if !ep.math.is_empty() {
-                    let _ = crate::math::register_katex_fonts(&window.text_system().clone());
-                }
-                for m in &ep.math {
-                    m.layout
-                        .paint(m.rel_origin, m.em_px, self.style.text_color, window, cx);
-                }
-                for dot in &ep.emphasis_dots {
-                    let radius = dot.size.width / 2.0;
-                    window.paint_quad(
-                        fill(*dot, self.style.emphasis_dot_color)
-                            .corner_radii(Corners::all(radius)),
-                    );
-                }
-            });
-            // Record what was painted (moving, not cloning — `ep` is dropped
-            // here regardless). See `LaidOutBlock::embed_content`.
-            embed_content = Some(EmbedContentGeometry {
-                pieces: ep
-                    .pieces
-                    .into_iter()
-                    .map(|p| (p.line.text.clone(), p.rel_origin))
-                    .collect(),
-                code_panels: ep.code_panels,
-                math_origins: ep.math.into_iter().map(|m| m.rel_origin).collect(),
-                rules: ep.rules.into_iter().map(|(r, _)| r).collect(),
-                bars: ep.bars,
-            });
-        }
-
-        let cursor_quad = prepaint.cursor_quad.take();
-        let selection_quads = std::mem::take(&mut prepaint.selection_quads);
-        let highlight_quads = std::mem::take(&mut prepaint.highlight_quads);
-        let focused = focus_handle.is_focused(window);
-
-        // Split paint into delimiter and content phases. Fence-row
-        // text and the cursor / selection quads attached to fence
-        // rows paint *outside* the content mask so they stay visible
-        // regardless of horizontal scroll (fences are pinned in x).
-        // Content text and content-row cursor / selection paint
-        // *inside* the mask so long lines clip at the visible band's
-        // right edge. Non-code blocks have `code_block_paint == None`
-        // and skip the mask entirely.
-        if let Some(cb) = &code_block_paint {
-            let (delim_hl, content_hl): (Vec<_>, Vec<_>) =
-                highlight_quads.into_iter().partition(|t| t.is_delimiter);
-            let (delim_sel, content_sel): (Vec<_>, Vec<_>) =
-                selection_quads.into_iter().partition(|t| t.is_delimiter);
-            let (cursor_for_delim, cursor_for_content) = match cursor_quad {
-                Some(tq) if tq.is_delimiter => (Some(tq), None),
-                Some(tq) => (None, Some(tq)),
-                None => (None, None),
-            };
-
-            // Phase 1: delimiter lines + their cursor / selection,
-            // unmasked.
-            for tq in delim_hl {
-                window.paint_quad(tq.quad);
-            }
-            for tq in delim_sel {
-                window.paint_quad(tq.quad);
-            }
-            for laid in &prepaint.laid_out.lines {
-                if laid.is_delimiter {
-                    let _ = laid.line.paint(
-                        laid.paint_origin(),
-                        laid.row_stride,
-                        gpui::TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
-                }
-            }
-            if focused
-                && !disabled
-                && let Some(tq) = cursor_for_delim
-            {
-                window.paint_quad(tq.quad);
+                    for bar in &ep.bars {
+                        window.paint_quad(fill(*bar, self.style.blockquote_border_color));
+                    }
+                    for (rule, full) in &ep.rules {
+                        let mut color = self.style.table_rule_color;
+                        if !full {
+                            color.a *= 0.45;
+                        }
+                        window.paint_quad(fill(*rule, color));
+                    }
+                    // Inline-code chips first, then glyphs — the same two-pass
+                    // order as the regular content path.
+                    for chip in &ep.code_chips {
+                        window.paint_quad(fill(*chip, self.style.inline_code_background));
+                    }
+                    for piece in &ep.pieces {
+                        let _ = piece.line.paint(
+                            piece.rel_origin,
+                            piece.row_stride,
+                            gpui::TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                    if !ep.math.is_empty() {
+                        let _ = crate::math::register_katex_fonts(&window.text_system().clone());
+                    }
+                    for m in &ep.math {
+                        m.layout
+                            .paint(m.rel_origin, m.em_px, self.style.text_color, window, cx);
+                    }
+                    for dot in &ep.emphasis_dots {
+                        let radius = dot.size.width / 2.0;
+                        window.paint_quad(
+                            fill(*dot, self.style.emphasis_dot_color)
+                                .corner_radii(Corners::all(radius)),
+                        );
+                    }
+                });
+                // Record what was painted (moving, not cloning — `ep` is dropped
+                // here regardless). See `LaidOutBlock::embed_content`.
             }
 
-            // Phase 2: content lines + their cursor / selection,
-            // masked to the content strip.
-            let mask = ContentMask {
-                bounds: cb.content_clip,
-            };
-            window.with_content_mask(Some(mask), |window| {
-                for tq in content_hl {
+            let cursor_quad = prepaint.cursor_quad.take();
+            let selection_quads = std::mem::take(&mut prepaint.selection_quads);
+            let highlight_quads = std::mem::take(&mut prepaint.highlight_quads);
+            let focused = focus_handle.is_focused(window);
+
+            // Split paint into delimiter and content phases. Fence-row
+            // text and the cursor / selection quads attached to fence
+            // rows paint *outside* the content mask so they stay visible
+            // regardless of horizontal scroll (fences are pinned in x).
+            // Content text and content-row cursor / selection paint
+            // *inside* the mask so long lines clip at the visible band's
+            // right edge. Non-code blocks have `code_block_paint == None`
+            // and skip the mask entirely.
+            if let Some(cb) = &code_block_paint {
+                let (delim_hl, content_hl): (Vec<_>, Vec<_>) =
+                    highlight_quads.into_iter().partition(|t| t.is_delimiter);
+                let (delim_sel, content_sel): (Vec<_>, Vec<_>) =
+                    selection_quads.into_iter().partition(|t| t.is_delimiter);
+                let (cursor_for_delim, cursor_for_content) = match cursor_quad {
+                    Some(tq) if tq.is_delimiter => (Some(tq), None),
+                    Some(tq) => (None, Some(tq)),
+                    None => (None, None),
+                };
+
+                // Phase 1: delimiter lines + their cursor / selection,
+                // unmasked.
+                for tq in delim_hl {
                     window.paint_quad(tq.quad);
                 }
-                for tq in content_sel {
+                for tq in delim_sel {
                     window.paint_quad(tq.quad);
                 }
                 for laid in &prepaint.laid_out.lines {
-                    if !laid.is_delimiter {
+                    if laid.is_delimiter {
                         let _ = laid.line.paint(
                             laid.paint_origin(),
                             laid.row_stride,
@@ -3425,143 +3392,187 @@ impl Element for BlockElement {
                 }
                 if focused
                     && !disabled
-                    && let Some(tq) = cursor_for_content
+                    && let Some(tq) = cursor_for_delim
                 {
                     window.paint_quad(tq.quad);
                 }
-            });
-        } else {
-            // Non-code blocks: no fence split. Tables additionally
-            // clip to their visible band when wider than the content
-            // area (they never soft-wrap — the same horizontal-scroll
-            // treatment as code blocks, minus the background chrome)
-            // and paint their hairline rules under everything.
-            let table_mask = prepaint.table_paint.as_ref().and_then(|tp| {
-                (tp.content_width > tp.visible_width).then_some(ContentMask { bounds: tp.clip })
-            });
-            let table_rules: Vec<(Bounds<Pixels>, bool)> = prepaint
-                .table_paint
-                .as_ref()
-                .map(|tp| {
-                    tp.rules
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| (*r, i == 0))
-                        .collect()
-                })
-                .unwrap_or_default();
-            window.with_content_mask(table_mask, |window| {
-                // Table rules paint first — chrome under content.
-                for (rule, is_header_rule) in &table_rules {
-                    let mut color = self.style.table_rule_color;
-                    if !is_header_rule {
-                        color.a *= 0.45;
+
+                // Phase 2: content lines + their cursor / selection,
+                // masked to the content strip.
+                let mask = ContentMask {
+                    bounds: cb.content_clip,
+                };
+                window.with_content_mask(Some(mask), |window| {
+                    for tq in content_hl {
+                        window.paint_quad(tq.quad);
                     }
-                    window.paint_quad(fill(*rule, color));
-                }
-                // Inline-code chips paint first so the selection wash and
-                // the glyphs layer on top of them. `WrappedLine::paint`
-                // draws glyphs + underline/strikethrough only, so the
-                // chip needs its own pass either way — and it has to be
-                // ours rather than gpui's, because a row reservation
-                // makes the stride and the fill height differ (see
-                // `run_background_bounds`).
-                let index = BlockIndex::new(&prepaint.shaped_block);
-                for laid in &prepaint.laid_out.lines {
-                    for chip in run_background_bounds(
-                        &laid.line,
-                        &laid.display_to_source,
-                        laid.origin,
-                        laid.row_stride,
-                        laid.row_height,
-                        &index,
+                    for tq in content_sel {
+                        window.paint_quad(tq.quad);
+                    }
+                    for laid in &prepaint.laid_out.lines {
+                        if !laid.is_delimiter {
+                            let _ = laid.line.paint(
+                                laid.paint_origin(),
+                                laid.row_stride,
+                                gpui::TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    if focused
+                        && !disabled
+                        && let Some(tq) = cursor_for_content
+                    {
+                        window.paint_quad(tq.quad);
+                    }
+                });
+            } else {
+                // Non-code blocks: no fence split. Tables additionally
+                // clip to their visible band when wider than the content
+                // area (they never soft-wrap — the same horizontal-scroll
+                // treatment as code blocks, minus the background chrome)
+                // and paint their hairline rules under everything.
+                let table_mask = prepaint.table_paint.as_ref().and_then(|tp| {
+                    (tp.content_width > tp.visible_width).then_some(ContentMask { bounds: tp.clip })
+                });
+                let table_rules: Vec<(Bounds<Pixels>, bool)> = prepaint
+                    .table_paint
+                    .as_ref()
+                    .map(|tp| {
+                        tp.rules
+                            .iter()
+                            .enumerate()
+                            .map(|(i, r)| (*r, i == 0))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                window.with_content_mask(table_mask, |window| {
+                    // Table rules paint first — chrome under content.
+                    for (rule, is_header_rule) in &table_rules {
+                        let mut color = self.style.table_rule_color;
+                        if !is_header_rule {
+                            color.a *= 0.45;
+                        }
+                        window.paint_quad(fill(*rule, color));
+                    }
+                    // Inline-code chips paint first so the selection wash and
+                    // the glyphs layer on top of them. `WrappedLine::paint`
+                    // draws glyphs + underline/strikethrough only, so the
+                    // chip needs its own pass either way — and it has to be
+                    // ours rather than gpui's, because a row reservation
+                    // makes the stride and the fill height differ (see
+                    // `run_background_bounds`).
+                    let index = BlockIndex::new(&prepaint.shaped_block);
+                    for laid in &prepaint.laid_out.lines {
+                        for chip in run_background_bounds(
+                            &laid.line,
+                            &laid.display_to_source,
+                            laid.origin,
+                            laid.row_stride,
+                            laid.row_height,
+                            &index,
+                            &self.style,
+                        ) {
+                            window.paint_quad(fill(chip, self.style.inline_code_background));
+                        }
+                    }
+                    for tq in highlight_quads {
+                        window.paint_quad(tq.quad);
+                    }
+                    for tq in selection_quads {
+                        window.paint_quad(tq.quad);
+                    }
+                    for laid in &prepaint.laid_out.lines {
+                        let _ = laid.line.paint(
+                            laid.paint_origin(),
+                            laid.row_stride,
+                            gpui::TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                    // Emphasis dots under emphasized CJK characters, in
+                    // the same over-the-text / under-the-cursor band as
+                    // the overlays below.
+                    paint_emphasis_dots(
+                        &prepaint.laid_out.lines,
+                        &prepaint.shaped_block,
                         &self.style,
-                    ) {
-                        window.paint_quad(fill(chip, self.style.inline_code_background));
-                    }
-                }
-                for tq in highlight_quads {
-                    window.paint_quad(tq.quad);
-                }
-                for tq in selection_quads {
-                    window.paint_quad(tq.quad);
-                }
-                for laid in &prepaint.laid_out.lines {
-                    let _ = laid.line.paint(
-                        laid.paint_origin(),
-                        laid.row_stride,
-                        gpui::TextAlign::Left,
-                        None,
+                        window,
+                    );
+                    // Inline math overlays paint *after* the line text (so
+                    // they sit on top of the NBSP placeholders that
+                    // reserved the space) but *before* the cursor (so the
+                    // caret remains visible above the math).
+                    paint_inline_math_overlays(
+                        &prepaint.inline_math,
+                        &prepaint.laid_out.lines,
+                        &self.style,
+                        &self.block.kind,
                         window,
                         cx,
                     );
-                }
-                // Emphasis dots under emphasized CJK characters, in
-                // the same over-the-text / under-the-cursor band as
-                // the overlays below.
-                paint_emphasis_dots(
-                    &prepaint.laid_out.lines,
-                    &prepaint.shaped_block,
+                    // Inline image overlays — same paint ordering as math
+                    // (over the line text, under the cursor). Each spec
+                    // paints exactly where its substitution placed pad
+                    // glyphs in the shaped line.
+                    paint_inline_image_overlays(
+                        &prepaint.inline_images,
+                        &prepaint.laid_out.lines,
+                        window,
+                    );
+                    if focused
+                        && !disabled
+                        && let Some(tq) = cursor_quad
+                    {
+                        window.paint_quad(tq.quad);
+                    }
+                });
+            }
+
+            // Horizontal scrollbar overlay — only when the code block has
+            // overflow. A thin track at the bottom of the bg fill, with a
+            // muted thumb whose size and offset reflect the visible /
+            // total ratio. Painted *outside* the content mask so it stays
+            // visible when the user is scrolled past the right edge of
+            // their content.
+            if let Some(cb) = &code_block_paint
+                && cb.content_width > cb.visible_width
+            {
+                paint_horizontal_scrollbar(window, cb, &self.style);
+            }
+            // Table scrollbar: same overlay as code blocks, tracked along
+            // the block's bottom edge (tables have no fence seam to sit on).
+            if let Some(tp) = &prepaint.table_paint
+                && tp.content_width > tp.visible_width
+            {
+                paint_h_scrollbar_at(
+                    window,
                     &self.style,
-                    window,
+                    tp.clip.bottom() - px(3.0),
+                    tp.clip.left(),
+                    tp.clip.right(),
+                    tp.content_width,
+                    tp.visible_width,
+                    tp.scroll_x,
                 );
-                // Inline math overlays paint *after* the line text (so
-                // they sit on top of the NBSP placeholders that
-                // reserved the space) but *before* the cursor (so the
-                // caret remains visible above the math).
-                paint_inline_math_overlays(
-                    &prepaint.inline_math,
-                    &prepaint.laid_out.lines,
-                    &self.style,
-                    &self.block.kind,
-                    window,
-                    cx,
-                );
-                // Inline image overlays — same paint ordering as math
-                // (over the line text, under the cursor). Each spec
-                // paints exactly where its substitution placed pad
-                // glyphs in the shaped line.
-                paint_inline_image_overlays(
-                    &prepaint.inline_images,
-                    &prepaint.laid_out.lines,
-                    window,
-                );
-                if focused
-                    && !disabled
-                    && let Some(tq) = cursor_quad
-                {
-                    window.paint_quad(tq.quad);
-                }
-            });
+            }
         }
 
-        // Horizontal scrollbar overlay — only when the code block has
-        // overflow. A thin track at the bottom of the bg fill, with a
-        // muted thumb whose size and offset reflect the visible /
-        // total ratio. Painted *outside* the content mask so it stays
-        // visible when the user is scrolled past the right edge of
-        // their content.
-        if let Some(cb) = &code_block_paint
-            && cb.content_width > cb.visible_width
-        {
-            paint_horizontal_scrollbar(window, cb, &self.style);
-        }
-        // Table scrollbar: same overlay as code blocks, tracked along
-        // the block's bottom edge (tables have no fence seam to sit on).
-        if let Some(tp) = &prepaint.table_paint
-            && tp.content_width > tp.visible_width
-        {
-            paint_h_scrollbar_at(
-                window,
-                &self.style,
-                tp.clip.bottom() - px(3.0),
-                tp.clip.left(),
-                tp.clip.right(),
-                tp.content_width,
-                tp.visible_width,
-                tp.scroll_x,
-            );
-        }
+        let embed_content = embed_paint.map(|ep| EmbedContentGeometry {
+            pieces: ep
+                .pieces
+                .into_iter()
+                .map(|p| (p.line.text.clone(), p.rel_origin))
+                .collect(),
+            code_panels: ep.code_panels,
+            math_origins: ep.math.into_iter().map(|m| m.rel_origin).collect(),
+            rules: ep.rules.into_iter().map(|(r, _)| r).collect(),
+            bars: ep.bars,
+        });
 
         // Horizontal scroll-wheel routing for the no-wrap blocks
         // (code + table): one listener over the block's scrollable

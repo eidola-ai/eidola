@@ -209,6 +209,15 @@ These power `enter_insertion`, `line_break_insertion`, soft-break promotion, lis
 
 The doc comment on `render::render` carries this same list; keep both in sync.
 
+### Frame cost
+
+The host scrolls the editor, so every frame — a scroll, a hover, a blink — renders the whole document: `parse`, `render`, one `BlockElement` per block, three measure passes per block (taffy asks max-content, min-content and the definite size, all at one width) and a prepaint. What keeps that proportional to the document, and mostly to what changed:
+
+- **No per-byte walk over a collection.** `escapes::scan` steps one cursor through the sorted verbatim ranges. Per-line layout reads a block only through its `BlockIndex` — substitution starts sorted, the hidden ranges as their union, the inline styles as constant segments (merging is a union of flags) — built once per block where its lines are laid out, never inside a per-line or per-byte loop. A table lays out every cell (and every token of a cell, for min-content) against one index of the whole table. `the_inline_style_map_matches_every_covering_run` and `indexed_display_lines_match_the_per_byte_walk` hold both to the per-byte rules.
+- **`ShapeCache` keeps each block's layout across frames.** It lives on the state (shared with the measure closures through `Rc<RefCell<…>>`) and holds `shape_block_lines` / `layout_table` results by block start, reused when every input is equal: the block, its source text, the font size and heading weight the style gives it, the width, and the rest of the style. **Anything new a layout reads must join that key**, or the cache serves stale lines. Style compares through `MarkdownStyle::eq_ignoring_heading_fns`, which destructures every field, so a new style field does not compile until it is compared; the heading functions are skipped because hosts may rebuild them each frame and they matter only through the size and weight already keyed. `MarkdownEditor::render` drops entries for block starts the document no longer has. An edit moves the start of every later block, so the keystroke's frame lays those out again.
+- **Paint draws only blocks inside the content mask**, and every block still records its `LaidOutBlock`: hit-testing, caret motion, drag-selection past the fold and `content_y_for_offset` all ask about rows off screen (`blocks_outside_the_window_still_record_their_geometry`).
+- **Not yet bounded:** inline-code chips and emphasis dots are measured at paint through gpui's `position_for_index`, which walks the line's glyphs, so a visible line holding hundreds of chips costs chips × glyphs every frame.
+
 ## Clipboard pipeline
 
 Three event variants, one `update.rs:paste` router (which drops any active selection first, so chain/verbatim analysis runs on the post-deletion buffer):
