@@ -5,12 +5,12 @@
 #   ds_gpu_session.sh [step ...]        (no argument: every step, in order)
 #
 #   steps: setup build kernels ds_ops ds_gemm_ref ds_gemm ds_gemm_bench
-#          ds_attention ds_index ds_tiny ds_tiny_drafting ds_tiny_memory mimo
-#          summary
+#          ds_attention ds_index ds_tiny ds_tiny_banded ds_tiny_drafting
+#          ds_tiny_memory mimo summary
 #   named only:  ds_gemm_profile
 #   with the released checkpoint (never run by default; name them):
 #          halves_build halves_encoder halves_decoder halves_reference
-#          halves_invariance
+#          halves_invariance halves_banded
 #
 # `ds_gemm` is the quantised GEMMs on tensor cores: the probe of their block
 # product, both forms against the scalar reference in every block shape, and
@@ -35,6 +35,14 @@
 # order. `DRY_RUN=1` prints every command of the step instead of running it.
 #
 #   ds_gpu_session.sh setup build kernels ds_gemm_profile
+#
+# `ds_tiny_banded` is `ds_tiny` with the executor's quantised GEMMs in the
+# banded form (`EIDOLA_DS_GEMM_FORM=banded`), held to the same CPU reference
+# executor bit for bit (`ds_tiny_banded.json`). `halves_banded` runs both
+# device phases of the released model again in the banded form, under
+# $OUT/ds_halves_banded, and requires every recording (boundary, both halves'
+# layers, logits) to be byte for byte the exact run's: run it after
+# `halves_encoder` and `halves_decoder`.
 #
 # `ds_tiny` is the executor without drafts; `ds_tiny_drafting` is every draft
 # width and acceptance pattern, seeded sampling and the scenarios again with
@@ -292,6 +300,10 @@ ds_tiny() { device_test_named ds_tiny the_tiny_model_equals_the_cpu_reference_ex
 ds_tiny_drafting() {
     device_test_named ds_tiny the_tiny_model_drafts_as_the_cpu_reference_executor
 }
+ds_tiny_banded() {
+    EIDOLA_DS_GEMM_FORM=banded EIDOLA_DS_TINY_SUMMARY="$OUT/ds_tiny_banded.json" \
+        device_test_named ds_tiny the_tiny_model_equals_the_cpu_reference_executor
+}
 ds_tiny_memory() {
     device_test_named ds_tiny the_tiny_model_keeps_its_memory_as_the_cpu_reference_executor
 }
@@ -329,6 +341,22 @@ halves_invariance() {
         cargo run --release --locked -p eidola-engine-cuda --example ds_halves)
 }
 
+# The released model's device phases with the banded GEMMs, and every
+# recording against the exact run's.
+halves_banded() {
+    [ -n "${CHECKPOINT:-}" ] && [ -d "$CHECKPOINT" ] || die "CHECKPOINT names no directory"
+    [ -f "$OUT/ds_halves/logits.bin" ] || die "run halves_encoder and halves_decoder first"
+    (cd "$REPO" && EIDOLA_DEEPSEEK_FULL_DIR="$CHECKPOINT" EIDOLA_DS_HALVES_OUT="$OUT/ds_halves_banded" \
+        EIDOLA_DS_HALVES_PHASES=encoder,decoder EIDOLA_DS_GEMM_FORM=banded \
+        cargo run --release --locked -p eidola-engine-cuda --example ds_halves)
+    local f
+    for f in boundary_entries.bin boundary_streams.bin boundary_pre.bin encoder_layers.bin \
+        decoder_layers.bin logits.bin; do
+        cmp "$OUT/ds_halves/$f" "$OUT/ds_halves_banded/$f" || die "banded $f differs from the exact run's"
+        say "banded $f: equal"
+    done
+}
+
 summary() {
     {
         printf '{\n  "gpu": "%s",\n  "kernels": "%s",\n  "steps": [\n' \
@@ -347,8 +375,8 @@ summary() {
     cat "$OUT/session.json"
 }
 
-ALL="setup build kernels ds_ops ds_gemm_ref ds_gemm ds_gemm_bench ds_attention ds_index ds_tiny ds_tiny_drafting ds_tiny_memory mimo summary"
-NAMED="ds_gemm_profile halves_build halves_encoder halves_decoder halves_reference halves_invariance"
+ALL="setup build kernels ds_ops ds_gemm_ref ds_gemm ds_gemm_bench ds_attention ds_index ds_tiny ds_tiny_banded ds_tiny_drafting ds_tiny_memory mimo summary"
+NAMED="ds_gemm_profile halves_build halves_encoder halves_decoder halves_reference halves_invariance halves_banded"
 for step in ${*:-$ALL}; do
     case " $ALL $NAMED " in
         *" $step "*) ;;
