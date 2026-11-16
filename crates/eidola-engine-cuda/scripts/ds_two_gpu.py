@@ -490,6 +490,8 @@ def bench(base: str, model: str, prompts: list, concurrency: list, out_len: int,
     runs = []
     for c in concurrency:
         n = 3 if c == 1 else c
+        if n > len(prompts):
+            raise SystemExit(f"concurrency {c} needs {n} prompts; the sequences hold {len(prompts)}")
         began = time.time()
         with concurrent.futures.ThreadPoolExecutor(c) as pool:
             results = list(pool.map(lambda p: stream_completion(base, model, p, out_len), prompts[:n]))

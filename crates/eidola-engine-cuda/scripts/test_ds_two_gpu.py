@@ -310,6 +310,17 @@ class Summary(unittest.TestCase):
         self.assertIn("90.0 out tok/s", text)
 
 
+class BenchPrompts(unittest.TestCase):
+    def test_a_concurrency_beyond_the_prompts_is_refused_before_any_request(self):
+        s = Server(lambda m, path, b: (500, "text/plain", b""))
+        try:
+            with self.assertRaises(SystemExit):
+                t.bench(s.base, "m", [[1, 2]] * 4, [8], 4, {})
+            self.assertEqual(s.requests, [])
+        finally:
+            s.close()
+
+
 class SummaryFailure(unittest.TestCase):
     def test_the_summary_fails_when_the_node_disagrees_across_widths(self):
         out = Path(tempfile.mkdtemp())
