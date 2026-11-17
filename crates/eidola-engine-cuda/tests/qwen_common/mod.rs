@@ -93,6 +93,24 @@ pub fn compiled() -> Option<HostDevice> {
     library().map(host_device)
 }
 
+/// Raises the soft memory-lock limit to the hard one, for the reference executor's
+/// locked host tier, and serializes the tests of one binary that build one.
+pub fn memlock_guard() -> std::sync::MutexGuard<'static, ()> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let l = getrlimit(Resource::Memlock);
+    if l.current.is_some() && l.current != l.maximum {
+        let _ = setrlimit(
+            Resource::Memlock,
+            Rlimit {
+                current: l.maximum,
+                maximum: l.maximum,
+            },
+        );
+    }
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A device allocation holding `data`, kept alive with it.
 pub struct Buf {
     pub addr: u64,

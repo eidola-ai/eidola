@@ -464,13 +464,19 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         self.dims.layer_floats() * 4
     }
 
+    /// A slot's whole tail: its address and bytes (none with one-token blocks and no
+    /// drafts).
+    fn slot_tail(&self, slot: Slot) -> (u64, usize) {
+        let bytes = self.tail_cap as usize * self.dn_layers() * self.dims.tail_floats() * 4;
+        (self.tails.addr + u64::from(slot) * bytes as u64, bytes)
+    }
+
+    /// The row of tail position `pos` of a DeltaNet layer; only a slot with a tail has one.
     fn tail_row(&self, slot: Slot, pos: u32, layer: usize) -> u64 {
         let tf = self.dims.tail_floats();
         let per_pos = self.dn_layers() * tf;
-        let i = (u64::from(slot) * u64::from(self.tail_cap) + u64::from(pos % self.tail_cap))
-            * per_pos as u64
-            + (layer * tf) as u64;
-        self.tails.addr + i * 4
+        let i = u64::from(pos % self.tail_cap) * per_pos as u64 + (layer * tf) as u64;
+        self.slot_tail(slot).0 + i * 4
     }
 
     fn hidden_row(&self, slot: Slot, i: usize) -> u64 {
@@ -560,12 +566,12 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             g.fill(NULL_BLOCK);
         }
         self.slots[s] = SlotRec::default();
-        let tail_bytes = self.tail_cap as usize * self.dn_layers() * self.dims.tail_floats() * 4;
+        let (tail, tail_bytes) = self.slot_tail(slot);
         let k1 = self.cfg.draft_tokens as usize + 1;
         // SAFETY: the slot's own ranges of the live images, tails and hiddens.
         unsafe {
             self.dev.zero(self.live_addr(slot), self.image_stride)?;
-            self.dev.zero(self.tail_row(slot, 0, 0), tail_bytes)?;
+            self.dev.zero(tail, tail_bytes)?;
             self.dev
                 .zero(self.hidden_row(slot, 0), k1 * self.dims.hidden as usize * 2)?;
         }
@@ -2208,7 +2214,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
     /// image, tail and kept states all zero.
     pub fn slot_state_is_zero(&self, slot: Slot) -> bool {
         let s = slot as usize;
-        let tail_bytes = self.tail_cap as usize * self.dn_layers() * self.dims.tail_floats() * 4;
+        let (tail, tail_bytes) = self.slot_tail(slot);
         let k1 = self.cfg.draft_tokens as usize + 1;
         self.tables[s].iter().flatten().all(|&b| b == NULL_BLOCK)
             && self.slots[s].base.is_none()
@@ -2216,10 +2222,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 .read_words(self.live_addr(slot), self.image_stride)
                 .iter()
                 .all(|&x| x == 0)
-            && self
-                .read_words(self.tail_row(slot, 0, 0), tail_bytes)
-                .iter()
-                .all(|&x| x == 0)
+            && self.read_words(tail, tail_bytes).iter().all(|&x| x == 0)
             && self
                 .read_words(self.hidden_row(slot, 0), k1 * self.dims.hidden as usize * 2)
                 .iter()

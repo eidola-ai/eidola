@@ -13,8 +13,10 @@
 # (`fetch`: every file hashed against its recorded upstream SHA-256 as it
 # arrives, never resumed), into $WORK/checkpoint; that session's own markers and
 # logs stay under $WORK/golden-out, on this machine, and its logs are copied
-# into $OUT/golden after each step. `fetch` is never marked: on a fresh machine
-# (a preempted instance, $OUT copied back) it fetches and verifies again.
+# into $OUT/golden after each step. `fetch` and `golden_tokens` are never
+# marked, since what they write lives under $WORK: on a fresh machine (a
+# preempted instance, $OUT copied back) they fetch, verify and write it again,
+# and on this one the model crate's session skips them by its own markers.
 #
 # - `golden_tokens`: the health check's token sequences
 #   (`$WORK/checkpoint/golden/health.safetensors`);
@@ -24,15 +26,16 @@
 # - `whole_health`: licence accuracy at least 0.95 and "Paris", both profiles;
 # - `whole_generate`: the fast profile's greedy tokens equal at draft widths 0
 #   to 3;
-# - `whole_bench`: the fast profile through the engine at concurrency 1 to 64,
-#   widths 0 and 3, and prefill alone at 1k and 8k;
+# - `whole_bench`: the fast profile through the engine at widths 0 and 3: the
+#   workloads of `scripts/qwen_workloads.json` at concurrency 1 to 128, and
+#   prefill alone at 1k and 8k;
 # - `golden_gpu`: the model crate's GPU reference steps (`released`,
 #   `released-torch`, `health` with DEVICE=cuda): the reference as released on
 #   this GPU, against which ours is compared;
 # - `vllm_generate`, `vllm_bench`, `vllm_mtp_bench`: vLLM 0.33.0 (pinned
 #   image, `scripts/qwen_vllm.py`) on the same files and GPU: its greedy
-#   replies to the same prompts (beside ours), and the same decode workload
-#   without and with its MTP drafter (acceptance from its metrics).
+#   replies to the same prompts (beside ours), and the same workloads without
+#   and with its MTP drafter (acceptance from its metrics).
 #
 # Expected (estimates): fetch 15 to 30 minutes, whole_compare 10 to 20 (the
 # CPU forward and the exact profile's scalar GEMMs), whole_health 10 to 20,
@@ -87,6 +90,6 @@ vllm_mtp_bench() {
     vllm stop
 }
 
-UNMARKED=" setup build kernels_build fetch summary "
+UNMARKED=" setup build kernels_build fetch golden_tokens summary "
 main "facts setup build kernels_build kernels fetch golden_tokens whole_compare whole_health whole_generate whole_bench golden_gpu vllm_generate vllm_bench vllm_mtp_bench summary" \
     "golden_rust whole_bench_lagging" "$@"

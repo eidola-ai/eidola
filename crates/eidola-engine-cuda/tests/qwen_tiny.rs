@@ -26,6 +26,8 @@ fn qwen_tiny_scenarios_on_the_device() {
     eprintln!("ok      chunkings");
     scenarios::hits_and_pressure(&make);
     eprintln!("ok      hits_and_pressure");
+    scenarios::empty_tails(&make);
+    eprintln!("ok      empty_tails");
     scenarios::alone_and_crowded(&make);
     eprintln!("ok      alone_and_crowded");
 }
