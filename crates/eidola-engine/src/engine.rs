@@ -40,7 +40,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::executor::{Executor, ExecutorError, SeqEntry, StepAux, StepInput};
+use crate::executor::{Executor, ExecutorError, SeqEntry, StateWrite, StepAux, StepInput};
 use crate::kv::{CachePolicy, KvManager, Millis, PendingWork, Release};
 use crate::sampling::SamplingParams;
 use crate::secret::Lineage;
@@ -647,7 +647,9 @@ impl<E: Executor> Engine<E> {
         }
     }
 
-    /// Maps KV for a row being planned, shedding optional reservations under pressure.
+    /// Maps KV for a row being planned, and with a recurrent state reserves the buffers
+    /// its state writes need ([`KvManager::reserve_state`]), shedding optional
+    /// reservations under pressure.
     ///
     /// A row's **minimum progress unit** is one host token for a decode row, and for a
     /// prefill row the tokens up to the next block boundary: at most one new block per
@@ -682,6 +684,7 @@ impl<E: Executor> Engine<E> {
     ) -> bool {
         let fits = |kv: &mut KvManager, e: &SeqEntry| {
             kv.allocate(id, e.context_len + e.num_tokens + e.num_drafts)
+                && kv.reserve_state(id, e.context_len + e.num_tokens)
         };
         if fits(&mut self.kv, entry) {
             return true;
@@ -802,6 +805,16 @@ impl<E: Executor> Engine<E> {
                     end as u32,
                     target,
                 ));
+            }
+            if let Some((row, writes)) = self.kv.state_row(p.id) {
+                let index = aux.state_rows.len() as u32;
+                aux.state_rows.push(row);
+                aux.state_writes
+                    .extend(writes.into_iter().map(|(len, buffer)| StateWrite {
+                        row: index,
+                        len,
+                        buffer,
+                    }));
             }
         }
         let rows = planned.len() as u32;

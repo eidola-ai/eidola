@@ -131,14 +131,49 @@
 //! promotions (into blocks zeroed above), then encryptions and decryptions (a promoted
 //! block's decryption after its copy), then host zeros (after the promotions that read
 //! those blocks).
+//!
+//! # Recurrent state
+//!
+//! A model with recurrent state ([`ModelSpec::state`]) has one more pool, at index
+//! [`ModelSpec::state_pool`], of state buffers, each holding the state at one block
+//! boundary. Its buffers go through the same reference counts, holders, zeros,
+//! encryption, demotion and promotion as blocks, by the same code; what differs is when
+//! they are allocated and what holds them.
+//!
+//! - **A base per sequence.** A running sequence maps one buffer, its base: the state at
+//!   its last stored boundary (none, the zero state, before its first). Each row stores
+//!   the state at the last boundary its host tokens reach, which becomes the next base:
+//!   in place when nothing else holds the base, else in a fresh buffer. A row's drafts
+//!   never reach a stored state; the executor keeps their inputs and the next row folds
+//!   the accepted ones ([`crate::executor`] → *Recurrent state*).
+//! - **Snapshots at retention points.** An entry holds at most one buffer: the state at
+//!   the boundary that ends its block. A sequence leaves one at its branch and
+//!   regeneration points, written by the row that crosses them and attached when they are
+//!   sealed, and one at its continuation point when it is released: its base as it is, or
+//!   a state saved from its slot ([`Maintenance::SaveState`]) when accepted drafts crossed
+//!   that boundary after the base was stored. A hit of `m` blocks additionally requires
+//!   entry `m - 1` to hold a snapshot, which becomes the sequence's base; the KV of a
+//!   longer match is recomputed.
+//! - **Reclaiming.** Under pressure on the state pool the least recently used idle
+//!   snapshot is demoted to the host tier (when it is ciphertext with nothing queued) or
+//!   taken back from its entry and zeroed; the entry stays, its point no longer a hit.
+//!   Snapshots are ordered by when they were last attached, resumed from or released by
+//!   the sequence that left them, then by retention point: branch first, continuation
+//!   next, regeneration (where a client's declared prefix rests) last. Pressure on a KV
+//!   pool demotes an entry's KV blocks alone, or evicts entries (their snapshots with
+//!   them), as it would without a state; pressure on the state's host tier zeroes the
+//!   least recently used host snapshot. No entry is evicted to make room for a state.
+//! - **Nonces.** A snapshot is handed to its entry rather than sealed with it, so its
+//!   nonce comes from its attachment, as a chain-covered block's does; within one
+//!   attachment the buffer is never written.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::executor::{Maintenance, Slot, TableUpdate};
+use crate::executor::{Maintenance, Slot, StateRow, TableUpdate};
 use crate::hash::{BlockHash, extend_chain};
 use crate::kv_cipher::KvNonce;
 use crate::secret::{KvKey, Lineage};
-use crate::spec::{AttentionKind, Coverage, ModelSpec, NULL_BLOCK};
+use crate::spec::{AttentionKind, Coverage, ModelSpec, NULL_BLOCK, NULL_STATE};
 
 /// Milliseconds on a monotonic clock supplied by the caller.
 pub type Millis = u64;
@@ -302,7 +337,21 @@ struct Entry {
     /// Transient protections ([`KvManager::protect`]) on the entry: while non-zero, no
     /// window block is taken from it to make room ([`KvManager::strip_window`]).
     shield: u32,
+    /// When the entry's state snapshot was last attached, resumed from, or released by
+    /// the sequence that attached it: what snapshots are reclaimed by.
+    state_used: Millis,
+    /// Which retention point the snapshot is ([`RANK_BRANCH`] and the others): the order
+    /// among snapshots last used at the same time.
+    state_rank: u8,
 }
+
+/// A branch point's snapshot, reclaimed first among snapshots last used together.
+const RANK_BRANCH: u8 = 0;
+/// A continuation point's snapshot.
+const RANK_CONTINUATION: u8 = 1;
+/// A regeneration point's snapshot, the boundary a client's declared prefix rests on,
+/// reclaimed last.
+const RANK_REGENERATION: u8 = 2;
 
 impl Entry {
     /// Whether the entry holds group `g`'s block, on the device or the host.
@@ -330,6 +379,26 @@ struct SeqKv {
     /// With a window chain: the position from which every chain layer's KV is valid up
     /// to `computed` (equal to `computed` when none is).
     deep_from: u32,
+    /// With a recurrent state: its base, plan and retention.
+    state: Option<SeqState>,
+}
+
+/// A sequence's recurrent state as the host tracks it.
+#[derive(Debug)]
+struct SeqState {
+    /// The state buffer holding the state at `base_len`, or [`NULL_STATE`] at 0.
+    base: u32,
+    /// A block boundary, at most `computed`.
+    base_len: u32,
+    /// The step's planned writes, `(len, buffer)` ascending: reserved by
+    /// [`KvManager::reserve_state`], applied by [`KvManager::commit`]. Each holds one
+    /// reference of the sequence's (the base's own, for a write in place).
+    plan: Vec<(u32, u32)>,
+    /// Snapshots it attached at branch and regeneration points, `(entry, buffer)`, while
+    /// it runs (so [`KvManager::unpin`] can take them back).
+    attached: Vec<(EntryId, u32)>,
+    /// Its regeneration point, in blocks.
+    regen: u32,
 }
 
 /// The window chain's two distances, in positions behind a target.
@@ -376,6 +445,14 @@ pub struct KvManager {
     tier: TierStats,
     /// Window blocks taken from referenced entries to make room.
     stripped_windows: u64,
+    /// KV groups: pools `0..kv_groups` are theirs.
+    kv_groups: usize,
+    /// The state pool's index (`kv_groups`), for a model with recurrent state.
+    state: Option<usize>,
+    /// State snapshots taken back from their entries to make room.
+    stripped_states: u64,
+    /// States stored at release ([`Maintenance::SaveState`]).
+    saved_states: u64,
 }
 
 impl KvManager {
@@ -394,7 +471,9 @@ impl KvManager {
             pools: spec
                 .kv_groups
                 .iter()
-                .map(|g| Pool::new(g.num_blocks))
+                .map(|g| g.num_blocks)
+                .chain(spec.state.as_ref().map(|s| s.num_buffers))
+                .map(Pool::new)
                 .collect(),
             entries: HashMap::new(),
             map: HashMap::new(),
@@ -410,7 +489,9 @@ impl KvManager {
             host: if spec.has_host_tier() && policy.enabled {
                 spec.kv_groups
                     .iter()
-                    .map(|g| HostPool::new(g.host_blocks))
+                    .map(|g| g.host_blocks)
+                    .chain(spec.state.as_ref().map(|s| s.host_buffers))
+                    .map(HostPool::new)
                     .collect()
             } else {
                 Vec::new()
@@ -422,6 +503,10 @@ impl KvManager {
             pending_host_zero: BTreeSet::new(),
             tier: TierStats::default(),
             stripped_windows: 0,
+            kv_groups: spec.kv_groups.len(),
+            state: spec.state_pool().map(|p| p as usize),
+            stripped_states: 0,
+            saved_states: 0,
         }
     }
 
@@ -560,7 +645,7 @@ impl KvManager {
         assert!(!self.seqs.contains_key(&id), "sequence admitted twice");
         let slot = self.free_slots.pop()?;
         self.reset_slot(slot);
-        let groups = self.pools.len();
+        let groups = self.kv_groups;
         let bs = self.block_size;
         let mut seq = SeqKv {
             slot,
@@ -575,6 +660,13 @@ impl KvManager {
             attached: Vec::new(),
             slide_cursor: vec![0; groups],
             deep_from: 0,
+            state: self.state.map(|_| SeqState {
+                base: NULL_STATE,
+                base_len: 0,
+                plan: Vec::new(),
+                attached: Vec::new(),
+                regen: (prompt_len.max(1) - 1) / bs,
+            }),
         };
 
         if self.policy.enabled {
@@ -607,7 +699,7 @@ impl KvManager {
                 entry.last_used = now;
                 let blocks = entry.blocks.clone();
                 self.lru_refresh(eid);
-                for (g, &cached) in blocks.iter().enumerate() {
+                for (g, &cached) in blocks.iter().enumerate().take(groups) {
                     let lo = self.attention[g].first_visible(m * bs) / bs;
                     let b = if (idx as u32) >= lo {
                         debug_assert_ne!(cached, NULL_BLOCK, "a hit maps only device blocks");
@@ -628,6 +720,18 @@ impl KvManager {
                     seq.blocks[g].push(b);
                 }
             }
+            // The snapshot at the hit's boundary is the sequence's base.
+            if let (Some(p), Some(st), Some(&eid)) = (self.state, seq.state.as_mut(), chain.last())
+            {
+                let entry = self.entries.get_mut(&eid).expect("chain entry exists");
+                entry.state_used = now;
+                let b = entry.blocks[p];
+                debug_assert_ne!(b, NULL_STATE, "a hit maps a device snapshot");
+                self.pools[p].refs[b as usize] += 1;
+                self.settle(p, b, Some(seq.lineage.kv_key()));
+                st.base = b;
+                st.base_len = m * bs;
+            }
             seq.entries = chain;
             seq.hashes = hashes;
             seq.computed = m * bs;
@@ -639,7 +743,7 @@ impl KvManager {
             // Retention points this sequence will attach its window at once sealed. Only a
             // keyed sequence's entries outlive it, and only sliding groups need them.
             let sliding = self.attention.iter().any(|a| *a != AttentionKind::Full);
-            if retain && sliding {
+            if retain && (sliding || self.state.is_some()) {
                 let regen = (prompt_len.max(1) - 1) / bs;
                 let mut points: Vec<u32> = [branch, regen].into_iter().filter(|&p| p > m).collect();
                 points.sort_unstable();
@@ -715,7 +819,7 @@ impl KvManager {
         if needed <= have {
             return true;
         }
-        let groups = self.pools.len();
+        let groups = self.kv_groups;
         let mut got: Vec<Vec<u32>> = vec![Vec::new(); groups];
         let count = (needed - have) as usize;
         for (g, got_g) in got.iter_mut().enumerate() {
@@ -760,7 +864,7 @@ impl KvManager {
         let mut seq = self.seqs.remove(&id).expect("live sequence");
         assert!(upto >= seq.computed, "shrink into computed KV");
         let keep = upto.div_ceil(self.block_size) as usize;
-        for g in 0..self.pools.len() {
+        for g in 0..self.kv_groups {
             while seq.blocks[g].len() > keep {
                 let idx = seq.blocks[g].len() - 1;
                 let b = seq.blocks[g].pop().expect("non-empty");
@@ -791,7 +895,28 @@ impl KvManager {
         let seq = self.seqs.get_mut(&id).expect("live sequence");
         seq.points.clear();
         let attached = std::mem::take(&mut seq.attached);
+        let snapshots = seq
+            .state
+            .as_mut()
+            .map(|st| std::mem::take(&mut st.attached))
+            .unwrap_or_default();
         let mut freed = false;
+        if let Some(p) = self.state {
+            for (eid, b) in snapshots {
+                let Some(entry) = self.entries.get_mut(&eid) else {
+                    continue;
+                };
+                if entry.blocks[p] != b {
+                    continue;
+                }
+                entry.blocks[p] = NULL_STATE;
+                entry.attachment[p] = 0;
+                self.pools[p].holder[b as usize] = NO_ENTRY;
+                freed |= self.pools[p].refs[b as usize] == 1;
+                self.decref(p, b);
+                self.settle(p, b, None);
+            }
+        }
         for (eid, g, b) in attached {
             let Some(entry) = self.entries.get_mut(&eid) else {
                 continue;
@@ -808,6 +933,115 @@ impl KvManager {
             self.settle(g, b, None);
         }
         freed
+    }
+
+    /// Plans the state writes of `id`'s next row, whose host tokens end at `end`: each
+    /// retention point past the base and before the row's last boundary, then that last
+    /// boundary, which becomes the next base. The last write goes into the base itself
+    /// when nothing else holds it, every other into a fresh buffer (reclaiming snapshots
+    /// to find one). A re-plan within a step first gives back the previous plan's buffers,
+    /// untouched. Returns false, holding nothing new, when a buffer cannot be found;
+    /// true for a model without state.
+    pub fn reserve_state(&mut self, id: SeqId, end: u32) -> bool {
+        let Some(p) = self.state else {
+            return true;
+        };
+        let bs = self.block_size;
+        let mut seq = self.seqs.remove(&id).expect("live sequence");
+        let st = seq.state.as_mut().expect("a sequence with state");
+        for (_, b) in std::mem::take(&mut st.plan) {
+            if b != st.base {
+                self.give_back_state(p, b);
+            }
+        }
+        let last = end / bs * bs;
+        let mut ok = true;
+        if last > st.base_len {
+            let mut lens: Vec<u32> = seq
+                .points
+                .iter()
+                .map(|&point| point * bs)
+                .filter(|&len| len > st.base_len && len < last)
+                .collect();
+            lens.push(last);
+            let pool = &self.pools[p];
+            let in_place = st.base != NULL_STATE
+                && pool.refs[st.base as usize] == 1
+                && pool.holder[st.base as usize] == NO_ENTRY;
+            for (i, &len) in lens.iter().enumerate() {
+                let b = if i + 1 == lens.len() && in_place {
+                    Some(st.base)
+                } else {
+                    self.alloc_state()
+                };
+                match b {
+                    Some(b) => st.plan.push((len, b)),
+                    None => {
+                        for (_, b) in std::mem::take(&mut st.plan) {
+                            if b != st.base {
+                                self.give_back_state(p, b);
+                            }
+                        }
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        self.seqs.insert(id, seq);
+        ok
+    }
+
+    /// The state base of `id`'s planned row and its planned writes, `(len, buffer)`
+    /// ascending; `None` without state.
+    pub fn state_row(&self, id: SeqId) -> Option<(StateRow, Vec<(u32, u32)>)> {
+        let st = self.seqs[&id].state.as_ref()?;
+        Some((
+            StateRow {
+                base: st.base,
+                base_len: st.base_len,
+            },
+            st.plan.clone(),
+        ))
+    }
+
+    /// The state pool's index, for a model with recurrent state.
+    pub fn state_pool(&self) -> Option<u32> {
+        self.state.map(|p| p as u32)
+    }
+
+    /// Every running sequence's state base, as `(buffer, base_len)` by sequence (testing).
+    pub fn state_bases(&self) -> BTreeMap<SeqId, (u32, u32)> {
+        self.seqs
+            .iter()
+            .filter_map(|(&id, s)| s.state.as_ref().map(|st| (id, (st.base, st.base_len))))
+            .collect()
+    }
+
+    /// State snapshots taken back from their entries to make room.
+    pub fn stripped_states(&self) -> u64 {
+        self.stripped_states
+    }
+
+    /// States stored at release ([`Maintenance::SaveState`]).
+    pub fn saved_states(&self) -> u64 {
+        self.saved_states
+    }
+
+    /// The state snapshots cache entries hold, as `(boundary, device buffer, host
+    /// buffer)` with [`NULL_STATE`] for the tier a snapshot is not in (testing).
+    pub fn state_snapshots(&self) -> Vec<(u32, u32, u32)> {
+        let Some(p) = self.state else {
+            return Vec::new();
+        };
+        let mut out: Vec<_> = self
+            .entries
+            .values()
+            .filter(|e| e.holds(p))
+            .map(|e| ((e.depth + 1) * self.block_size, e.blocks[p], e.host[p]))
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// The next position at which `id` needs full-depth chain state for a retention point
@@ -854,7 +1088,7 @@ impl KvManager {
     /// releases sliding-window blocks that left the window.
     pub fn commit(&mut self, id: SeqId, computed: u32, tokens: &[u32], now: Millis) {
         let bs = self.block_size;
-        let groups = self.pools.len();
+        let groups = self.kv_groups;
         let mut seq = self.seqs.remove(&id).expect("live sequence");
         assert!(computed as usize <= tokens.len());
         assert!(
@@ -902,8 +1136,10 @@ impl KvManager {
             if point <= seq.entries.len() as u32 {
                 let attached = self.attach_window(&seq, point);
                 seq.attached.extend(attached);
+                self.attach_state_point(&mut seq, point, now);
             }
         }
+        self.apply_state_plan(&mut seq);
 
         // Slide windows behind the newest sealed boundary.
         for g in 0..groups {
@@ -926,8 +1162,8 @@ impl KvManager {
     /// lineage is dropped here; the copy of its key those encryptions carry goes with the
     /// next step.
     pub fn release(&mut self, id: SeqId, kind: Release, now: Millis) {
-        let groups = self.pools.len();
-        let seq = self.seqs.remove(&id).expect("live sequence");
+        let groups = self.kv_groups;
+        let mut seq = self.seqs.remove(&id).expect("live sequence");
         let retain = kind == Release::Preempt || seq.retain;
 
         if self.policy.enabled && retain {
@@ -935,6 +1171,7 @@ impl KvManager {
             // they were sealed.
             self.attach_window(&seq, seq.entries.len() as u32);
         }
+        self.release_state(&mut seq, retain, now);
 
         for g in 0..groups {
             for idx in 0..seq.blocks[g].len() {
@@ -1024,6 +1261,11 @@ impl KvManager {
                         out.insert((g as u32, b));
                     }
                 }
+            }
+            if let (Some(p), Some(st)) = (self.state, &s.state)
+                && st.base != NULL_STATE
+            {
+                out.insert((p as u32, st.base));
             }
         }
         out
@@ -1158,6 +1400,10 @@ impl KvManager {
     /// beyond the positions with valid KV: rejected speculative positions were rolled back.
     pub fn check_no_reservations(&self) {
         for s in self.seqs.values() {
+            assert!(
+                s.state.as_ref().is_none_or(|st| st.plan.is_empty()),
+                "a state write planned past its step"
+            );
             let want = s.computed.div_ceil(self.block_size) as usize;
             for list in &s.blocks {
                 assert!(
@@ -1175,9 +1421,21 @@ impl KvManager {
             let pool = &self.pools[g];
             let mut expected = vec![0u32; pool.refs.len()];
             for s in self.seqs.values() {
-                for &b in &s.blocks[g] {
-                    if b != NULL_BLOCK {
-                        expected[b as usize] += 1;
+                if g < self.kv_groups {
+                    for &b in &s.blocks[g] {
+                        if b != NULL_BLOCK {
+                            expected[b as usize] += 1;
+                        }
+                    }
+                } else if let Some(st) = &s.state {
+                    // The base, and each planned write that is not the base itself.
+                    for b in std::iter::once(st.base).chain(st.plan.iter().map(|&(_, b)| b)) {
+                        if b != NULL_STATE {
+                            expected[b as usize] += 1;
+                        }
+                    }
+                    if st.plan.iter().any(|&(_, b)| b == st.base) {
+                        expected[st.base as usize] -= 1;
                     }
                 }
             }
@@ -1260,7 +1518,14 @@ impl KvManager {
             for c in &e.children {
                 assert_eq!(self.entries[c].parent, Some(*id));
             }
-            assert_eq!(e.blocks.len(), self.attention.len(), "entry group count");
+            assert_eq!(e.blocks.len(), self.pools.len(), "entry group count");
+            if let Some(p) = self.state {
+                assert_eq!(
+                    e.attachment[p] != 0,
+                    e.holds(p),
+                    "entry attachment disagrees with its state snapshot"
+                );
+            }
             for (g, cov) in self.coverage.iter().enumerate() {
                 assert_eq!(
                     e.attachment[g] != 0,
@@ -1302,6 +1567,36 @@ impl KvManager {
                 s.deep_from <= s.computed,
                 "chain valid past the computed KV"
             );
+            assert_eq!(s.state.is_some(), self.state.is_some(), "sequence state");
+            if let (Some(p), Some(st)) = (self.state, &s.state) {
+                assert_eq!(
+                    st.base == NULL_STATE,
+                    st.base_len == 0,
+                    "a base and its length"
+                );
+                assert!(
+                    st.base_len.is_multiple_of(self.block_size) && st.base_len <= s.computed,
+                    "a base past the computed positions or off a boundary"
+                );
+                for &(len, b) in &st.plan {
+                    assert!(len > st.base_len && len.is_multiple_of(self.block_size));
+                    if b != st.base {
+                        assert_eq!(
+                            self.pools[p].holder[b as usize], NO_ENTRY,
+                            "a planned write into a held snapshot"
+                        );
+                    }
+                }
+                if let Some(&(_, b)) = st.plan.last()
+                    && b == st.base
+                {
+                    assert!(
+                        self.pools[p].refs[b as usize] == 1
+                            && self.pools[p].holder[b as usize] == NO_ENTRY,
+                        "a write in place into a base something else holds"
+                    );
+                }
+            }
         }
         let used_slots: Vec<Slot> = self.seqs.values().map(|s| s.slot).collect();
         for s in &used_slots {
@@ -1374,6 +1669,9 @@ impl KvManager {
                     self.pending_host_zero.contains(&(g as u32, h)),
                     "group {g}: quarantined host block {h} has no zero queued"
                 );
+            }
+            if g >= self.kv_groups {
+                continue;
             }
             let (mut dev, mut host) = (BTreeSet::new(), BTreeSet::new());
             for (&eid, e) in &self.entries {
@@ -1469,10 +1767,11 @@ impl KvManager {
             "group {g}: block {b} changes encryption with no entry holding it"
         );
         let e = &self.entries[&holder];
-        let nonce = match self.coverage[g] {
+        let nonce = match self.coverage.get(g).copied().unwrap_or(Coverage::Chain) {
             Coverage::All => e.hash.kv_nonce(g as u32),
             // The bytes depend on the rows the attaching sequence ran, not on the hash
-            // alone: each attachment has its own nonce.
+            // alone; or the block is a state snapshot, handed to the entry rather than
+            // sealed with it: each attachment has its own nonce.
             Coverage::Chain => e.hash.kv_nonce_attached(g as u32, e.attachment[g]),
         };
         let key = match self.pending_keys.iter().position(|k| k.ct_eq(key)) {
@@ -1492,7 +1791,236 @@ impl KvManager {
         );
     }
 
+    /// Returns a planned buffer nothing has written to the free list, with no zero.
+    fn give_back_state(&mut self, p: usize, b: u32) {
+        let pool = &mut self.pools[p];
+        assert_eq!(
+            pool.refs[b as usize], 1,
+            "a planned buffer is the sequence's alone"
+        );
+        pool.refs[b as usize] = 0;
+        pool.free.push(b);
+    }
+
+    /// Hands the buffer `seq` wrote at retention point `point` to the entry sealed there,
+    /// if it holds no snapshot yet.
+    fn attach_state_point(&mut self, seq: &mut SeqKv, point: u32, now: Millis) {
+        let (Some(p), Some(st)) = (self.state, seq.state.as_mut()) else {
+            return;
+        };
+        let len = point * self.block_size;
+        let Some(&(_, b)) = st.plan.iter().find(|&&(l, _)| l == len) else {
+            return;
+        };
+        let eid = seq.entries[point as usize - 1];
+        let rank = if point == st.regen {
+            RANK_REGENERATION
+        } else {
+            RANK_BRANCH
+        };
+        if self.attach_state(eid, p, b, rank, now) {
+            self.pools[p].refs[b as usize] += 1;
+            st.attached.push((eid, b));
+        }
+    }
+
+    /// Makes `b` entry `eid`'s snapshot, unless the entry holds one already. Mints the
+    /// attachment its nonce comes from; the caller counts the entry's reference.
+    fn attach_state(&mut self, eid: EntryId, p: usize, b: u32, rank: u8, now: Millis) -> bool {
+        let Some(entry) = self.entries.get(&eid) else {
+            return false;
+        };
+        if entry.holds(p) {
+            return false;
+        }
+        let attachment = self.next_attachment;
+        self.next_attachment += 1;
+        let entry = self.entries.get_mut(&eid).expect("entry exists");
+        entry.blocks[p] = b;
+        entry.attachment[p] = attachment;
+        entry.state_used = now;
+        entry.state_rank = rank;
+        debug_assert_eq!(self.pools[p].holder[b as usize], NO_ENTRY);
+        self.pools[p].holder[b as usize] = eid;
+        true
+    }
+
+    /// After a row: its last write becomes the sequence's base; every other planned
+    /// buffer, and the old base, loses the sequence's reference (freed, or left idle with
+    /// the entry that holds it).
+    fn apply_state_plan(&mut self, seq: &mut SeqKv) {
+        let (Some(p), Some(st)) = (self.state, seq.state.as_mut()) else {
+            return;
+        };
+        let plan = std::mem::take(&mut st.plan);
+        let Some(&(len, last)) = plan.last() else {
+            return;
+        };
+        let key = seq.lineage.kv_key();
+        let old = std::mem::replace(&mut st.base, last);
+        st.base_len = len;
+        for &(_, b) in &plan[..plan.len() - 1] {
+            self.decref(p, b);
+            self.settle(p, b, Some(key));
+        }
+        if old != last && old != NULL_STATE {
+            self.decref(p, old);
+            self.settle(p, old, Some(key));
+        }
+    }
+
+    /// A sequence leaves its slot: its plan goes back untouched; a retained one keeps its
+    /// state at the continuation point (its base as it is, or a state saved from its
+    /// slot when accepted drafts crossed that boundary after the base); then its base
+    /// loses the sequence's reference.
+    fn release_state(&mut self, seq: &mut SeqKv, retain: bool, now: Millis) {
+        let (Some(p), Some(st)) = (self.state, seq.state.as_mut()) else {
+            return;
+        };
+        for (_, b) in std::mem::take(&mut st.plan) {
+            if b != st.base {
+                self.give_back_state(p, b);
+            }
+        }
+        let point = seq.entries.len() as u32;
+        let len = point * self.block_size;
+        if self.policy.enabled && retain && point > 0 && len >= st.base_len {
+            let eid = seq.entries[point as usize - 1];
+            let open = self.entries.get(&eid).is_some_and(|e| !e.holds(p));
+            if open {
+                let exclusive = st.base != NULL_STATE
+                    && self.pools[p].refs[st.base as usize] == 1
+                    && self.pools[p].holder[st.base as usize] == NO_ENTRY;
+                let buffer = if len == st.base_len || exclusive {
+                    Some(st.base)
+                } else {
+                    self.alloc_state()
+                };
+                if let Some(b) = buffer {
+                    if len != st.base_len {
+                        self.pending_maint.push(Maintenance::SaveState {
+                            slot: seq.slot,
+                            len,
+                            buffer: b,
+                        });
+                        self.saved_states += 1;
+                    }
+                    let attached = self.attach_state(eid, p, b, RANK_CONTINUATION, now);
+                    debug_assert!(attached, "the entry was open");
+                    if b == st.base {
+                        // The entry's reference beside the sequence's, which goes below.
+                        self.pools[p].refs[b as usize] += 1;
+                    } else {
+                        // The fresh buffer's reference is the entry's.
+                        self.settle(p, b, Some(seq.lineage.kv_key()));
+                    }
+                }
+            }
+        }
+        if self.policy.enabled && retain {
+            for &(eid, b) in &st.attached {
+                if let Some(e) = self.entries.get_mut(&eid)
+                    && e.blocks[p] == b
+                {
+                    e.state_used = now;
+                }
+            }
+        }
+        if st.base != NULL_STATE {
+            let b = st.base;
+            self.decref(p, b);
+            self.settle(p, b, Some(seq.lineage.kv_key()));
+        }
+    }
+
+    /// A free state buffer: from the free list, else by demoting (with a host tier) or
+    /// taking back the least recently used idle snapshot.
+    fn alloc_state(&mut self) -> Option<u32> {
+        let p = self.state?;
+        loop {
+            if let Some(b) = self.pools[p].free.pop() {
+                self.pools[p].refs[b as usize] = 1;
+                return Some(b);
+            }
+            let victims = self.state_victims(p, false);
+            let &(_, _, first, _) = victims.first()?;
+            let demoted = self.has_host_tier()
+                && victims
+                    .iter()
+                    .find(|v| self.settled_state(p, v.3))
+                    .is_some_and(|v| self.demote_state(p, v.2));
+            if !demoted {
+                self.detach_block(first, p);
+                self.stripped_states += 1;
+            }
+        }
+    }
+
+    /// Idle snapshots on the device (`host` false) or the host tier, in the order they
+    /// are reclaimed: least recently used first, then by retention point, as
+    /// `(last use, rank, entry, buffer)`. None an admission is promoting into.
+    fn state_victims(&self, p: usize, host: bool) -> Vec<(Millis, u8, EntryId, u32)> {
+        let mut out: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.shield == 0)
+            .filter_map(|(&eid, e)| {
+                let b = if host { e.host[p] } else { e.blocks[p] };
+                let pool = &self.pools[p];
+                let idle = host || (pool.idle(b) && !pool.landing[b as usize]);
+                (b != NULL_STATE && idle).then_some((e.state_used, e.state_rank, eid, b))
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Whether an idle snapshot is ciphertext on the device as the next step begins.
+    fn settled_state(&self, p: usize, b: u32) -> bool {
+        let pool = &self.pools[p];
+        pool.encrypted[b as usize]
+            && !pool.landing[b as usize]
+            && !self.pending_crypt.contains_key(&(p as u32, b))
+    }
+
+    /// Moves entry `eid`'s settled snapshot to the host tier, its device buffer freed.
+    fn demote_state(&mut self, p: usize, eid: EntryId) -> bool {
+        let Some(h) = self.alloc_state_host(p) else {
+            return false;
+        };
+        let e = self.entries.get_mut(&eid).expect("demoted entry exists");
+        let b = std::mem::replace(&mut e.blocks[p], NULL_STATE);
+        e.host[p] = h;
+        self.host[p].holder[h as usize] = eid;
+        self.pools[p].holder[b as usize] = NO_ENTRY;
+        self.pending_demote.push(Maintenance::Demote {
+            group: p as u32,
+            block: b,
+            host: h,
+        });
+        self.decref(p, b);
+        self.tier.demoted_blocks += 1;
+        true
+    }
+
+    /// A free host state buffer, taking back the least recently used host snapshot if
+    /// there is none (its entry stays).
+    fn alloc_state_host(&mut self, p: usize) -> Option<u32> {
+        loop {
+            if let Some(h) = self.host[p].free.pop() {
+                self.pending_host_zero.remove(&(p as u32, h));
+                return Some(h);
+            }
+            let &(_, _, eid, _) = self.state_victims(p, true).first()?;
+            self.detach_block(eid, p);
+            self.tier.host_drops += 1;
+        }
+    }
+
     fn alloc_block(&mut self, g: usize) -> Option<u32> {
+        if self.state == Some(g) {
+            return self.alloc_state();
+        }
         loop {
             if let Some(b) = self.pools[g].free.pop() {
                 self.pools[g].refs[b as usize] = 1;
@@ -1551,6 +2079,12 @@ impl KvManager {
     /// Whether the window of every sliding group is attached for a hit of `m` blocks along
     /// `chain`.
     fn window_covered(&self, chain: &[EntryId], m: u32) -> bool {
+        if let Some(p) = self.state
+            && m > 0
+            && !self.entries[&chain[m as usize - 1]].holds(p)
+        {
+            return false;
+        }
         let bs = self.block_size;
         for (g, att) in self.attention.iter().enumerate() {
             if *att == AttentionKind::Full {
@@ -1593,7 +2127,7 @@ impl KvManager {
         {
             return attached;
         }
-        for g in 0..self.pools.len() {
+        for g in 0..self.kv_groups {
             if self.attention[g] == AttentionKind::Full {
                 continue;
             }
@@ -1743,13 +2277,16 @@ impl KvManager {
     /// queued for it.
     fn settled(&self, eid: EntryId) -> bool {
         let e = &self.entries[&eid];
-        e.blocks.iter().enumerate().all(|(g, &b)| {
-            let pool = &self.pools[g];
-            b == NULL_BLOCK
-                || (pool.encrypted[b as usize]
-                    && !pool.landing[b as usize]
-                    && !self.pending_crypt.contains_key(&(g as u32, b)))
-        })
+        e.blocks[..self.kv_groups]
+            .iter()
+            .enumerate()
+            .all(|(g, &b)| {
+                let pool = &self.pools[g];
+                b == NULL_BLOCK
+                    || (pool.encrypted[b as usize]
+                        && !pool.landing[b as usize]
+                        && !self.pending_crypt.contains_key(&(g as u32, b)))
+            })
     }
 
     /// Takes one idle device block of sliding group `g` from the entry that holds it, for
@@ -1816,7 +2353,7 @@ impl KvManager {
     /// if the host tier cannot take it.
     fn demote(&mut self, eid: EntryId) -> bool {
         self.protect(eid);
-        let groups: Vec<usize> = (0..self.pools.len())
+        let groups: Vec<usize> = (0..self.kv_groups)
             .filter(|&g| self.entries[&eid].blocks[g] != NULL_BLOCK)
             .collect();
         let mut got = Vec::with_capacity(groups.len());
@@ -1887,8 +2424,15 @@ impl KvManager {
     /// cannot take one; what was promoted stays promoted.
     fn promote_hit(&mut self, chain: &[EntryId], m: u32) -> bool {
         let bs = self.block_size;
+        if let Some(p) = self.state
+            && let Some(&eid) = chain[..m as usize].last()
+            && self.entries[&eid].host[p] != NULL_STATE
+            && !self.promote(eid, p)
+        {
+            return false;
+        }
         for (idx, &eid) in chain[..m as usize].iter().enumerate() {
-            for g in 0..self.pools.len() {
+            for g in 0..self.kv_groups {
                 let lo = self.attention[g].first_visible(m * bs) / bs;
                 if (idx as u32) >= lo
                     && self.entries[&eid].host[g] != NULL_BLOCK
@@ -1997,7 +2541,7 @@ impl KvManager {
         let eid = self.next_entry;
         self.next_entry += 1;
         let mut blocks = vec![NULL_BLOCK; groups];
-        for (g, slot) in blocks.iter_mut().enumerate() {
+        for (g, slot) in blocks.iter_mut().enumerate().take(self.kv_groups) {
             if self.attention[g] == AttentionKind::Full {
                 let b = seq.blocks[g][idx];
                 debug_assert_ne!(b, NULL_BLOCK);
@@ -2025,6 +2569,8 @@ impl KvManager {
                 valid_from: vec![0; groups],
                 attachment: vec![0; groups],
                 shield: 0,
+                state_used: now,
+                state_rank: RANK_BRANCH,
             },
         );
         self.map.insert(h, eid);
@@ -2271,5 +2817,57 @@ mod tests {
         kv.release(1, Release::Preempt, 0);
         kv.check_invariants();
         assert_eq!(kv.free_blocks(0), 4);
+    }
+
+    /// Giving up retention under pressure takes back the snapshots the sequence attached
+    /// at its branch and regeneration points: one it no longer maps is freed and zeroed,
+    /// and its point stops being a hit.
+    #[test]
+    fn unpin_gives_back_the_snapshots_a_sequence_attached() {
+        let spec = crate::mock::qwen_like_spec(32, 4, 64, 8, 4, 0);
+        let p = spec.state_pool().unwrap();
+        let mut kv = KvManager::new(&spec, CachePolicy::default());
+        let tokens: Vec<u32> = (0..13).collect();
+        // Prompt 12: its regeneration point (8) is crossed inside the row that ends on
+        // the boundary at 12, so it takes a buffer of its own.
+        kv.admit(1, salt(), true, &tokens[..12], 12, 0);
+        assert!(kv.allocate(1, 12));
+        assert!(kv.reserve_state(1, 12));
+        let (_, plan) = kv.state_row(1).unwrap();
+        assert_eq!(plan.iter().map(|w| w.0).collect::<Vec<_>>(), vec![8, 12]);
+        let regen = plan[0].1;
+        kv.commit(1, 12, &tokens, 0);
+        kv.check_invariants();
+        assert!(
+            kv.state_snapshots()
+                .iter()
+                .any(|s| s.0 == 8 && s.1 == regen)
+        );
+        kv.take_pending();
+        assert!(kv.unpin(1));
+        kv.check_invariants();
+        assert!(kv.state_snapshots().is_empty());
+        assert!(kv.pending_zeros().contains(&(p, regen)));
+        assert_eq!(kv.lookup(&salt(), &tokens[..12], 0), 0);
+    }
+
+    /// A state model rejects shapes the state cannot sit beside.
+    #[test]
+    fn a_state_needs_full_attention_groups_and_room() {
+        let spec = crate::mock::qwen_like_spec(32, 4, 64, 8, 4, 3);
+        assert_eq!(spec.validate(), Ok(()));
+        let mut sliding = spec.clone();
+        sliding.kv_groups[0].attention = AttentionKind::Sliding { window: 6 };
+        assert!(sliding.validate().is_err());
+        let mut tight = spec.clone();
+        tight.state.as_mut().unwrap().num_buffers = 2;
+        assert!(tight.validate().is_err());
+        let mut short = spec.clone();
+        short.state.as_mut().unwrap().tail_positions = 5;
+        assert!(short.validate().is_err());
+        let mut tier = spec.clone();
+        tier.state.as_mut().unwrap().host_buffers = 8;
+        assert!(tier.validate().is_err());
+        assert_eq!(crate::mock::with_host_tier(spec, 8).validate(), Ok(()));
     }
 }
