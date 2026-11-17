@@ -43,14 +43,20 @@ pub enum Architecture {
     /// first 20 with the embedding on device 0 and the rest with the head and
     /// the drafter on device 1.
     DeepSeekV41Flash,
+    /// Qwen3.8-27B, text only: a dense model of 48 Gated DeltaNet and 16
+    /// gated full-attention layers, with one MTP layer. **Not implemented**:
+    /// a stub while its engine work is in progress, and nothing may name it
+    /// in a catalog row or a deployment.
+    Qwen38Dense27B,
 }
 
 impl Architecture {
     /// Every architecture, implemented or not.
-    pub const ALL: [Architecture; 3] = [
+    pub const ALL: [Architecture; 4] = [
         Architecture::MimoV26Flash,
         Architecture::MimoV26Pro,
         Architecture::DeepSeekV41Flash,
+        Architecture::Qwen38Dense27B,
     ];
 
     /// The spelling the catalog and `deployment.json` use.
@@ -59,6 +65,7 @@ impl Architecture {
             Architecture::MimoV26Flash => "MimoV26Flash",
             Architecture::MimoV26Pro => "MimoV26Pro",
             Architecture::DeepSeekV41Flash => "DeepSeekV41Flash",
+            Architecture::Qwen38Dense27B => "Qwen38Dense27B",
         }
     }
 
@@ -74,6 +81,7 @@ impl Architecture {
             Architecture::MimoV26Flash => true,
             Architecture::MimoV26Pro => false,
             Architecture::DeepSeekV41Flash => true,
+            Architecture::Qwen38Dense27B => false,
         }
     }
 
@@ -94,6 +102,10 @@ impl Architecture {
                  implemented; nothing may name this architecture yet"
             ),
             Architecture::DeepSeekV41Flash => &DEEPSEEK_V41_FLASH,
+            Architecture::Qwen38Dense27B => unimplemented!(
+                "Qwen3.8-27B: its KV and recurrent-state layout, drafter, executor scratch and \
+                 kernels are not implemented; nothing may name this architecture yet"
+            ),
         }
     }
 
@@ -544,5 +556,12 @@ mod tests {
     fn the_pro_stub_has_no_shape() {
         assert!(!Architecture::MimoV26Pro.is_implemented());
         let _ = Architecture::MimoV26Pro.shape();
+    }
+
+    #[test]
+    #[should_panic(expected = "Qwen3.8-27B")]
+    fn the_qwen_stub_has_no_shape() {
+        assert!(!Architecture::Qwen38Dense27B.is_implemented());
+        let _ = Architecture::Qwen38Dense27B.shape();
     }
 }

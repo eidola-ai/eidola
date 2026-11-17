@@ -59,6 +59,8 @@ pub fn required_files(architecture: Architecture) -> &'static [&'static str] {
     match architecture {
         Architecture::MimoV26Flash | Architecture::MimoV26Pro => &REQUIRED_FILES,
         Architecture::DeepSeekV41Flash => &DEEPSEEK_V4_1_REQUIRED_FILES,
+        // A stub: the files its node will read are settled with its node.
+        Architecture::Qwen38Dense27B => &REQUIRED_FILES,
     }
 }
 
