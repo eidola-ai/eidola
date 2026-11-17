@@ -21,7 +21,7 @@
 //!
 //! A response cut off by `length` keeps the calls already completed; a call
 //! whose closing tag never arrived is given out as content (see
-//! [`crate::mimo::tool_call`] and [`crate::deepseek::output`]).
+//! [`crate::tool_call::xml`] and [`crate::deepseek::output`]).
 
 use std::ops::Range;
 
@@ -29,10 +29,9 @@ use crate::ChatFormat;
 use crate::args::ToolSchemas;
 use crate::deepseek::output::{DsmlParser, ReasoningSplitter};
 use crate::error::ChatError;
-use crate::mimo::reasoning::ReasoningParser;
-use crate::mimo::tool_call::ToolCallParser;
-use crate::reasoning::ReasoningDelta;
+use crate::reasoning::{ReasoningDelta, ReasoningParser};
 use crate::tokenizer::{Detokenizer, Tokenizer};
+use crate::tool_call::xml::{Markup, ToolCallParser};
 use crate::tool_call::{CallIdSource, ToolCall, ToolCallDelta};
 
 /// Why the engine stopped generating.
@@ -119,6 +118,17 @@ impl OutputConfig {
         }
     }
 
+    /// The configuration for a Qwen3.8 response to a prompt rendered with
+    /// [`crate::qwen::RenderOptions::enable_thinking`] as `enable_thinking`;
+    /// `tools` are the request's, from [`ToolSchemas::from_tools`]. A Qwen3.8
+    /// response is never continuable ([`OutputParser::resumes_exactly`]).
+    pub fn qwen3_8(enable_thinking: Option<bool>, tools: Option<ToolSchemas>) -> OutputConfig {
+        OutputConfig {
+            format: ChatFormat::Qwen3_8,
+            ..OutputConfig::new(enable_thinking, tools)
+        }
+    }
+
     /// The same configuration for the output of a prompt rendered with
     /// `continue_final_message` set to `field`.
     pub fn continuing_in(mut self, field: Option<&'static str>) -> OutputConfig {
@@ -171,21 +181,21 @@ impl ChatDelta {
 
 /// A format's reasoning splitter.
 enum Reasoning {
-    Mimo(ReasoningParser),
+    Think(ReasoningParser),
     DeepSeek(ReasoningSplitter),
 }
 
 impl Reasoning {
     fn push(&mut self, text: &str) -> ReasoningDelta {
         match self {
-            Reasoning::Mimo(parser) => parser.push(text),
+            Reasoning::Think(parser) => parser.push(text),
             Reasoning::DeepSeek(splitter) => splitter.push(text),
         }
     }
 
     fn finish(&mut self) -> ReasoningDelta {
         match self {
-            Reasoning::Mimo(parser) => parser.finish(),
+            Reasoning::Think(parser) => parser.finish(),
             Reasoning::DeepSeek(splitter) => splitter.finish(),
         }
     }
@@ -193,28 +203,28 @@ impl Reasoning {
 
 /// A format's tool-call parser.
 enum Tools {
-    Mimo(ToolCallParser),
+    Xml(ToolCallParser),
     DeepSeek(DsmlParser),
 }
 
 impl Tools {
     fn push(&mut self, text: &str) -> ToolCallDelta {
         match self {
-            Tools::Mimo(parser) => parser.push(text),
+            Tools::Xml(parser) => parser.push(text),
             Tools::DeepSeek(parser) => parser.push(text),
         }
     }
 
     fn before_any_block(&self) -> bool {
         match self {
-            Tools::Mimo(parser) => parser.before_any_block(),
+            Tools::Xml(parser) => parser.before_any_block(),
             Tools::DeepSeek(parser) => parser.before_any_block(),
         }
     }
 
     fn finish(&mut self) -> ToolCallDelta {
         match self {
-            Tools::Mimo(parser) => parser.finish(),
+            Tools::Xml(parser) => parser.finish(),
             Tools::DeepSeek(parser) => parser.finish(),
         }
     }
@@ -237,6 +247,7 @@ pub struct OutputParser {
     cut_in_delimiter: bool,
     thinking: bool,
     continuing: Option<&'static str>,
+    format: ChatFormat,
 }
 
 impl std::fmt::Debug for OutputParser {
@@ -252,11 +263,11 @@ impl OutputParser {
         OutputParser {
             detok: Detokenizer::new(config.skip_special_tokens),
             reasoning: match (config.format, config.continuing) {
-                (ChatFormat::MimoV2_6, None) => {
-                    Reasoning::Mimo(ReasoningParser::new(config.thinking))
+                (ChatFormat::MimoV2_6 | ChatFormat::Qwen3_8, None) => {
+                    Reasoning::Think(ReasoningParser::new(config.thinking))
                 }
-                (ChatFormat::MimoV2_6, Some(field)) => {
-                    Reasoning::Mimo(ReasoningParser::resuming(field == "reasoning_content"))
+                (ChatFormat::MimoV2_6 | ChatFormat::Qwen3_8, Some(field)) => {
+                    Reasoning::Think(ReasoningParser::resuming(field == "reasoning_content"))
                 }
                 (ChatFormat::DeepSeekV4_1, None) => {
                     Reasoning::DeepSeek(ReasoningSplitter::new(config.thinking))
@@ -266,7 +277,10 @@ impl OutputParser {
                 }
             },
             tools: config.tools.map(|schemas| match config.format {
-                ChatFormat::MimoV2_6 => Tools::Mimo(ToolCallParser::new(schemas, ids)),
+                ChatFormat::MimoV2_6 => Tools::Xml(ToolCallParser::new(schemas, ids)),
+                ChatFormat::Qwen3_8 => {
+                    Tools::Xml(ToolCallParser::in_markup(Markup::Newlines, schemas, ids))
+                }
                 ChatFormat::DeepSeekV4_1 => Tools::DeepSeek(DsmlParser::new(schemas, ids)),
             }),
             tool_calls_emitted: false,
@@ -277,6 +291,7 @@ impl OutputParser {
             cut_in_delimiter: false,
             thinking: config.thinking,
             continuing: config.continuing,
+            format: config.format,
         }
     }
 
@@ -325,9 +340,11 @@ impl OutputParser {
     /// the template's own `<think>` and `</think>` are. `None` where no
     /// continuation would resume this parse.
     fn continued_text(&self) -> Option<(String, Vec<Range<usize>>)> {
-        // The DeepSeek-V4.1 encoder has no continued final message to resume
-        // from.
-        let Reasoning::Mimo(reasoning) = &self.reasoning else {
+        // Only MiMo-V2.6's continued final message is rendered as the text the
+        // model generated: the DeepSeek-V4.1 encoder has none, and Qwen3.8's
+        // template trims the reasoning and the answer it continues.
+        let (ChatFormat::MimoV2_6, Reasoning::Think(reasoning)) = (self.format, &self.reasoning)
+        else {
             return None;
         };
         if self.tool_calls_emitted || self.lossy || self.cut_in_delimiter {

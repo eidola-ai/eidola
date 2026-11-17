@@ -1,9 +1,12 @@
 //! Tool calls as every chat format's output parser produces them: the call, the
 //! source of its ids, one streaming step, a complete output's result, and what
-//! becomes of text that is not a call. Each format's parser is its own:
-//! [`crate::mimo::tool_call`] and [`crate::deepseek::output`].
+//! becomes of text that is not a call. The `<tool_call><function=…>` markup
+//! MiMo-V2.6 and Qwen3.8 write is parsed by [`xml`]; DeepSeek-V4.1's DSML by
+//! [`crate::deepseek::output`].
 
-/// What becomes of output text that is not a call ([`crate::mimo::tool_call`]'s
+pub mod xml;
+
+/// What becomes of output text that is not a call ([`xml`]'s
 /// module docs).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UnparsedText {

@@ -2,7 +2,7 @@
 
 `Qwen/Qwen3.8-27B-FP8`, text only, on one Blackwell GPU. The architecture is `eidola_common::architecture::Architecture::Qwen38Dense27B`.
 
-**Status: in progress.** The reference forward is implemented and verified on the CPU; the serving core carries the recurrent state (below); and the CPU executor reproduces the forward bit for bit through the real scheduler, drafting included. Nothing else is implemented. The variant is a stub: its shape is `unimplemented!`, and no catalog row or deployment may name it.
+**Status: in progress.** The reference forward and the chat format are implemented and verified; the serving core carries the recurrent state (below); and the CPU executor reproduces the forward bit for bit through the real scheduler, drafting included. Nothing else is implemented. The variant is a stub: its shape is `unimplemented!`, and no catalog row or deployment may name it.
 
 ## The model
 
@@ -34,7 +34,7 @@ The DeltaNet layers' state is a pool of state buffers beside the KV groups (`eid
 | `eidola-common` | `architecture.rs` (`Qwen38Dense27B`, a stub); then its `Shape`, `engine_deployment` (one device) and `weights_manifest` (required files) |
 | `eidola-engine` | the seam's recurrent state (`spec.rs` `StateSpec`, `executor.rs` → Recurrent state) and its snapshots in the prefix cache (`kv.rs`); `mock::qwen_like_spec` and `mock/recurrent.rs`; `tests/recurrent_state.rs` |
 | `eidola-engine-model` | `src/qwen/`; `tests/qwen_*` (`qwen_tiny`, `qwen_config`, `qwen_real`, `qwen_health`, `qwen_upstream/`); `tests/fixtures/qwen_tiny/`; `tests/data/qwen3.8-27b.config.json`; `golden/qwen/` (pinned reference tooling, upstream hashes, health check, the whole-model session) |
-| `eidola-engine-chat` | `src/qwen/` (the template, `<think>` reasoning and `<tool_call>` parsers); `tests/qwen_*`; `tests/fixtures/qwen/`; `dev/qwen_*` |
+| `eidola-engine-chat` | `src/qwen/` (the template, options and validation); with MiMo, the shared `src/jinja.rs`, `src/reasoning.rs` and `src/tool_call/xml.rs`; `tests/qwen_*`; `tests/fixtures/qwen/`; `dev/qwen_*` |
 | `eidola-engine-cpu` | `src/qwen/` (`QwenCpuExecutor`, its state buffers and tails, `QwenDenseOracle`); `tests/qwen_engine.rs`, `tests/qwen_memory.rs`, `tests/qwen_common/` |
 | `eidola-engine-kernels` | `csrc/qwen_*` and their `kernels.json` entries; `oracle/qwen_*`; `tests/qwen_*` |
 | `eidola-engine-cuda` | `src/qwen/`; `tests/qwen_*`; `examples/qwen_*`; `scripts/qwen_*` |
@@ -44,8 +44,6 @@ The DeltaNet layers' state is a pool of state buffers beside the KV groups (`eid
 ## Outstanding work
 
 - the reference forward against the reference as released on a GPU, and its drafter against vLLM's (prepared: `golden/qwen/full_session.sh`);
-- the chat template, rendered byte for byte, and the reasoning and tool-call parsers;
-- MTP drafting: the drafter's rows and the canonical rewrite of its KV at accepted positions (the serving core already keeps the recurrent state across rejected drafts);
 - ahead-of-time kernels for the DeltaNet recurrence, the short convolution and gated attention, and the CUDA executor;
 - the architecture's `Shape`, the node, the catalog row and the deployment;
 - speed measured against a reference serving stack on the same GPU.
