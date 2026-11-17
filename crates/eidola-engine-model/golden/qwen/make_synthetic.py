@@ -1,12 +1,17 @@
 """Rewrite the committed synthetic fixture and its goldens.
 
-    uv run python make_synthetic.py [--out <dir>]
+    uv run python make_synthetic.py [--out <dir>] [--head-dim 256]
 
 Writes `config.json`, `model.safetensors` (seeded random weights in the
 checkpoint's storage formats, `qwen_golden/synthetic.py`) and
 `golden.safetensors`: the released model code's outputs, with the unspecified
 operations pinned (`qwen_golden/pinned_ops.py`), for a fixed token sequence.
 The bytes are a function of the code alone.
+
+`--head-dim 256` writes the released attention geometry at the fixture's other
+sizes (`synthetic.head_dim_256`) into `tests/fixtures/qwen_tiny256` by default:
+the fixture the CUDA executor's fast profile runs, whose attention kernels are
+compiled for 256-wide heads.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from qwen_golden import pinned_ops, reference, st, synthetic  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_OUT = HERE.parent.parent / "tests" / "fixtures" / "qwen_tiny"
+D256_OUT = HERE.parent.parent / "tests" / "fixtures" / "qwen_tiny256"
 
 
 def bf16(t: torch.Tensor) -> tuple:
@@ -34,8 +40,12 @@ def bf16(t: torch.Tensor) -> tuple:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--head-dim", type=int, choices=[128, 256], default=128)
     a = ap.parse_args()
+    if a.head_dim == 256:
+        synthetic.head_dim_256()
+    a.out = a.out or (D256_OUT if a.head_dim == 256 else DEFAULT_OUT)
     torch.set_num_threads(1)
     pinned_ops.install()
     a.out.mkdir(parents=True, exist_ok=True)

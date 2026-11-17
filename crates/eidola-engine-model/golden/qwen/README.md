@@ -1,6 +1,6 @@
 # Qwen3.8 golden generation (dev-only)
 
-Python tooling that produces the reference outputs the Qwen3.8 forward (`src/qwen/`) is checked against, and checks the released checkpoint's health. It is never a build input: `cargo test` reads only the committed fixture under `tests/fixtures/qwen_tiny/` and needs neither Python nor the network.
+Python tooling that produces the reference outputs the Qwen3.8 forward (`src/qwen/`) is checked against, and checks the released checkpoint's health. It is never a build input: `cargo test` reads only the committed fixtures under `tests/fixtures/qwen_tiny/` and `tests/fixtures/qwen_tiny256/` and needs neither Python nor the network.
 
 ## What the goldens are
 
@@ -48,6 +48,12 @@ rewrites `tests/fixtures/qwen_tiny/` (about 3 MB):
 - `golden.safetensors`: `tokens` (80); `prefill.*`, the sequence as one call (logits, the normed final state, every layer's stream, every DeltaNet layer's convolution history and recurrent state after the last token); `step.logits`, a call of 24 tokens then one token per call; `mtp.*`, the drafter at every position but the last.
 
 Output is deterministic down to the file bytes. After regenerating, run `cargo test -p eidola-engine-model`.
+
+```sh
+uv run python make_synthetic.py --head-dim 256
+```
+
+rewrites `tests/fixtures/qwen_tiny256/` (about 5 MB): the same model with the released attention geometry (256-wide heads, 12 query heads over 2 KV heads, a rotary width of 64; `synthetic.head_dim_256`), the files and goldens as above. The CUDA executor's fast profile runs on it, since its attention kernels are compiled for 256-wide heads; `eidola-engine-cuda`'s `tests/qwen_host.rs` holds the model crate's forward to its goldens bit for bit.
 
 ## Real weights (local, not CI)
 
