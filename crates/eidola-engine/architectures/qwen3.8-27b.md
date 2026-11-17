@@ -2,7 +2,7 @@
 
 `Qwen/Qwen3.8-27B-FP8`, text only, on one Blackwell GPU. The architecture is `eidola_common::architecture::Architecture::Qwen38Dense27B`.
 
-**Status: in progress; nothing is implemented.** The variant is a stub: its shape is `unimplemented!`, and no catalog row or deployment may name it.
+**Status: in progress.** The serving core carries its recurrent state (below) and its mock runs it; nothing else is implemented. The variant is a stub: its shape is `unimplemented!`, and no catalog row or deployment may name it.
 
 ## The model
 
@@ -23,12 +23,16 @@ Each level is held to the one before it, as for the other architectures:
 
 The Gated DeltaNet can be computed token by token or in chunks of tokens, and the two orders round differently. The executors' contract fixes one form, chosen so that a layer's state and output depend only on the token prefix, never on how a sequence was chunked; the reference forward documents it.
 
+## The recurrent state in the serving core
+
+The DeltaNet layers' state is a pool of state buffers beside the KV groups (`eidola-engine/AGENTS.md` → Recurrent state): a sequence keeps a base buffer at its last block boundary and its executor slot the inputs after it; drafts never reach a stored state; and the prefix cache keeps snapshots only at a sequence's branch, regeneration and continuation points, with every guarantee its KV blocks get. `mock::qwen_like_spec` is the shape the serving core's tests run (`tests/recurrent_state.rs`).
+
 ## Where the code will live
 
 | Crate | Qwen3.8 code |
 |---|---|
 | `eidola-common` | `architecture.rs` (`Qwen38Dense27B`, a stub); then its `Shape`, `engine_deployment` (one device) and `weights_manifest` (required files) |
-| `eidola-engine` | the seam's recurrent-state groups and their snapshots in the prefix cache; a Qwen-shaped mock |
+| `eidola-engine` | the seam's recurrent state (`spec.rs` `StateSpec`, `executor.rs` → Recurrent state) and its snapshots in the prefix cache (`kv.rs`); `mock::qwen_like_spec` and `mock/recurrent.rs`; `tests/recurrent_state.rs` |
 | `eidola-engine-model` | `src/qwen/`; `tests/qwen_*`; `tests/fixtures/qwen_tiny/`; `golden/qwen/` (pinned reference tooling, upstream hashes, health check) |
 | `eidola-engine-chat` | `src/qwen/` (the template, `<think>` reasoning and `<tool_call>` parsers); `tests/qwen_*`; `tests/fixtures/qwen/`; `dev/qwen_*` |
 | `eidola-engine-cpu` | `src/qwen/`; `tests/qwen_*` |
@@ -43,8 +47,7 @@ Everything:
 
 - the reference forward, its oracle tooling and the health check;
 - the chat template, rendered byte for byte, and the reasoning and tool-call parsers;
-- the seam's recurrent state and its place in the prefix cache: snapshots zeroed on free, encrypted when idle and demoted as ciphertext, like KV;
-- MTP drafting, including the recurrent state across rejected drafts;
+- MTP drafting: the drafter's rows and the canonical rewrite of its KV at accepted positions (the serving core already keeps the recurrent state across rejected drafts);
 - the CPU executor;
 - ahead-of-time kernels for the DeltaNet recurrence, the short convolution and gated attention, and the CUDA executor;
 - the architecture's `Shape`, the node, the catalog row and the deployment;

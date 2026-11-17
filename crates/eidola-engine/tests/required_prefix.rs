@@ -11,7 +11,7 @@ mod common;
 use common::*;
 use eidola_common::engine_protocol::{CACHED_PREFIX_QUANTUM, declarable_cached_tokens};
 use eidola_engine::engine::{CacheScope, FinishReason, Request, SchedulerConfig, SubmitError};
-use eidola_engine::mock::{MockConfig, mimo_like_spec, with_host_tier};
+use eidola_engine::mock::{MockConfig, mimo_like_spec, qwen_like_spec, with_host_tier};
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::secret::{BootKey, CacheKey, SaltDeriver};
 use eidola_engine::spec::ModelSpec;
@@ -420,6 +420,9 @@ struct Geometry {
     window: u32,
     drafter_window: u32,
     chunk: u32,
+    /// A model with recurrent state (full-attention KV and a state snapshot per retained
+    /// point) instead of sliding windows.
+    state: bool,
 }
 
 const VOCAB: u32 = 4096;
@@ -431,7 +434,11 @@ const VOCAB: u32 = 4096;
 /// `None` when a stop ending at `c` cannot be arranged (the token at `c` came earlier
 /// too); otherwise the failures, described.
 fn rule_case(geo: Geometry, speculative: bool, n: u32, c: u32, stop: bool) -> Option<Vec<String>> {
-    let spec = mimo_like_spec(VOCAB, geo.block, geo.window, geo.drafter_window, 256, 8, 3);
+    let spec = if geo.state {
+        qwen_like_spec(VOCAB, geo.block, 256, 64, 8, 3)
+    } else {
+        mimo_like_spec(VOCAB, geo.block, geo.window, geo.drafter_window, 256, 8, 3)
+    };
     let mut cfg = sched(speculative);
     cfg.max_prefill_chunk = geo.chunk;
     let mut h = Harness::new(spec, cfg, MockConfig::default());
@@ -553,6 +560,7 @@ const BLOCK_16: Geometry = Geometry {
     window: 40,
     drafter_window: 70,
     chunk: 256,
+    state: false,
 };
 
 const BLOCK_32: Geometry = Geometry {
@@ -560,6 +568,7 @@ const BLOCK_32: Geometry = Geometry {
     window: 70,
     drafter_window: 100,
     chunk: 100,
+    state: false,
 };
 
 #[test]
@@ -584,4 +593,30 @@ fn the_declaration_rule_holds_at_block_32_in_uneven_chunks() {
 fn the_declaration_rule_holds_at_block_32_across_a_quantum() {
     let (ns, cs) = crossing(481..513, &[32, 33, 48, 63]);
     sweep(BLOCK_32, ns, &cs);
+}
+
+#[test]
+fn the_declaration_rule_holds_with_recurrent_state_at_block_16() {
+    let cs: Vec<u32> = (1..=16).collect();
+    sweep(
+        Geometry {
+            state: true,
+            ..BLOCK_16
+        },
+        257..273,
+        &cs,
+    );
+}
+
+#[test]
+fn the_declaration_rule_holds_with_recurrent_state_across_a_quantum() {
+    let (ns, cs) = crossing(481..513, &[32, 33, 48, 63]);
+    sweep(
+        Geometry {
+            state: true,
+            ..BLOCK_32
+        },
+        ns,
+        &cs,
+    );
 }

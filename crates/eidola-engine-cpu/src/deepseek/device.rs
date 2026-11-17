@@ -824,6 +824,7 @@ mod tests {
             buckets: Vec::new(),
             window_chain: None,
             token_history: 3,
+            state: None,
         };
         let cfg = DsCpuExecutorConfig {
             block_size,

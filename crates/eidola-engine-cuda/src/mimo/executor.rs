@@ -396,6 +396,7 @@ impl CudaExecutor {
             buckets: cfg.buckets.clone(),
             window_chain: None,
             token_history: 0,
+            state: None,
         };
         spec.validate().map_err(CudaError::new)?;
         Ok(Plan {
