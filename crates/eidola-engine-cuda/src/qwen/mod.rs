@@ -4,12 +4,16 @@
 //! ([`executor`]).
 
 pub mod abi;
+pub mod attention;
 pub mod cuda;
 pub mod device;
 pub mod executor;
 pub mod host;
 pub mod kernels;
+pub mod plan;
 pub mod weights;
 
 pub use device::{QwenDevice, QwenProfile};
-pub use executor::{QwenCudaExecutor, QwenCudaExecutorConfig, StateStrategy};
+pub use executor::{
+    CudaGraphs, DecodePath, DecodeStats, QwenCudaExecutor, QwenCudaExecutorConfig, StateStrategy,
+};

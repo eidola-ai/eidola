@@ -5,18 +5,26 @@
 //! function ([`super::kernels`]), exactly as a device launch does, and then runs the body
 //! over that grid. So without a GPU the executor's scenarios exercise the structs it
 //! fills, the wrappers' preconditions, the grids and the C++ a GPU compiles. It computes
-//! only the exact profile.
+//! only the exact profile. The row copy, the sampler and chain acceptance have no host
+//! body: here they are this device's reading of `eidola_copy_rows` (every index bounded,
+//! as the kernel bounds it) and of `eidola_sample` and `eidola_chain_accept`
+//! (`eidola_engine::sampling`, which the device sampler equals bit for bit given equal
+//! logits). It captures no graphs: the executor's padded launch sequence runs on it
+//! directly.
 
 use std::any::Any;
 use std::ffi::c_void;
 
 use eidola_engine::kv_cipher::{KvKeystream, KvNonce};
+use eidola_engine::sampling::{self, Logits, SamplingParams};
 use eidola_engine::secret::KvKey;
 
 use super::abi::*;
+use super::attention::Fa2Args;
 use super::device::{QwenDevice, QwenProfile};
 use super::kernels::*;
-use crate::Result;
+use crate::sampler::{STATUS_BAD_TOKEN as SAMPLE_BAD_TOKEN, STATUS_NON_FINITE, SampleRow};
+use crate::{CudaError, Result};
 
 /// Runs one launch: the family's name (the oracle's `qwen_host_<family>`), its parameter
 /// struct, and the grid's x and y.
@@ -25,11 +33,26 @@ pub type HostLaunch = dyn Fn(&'static str, *const c_void, u32, u32) + Send + Syn
 /// Host memory with a host function per kernel family.
 pub struct HostDevice {
     launch: Box<HostLaunch>,
+    profile: QwenProfile,
 }
 
 impl HostDevice {
     pub fn new(launch: Box<HostLaunch>) -> HostDevice {
-        HostDevice { launch }
+        HostDevice {
+            launch,
+            profile: QwenProfile::Exact,
+        }
+    }
+
+    /// A device that plans as the fast profile does, for the plans' tests: every
+    /// launch but FA2 computes as in the exact profile, and each FA2 launch is checked
+    /// (its plan against its layer and scratch) and computes nothing, leaving its output
+    /// as it was.
+    pub fn planning_fast(launch: Box<HostLaunch>) -> HostDevice {
+        HostDevice {
+            launch,
+            profile: QwenProfile::Fast,
+        }
     }
 
     fn run<T>(&self, family: &'static str, p: &T, grid: Result<[u32; 3]>) -> Result<()> {
@@ -75,7 +98,7 @@ impl QwenKernels for HostDevice {
         }
         self.run("lin8", p, lin8_grid(p))
     }
-    unsafe fn linear(&self, p: &LinearParams, _large: bool) -> Result<()> {
+    unsafe fn linear(&self, p: &LinearParams, _fast: Option<u64>) -> Result<()> {
         if p.rows == 0 {
             return Ok(());
         }
@@ -129,6 +152,143 @@ impl QwenKernels for HostDevice {
         }
         self.run("round", p, round_grid(p))
     }
+    unsafe fn copy_rows(&self, a: &CopyArgs) -> Result<()> {
+        copy_grid(a.items, a.width)?;
+        let w = a.width as usize;
+        for i in 0..a.items as usize {
+            // SAFETY: the caller's item arrays of `items` words and buffers of
+            // `rows[b] · width` words; every index is bounded below as the kernel does.
+            unsafe {
+                let sb = rd::<u32>(a.src_buf, i) as usize;
+                let db = rd::<u32>(a.dst_buf, i) as usize;
+                let sr = u64::from(rd::<u32>(a.src_row, i));
+                let dr = u64::from(rd::<u32>(a.dst_row, i));
+                if sb >= COPY_BUFFERS || db >= COPY_BUFFERS || sr >= a.rows[sb] || dr >= a.rows[db]
+                {
+                    *wr::<u32>(a.status, 1).first_mut().expect("a word") |= STATUS_BAD_INDEX;
+                    continue;
+                }
+                let src = a.buf[sb] + sr * w as u64 * 4;
+                let dst = a.buf[db] + dr * w as u64 * 4;
+                std::ptr::copy(src as *const u32, dst as *mut u32, w);
+            }
+        }
+        Ok(())
+    }
+    unsafe fn sample(&self, a: &SampleArgs) -> Result<()> {
+        let n = a.n as usize;
+        if a.num_rows == 0 {
+            return Ok(());
+        }
+        if n == 0 || a.n as u64 > a.logits_stride || a.n > 1 << 20 {
+            return Err(CudaError::new(format!("sample: vocabulary {n}")));
+        }
+        for r in 0..a.num_rows as usize {
+            // SAFETY: the caller's rows, logits, distributions and tokens.
+            unsafe {
+                let row = rd::<SampleRow>(a.rows, r);
+                let params = params_of(&row)?;
+                let at = a.logits + u64::from(row.logit_row) * a.logits_stride * 4;
+                let logits = wr::<f32>(at, n);
+                if logits.iter().any(|v| v.is_nan() || *v == f32::INFINITY)
+                    || (!params.is_greedy() && logits.iter().all(|v| *v == f32::NEG_INFINITY))
+                {
+                    *wr::<u32>(a.status, 1).first_mut().expect("a word") |= STATUS_NON_FINITE;
+                    continue;
+                }
+                let l = Logits::new(logits, a.n);
+                let probs = sampling::processed_probs(l, &params);
+                wr::<f64>(a.probs + (r * n * 8) as u64, n).copy_from_slice(&probs);
+                if let Some(stream) = a.draw {
+                    let t = if params.is_greedy() {
+                        sampling::argmax(l)
+                    } else {
+                        let u = sampling::uniform(params.seed(), u64::from(row.position), stream);
+                        sampling::sample_from(&probs, u)
+                    };
+                    wr::<u32>(a.tokens + (r * 4) as u64, 1)[0] = t;
+                }
+            }
+        }
+        Ok(())
+    }
+    unsafe fn accept(&self, a: &AcceptLaunch) -> Result<()> {
+        let n = a.n as usize;
+        for r in 0..a.num_rows as usize {
+            // SAFETY: the caller's rows, distributions, ids and outputs.
+            unsafe {
+                let row = rd::<SampleRow>(a.rows, r);
+                let params = params_of(&row)?;
+                let k = rd::<u32>(a.num_drafts, r) as usize;
+                let t0 = rd::<u32>(a.target_row, r) as usize;
+                let d0 = rd::<u32>(a.draft_row, r) as usize;
+                let step = a.draft_step as usize;
+                let dist = |base: u64, i: usize| wr::<f64>(base + (i * n * 8) as u64, n).to_vec();
+                let mut ids = Vec::with_capacity(k);
+                let mut bad = false;
+                for i in 0..k {
+                    let id = rd::<u32>(a.drafts, d0 + i * step);
+                    bad |= id >= a.n;
+                    ids.push(id);
+                }
+                let count = wr::<u32>(a.counts + (r * 4) as u64, 1);
+                if bad {
+                    *wr::<u32>(a.status, 1).first_mut().expect("a word") |= SAMPLE_BAD_TOKEN;
+                    count[0] = 0;
+                    continue;
+                }
+                let target: Vec<Vec<f64>> = (0..=k).map(|i| dist(a.target, t0 + i)).collect();
+                let draft: Vec<Vec<f64>> = (0..k).map(|i| dist(a.draft, d0 + i * step)).collect();
+                let out =
+                    sampling::chain_accept(&target, &draft, &ids, &params, u64::from(row.position));
+                let dst = wr::<u32>(a.out + (r * a.stride as usize * 4) as u64, out.len());
+                dst.copy_from_slice(&out);
+                count[0] = u32::try_from(out.len()).expect("at most k + 1 tokens");
+            }
+        }
+        Ok(())
+    }
+    unsafe fn fa2(&self, a: &Fa2Args) -> Result<()> {
+        if self.profile != QwenProfile::Fast {
+            return Err(CudaError::new(
+                "FA2 has no host body: the host device runs the exact profile",
+            ));
+        }
+        let s = &a.view.shape;
+        let l = &a.layer;
+        let ok = s.split
+            && l.window_left < 0
+            && (s.tile == 16 || s.tile == 64)
+            && l.num_kv_heads > 0
+            && a.num_qo_heads / l.num_kv_heads == s.group_size
+            && l.page_size == s.page_size
+            && s.partial_rows <= a.partials.rows
+            && a.partials.heads == a.num_qo_heads;
+        if !ok {
+            return Err(CudaError::new(format!("FA2 launch refused: {a:?}")));
+        }
+        // SAFETY: the view's work-item count word, in the table.
+        let work = unsafe { rd::<u32>(a.view.work_items, 0) };
+        if work > s.grid.max(1) * 1_000_000 {
+            return Err(CudaError::new("FA2 work items past any plan"));
+        }
+        Ok(())
+    }
+}
+
+/// Element `i` of a host array at `addr`.
+///
+/// # Safety
+///
+/// `addr` holds at least `i + 1` values of `T`, aligned.
+unsafe fn rd<T: Copy>(addr: u64, i: usize) -> T {
+    // SAFETY: the caller's.
+    unsafe { *(addr as *const T).add(i) }
+}
+
+fn params_of(row: &SampleRow) -> Result<SamplingParams> {
+    SamplingParams::new(row.temperature, row.top_k, row.top_p, row.min_p, row.seed)
+        .map_err(|e| CudaError::new(format!("a sample row's parameters: {e:?}")))
 }
 
 /// Host allocations are aligned to this, as device ones are.
@@ -145,7 +305,7 @@ fn host_alloc(bytes: usize) -> (u64, Box<dyn Any>) {
 
 impl QwenDevice for HostDevice {
     fn profile(&self) -> QwenProfile {
-        QwenProfile::Exact
+        self.profile
     }
 
     fn alloc(&self, bytes: usize) -> Result<(u64, Box<dyn Any>)> {
@@ -204,5 +364,17 @@ impl QwenDevice for HostDevice {
 
     fn synchronize(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn capture(&self, _run: &mut dyn FnMut() -> Result<()>) -> Result<Box<dyn Any>> {
+        Err(CudaError::new("the host device captures no graphs"))
+    }
+
+    fn replay(&self, _graph: &dyn Any) -> Result<()> {
+        Err(CudaError::new("the host device replays no graphs"))
+    }
+
+    fn free_memory(&self) -> Result<i64> {
+        Ok(0)
     }
 }

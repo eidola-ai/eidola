@@ -19,23 +19,32 @@ use eidola_engine::secret::{BootKey, CacheKey, Lineage, SaltDeriver};
 use eidola_engine::spec::{Bucket, ModelSpec};
 use eidola_engine_cpu::qwen::{QwenCpuExecutor, QwenCpuExecutorConfig};
 use eidola_engine_cuda::qwen::{
-    QwenCudaExecutor, QwenCudaExecutorConfig, QwenDevice, StateStrategy,
+    CudaGraphs, QwenCudaExecutor, QwenCudaExecutorConfig, QwenDevice, StateStrategy,
 };
 use eidola_engine_model::qwen::{QwenModel, load_reference};
 
 pub const VOCAB: u32 = 500;
 pub const SAMPLEABLE: u32 = 508;
 
-/// The model crate's committed synthetic fixture.
+/// The model crate's committed synthetic fixture: `qwen_tiny`, or with
+/// [`super::with_fixture_256`] `qwen_tiny256` (the released attention geometry, which the
+/// fast profile's attention kernels are compiled for).
 pub fn fixture() -> Arc<QwenModel> {
     static MODEL: OnceLock<Arc<QwenModel>> = OnceLock::new();
-    MODEL
-        .get_or_init(|| {
-            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../eidola-engine-model/tests/fixtures/qwen_tiny");
-            Arc::new(load_reference(&dir, Ok).expect("the fixture"))
-        })
+    static MODEL_256: OnceLock<Arc<QwenModel>> = OnceLock::new();
+    let (cell, name) = if super::fixture_256() {
+        (&MODEL_256, "qwen_tiny256")
+    } else {
+        (&MODEL, "qwen_tiny")
+    };
+    cell.get_or_init(|| Arc::new(load_reference(&fixture_dir(name), Ok).expect("the fixture")))
         .clone()
+}
+
+pub fn fixture_dir(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../eidola-engine-model/tests/fixtures")
+        .join(name)
 }
 
 /// Deterministic test RNG (SplitMix64).
@@ -63,6 +72,7 @@ pub struct Geometry {
     pub host_buffers: u32,
     pub k: u32,
     pub strategy: StateStrategy,
+    pub graphs: CudaGraphs,
 }
 
 impl Geometry {
@@ -74,6 +84,7 @@ impl Geometry {
             host_buffers: 0,
             k,
             strategy: StateStrategy::Live,
+            graphs: super::graphs_now(),
         }
     }
 }
@@ -124,6 +135,7 @@ pub fn cuda_config(g: &Geometry) -> QwenCudaExecutorConfig {
         draft_tokens: g.k,
         sampleable_vocab_size: SAMPLEABLE,
         strategy: g.strategy,
+        graphs: g.graphs,
     }
 }
 
@@ -196,7 +208,10 @@ impl<D: QwenDevice> Executor for Pair<D> {
         let mut s = step.clone();
         s.return_logits = true;
         let a = self.cpu.execute(&s)?;
+        let before = self.cuda.decode_stats();
         let b = self.cuda.execute(&s)?;
+        let after = self.cuda.decode_stats();
+        super::note_rung_steps(after.direct + after.replay - before.direct - before.replay);
         let n = self.steps;
         assert_eq!(a.num_tokens, b.num_tokens, "step {n}: token counts");
         assert_eq!(a.tokens, b.tokens, "step {n}: tokens");
@@ -258,7 +273,8 @@ impl<D: QwenDevice> Harness<D> {
     pub fn new(dev: D, g: &Geometry, sched: SchedulerConfig) -> Self {
         let model = fixture();
         let cpu = QwenCpuExecutor::new(model.clone(), cpu_config(g));
-        let cuda = QwenCudaExecutor::new(dev, &model, cuda_config(g)).expect("the executor");
+        let mut cuda = QwenCudaExecutor::new(dev, &model, cuda_config(g)).expect("the executor");
+        super::apply_path(&mut cuda);
         assert_eq!(
             cpu.spec(),
             cuda.spec(),

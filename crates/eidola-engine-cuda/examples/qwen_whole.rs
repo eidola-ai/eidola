@@ -32,7 +32,7 @@ use eidola_engine::spec::Bucket;
 use eidola_engine_cuda::KernelDir;
 use eidola_engine_cuda::qwen::cuda::CudaDevice;
 use eidola_engine_cuda::qwen::{
-    QwenCudaExecutor, QwenCudaExecutorConfig, QwenProfile, StateStrategy,
+    CudaGraphs, QwenCudaExecutor, QwenCudaExecutorConfig, QwenProfile, StateStrategy,
 };
 use eidola_engine_model::WeightSet;
 use eidola_engine_model::qwen::{LogitRows, QwenForwardOptions, QwenModel, QwenWeights, config_of};
@@ -69,6 +69,11 @@ fn config(k: u32, strategy: StateStrategy) -> QwenCudaExecutorConfig {
         draft_tokens: k,
         sampleable_vocab_size: 248_077,
         strategy,
+        graphs: match std::env::var("EIDOLA_QWEN_GRAPHS").as_deref() {
+            Ok("on") => CudaGraphs::On,
+            Ok("off") | Err(_) => CudaGraphs::Off,
+            Ok(_) => fail("EIDOLA_QWEN_GRAPHS is on or off"),
+        },
     }
 }
 

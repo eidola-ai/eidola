@@ -269,6 +269,7 @@ pub fn linear<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
         let wb = buf(dev, &wbits);
         for out_f32 in [0u32, 1] {
             let ob = zeros(dev, rows * n * 4);
+            let tmp = zeros(dev, rows * n * 4);
             let p = LinearParams {
                 x: xb.addr,
                 w: wb.addr,
@@ -281,7 +282,7 @@ pub fn linear<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
                 out_f32,
             };
             // SAFETY: the buffers hold what the struct names.
-            unsafe { dev.linear(&p, true) }.map_err(|e| e.to_string())?;
+            unsafe { dev.linear(&p, Some(tmp.addr)) }.map_err(|e| e.to_string())?;
             if out_f32 == 1 {
                 same(
                     "linear f32",

@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
-use eidola_engine_cuda::qwen::QwenDevice;
 use eidola_engine_cuda::qwen::host::HostDevice;
+use eidola_engine_cuda::qwen::{CudaGraphs, DecodePath, QwenCudaExecutor, QwenDevice};
 
 /// The compiled bodies, or `None` (after saying why) without a C++ compiler.
 pub fn library() -> Option<Arc<libloading::Library>> {
@@ -76,7 +76,11 @@ type HostFn = unsafe extern "C" fn(*const c_void, u32, u32);
 
 /// A [`HostDevice`] whose launches run the compiled bodies.
 pub fn host_device(lib: Arc<libloading::Library>) -> HostDevice {
-    HostDevice::new(Box::new(move |family, params, gx, gy| {
+    HostDevice::new(host_launch(lib))
+}
+
+fn host_launch(lib: Arc<libloading::Library>) -> Box<eidola_engine_cuda::qwen::host::HostLaunch> {
+    Box::new(move |family, params, gx, gy| {
         let name = format!("qwen_host_{family}\0");
         // SAFETY: every `qwen_host_*` symbol has this signature, and takes the family's
         // parameter struct, which the device built for it.
@@ -85,7 +89,13 @@ pub fn host_device(lib: Arc<libloading::Library>) -> HostDevice {
                 lib.get(name.as_bytes()).expect("a host body per family");
             f(params, gx, gy);
         }
-    }))
+    })
+}
+
+/// A [`HostDevice`] planning as the fast profile: the compiled bodies, and FA2's launches
+/// checked and computing nothing.
+pub fn planning_fast(lib: Arc<libloading::Library>) -> HostDevice {
+    HostDevice::planning_fast(host_launch(lib))
 }
 
 /// The compiled-bodies device, or `None` without a compiler.
@@ -200,4 +210,55 @@ pub fn record(name: &str, text: &str) {
         std::fs::write(&path, text).expect("write the measurement");
         eprintln!("recorded {}", path.display());
     }
+}
+
+thread_local! {
+    static PATH: std::cell::Cell<(CudaGraphs, DecodePath)> =
+        const { std::cell::Cell::new((CudaGraphs::Off, DecodePath::Eager)) };
+    static RUNG_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FIXTURE_256: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with every harness on this thread over the fixture with 256-wide attention
+/// heads (`qwen_tiny256`).
+pub fn with_fixture_256<R>(f: impl FnOnce() -> R) -> R {
+    let old = FIXTURE_256.with(|c| c.replace(true));
+    let r = f();
+    FIXTURE_256.with(|c| c.set(old));
+    r
+}
+
+/// Whether harnesses built now use `qwen_tiny256`.
+pub fn fixture_256() -> bool {
+    FIXTURE_256.with(std::cell::Cell::get)
+}
+
+/// Runs `f` with every executor the harnesses build on this thread capturing graphs as
+/// `graphs` says and running decode steps that fit a rung by `path`.
+pub fn with_path<R>(graphs: CudaGraphs, path: DecodePath, f: impl FnOnce() -> R) -> R {
+    let old = PATH.with(|p| p.replace((graphs, path)));
+    let r = f();
+    PATH.with(|p| p.set(old));
+    r
+}
+
+/// The graphs setting executors built now take.
+pub fn graphs_now() -> CudaGraphs {
+    PATH.with(|p| p.get().0)
+}
+
+/// Sets the current decode path on a freshly built executor.
+pub fn apply_path<D: QwenDevice>(ex: &mut QwenCudaExecutor<D>) {
+    let path = PATH.with(|p| p.get().1);
+    ex.set_decode_path(path).expect("the decode path");
+}
+
+/// Counts steps a rung ran (directly or replayed), on this thread.
+pub fn note_rung_steps(n: u64) {
+    RUNG_STEPS.with(|c| c.set(c.get() + n));
+}
+
+/// Steps a rung ran on this thread so far.
+pub fn rung_steps() -> u64 {
+    RUNG_STEPS.with(std::cell::Cell::get)
 }

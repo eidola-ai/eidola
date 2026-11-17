@@ -102,4 +102,11 @@ pub trait QwenDevice: QwenKernels {
     unsafe fn copy_from_host(&self, dst: u64, src: *const u8, bytes: usize) -> Result<()>;
     /// Waits for everything queued.
     fn synchronize(&self) -> Result<()>;
+    /// Records the launches `run` queues into a graph, instead of running them, and
+    /// returns it instantiated and uploaded. A device that cannot capture refuses.
+    fn capture(&self, run: &mut dyn FnMut() -> Result<()>) -> Result<Box<dyn Any>>;
+    /// Queues a graph [`QwenDevice::capture`] returned.
+    fn replay(&self, graph: &dyn Any) -> Result<()>;
+    /// Free device memory, in bytes (0 where there is no device).
+    fn free_memory(&self) -> Result<i64>;
 }

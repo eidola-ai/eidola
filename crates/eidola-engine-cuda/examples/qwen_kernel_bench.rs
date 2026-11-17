@@ -156,6 +156,7 @@ fn main() {
     let x = alloc(&fast, 256 * hidden as usize * 2, &mut keep);
     fill(&fast, x, 256 * hidden as usize * 2, 4);
     let logits = alloc(&fast, 256 * vocab as usize * 4, &mut keep);
+    let head_tmp = alloc(&fast, 256 * vocab as usize * 4, &mut keep);
     for rows in [1u32, 4, 64, 256] {
         let p = LinearParams {
             x,
@@ -170,7 +171,7 @@ fn main() {
         };
         // SAFETY: the buffers cover `rows`.
         let s = time(&fast, it, || {
-            unsafe { fast.linear(&p, true) }.unwrap_or_else(|e| fail(e))
+            unsafe { fast.linear(&p, Some(head_tmp)) }.unwrap_or_else(|e| fail(e))
         });
         println!(
             "{{\"bench\":\"head\",\"rows\":{rows},\"us\":{:.1},\"weight_tb_per_s\":{:.2}}}",

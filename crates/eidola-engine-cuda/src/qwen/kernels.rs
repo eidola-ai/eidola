@@ -11,8 +11,31 @@
 //! kernel body is written for and returns the grid: a pure function of the row count and
 //! the widths, tested without a device. A launch over no rows launches nothing.
 
+use eidola_engine::sampling::Stream;
+
 use super::abi::*;
+use super::attention::Fa2Args;
+pub use crate::mimo::engine_ops::{COPY_BUFFERS, CopyArgs, STATUS_BAD_INDEX, copy_grid};
+pub use crate::sampler::AcceptLaunch;
 use crate::{CudaError, Result};
+
+/// One `eidola_sample` launch over device rows (`crate::sampler`): for each of
+/// `num_rows` sample rows at `rows` (`SampleRow`s), the processed distribution over the
+/// first `n` logits of its logit row into `probs[r · n ..]` (f64) and, with `draw`, a
+/// token drawn from it with that stream into `tokens[r]` (a greedy row takes the
+/// argmax). Non-finite logits raise `STATUS_NON_FINITE` in `status`.
+#[derive(Clone, Copy, Debug)]
+pub struct SampleArgs {
+    pub logits: u64,
+    pub logits_stride: u64,
+    pub n: u32,
+    pub rows: u64,
+    pub num_rows: u32,
+    pub draw: Option<Stream>,
+    pub probs: u64,
+    pub tokens: u64,
+    pub status: u64,
+}
 
 /// The kernel families of the forward.
 ///
@@ -32,9 +55,10 @@ pub trait QwenKernels {
     /// the fast one.
     unsafe fn lin8(&self, p: &Lin8Params) -> Result<()>;
     /// The BF16 linear: exact (`linear_bf16_rows`) in the exact profile, the tensor-core
-    /// form in the fast one (`large` says whether the fast form is used for it: the head
-    /// and the drafter's input projection, not the DeltaNet's small projections).
-    unsafe fn linear(&self, p: &LinearParams, large: bool) -> Result<()>;
+    /// form in the fast one for the large linears (the head and the drafter's input
+    /// projection), which name an f32 scratch of `rows · n` values in `fast`; `None` for
+    /// the DeltaNet's small projections, exact in both profiles.
+    unsafe fn linear(&self, p: &LinearParams, fast: Option<u64>) -> Result<()>;
     unsafe fn gate(&self, p: &GateParams) -> Result<()>;
     unsafe fn kv_write(&self, p: &KvWriteParams) -> Result<()>;
     /// The exact attention core (`attend`).
@@ -44,6 +68,16 @@ pub trait QwenKernels {
     unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()>;
     unsafe fn widen(&self, p: &WidenParams) -> Result<()>;
     unsafe fn round(&self, p: &RoundParams) -> Result<()>;
+    /// Row copies between up to [`COPY_BUFFERS`] buffers (`eidola_copy_rows`): every
+    /// buffer and row index bounded, an item out of range copying nothing and raising
+    /// [`STATUS_BAD_INDEX`].
+    unsafe fn copy_rows(&self, a: &CopyArgs) -> Result<()>;
+    /// The device sampler ([`SampleArgs`]).
+    unsafe fn sample(&self, a: &SampleArgs) -> Result<()>;
+    /// Chain acceptance (`eidola_chain_accept`).
+    unsafe fn accept(&self, a: &AcceptLaunch) -> Result<()>;
+    /// One FA2 head-dim-256 pass and its merge (the fast profile's attention).
+    unsafe fn fa2(&self, a: &Fa2Args) -> Result<()>;
 }
 
 fn refuse(what: &str) -> CudaError {
