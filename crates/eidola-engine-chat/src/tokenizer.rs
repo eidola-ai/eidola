@@ -43,6 +43,13 @@ pub const DEEPSEEK_V4_1_TOKENIZER_SHA256: &str =
 /// Every DeepSeek-V4.1 `tokenizer.json` this crate will load.
 pub const PINNED_DEEPSEEK_V4_1_TOKENIZER_SHA256: &[&str] = &[DEEPSEEK_V4_1_TOKENIZER_SHA256];
 
+/// SHA-256 of the Qwen3.8-27B `tokenizer.json`.
+pub const QWEN3_8_TOKENIZER_SHA256: &str =
+    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3";
+
+/// Every Qwen3.8 `tokenizer.json` this crate will load.
+pub const PINNED_QWEN3_8_TOKENIZER_SHA256: &[&str] = &[QWEN3_8_TOKENIZER_SHA256];
+
 /// The tokenizer of a MiMo model: [`Tokenizer`] loaded through its MiMo
 /// constructors.
 pub type MimoTokenizer = Tokenizer;
@@ -1171,5 +1178,135 @@ mod reference_tests {
             .unwrap();
         assert!(!served.contains(&dsml));
         assert_eq!(t.decode(&served, false).unwrap(), text);
+    }
+
+    fn qwen() -> Tokenizer {
+        let dir = fixtures_dir().join("qwen");
+        let compressed = std::fs::read(dir.join("tokenizer.json.gz")).unwrap();
+        let mut tokenizer_json = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut tokenizer_json)
+            .unwrap();
+        let config = std::fs::read(dir.join(GENERATION_CONFIG_FILE)).unwrap();
+        // Each format's pin refuses the others' tokenizers.
+        for other in [ChatFormat::MimoV2_6, ChatFormat::DeepSeekV4_1] {
+            assert!(matches!(
+                Tokenizer::for_format(other, &tokenizer_json, &config),
+                Err(ChatError::UnpinnedArtifact { .. })
+            ));
+        }
+        Tokenizer::for_format(ChatFormat::Qwen3_8, &tokenizer_json, &config)
+            .expect("pinned tokenizer")
+    }
+
+    /// Every Qwen3.8 fixture prompt and a few hundred strings encode to
+    /// Python's ids, and request data's plain encoding is Python's wherever it
+    /// spells no added token.
+    #[test]
+    fn qwen_encodes_like_python_tokenizers() {
+        let t = qwen();
+        let dir = fixtures_dir().join("qwen");
+        let fixtures: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("template_token_ids.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fixtures["meta"]["tokenizer_sha256"].as_str(),
+            Some(t.sha256())
+        );
+        let cases: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("template_cases.json")).unwrap(),
+        )
+        .unwrap();
+        let mut failures = Vec::new();
+        let mut prompts = 0;
+        for case in cases["cases"].as_array().unwrap() {
+            let (Some(text), Some(expected)) = (
+                case["expected"].as_str(),
+                fixtures["token_ids"].get(case["name"].as_str().unwrap()),
+            ) else {
+                continue;
+            };
+            if t.encode(text).unwrap() != ids(expected) {
+                failures.push(case["name"].as_str().unwrap().to_string());
+            }
+            prompts += 1;
+        }
+        let added: Vec<String> = (0..t.vocab_size() as u32)
+            .filter(|&id| t.is_added(id))
+            .map(|id| t.decode(&[id], false).unwrap())
+            .collect();
+        assert_eq!(added.len(), 33);
+        let mut strings = 0;
+        for pair in fixtures["strings"].as_array().unwrap() {
+            let text = pair[0].as_str().unwrap();
+            let expected = ids(&pair[1]);
+            if t.encode(text).unwrap() != expected {
+                failures.push(format!("string {text:?}"));
+            }
+            let plain = t.encode_plain(text).unwrap();
+            assert!(plain.iter().all(|&id| !t.is_added(id)), "{text:?}");
+            if !added.iter().any(|token| text.contains(token.as_str())) {
+                assert_eq!(plain, expected, "{text:?}");
+            }
+            strings += 1;
+        }
+        assert!(
+            failures.is_empty(),
+            "{} mismatches: {failures:#?}",
+            failures.len()
+        );
+        assert!(prompts > 500 && strings > 400, "{prompts} {strings}");
+    }
+
+    /// The vocabulary is dense: 248,044 base ids and 33 added tokens; the
+    /// model's head is padded past them. Both end-of-sequence ids are special,
+    /// and the format's markers are not, so they reach the parsers as text.
+    #[test]
+    fn qwen_vocabulary_and_decode_table() {
+        let t = qwen();
+        assert_eq!(t.vocab_size(), 248_077);
+        assert_eq!(t.eos_token_ids(), &[248_046, 248_044]);
+        assert_eq!(t.token_to_id("<|im_end|>"), Some(248_046));
+        assert_eq!(t.token_to_id("<|endoftext|>"), Some(248_044));
+        assert!(t.is_special(248_046) && t.is_special(248_044));
+        assert_eq!(t.token_bytes(248_077), None);
+        for marker in [
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+        ] {
+            let id = t.token_to_id(marker).unwrap();
+            assert!(t.is_added(id) && !t.is_special(id), "{marker}");
+            assert_eq!(t.decode(&[id], true).unwrap(), marker);
+        }
+        for id in 0..t.vocab_size() as u32 {
+            assert_eq!(
+                t.decode(&[id], false).unwrap(),
+                t.inner.decode(&[id], false).unwrap(),
+                "id {id}"
+            );
+        }
+        let mut state = 0x2545f4914f6cdd1du64;
+        for _ in 0..2000 {
+            let len = (state % 24) as usize;
+            let seq: Vec<u32> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state % t.vocab_size() as u64) as u32
+                })
+                .collect();
+            for skip in [false, true] {
+                assert_eq!(
+                    t.decode(&seq, skip).unwrap(),
+                    t.inner.decode(&seq, skip).unwrap()
+                );
+            }
+        }
     }
 }

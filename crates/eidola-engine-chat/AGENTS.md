@@ -1,32 +1,32 @@
 # eidola-engine-chat
 
-The chat layer of Eidola's inference engine: prompt rendering, tokenization, and turning generated tokens back into OpenAI-shaped `reasoning_content` / `content` / `tool_calls` deltas, for two formats: the MiMo-V2.6 model family (Flash and Pro share every file this crate reads) and DeepSeek-V4.1 (text only). AGPL-3.0-only. Workspace context: root `AGENTS.md`.
+The chat layer of Eidola's inference engine: prompt rendering, tokenization, and turning generated tokens back into OpenAI-shaped `reasoning_content` / `content` / `tool_calls` deltas, for three formats: the MiMo-V2.6 model family (Flash and Pro share every file this crate reads), DeepSeek-V4.1 (text only) and Qwen3.8 (27B, text only). AGPL-3.0-only. Workspace context: root `AGENTS.md`.
 
 ## Formats
 
-`ChatFormat` names the format of a model architecture, and the caller picks it from the model it serves. Each format is a module, `mimo` and `deepseek`; the root modules are shared by both (`json`, `pysem`, `args`, `prompt`, `tokenizer`, `output`, `format`, `error`, and the shared types of `tool_call` and `reasoning`). The steps are the same for both; what differs is reached through the format:
+`ChatFormat` names the format of a model architecture, and the caller picks it from the model it serves. Each format is a module, `mimo`, `deepseek` and `qwen`; the root modules are shared (`json`, `pysem`, `args`, `prompt`, `tokenizer`, `output`, `format`, `error`, the shared types of `tool_call` and `reasoning`), and so is what two formats share: the Jinja environment of a model's own template (`jinja`, MiMo and Qwen), the `<think>` splitter (`reasoning`, MiMo and Qwen) and the `<tool_call><function=…>` parser (`tool_call::xml`, MiMo's compact markup and Qwen's, whose values sit between newlines; `mimo::reasoning`, `mimo::tool_call`, `qwen::reasoning` and `qwen::tool_call` name them). The steps are the same for all; what differs is reached through the format:
 
-| Step | MiMo-V2.6 | DeepSeek-V4.1 |
-|---|---|---|
-| Tokenizer | `mimo::MimoTokenizer::from_bytes` / `from_model_dir` (`tokenizer.json` + `generation_config.json`) | `Tokenizer::for_format(ChatFormat::DeepSeekV4_1, …)` / `for_format_from_model_dir` (`tokenizer.json` + `config.json`, `ChatFormat::eos_config_file`) |
-| History tool-call arguments | `ChatInput::normalize_tool_call_arguments` first | as the request sent them |
-| Prompt | `mimo::ChatTemplate::render_prompt` (the model's Jinja file) | `deepseek::encode` (compiled in) |
-| Options | `mimo::RenderOptions` | `deepseek::EncodeOptions` (`from_request` resolves a request's thinking switch and `reasoning_effort`) |
-| Declared tools | `ToolSchemas::from_tools` | `deepseek::tool_schemas` |
-| Output | `OutputConfig::new` | `OutputConfig::deepseek_v4_1` |
+| Step | MiMo-V2.6 | DeepSeek-V4.1 | Qwen3.8 |
+|---|---|---|---|
+| Tokenizer | `mimo::MimoTokenizer::from_bytes` / `from_model_dir` (`tokenizer.json` + `generation_config.json`) | `Tokenizer::for_format(ChatFormat::DeepSeekV4_1, …)` / `for_format_from_model_dir` (`tokenizer.json` + `config.json`, `ChatFormat::eos_config_file`) | `Tokenizer::for_format(ChatFormat::Qwen3_8, …)` (`tokenizer.json` + `generation_config.json`) |
+| History tool-call arguments | `ChatInput::normalize_tool_call_arguments` first | as the request sent them | as the request sent them (the render decodes strings) |
+| Prompt | `mimo::ChatTemplate::render_prompt` (the model's Jinja file) | `deepseek::encode` (compiled in) | `qwen::ChatTemplate::render_prompt` (the model's Jinja file) |
+| Options | `mimo::RenderOptions` | `deepseek::EncodeOptions` (`from_request` resolves a request's thinking switch and `reasoning_effort`) | `qwen::RenderOptions` |
+| Declared tools | `ToolSchemas::from_tools` | `deepseek::tool_schemas` | `ToolSchemas::from_tools` |
+| Output | `OutputConfig::new` | `OutputConfig::deepseek_v4_1` | `OutputConfig::qwen3_8` |
 
-`Tokenizer` (of which `MimoTokenizer` is an alias), `Prompt`, `Tokenizer::encode_prompt`, `Detokenizer`, `OutputParser`, `ChatDelta` and the finish-reason mapping are shared. Each format's tokenizer pin refuses the other's file. Everything from Pipeline to Output parsing below describes MiMo; DeepSeek-V4.1 has its own section after them.
+`Tokenizer` (of which `MimoTokenizer` is an alias), `Prompt`, `Tokenizer::encode_prompt`, `Detokenizer`, `OutputParser`, `ChatDelta` and the finish-reason mapping are shared. Each format's tokenizer pin refuses the other's file. Everything from Pipeline to Output parsing below describes MiMo; DeepSeek-V4.1 and Qwen3.8 have their own sections after them.
 
 ## Pipeline
 
 | Step | Module | Reference it must equal |
 |---|---|---|
 | Parse `messages` / `tools` | `json`, `prompt::ChatInput` | Python `json.loads` |
-| Render the prompt | `mimo::template` | `transformers.apply_chat_template` |
+| Render the prompt | `mimo::template` (in `jinja`'s environment) | `transformers.apply_chat_template` |
 | Encode | `tokenizer` | Python `tokenizers` (Oniguruma build), except that request data spells no added token (below) |
 | Decode, incrementally | `tokenizer::Detokenizer` | `tokenizers` `decode(ids)` |
-| Split reasoning | `mimo::reasoning` | (own rule, below) |
-| Extract tool calls | `mimo::tool_call` | SGLang's MiMo detector (block structure) |
+| Split reasoning | `reasoning` | (own rule, below) |
+| Extract tool calls | `tool_call::xml` | SGLang's MiMo detector (block structure) |
 | Type arguments | `args`, `pysem` | the template, inverted |
 | Assemble deltas, finish reason | `output` | (own rule, `output.rs` docs) |
 
@@ -82,9 +82,9 @@ Decoding uses a per-id byte table built from `tokenizers`' byte-level decoder ru
 
 ## Output parsing
 
-**Reasoning** (`mimo::reasoning`): with thinking enabled (`enable_thinking` not `false`), output starts in reasoning; leading `<think>` tags are dropped; reasoning ends at the first `</think>` (dropped) or `<tool_call>` (kept as content), whichever comes first; output that ends inside reasoning is all reasoning. A continued message's output starts where its prompt ended (Continuation, above). With thinking disabled everything is content. SGLang's non-streaming path differs when `<tool_call>` precedes `</think>`; ours is the streaming behaviour, which is split-independent.
+**Reasoning** (`reasoning`): with thinking enabled (`enable_thinking` not `false`), output starts in reasoning; leading `<think>` tags are dropped; reasoning ends at the first `</think>` (dropped) or `<tool_call>` (kept as content), whichever comes first; output that ends inside reasoning is all reasoning. A continued message's output starts where its prompt ended (Continuation, above). With thinking disabled everything is content. SGLang's non-streaming path differs when `<tool_call>` precedes `</think>`; ours is the streaming behaviour, which is split-independent.
 
-**Tool calls** (`mimo::tool_call`): SGLang's `detect_and_parse` block structure — content is the text before the first `<tool_call>`; each closed block is a call, and an undeclared function's block (plus the text before it) goes back into content. **The answer loses only its calls**: a block without a complete `<function=…>…</function>`, an unclosed block (prose that mentions `<tool_call>`, or a cut at `max_tokens`) and text between or after blocks are content too, except text that is only whitespace next to a call. Text after a block is held until the next block closes or the output ends. SGLang drops all three; its rule survives only as `UnparsedText::Sglang`, selected by the differential test. Calls stream whole, when their closing tag arrives, with a stable `index` and an id from a caller-supplied `CallIdSource` (pass a per-response unique prefix).
+**Tool calls** (`tool_call::xml`, `Markup::Compact`): SGLang's `detect_and_parse` block structure — content is the text before the first `<tool_call>`; each closed block is a call, and an undeclared function's block (plus the text before it) goes back into content. **The answer loses only its calls**: a block without a complete `<function=…>…</function>`, an unclosed block (prose that mentions `<tool_call>`, or a cut at `max_tokens`) and text between or after blocks are content too, except text that is only whitespace next to a call. Text after a block is held until the next block closes or the output ends. SGLang drops all three; its rule survives only as `UnparsedText::Sglang`, selected by the differential test. Calls stream whole, when their closing tag arrives, with a stable `index` and an id from a caller-supplied `CallIdSource` (pass a per-response unique prefix).
 
 **Argument typing** (`args`) — the rule is that conversion inverts the template. The template writes a string argument verbatim and anything else as `json.dumps(value)`; the parser takes string-typed (and undeclared) parameters verbatim and parses the others as strict JSON, falling back to a lenient Python spelling for the declared type (`int()`, `float()`, `true`/`false` in any case, `ast.literal_eval`) and finally to the text. For schema-conforming arguments this guarantees:
 
@@ -126,6 +126,27 @@ The format is defined by the reference encoder the model repository ships, `enco
 
 **Format limits**: a string value containing `</｜DSML｜ parameter>`, or a parameter name containing `" string="true">` or `" string="false">`, cannot be represented.
 
+## Qwen3.8
+
+Qwen3.8-27B (`Qwen/Qwen3.8-27B-FP8`, text only). Like MiMo's, the format is the model's own `chat_template.jinja`, run by `qwen::ChatTemplate` in `jinja`'s environment and pinned (`QWEN3_8_CHAT_TEMPLATE_SHA256`), with a pinned tokenizer (`QWEN3_8_TOKENIZER_SHA256`; `generation_config.json` names two end-of-sequence ids, `<|im_end|>` 248046 and `<|endoftext|>` 248044). `vocab_size()` is 248,077 (248,044 base ids and 33 added tokens; the markup tokens `<think>`, `<tool_call>`, `<tool_response>` and their closers are not special and reach the parsers as text). The fixtures record the Hugging Face revision; `tests/fixtures/qwen/` holds Qwen's Apache-2.0 template, generation config and gzipped tokenizer, annotated in `REUSE.toml`.
+
+**Template.** What it needs beyond MiMo's environment: `transformers`' own `{% generation %}` tags, rewritten before compiling to `{% if true %}` / `{% endif %}`, which render the body as they do; `trim` as Python's `str.strip()` (it also strips U+001C–U+001F); `str.startswith` / `str.endswith`; and `loop.previtem` / `loop.nextitem`. `qwen::RenderOptions` carries `enable_thinking`, `preserve_thinking` and `reasoning_effort`, each undefined unless set:
+
+- Thinking (on unless `false`) writes the effort's instructions into a system turn (none for `medium`); the generation prompt is `<|im_start|>assistant\n<think>\n`, or with thinking off `…<think>\n\n</think>\n\n`.
+- `preserve_thinking` undefined is on: every past assistant turn keeps `<think>\nR\n</think>\n\n`. `false` drops the reasoning of turns before the last user query (a user message whose trimmed content is wrapped in `<tool_response>` tags is a tool turn to that search).
+- `reasoning_effort` is passed as given: the template takes `xhigh` (its default), `medium` and `low`, and raises on anything else. Mapping OpenAI's effort names onto these is the caller's.
+- Every content and reasoning is trimmed; a tool call writes `<tool_call>\n<function=NAME>\n`, each argument as `<parameter=K>\nV\n</parameter>\n` (a string verbatim, anything else through `tojson`), `</function>\n</tool_call>`; tool results are `<tool_response>` blocks of a user turn.
+
+**Accepted input** (`qwen::template::validate`): roles `system`, `user`, `assistant`, `tool`; content `null`, a string, or an array of objects with a string `text`; `tools` an array of objects (as `apply_chat_template` requires); a call's body (its `function`, else the call) with a string `name` and `arguments` absent, an object, or `""`. `render_prompt` decodes string `arguments` itself: the template renders none (Python raises on them), so decoding never changes a prompt the reference renders. An image or video part is `ChatError::UnsupportedContent`; refused although Python renders them are string content parts and a `tool_calls` that is not an array. The rest the template refuses itself (a late system message, no user query, an unknown effort).
+
+**Request data** is found as MiMo's is, with the template's three readings of it (`trim`, `startswith`, `endswith`) seeing through the marks, so the marked render takes the same branches. Roles are not data: validation holds them to the four the template knows, and it prints only `user` and `assistant`.
+
+**Output.** The shared `<think>` splitter (with thinking on the prompt has opened the reasoning, so the output starts in it) and the `tool_call::xml` parser in `Markup::Newlines`, where one newline at each end of a value is the markup's. Reasoning and answer are given out verbatim, as vLLM gives them (`R\n`, `\n\nC`); the template trims both when they come back. The rules are MiMo's: the answer loses only its calls, and argument typing inverts the template. On every well-formed output the result is that of vLLM's `qwen3` / `qwen3_coder` parser (`vllm/parser/qwen3.py`, v0.33.0) once vLLM's stripping of the content beside calls is applied; it parts where vLLM's is lossy: vLLM makes calls of unclosed blocks, bare `<function=` markup, undeclared functions and text with no tools offered, drops text after or between calls and after prose mentioning `<tool_call>`, drops `<think>` anywhere in the reasoning and `</think>` anywhere in the answer, ends a value at the next `<parameter=`, and keeps whitespace in a parameter name. **A Qwen3.8 response is never continuable** (`resumes_exactly` is false): the template trims the field it would continue.
+
+**Prefix across turns** (`tests/qwen_prefix.rs`). The next turn's prompt is this prompt, the output, `<|im_end|>` and more, in text and in tokens, when the output is in the trained format and ended with `<|im_end|>` (not `<|endoftext|>`), the client sends back the reasoning and calls it was given, the thinking switch and effort are unchanged, and the reasoning is kept (`preserve_thinking` not `false`, or only tool results since). With thinking on, an empty reasoning re-encodes the prompt's last token (`<think>\n\n</think>` makes the two newlines one), so the tokens extend the prompt less its last; a client that drops the reasoning keeps the same. Otherwise the shared prefix ends at the generation header `<|im_start|>assistant\n` of the user turn's first request: two tokens before that prompt's end with thinking on, four with it off.
+
+**Format limits**: as MiMo's, plus a value's newline at either end beyond the markup's own is kept, so a value that starts or ends with one is represented exactly.
+
 ## Tests
 
 - `tests/deepseek_encoding.rs` — every case in `tests/fixtures/deepseek/encoding_cases.json` against the reference's prompt byte for byte (the reference's shipped pairs, 670+ generated, and cases that must be refused, the shipped vision pair among them); every prompt and 400 strings against Python `tokenizers` ids; no added token on request data, with a token appended to every string of every fixture; request options.
@@ -138,6 +159,12 @@ The format is defined by the reference encoder the model repository ships, `enco
 - `tests/mimo_sglang_differential.rs` — with SGLang's rules selected (typing and unparsed text): every value × declared-type case in `sglang_param_cases.json` (28k, including 3k fuzzed literals) and every model output in `sglang_text_cases.json`, against SGLang's own code; the outputs are also re-parsed in 1-, 3- and 7-character chunks.
 - `tests/mimo_linear_parsing.rs` — one chunk holding many tool-call blocks allocates in proportion to its length, counted by the test binary's own allocator.
 - `tests/mimo_round_trip.rs` — property test that the rule inverts the real template; pinned counterexamples showing SGLang's rule does not.
+- `tests/qwen_template_fixtures.rs` — every case in `tests/fixtures/qwen/template_cases.json` against `apply_chat_template` byte for byte (580+ rendered, and refusals by kind), and every fixture's object arguments re-sent as JSON strings.
+- `tests/qwen_prompt_data.rs` — request data spells no added token (every string of every fixture wrapped in each of ten added tokens, tokens completed by the template's text), the spans, and every fixture prompt whose data spells none keeping Python's ids.
+- `tests/qwen_output.rs` — the output rule on the cases it decides, value framing, and property tests: format fragments split anywhere (unclosed markup, reasoning tags among calls), arbitrary text and arbitrary ids of the real tokenizer (no panic, streaming equals whole-output parsing, strict-JSON arguments), and parsing inverting the real template.
+- `tests/qwen_vllm_differential.rs` — `vllm_parser_cases.json`: every well-formed output parsed as vLLM parses it, every other case agreeing or listed with its reason, in 1-, 3- and 7-character chunks too.
+- `tests/qwen_prefix.rs` — the prefix relation across turns, in text and tokens.
+- `tokenizer::reference_tests` (Qwen3.8) — every fixture prompt and 470 strings against Python `tokenizers` ids, the decode table for every id, the vocabulary and end-of-sequence ids.
 - Unit and property tests in each module (`cargo test -p eidola-engine-chat`).
 - `tokenizer::reference_tests` — encoding and decoding against the Python tokenizer, on the committed pinned tokenizers; for DeepSeek-V4.1 the decode table for every id and the self-overlapping token.
 
@@ -153,6 +180,6 @@ python -I dev/gen_tables.py
 python -I dev/gen_float_repr_cases.py
 ```
 
-The DeepSeek-V4.1 fixtures (`tests/fixtures/deepseek/`: prompts, outputs, token ids and the Engram map, with DeepSeek's MIT-licensed `tokenizer.json.gz` and `config.json`; `EIDOLA_DEEPSEEK_MODEL_DIR` overrides the copy) come from `dev/deepseek_gen_fixtures.py`, run with `uv` against a checkout of the model repository; its dependencies are pinned in the script and its lock file. See `dev/README.md`.
+The DeepSeek-V4.1 fixtures (`tests/fixtures/deepseek/`: prompts, outputs, token ids and the Engram map, with DeepSeek's MIT-licensed `tokenizer.json.gz` and `config.json`; `EIDOLA_DEEPSEEK_MODEL_DIR` overrides the copy) come from `dev/deepseek_gen_fixtures.py`, run with `uv` against a checkout of the model repository; its dependencies are pinned in the script and its lock file. The Qwen3.8 fixtures come from `dev/qwen_gen_template_fixtures.py` and `dev/qwen_gen_vllm_fixtures.py`, run the same way. See `dev/README.md`.
 
 `mimo_gen_template_fixtures.py` also refreshes the model-file copies in `tests/fixtures/mimo/`. Regenerate after changing a pinned artifact, the reference versions, or a case list; review the fixture diff like code. The SGLang harness applies `normalize_json_schema_types` to tools (as SGLang's request validation does) and the per-parameter containment described above, flagging each case where containment fired (`contained`).

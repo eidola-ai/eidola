@@ -134,6 +134,30 @@ precedence = "closest"
 SPDX-FileCopyrightText = ["© Eidola, Inc. and contributors", "© 2023 DeepSeek"]
 SPDX-License-Identifier = "AGPL-3.0-only AND MIT"
 
+# Verbatim files from the Qwen3.8-27B model release (Hugging Face
+# Qwen/Qwen3.8-27B-FP8, declared Apache-2.0), kept as test fixtures.
+[[annotations]]
+path = [
+    "crates/eidola-engine-chat/tests/fixtures/qwen/chat_template.jinja",
+    "crates/eidola-engine-chat/tests/fixtures/qwen/generation_config.json",
+    "crates/eidola-engine-chat/tests/fixtures/qwen/tokenizer.json.gz",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© 2026 Alibaba Cloud"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Test fixtures generated from the Qwen3.8 template and tokenizer, and from
+# vLLM's Qwen3 output parser.
+[[annotations]]
+path = [
+    "crates/eidola-engine-chat/tests/fixtures/qwen/template_cases.json",
+    "crates/eidola-engine-chat/tests/fixtures/qwen/template_token_ids.json",
+    "crates/eidola-engine-chat/tests/fixtures/qwen/vllm_parser_cases.json",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = ["© Eidola, Inc. and contributors", "© 2026 Alibaba Cloud", "Copyright contributors to the vLLM project"]
+SPDX-License-Identifier = "AGPL-3.0-only AND Apache-2.0"
+
 # Verbatim sample TDX quote and Intel collateral from the dcap-qvl crate
 # (declared MIT), kept as test fixtures; and the Intel SGX root certificate,
 # byte-identical to dcap-qvl's copy of Intel's published root.
