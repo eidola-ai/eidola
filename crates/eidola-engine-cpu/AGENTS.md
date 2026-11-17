@@ -1,6 +1,6 @@
 # eidola-engine-cpu
 
-The CPU reference executors of the engine, one module per architecture: `src/mimo/` and `src/deepseek/`. The only shared module is `page.rs`: the page-owned buffers (`PageBuf`) every KV pool is built from and the row tags (`Tag`) they carry. `CpuExecutor` (`src/mimo/`) implements the serving core's `Executor` (`eidola-engine`) for MiMo-V2.6 with the model crate's f32 reference numerics (`eidola-engine-model`), over paged KV, with MTP drafting and sampling inside the step. `DsCpuExecutor` (`src/deepseek/`) does the same for DeepSeek-V4.1, with KV in the model's packed formats and the model split across two logical devices; it has its own section, [DeepSeek-V4.1](#deepseek-v41), and everything before that section is about MiMo's. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
+The CPU reference executors of the engine, one module per architecture: `src/mimo/`, `src/deepseek/` and `src/qwen/`. The shared modules are `page.rs`, the page-owned buffers (`PageBuf`) every pool is built from and the row tags (`Tag`) they carry, and `pool.rs`, the per-layer K|V block pool MiMo-V2.6 and Qwen3.8 page their KV in. `CpuExecutor` (`src/mimo/`) implements the serving core's `Executor` (`eidola-engine`) for MiMo-V2.6 with the model crate's f32 reference numerics (`eidola-engine-model`), over paged KV, with MTP drafting and sampling inside the step. `DsCpuExecutor` (`src/deepseek/`) does the same for DeepSeek-V4.1, with KV in the model's packed formats and the model split across two logical devices; it has its own section, [DeepSeek-V4.1](#deepseek-v41). `QwenCpuExecutor` (`src/qwen/`) does it for Qwen3.8, with the DeltaNet layers' recurrent state kept as the serving core's state buffers; its section is [Qwen3.8](#qwen38). Everything before those sections is about MiMo's. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
 
 It is not a serving backend. It exists for two reasons:
 
@@ -11,7 +11,7 @@ It is not a serving backend. It exists for two reasons:
 |---|---|
 | `mimo/mod.rs` | The MiMo-V2.6 executor's re-exports. |
 | `mimo/executor.rs` | `CpuExecutor`, `CpuExecutorConfig`, `MtpHidden`, `RowRecord`. |
-| `mimo/pool.rs` | Physical KV pools, laid out by block, with per-row position tags. |
+| `pool.rs` | Shared: physical KV pools, laid out by block, with per-row position tags and boundary taps. |
 | `mimo/oracle.rs` | `DenseOracle`: the dense forward plus every MTP depth in the executor's row layout; `dense_generate`, `check_generation`. |
 | `page.rs` | Shared: `PageBuf` and `Tag`. |
 
@@ -252,3 +252,86 @@ Each class was checked to fail under a deliberate bug: a chain layer starting on
 **At the released sizes.** Construction allocates only what the configuration names: each bank group's pool of `num_blocks` blocks and each window group's (the encoder's, the decoder's and the drafter's) of `window_blocks` (a block of either target window group is 20 layers of `block_size` cells of 528 bytes, 169 KB at 16 positions), block tables of `max_model_len / block_size` entries per slot and group, and the pooled sources' open entries. Only the tables follow the context length (65,536 entries a slot and group at 2^20 positions in 16-position blocks), and the pools follow their counts, never the model's positions. A window group holds only live and retained windows, so `window_blocks` may be far below `num_blocks` (`eidola-engine/AGENTS.md` → Window pools); the node's `cpu` executor gives both `KV_BLOCKS`. The weights are the model's, shared (`Arc<DsModel>`): dense tensors decoded at load, routed experts and Engram rows read from the mapped checkpoint as a step needs them. The whole released model runs through it in the node crate's generation runner (`eidola-server-engine/AGENTS.md` → Generating from the released checkpoint on the CPU).
 
 **Decode rows at the released widths** (`tests/deepseek_real.rs`, ignored, `EIDOLA_DEEPSEEK_TRUNCATED_DIR`): the model crate's 12-layer truncation (window-only layers, two pooled sources with their consumers, the split at the per-position source with its candidate pool, both Engram layers, the drafter's targets; window 128, top-512, 64-slot attention blocks), through the real engine in 16-position blocks, with every sampled token replaced by the next token of a fixed sequence so the engine decodes that sequence one token a step. Each row's logits are compared bit for bit with the dense forward over the same tokens, and each layer's state at the row's last position by hash (`DsRowRecord::layer_streams`, which the fixture suites check on every row too). Equal on the goldens' passage from a 20-token prompt through 235 one-token rows (every parity, every block boundary, the window filling and sliding, every pooled pair), after chunked prefills of 33 and 130 tokens, and on a chat-format prompt (special tokens above any id the passage holds) with a continuation at draft widths 0 and 5, with one slot, 192 positions and 56 blocks a group; that last run reads Engram rows from a table defined at every index, the same for both sides, since only the passage's rows are fetched. About 7 minutes each in release, under 40 GB. `released_generation_follows_the_dense_forward` runs the same comparison on the whole checkpoint with its own tables (`EIDOLA_DEEPSEEK_DIR`, `EIDOLA_DEEPSEEK_TOKEN_MAP`); it has not been run.
+
+## Qwen3.8
+
+`QwenCpuExecutor` runs Qwen3.8 (`eidola-engine/AGENTS.md` → Recurrent state; `eidola-engine-model/AGENTS.md` → Qwen3.8) and reproduces the model crate's dense forward bit for bit through the real engine. It computes nothing itself: every number comes from a public model-crate kernel. Those are the DeltaNet's per-token `deltanet::token_core`, its projections `linear::lin8_rows` and `linear::linear_bf16_dense`, `forward::rms_norm_zc_rows`, `forward::residual_add`, `QwenModel::mlp`, `QwenModel::layer_forward` for each attention layer (over the KV gathered from the pages), `final_norm`, `head` and `mtp_forward`. A DeltaNet layer is assembled from those pieces exactly as `QwenModel` assembles it, so that its per-position recurrence inputs can be kept and its state taken at a boundary inside a row.
+
+| Module | Contents |
+|---|---|
+| `qwen/executor.rs` | `QwenCpuExecutor`, `QwenCpuExecutorConfig`, `QwenRowRecord`, `StoredState`: maintenance, a row, drafting, sampling. |
+| `qwen/state.rs` | `StatePool` (state buffers and their host tier) and `SlotTail` (a slot's base and the inputs after it). |
+| `qwen/oracle.rs` | `QwenDenseOracle`: the dense forward, the drafter's rows and the draft chain; `states_at`; `qwen_check_generation`. |
+
+### Memory
+
+- **KV.** A target group (`attention`, `Full`) holds every attention layer's K and V, and with drafting a drafter group (`mtp`, `Full`, `KvRole::Drafter`) holds the MTP layer's, with a boundary tap per block: the target's normed final state at the block's last position. Both are `pool.rs` pools, with tags on every row.
+- **State buffers.** A buffer holds the state at one block boundary, per DeltaNet layer in layer order: its convolution history (the last three raw `mixed` rows) and its recurrent state, all `f32`, then a tag (the boundary plus one). Every read checks the tag. **A buffer's image** (what a zero clears, a host-tier transfer moves and the idle cipher XORs) is two ranges, each from a fresh keystream block: the data's bits, then the tag. The host tier is a second pool of the same layout, `mlock`ed.
+- **Per slot.** The base the slot's last row left (buffer and boundary). The **tail**: per position after the base, every DeltaNet layer's `mixed`, `a` and `b` rows, with a position tag, at most `block_size - 1 + k` positions (the strategy that rebuilds the state from the base every row). The target's normed states at the positions the last row ended on (its last host token and its drafts), with their positions, which the drafter's next row continues from. All are allocated once at full size and overwritten in place, and `ResetSlot` zeroes them (`slot_state_is_zero`).
+
+### A step
+
+1. Maintenance in the order given, then table updates. `SaveState` folds the slot's tail from its base to the boundary and stores it, before the slot's reset.
+2. Per row, in order (rows share nothing but the pools):
+   1. **Fold.** The DeltaNet states at the row's `context_len`: the base (the zero state for `NULL_STATE`), then `token_core` over each kept position, its output discarded.
+   2. **The target over the host tokens**, every layer. Each named state write is taken as the recurrence passes its boundary, in the fold or in the row, and stored when the row's layers are done.
+   3. **The drafter over the host positions**: the row at `s` takes the token at `s` and the target's normed state at `s - 1`. That state comes from this row for `s > context_len`, else from the slot's kept states, else, after a resume at a boundary, from the drafter block's tap. The drafter's KV at `s` is the model's MTP cache entry `s - 1`.
+   4. **The draft chain**: the row at `p` draws the first draft; the layer then recurses on its own normed output, in a cache of its own that is never paged. Drafts are drawn as MiMo's are (argmax for greedy, `Stream::Draft` for sampled).
+   5. **The target over the drafts**, from the states the host tokens left. Its KV goes into the reserved positions. Nothing it computes is stored as state, but its inputs join the tail.
+   6. **Sampling and `chain_accept`**, with `sampling.rs` semantics over the sampleable vocabulary.
+   7. **The canonical rewrite.** The drafter's rows at the accepted drafts are recomputed from the target's normed states and written over the chain's. A sealed drafter block therefore always holds rows that depend only on their prefix, though the chain computed those positions from its own outputs.
+   8. Taps at every block's last position computed (host tokens and accepted drafts), the kept normed states, and the tail: every position from the row's last write (or its base) to its last draft.
+
+### What is verified
+
+On the model crate's committed fixture (three DeltaNet layers and one attention layer at hidden size 128, one MTP layer, vocabulary 512 of which 508 are sampleable), in 4-position blocks.
+
+**What is checked.** With `record`, every row's tokens, target logits at every computed position, the drafter's canonical rows, the chain's rows, drafts and output are kept. So is every state stored, with the tokens before its boundary read back through the block tables. `tests/qwen_common` checks each record bit for bit against `QwenDenseOracle` on its tokens: the target, the drafter's rows, the draft chain recomputed from the dense run, every draw and `chain_accept`. It also checks each stored state against the dense forward's states at that boundary, and every finished output against dense generation. After every step it runs the memory scan: the KV manager's invariants; every free block and state buffer zero; every free slot empty; every idle block and snapshot ciphertext and every mapped one plaintext; the host tier holding only ciphertext.
+
+**`tests/qwen_engine.rs`**. Through the engine, every row and stored state against the oracle:
+
+- chunk sizes 1, 3, 4, 5, 7 and whole, with and without drafting, keyed and private;
+- interleaved rows under step budgets of 8, 13 and 64;
+- a request's logits equal alone and beside others in another slot;
+- hits at the regeneration, continuation and branch snapshots and a short turn after a hit, each at its expected boundary;
+- preemption and resume under small KV pools, small state pools and both;
+- drafts accepted in every pattern from none to all three (the sampleable vocabulary narrowed to 2 and 3);
+- greedy drafting equal to plain decoding;
+- endings inside accepted drafts (a stop followed by accepted drafts, a length cut), where `SaveState` keeps the turn's own state and the next turn resumes there exactly;
+- a required prefix admitted at a snapshot and refused one token past it;
+- shedding down to the engine's ending.
+
+**`tests/qwen_memory.rs`**. On real bytes:
+
+- a finished request's snapshots ciphertext with no tag in the clear; a hit decrypting exactly the snapshot it resumes from; another lineage decrypting none;
+- the state at a boundary the same bytes under two lineages and two chunkings, and different ciphertext;
+- snapshots demoted to the host tier as ciphertext and promoted for an exact hit;
+- expired snapshots zeroed;
+- a randomized workload (shared prefixes, private and keyed requests, cancellations, drafting on and off, the host tier on odd seeds) under every check, every slot empty at the end.
+
+Each was checked to fail under a deliberate bug:
+
+- the row's fold skipping its last kept position;
+- `SaveState` folding one position short, or storing the base;
+- no canonical rewrite of the accepted drafter rows;
+- the drafts' inputs not kept;
+- no boundary taps;
+- the chain recursing on its first row's output;
+- the drafter's hidden state one position late;
+- a state taken one position early;
+- the drafter's state kept at the last host position only;
+- encryption skipping the tag;
+- `ResetSlot` keeping the tail;
+- a host-tier transfer dropping the tag;
+- a zero leaving the tag.
+
+Measured on an Apple M4 Max in the dev profile (the crate builds at `opt-level = 3`): `qwen_engine` 10 s, `qwen_memory` 9 s.
+
+### What a device executor must reproduce
+
+- The seam's state contract: bases, writes inside host tokens only, a tail of at most `block_size - 1 + k` positions, and `SaveState`.
+- Every stored image the same bytes whichever path wrote it.
+- The drafter's row layout and its canonical rewrite at accepted positions in the same step.
+- The boundary taps.
+
+It may keep the state differently (a live state per slot instead of folding the tail each row), but the images it stores and the logits it produces must be these.
