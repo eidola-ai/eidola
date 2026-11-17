@@ -15,8 +15,8 @@ use eidola_engine_model::mimo::weights::{AttentionWeights, FfnWeights};
 use eidola_engine_model::tensor::{Matrix, add_assign, linear, rms_norm_rows};
 use rayon::prelude::*;
 
-use crate::mimo::pool::{GroupLayout, Pool};
 use crate::page::Tag;
+use crate::pool::{GroupLayout, Pool};
 
 /// Which of the main model's hidden states feeds the MTP depths (every depth takes the
 /// main model's state, never another depth's output).
