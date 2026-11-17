@@ -32,6 +32,10 @@ struct Recorder {
 }
 
 fn render_step(step: &StepInput) -> String {
+    assert!(
+        step.aux.state_rows.is_empty() && step.aux.state_writes.is_empty(),
+        "state rows for a model without state"
+    );
     let mut s = String::new();
     let b = step.bucket;
     write!(s, "bucket {} {};", b.max_seqs, b.max_tokens).unwrap();
@@ -59,8 +63,9 @@ fn render_step(step: &StepInput) -> String {
                 write!(s, "promote {group} {host} {block};")
             }
             Maintenance::ZeroHost { group, host } => write!(s, "zerohost {group} {host};"),
-            #[allow(unreachable_patterns)]
-            _ => panic!("a maintenance operation these models never receive: {m:?}"),
+            Maintenance::SaveState { .. } => {
+                panic!("a state saved for a model without state: {m:?}")
+            }
         }
         .unwrap();
     }

@@ -188,6 +188,7 @@ fn model_spec(c: &DsConfig, shape: &DsShape, cfg: &DsCudaExecutorConfig) -> Resu
             window,
         }),
         token_history: narrow(shape.history, "token history")?,
+        state: None,
     };
     let mut spec = spec;
     if shape.drafting() {
@@ -559,6 +560,9 @@ impl DsCudaExecutor {
             let (group, key) = match *m {
                 Maintenance::Zero { group, .. } | Maintenance::Copy { group, .. } => (group, None),
                 Maintenance::ResetSlot { .. } => continue,
+                Maintenance::SaveState { .. } => {
+                    return Err(CudaError::new("a state saved for a model without state"));
+                }
                 Maintenance::Encrypt { group, key, .. }
                 | Maintenance::Decrypt { group, key, .. } => (group, Some(key)),
                 Maintenance::Demote { group, host, .. }
@@ -587,6 +591,7 @@ impl DsCudaExecutor {
     fn maintain(&mut self, step: &StepInput) -> Result<()> {
         for m in &step.maintenance {
             match *m {
+                Maintenance::SaveState { .. } => unreachable!("refused by check_maintenance"),
                 Maintenance::Zero { group, block } => {
                     let (n, g) = self.net_mut(group);
                     n.kv.zero(n.dev.as_ref(), g, block)?;
@@ -1708,6 +1713,7 @@ mod tests {
             aux: StepAux {
                 chain_start: vec![0],
                 history_ids: vec![0; 3],
+                ..StepAux::default()
             },
             ..step(x)
         }
@@ -2120,6 +2126,7 @@ mod tests {
         s.aux = StepAux {
             chain_start: vec![0, 0],
             history_ids: vec![0; 2 * x.spec.token_history as usize],
+            ..StepAux::default()
         };
         let out = x.execute(&s).unwrap();
         assert_eq!(out.num_tokens, vec![1, 1]);
@@ -2134,6 +2141,7 @@ mod tests {
         s.aux = StepAux {
             chain_start: vec![100, 60],
             history_ids: vec![0; 2 * x.spec.token_history as usize],
+            ..StepAux::default()
         };
         let e = x.execute(&s).unwrap_err();
         assert!(e.0.contains("chain acceptance produced no tokens"), "{e}");

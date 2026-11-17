@@ -472,6 +472,7 @@ fn check_order(maintenance: &[Maintenance]) {
     let mut hosts_zeroed = BTreeSet::new();
     for m in maintenance {
         match *m {
+            Maintenance::SaveState { .. } => panic!("a state saved for a model without state"),
             Maintenance::Encrypt { group, block, .. }
             | Maintenance::Decrypt { group, block, .. } => {
                 assert!(
@@ -567,6 +568,7 @@ fn stage(
     check_order(maintenance);
     for m in maintenance {
         match *m {
+            Maintenance::SaveState { .. } => unreachable!("refused by check_order"),
             Maintenance::Zero { group, block } => {
                 let (g, ranges) = block_ranges(geometry, group, block);
                 for r in ranges {

@@ -113,6 +113,44 @@ impl KvGroupSpec {
     }
 }
 
+/// The reserved state buffer: never allocated and never written, it reads as the zero
+/// state (the state before position 0). A row whose base is `NULL_STATE` starts at
+/// position 0 of its state.
+pub const NULL_STATE: u32 = 0;
+
+/// A set of layers whose dependence on the past is a state of fixed size per sequence (a
+/// linear-attention recurrence and its short convolution's last inputs), held on one
+/// logical device. Every state group shares one buffer id space: buffer `b` names `b`'s
+/// part in every group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateGroupSpec {
+    /// Human-readable name (diagnostics only).
+    pub name: String,
+    /// Layers in the group.
+    pub num_layers: u32,
+    /// The logical device holding this group's part of every buffer.
+    pub device: u32,
+    /// Bytes of this group's part of one buffer's image (what a zero clears).
+    pub image_bytes: u64,
+}
+
+/// Per-sequence state of fixed size beside the KV groups ([`crate::executor`] →
+/// *Recurrent state*): a pool of buffers, each one image of the state at a block
+/// boundary, which the host allocates as it allocates blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateSpec {
+    /// The state groups (at least one).
+    pub groups: Vec<StateGroupSpec>,
+    /// State buffers the executor allocated, including the reserved [`NULL_STATE`].
+    pub num_buffers: u32,
+    /// State buffers in the host tier, including a reserved buffer 0; 0 when there is
+    /// no host tier.
+    pub host_buffers: u32,
+    /// Positions whose inputs the executor keeps per slot past the slot's base: at least
+    /// `block_size - 1 + max_draft_tokens`.
+    pub tail_positions: u32,
+}
+
 /// A captured step shape: the executor can run any batch with at most `max_seqs`
 /// sequences and at most `max_tokens` query tokens (host tokens plus drafted tokens) as
 /// one pre-built graph, after padding to exactly this shape.
@@ -164,6 +202,9 @@ pub struct ModelSpec {
     /// host passes them with every row ([`crate::executor::StepAux::history_ids`]), so
     /// no slot holds them.
     pub token_history: u32,
+    /// Per-sequence fixed-size state beside the KV groups; `None` for a model whose only
+    /// per-sequence memory is KV.
+    pub state: Option<StateSpec>,
 }
 
 /// Reserved physical block id in every group: never allocated and never written, so it
@@ -227,12 +268,31 @@ impl ModelSpec {
 
     /// Logical devices the groups name.
     pub fn num_devices(&self) -> u32 {
-        self.kv_groups.iter().map(|g| g.device).max().unwrap_or(0) + 1
+        let state = self.state.iter().flat_map(|s| &s.groups).map(|g| g.device);
+        self.kv_groups
+            .iter()
+            .map(|g| g.device)
+            .chain(state)
+            .max()
+            .unwrap_or(0)
+            + 1
     }
 
     /// Whether the executor keeps a host tier for idle prefix-cache entries.
     pub fn has_host_tier(&self) -> bool {
         self.kv_groups.iter().all(|g| g.host_blocks > 1)
+            && self.state.as_ref().is_none_or(|s| s.host_buffers > 1)
+    }
+
+    /// The index maintenance names the state pool by: one past the last KV group. `None`
+    /// for a model without state.
+    pub fn state_pool(&self) -> Option<u32> {
+        self.state.as_ref().map(|_| self.kv_groups.len() as u32)
+    }
+
+    /// The pools maintenance can name: every KV group, and the state pool if any.
+    pub fn num_pools(&self) -> u32 {
+        self.kv_groups.len() as u32 + u32::from(self.state.is_some())
     }
 
     /// Smallest bucket that fits a batch, if any.
@@ -329,6 +389,9 @@ impl ModelSpec {
         if self.num_state_slots == 0 {
             return Err("num_state_slots must be non-zero".into());
         }
+        if let Some(state) = &self.state {
+            self.validate_state(state)?;
+        }
         if self.buckets.is_empty() {
             return Err("at least one bucket is required".into());
         }
@@ -338,6 +401,56 @@ impl ModelSpec {
             .any(|w| w[0].max_seqs > w[1].max_seqs || w[0].max_tokens > w[1].max_tokens)
         {
             return Err("buckets must be nondecreasing in both max_seqs and max_tokens".into());
+        }
+        Ok(())
+    }
+
+    /// The rules a model with state adds.
+    fn validate_state(&self, state: &StateSpec) -> Result<(), String> {
+        if state.groups.is_empty() {
+            return Err("a state needs at least one state group".into());
+        }
+        if let Some(g) = state
+            .groups
+            .iter()
+            .find(|g| g.num_layers == 0 || g.image_bytes == 0)
+        {
+            return Err(format!("state group {} has no layers or no image", g.name));
+        }
+        if state.num_buffers < 3 {
+            return Err(
+                "a state pool needs at least two allocatable buffers (a base and the one a \
+                 row writes)"
+                    .into(),
+            );
+        }
+        let tail = self.block_size - 1 + self.max_draft_tokens;
+        if state.tail_positions < tail {
+            return Err(format!(
+                "a slot must keep the inputs of {tail} positions past its base \
+                 (block_size - 1 + max_draft_tokens), not {}",
+                state.tail_positions
+            ));
+        }
+        // A retained point would need its windows and its state at once; no model needs
+        // that, so it is refused rather than half built.
+        if self.window_chain.is_some()
+            || self.kv_groups.iter().any(|g| {
+                g.attention != AttentionKind::Full || g.ratio != 1 || g.coverage != Coverage::All
+            })
+        {
+            return Err(
+                "a model with state has only full-attention, per-position KV groups".into(),
+            );
+        }
+        let kv_tier = self.kv_groups.iter().any(|g| g.host_blocks > 0);
+        if kv_tier != (state.host_buffers > 0) {
+            return Err(
+                "either the state pool and every KV group have a host tier or none does".into(),
+            );
+        }
+        if state.host_buffers == 1 {
+            return Err("the state pool's host tier needs an allocatable buffer".into());
         }
         Ok(())
     }
