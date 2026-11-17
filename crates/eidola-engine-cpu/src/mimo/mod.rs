@@ -9,7 +9,6 @@
 
 pub mod executor;
 pub mod oracle;
-mod pool;
 
 pub use executor::{CpuExecutor, CpuExecutorConfig, MtpHidden, RowRecord};
 pub use oracle::{DenseOracle, DenseRun};

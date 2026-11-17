@@ -9,10 +9,12 @@
 //!   [`eidola_engine_model::deepseek::DsModel`]: KV paged in the model's packed formats,
 //!   the model split across two logical devices, and its own dense oracle.
 //!
-//! Shared by both: `page`, the page-owned memory every KV pool is built from.
+//! Shared by both: `page`, the page-owned memory every KV pool is built from, and `pool`,
+//! the per-layer K|V block pool MiMo-V2.6 pages its KV in.
 //!
 //! Doctrine lives in this crate's `AGENTS.md`.
 
 pub mod deepseek;
 pub mod mimo;
 mod page;
+mod pool;
