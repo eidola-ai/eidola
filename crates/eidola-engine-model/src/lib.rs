@@ -1,8 +1,8 @@
 //! Model definitions for the engine: configuration, weight loading, and the
 //! dense reference forward pass, one module per architecture.
 //!
-//! - [`mimo`] is MiMo-V2.6; [`deepseek`] is DeepSeek-V4.1. Neither knows the
-//!   other exists.
+//! - [`mimo`] is MiMo-V2.6; [`deepseek`] is DeepSeek-V4.1; [`qwen`] is
+//!   Qwen3.8. None knows the others exist.
 //!
 //! What they share stays at the crate root:
 //!
@@ -19,6 +19,7 @@ pub mod deepseek;
 mod error;
 pub mod mimo;
 pub mod numeric;
+pub mod qwen;
 pub mod safetensors;
 pub mod tensor;
 
