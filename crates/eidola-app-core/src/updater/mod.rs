@@ -61,6 +61,8 @@ pub use eidola_attestation::{
 pub mod ci_sigstore;
 pub mod human_attestation;
 pub mod install;
+pub mod install_kind;
+pub mod installed;
 mod merkle;
 mod rekor_verify;
 pub mod sigstore_bundle;
@@ -124,6 +126,26 @@ impl Fetcher {
         }
     }
 
+    /// Fetch the `release.json` of the release tagged `tag` under
+    /// `releases_url` (`<releases_url>/download/<tag>/release.json`), the
+    /// way [`discover_next_release`] walks a release's history. In
+    /// `Fixtures` mode it reads `<dir>/<tag>/release.json`. A missing file
+    /// is a refusal: the release that named this one said it was there.
+    pub async fn fetch_release_json(
+        &self,
+        releases_url: &str,
+        tag: &str,
+    ) -> Result<Vec<u8>, ReleaseCheckError> {
+        let result = match self {
+            Fetcher::Network(client) => {
+                let url = release_json_url(releases_url, tag);
+                fetch_url_network(client, &url, "release.json", MAX_DOCUMENT_BYTES).await
+            }
+            Fetcher::Fixtures(dir) => read_fixture(&dir.join(tag), "release.json"),
+        };
+        result.map_err(ReleaseCheckError::from)
+    }
+
     /// Fetch a referenced asset by URL.
     ///
     /// Bounded at [`MAX_DOCUMENT_BYTES`]: every URL reached this way comes
@@ -159,6 +181,15 @@ impl Fetcher {
 pub fn latest_release_json_url(releases_url: &str) -> String {
     format!(
         "{}/latest/download/release.json",
+        releases_url.trim_end_matches('/')
+    )
+}
+
+/// Where the `release.json` of the release tagged `tag` is downloaded from,
+/// under a releases location.
+pub fn release_json_url(releases_url: &str, tag: &str) -> String {
+    format!(
+        "{}/download/{tag}/release.json",
         releases_url.trim_end_matches('/')
     )
 }
@@ -491,31 +522,43 @@ pub async fn check_for_update_with(
 ) -> Result<Option<ReleaseSummary>, AppError> {
     let tracer = Tracer::new(opts.verbose);
 
-    // ── discover ─────────────────────────────────────────────────────────
+    // ── discover, version, schema, continuity ────────────────────────────
     tracer.log("discover", "reading release.json");
-    let Some(release_json_bytes) = fetcher
-        .fetch_latest_release_json(trust_root::UPDATE_RELEASES_URL)
-        .await?
-    else {
-        tracer.log("discover", "no release is marked latest; no update");
-        return Ok(None);
-    };
-    tracer.log(
-        "discover",
-        format!("release.json ({} bytes)", release_json_bytes.len()),
-    );
-
-    // ── version, schema, continuity ──────────────────────────────────────
-    let release = match gate_release(&release_json_bytes, installed_version, installed_git_commit) {
-        Ok(ReleaseGate::Newer(release)) => *release,
-        Ok(ReleaseGate::NotNewer { version }) => {
+    let discovery = discover_next_release(
+        fetcher,
+        trust_root::UPDATE_RELEASES_URL,
+        installed_version,
+        installed_git_commit,
+    )
+    .await
+    .map_err(|e| AppError::from(e.error))?;
+    let release = match discovery {
+        Discovery::NothingMarked => {
+            tracer.log("discover", "no release is marked latest; no update");
+            return Ok(None);
+        }
+        Discovery::NotNewer { version } => {
             tracer.log(
                 "version",
                 format!("latest is {version}; installed {installed_version} is current"),
             );
             return Ok(None);
         }
-        Err(e) => return Err(AppError::Update { message: e.reason }),
+        Discovery::Next {
+            release,
+            latest_version,
+        } => {
+            if release.version != latest_version {
+                tracer.log(
+                    "discover",
+                    format!(
+                        "latest is {latest_version}; {} is the next release after the installed one",
+                        release.version
+                    ),
+                );
+            }
+            *release
+        }
     };
     tracer.log(
         "schema",
@@ -580,24 +623,12 @@ pub fn gate_release(
     installed_version: &str,
     installed_git_commit: Option<&str>,
 ) -> Result<ReleaseGate, GateError> {
-    let unreadable = |reason: String| GateError {
-        newer_version: None,
-        reason,
+    let (value, version) = match read_version(release_json_bytes, installed_version)? {
+        (_, version, VersionCompare::OlderOrEqual) => {
+            return Ok(ReleaseGate::NotNewer { version });
+        }
+        (value, version, VersionCompare::Newer) => (value, version),
     };
-
-    let value: serde_json::Value = serde_json::from_slice(release_json_bytes)
-        .map_err(|e| unreadable(format!("release.json failed to parse: {e}")))?;
-    let version = value
-        .get("version")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| unreadable("release.json has no string `version`".to_string()))?
-        .to_string();
-
-    match compare_versions(&version, installed_version) {
-        Ok(VersionCompare::OlderOrEqual) => return Ok(ReleaseGate::NotNewer { version }),
-        Ok(VersionCompare::Newer) => {}
-        Err(e) => return Err(unreadable(update_message(e))),
-    }
 
     let refuse = |reason: String| GateError {
         newer_version: Some(version.clone()),
@@ -630,6 +661,228 @@ pub fn gate_release(
     check_continuity(&release, installed_git_commit).map_err(|e| refuse(update_message(e)))?;
 
     Ok(ReleaseGate::Newer(Box::new(release)))
+}
+
+/// A `release.json`'s `version`, read alone and compared with the installed
+/// one. The refusal carries no version: a document that cannot say what it
+/// is has not claimed to be an update.
+fn read_version(
+    release_json_bytes: &[u8],
+    installed_version: &str,
+) -> Result<(serde_json::Value, String, VersionCompare), GateError> {
+    let unreadable = |reason: String| GateError {
+        newer_version: None,
+        reason,
+    };
+    let value: serde_json::Value = serde_json::from_slice(release_json_bytes)
+        .map_err(|e| unreadable(format!("release.json failed to parse: {e}")))?;
+    let version = value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| unreadable("release.json has no string `version`".to_string()))?
+        .to_string();
+    let compared =
+        compare_versions(&version, installed_version).map_err(|e| unreadable(update_message(e)))?;
+    Ok((value, version, compared))
+}
+
+/// What discovery found: whether there is a release to offer, and which.
+#[derive(Debug)]
+pub enum Discovery {
+    /// Nothing is marked latest.
+    NothingMarked,
+    /// The release marked latest is not newer than the one installed.
+    NotNewer { version: String },
+    /// The release to verify and offer next, gated
+    /// ([`ReleaseGate::Newer`]) and with its signed material unchecked.
+    /// `latest_version` is the release marked latest, which is this one
+    /// unless the installed release is more than one behind it.
+    Next {
+        release: Box<ReleaseIndex>,
+        latest_version: String,
+    },
+}
+
+/// Why discovery stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryError {
+    /// The version the release marked latest claims, once it has claimed to
+    /// be newer than the installed one. `None` means nothing claimed an
+    /// update.
+    pub newer_version: Option<String>,
+    pub error: ReleaseCheckError,
+}
+
+/// How many releases [`discover_next_release`] reads back through before it
+/// gives up. A client this far behind updates by a manual install.
+pub const MAX_RELEASE_HOPS: usize = 64;
+
+/// The release this client should be offered next.
+///
+/// **A release is checked by the clients of the release before it**, against
+/// the pins *they* embed (`releases/README.md` → Rotating the CI signing
+/// workflow). So when the installed commit is known, the release to offer
+/// is the one whose `previous_release` is that commit: the latest when the
+/// install is one release behind, and otherwise the first release after the
+/// installed one along the latest's history. A client several releases
+/// behind takes them one at a time, and each is verified under the pins of
+/// the release it replaces, which is the only chain of pins that holds
+/// across a rotation.
+///
+/// The history is read back from the latest through each `release.json`'s
+/// `previous_release`, by tag, through the same download redirects
+/// discovery uses. Those documents are unsigned and are used to *find* the
+/// next release, never to believe it: the release found is gated with the
+/// installed commit (strict continuity) and then has to pass
+/// [`verify_release`], whose human attestation names the previous commit it
+/// was sworn to. Only the fields the walk needs are read from the releases
+/// in between, so a later release in a schema this build cannot parse does
+/// not stop a client from taking the one it can.
+///
+/// With no installed commit known (a fresh install, or one replaced behind
+/// the updater's back) there is nothing to anchor continuity to, and the
+/// release offered is the oldest one newer than the installed version along
+/// the latest's history, gated without a commit. That is still the release
+/// whose clients' pins are the ones this build holds, so a fresh install of
+/// an older release steps across a pin rotation instead of reporting the
+/// rotated release as unverifiable.
+pub async fn discover_next_release(
+    fetcher: &Fetcher,
+    releases_url: &str,
+    installed_version: &str,
+    installed_git_commit: Option<&str>,
+) -> Result<Discovery, DiscoveryError> {
+    let latest_bytes = match fetcher.fetch_latest_release_json(releases_url).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(Discovery::NothingMarked),
+        Err(error) => {
+            return Err(DiscoveryError {
+                newer_version: None,
+                error,
+            });
+        }
+    };
+    let latest_version = match read_version(&latest_bytes, installed_version) {
+        Ok((_, version, VersionCompare::OlderOrEqual)) => {
+            return Ok(Discovery::NotNewer { version });
+        }
+        Ok((_, version, VersionCompare::Newer)) => version,
+        Err(GateError {
+            newer_version,
+            reason,
+        }) => {
+            return Err(DiscoveryError {
+                newer_version,
+                error: ReleaseCheckError::Rejected(reason),
+            });
+        }
+    };
+    // From here the latest has claimed an update, so every refusal names it.
+    let claimed = |error: ReleaseCheckError| DiscoveryError {
+        newer_version: Some(latest_version.clone()),
+        error,
+    };
+    let refuse = |reason: String| claimed(ReleaseCheckError::Rejected(reason));
+    // The release found, held to its schema and to continuity from the
+    // installed commit when one is known.
+    let offer = |bytes: &[u8]| match gate_release(bytes, installed_version, installed_git_commit) {
+        Ok(ReleaseGate::Newer(release)) => Ok(Discovery::Next {
+            release,
+            latest_version: latest_version.clone(),
+        }),
+        Ok(ReleaseGate::NotNewer { version }) => Err(refuse(format!(
+            "release {version} was found as the next release but is not newer than the \
+             installed version {installed_version}"
+        ))),
+        Err(GateError { reason, .. }) => Err(refuse(reason)),
+    };
+
+    let mut bytes = latest_bytes;
+    for _ in 0..MAX_RELEASE_HOPS {
+        let link = ReleaseLink::read(&bytes).map_err(refuse)?;
+        let Some((prev_version, prev_commit)) = link.previous else {
+            return match installed_git_commit {
+                // The oldest release there is, and newer than this build.
+                None => offer(&bytes),
+                Some(installed_commit) => Err(refuse(format!(
+                    "release {} declares no previous release, so the history of the latest \
+                     release {latest_version} does not reach the installed commit \
+                     `{installed_commit}`",
+                    link.version
+                ))),
+            };
+        };
+        if installed_git_commit.is_some_and(|c| prev_commit.eq_ignore_ascii_case(c)) {
+            return offer(&bytes);
+        }
+        let older = compare_versions(&prev_version, installed_version)
+            .map_err(|e| refuse(update_message(e)))?;
+        if matches!(older, VersionCompare::OlderOrEqual) {
+            return match installed_git_commit {
+                // This release is the oldest one newer than the installed
+                // version.
+                None => offer(&bytes),
+                // The history went past the installed release without
+                // passing through it: a fork, or a release.json describing
+                // someone else's history.
+                Some(installed_commit) => Err(refuse(format!(
+                    "continuity failure: the history of the latest release {latest_version} \
+                     passes release {prev_version} (commit `{prev_commit}`) without reaching \
+                     the installed commit `{installed_commit}` ({installed_version}). Either \
+                     the installed release is not one of this line's, or someone served a \
+                     forked release.json."
+                ))),
+            };
+        }
+        let tag = format!("v{prev_version}");
+        let fetched = fetcher
+            .fetch_release_json(releases_url, &tag)
+            .await
+            .map_err(&claimed)?;
+        let found = ReleaseLink::read(&fetched).map_err(refuse)?;
+        if found.version != prev_version || !found.git_commit.eq_ignore_ascii_case(&prev_commit) {
+            return Err(refuse(format!(
+                "release {} names its previous release as {prev_version} at commit \
+                 `{prev_commit}`, but the release.json under {tag} is {} at commit `{}`",
+                link.version, found.version, found.git_commit
+            )));
+        }
+        bytes = fetched;
+    }
+    Err(refuse(format!(
+        "the installed release is more than {MAX_RELEASE_HOPS} releases behind the latest \
+         ({latest_version}); install the latest release manually"
+    )))
+}
+
+/// The fields of a `release.json` that place it in a history, read without
+/// holding the document to any schema.
+struct ReleaseLink {
+    version: String,
+    git_commit: String,
+    previous: Option<(String, String)>,
+}
+
+impl ReleaseLink {
+    fn read(bytes: &[u8]) -> Result<Self, String> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| format!("release.json failed to parse: {e}"))?;
+        let string = |v: &serde_json::Value, name: &str| -> Result<String, String> {
+            v.get(name)
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| format!("release.json has no string `{name}`"))
+        };
+        let previous = match value.get("previous_release") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(prev) => Some((string(prev, "version")?, string(prev, "git_commit")?)),
+        };
+        Ok(Self {
+            version: string(&value, "version")?,
+            git_commit: string(&value, "git_commit")?,
+            previous,
+        })
+    }
 }
 
 /// What a release that verified is made of: the summary a person approves,

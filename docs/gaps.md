@@ -24,11 +24,11 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **What constrains it today.** The check itself now exists: `updater::install::stage` hashes each downloaded container against the value the verified manifest records and refuses on any difference, leaving no staged tree. What is still missing is the wiring that builds an install plan from a verified release — which waits on the attestation carrying the detached material's hash and the signing identity to expect.
 
-### Multi-hop / fast-forward continuity
+### Multi-hop continuity
 
-**What it would catch.** A client that skips multiple releases (e.g. v1.0 → v1.5, missing v1.1–v1.4). Today the continuity gate requires strict equality between `release.previous_release.git_commit` and the installed commit, so an out-of-date client must update through every release in order.
+**Current behavior.** A client several releases behind is offered the *next* release along the latest's history, not the latest: each release is verified by the clients of the release before it, against their pins, so a client steps through the releases it missed one at a time (`updater::discover_next_release`). The history is found by reading each release's unsigned `previous_release` back from the latest, by tag, and only the release found is gated and verified.
 
-**What constrains it today.** Strictly sequential is the safer floor. Relaxing to "fast-forward reachable via GitHub commits API" is a small follow-up that's only worth doing once the release cadence makes sequential updates painful in practice.
+**What it costs.** One update per release missed, each its own download, verification and relaunch. Jumping straight to the latest would need the client to trust each intermediate release's pins without having installed it, which is the chain a pin rotation breaks. A release removed from the listing breaks the walk for every client behind it, who then install the latest manually; so does falling more than `MAX_RELEASE_HOPS` releases behind.
 
 ## Operational
 
@@ -48,7 +48,7 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **Current behavior.** A fresh client (no prior installed `git_commit`) bypasses continuity, so an adversary serving an internally-consistent *older* `release.json` could route them onto a real-but-stale release.
 
-**Today every client is a fresh client.** No build knows the commit it was released from, and none can learn it at build time: the release commit records the binaries' `narHash` in `artifact-manifest.json`, so a binary embedding that commit could never reach a fixed point (the same reason the manifest is excluded from the build's source). The installed commit has to come from the updater recording what it installed, which waits on promotion (Install / atomic-replace, below). Until then the continuity stage is skipped on every check, and the version gate (`latest > installed`, against the compile-time workspace version) is the only ordering the client enforces.
+**Today every client is a fresh client.** No build knows the commit it was released from, and none can learn it at build time: the release commit records the binaries' `narHash` in `artifact-manifest.json`, so a binary embedding that commit could never reach a fixed point (the same reason the manifest is excluded from the build's source). The installed commit has to come from the updater recording what it installed (`updater::installed`, keyed by the SHA-256 of the install's main executable, so a manual install over the top reads as a fresh install again). The record is read on every check, and nothing writes it until promotion lands (Install / atomic-replace, below). Until then the continuity stage is skipped on every check, and the client is offered the oldest release newer than its compile-time version along the latest's history.
 
 **Mitigations today.** None that the client can enforce. A first install is exactly the case where the client has nothing to compare against, so the surface "did you download a current release or a stale-but-internally-consistent one?" lives outside the client's reach today.
 

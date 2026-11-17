@@ -163,8 +163,9 @@ enum UpdateCommand {
         /// compile-time version). Useful for testing the continuity gate.
         #[arg(long)]
         installed_version: Option<String>,
-        /// Pin the installed git commit (default: none, meaning "first
-        /// install — bypass continuity"). Useful for testing.
+        /// Pin the installed git commit (default: the one the updater
+        /// recorded installing, or none, which skips continuity). Useful
+        /// for testing.
         #[arg(long)]
         installed_git_commit: Option<String>,
         /// (dev only) read release bytes from a local directory instead
@@ -667,6 +668,9 @@ fn main() {
     // when the local database is held by another Eidola (opening the profile
     // takes its exclusive lock and can fail with `DatabaseInUse`).
     let cli = Cli::parse();
+    eidola_app_core::updater::install_kind::declare_running_program(
+        eidola_app_core::updater::install_kind::Program::Cli,
+    );
 
     // `service` never touches the local database — and must not: the running
     // service holds its exclusive lock, so building the core here would make
@@ -1681,6 +1685,12 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
         }) => {
             let installed_version =
                 installed_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+            // The commit the updater recorded installing, unless one is
+            // pinned on the command line.
+            let installed_git_commit = installed_git_commit.or_else(|| {
+                let (_, data_dir) = profile_dirs();
+                eidola_app_core::updater::installed::running_install_commit(&data_dir)
+            });
             let installed_git_commit = installed_git_commit.as_deref();
 
             eprintln!("Checking for updates...");
@@ -1688,7 +1698,9 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                 "  installed version: {installed_version}{}",
                 installed_git_commit
                     .map(|c| format!(" (commit {c})"))
-                    .unwrap_or_else(|| " (first-install; no commit pinned)".into())
+                    .unwrap_or_else(
+                        || " (no installed commit recorded; continuity not checked)".into()
+                    )
             );
             if let Some(d) = fixtures_dir.as_deref() {
                 eprintln!("  fixtures dir:      {d} (dev mode; no network fetches)");

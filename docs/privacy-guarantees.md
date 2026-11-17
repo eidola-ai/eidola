@@ -100,7 +100,7 @@ Every item is a permanent property of a specific release. Most are inherent attr
 **6.7.** Self-update requires that the incoming release's `previous_release.git_commit` equal the currently-installed `git_commit`. Stale-release substitution and rollback to a known-bad past release both fail this check.
 
 > [!WARNING]
-> **TODO, blocks release.** §6.7 is not enforced as written: no build can embed its own commit, so the client has no installed commit to compare against. Today an older or equal release is refused by version comparison only. This item must be reworded to the property actually enforced before any release is attested. See [#467](https://github.com/eidola-ai/eidola/issues/467).
+> **TODO, blocks release.** §6.7 is not enforced as written: no build can embed its own commit, so the client compares against the commit its updater recorded installing, and nothing records one until the updater installs releases. Today an older or equal release is refused by version comparison only. This item must be reworded to the property actually enforced before any release is attested. See [#467](https://github.com/eidola-ai/eidola/issues/467).
 
 **6.8.** Release-document `schema_version` values are integers with no semver tolerance. The verifier refuses a release document or attestation whose version is outside its pinned supported set. An artifact manifest with a version outside that set, or with a field the verifier does not recognize, is never accepted silently: it is shown to the user as a release whose claims differ from what the installed client expects, and is not trusted unless the user explicitly accepts it. (See [trust-root.md](trust-root.md#schema-versions-explicit-and-breaking).)
 
