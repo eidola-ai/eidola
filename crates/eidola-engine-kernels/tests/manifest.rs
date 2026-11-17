@@ -458,3 +458,79 @@ fn ds_gemm_tc_runs_on_tensor_cores_and_fuses_nothing() {
         assert_eq!(symbols, want, "{arch}");
     }
 }
+
+/// Qwen3.8's own kernels: every image is built without contraction; the images that
+/// neither divide nor take a square root (the linears, the KV write, the conversions and the
+/// DeltaNet recurrence) hold rounded operations and not one fused multiply-add in their SASS; the
+/// dividing image holds only its divisions' expansions. None uses tensor cores. Each
+/// image has exactly its entries.
+#[test]
+fn qwen_kernels_fuse_nothing() {
+    let manifest = Manifest::embedded();
+    let images: [(&str, bool, &[&str]); 3] = [
+        (
+            "qwen_ops",
+            false,
+            &[
+                "eidola_qwen_embed",
+                "eidola_qwen_kv_write",
+                "eidola_qwen_lin8",
+                "eidola_qwen_linear",
+                "eidola_qwen_round",
+                "eidola_qwen_widen",
+            ],
+        ),
+        (
+            "qwen_ops_div",
+            true,
+            &[
+                "eidola_qwen_attn",
+                "eidola_qwen_dn_norm",
+                "eidola_qwen_dn_prep",
+                "eidola_qwen_gate",
+                "eidola_qwen_norm",
+                "eidola_qwen_quant",
+            ],
+        ),
+        ("qwen_deltanet", false, &["eidola_qwen_dn_rec"]),
+    ];
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        for (name, divides, entries) in images {
+            let cubin = manifest
+                .cubin(name, arch)
+                .unwrap_or_else(|| panic!("no cubin {name} {arch}"));
+            assert_eq!(cubin.profile, "exact", "{name}");
+            let ops = cubin.float_ops.as_ref().expect("float_ops");
+            assert!(ops.ptx_rounded > 0, "{name} {arch}");
+            assert_eq!(ops.sass_fma > 0, divides, "{name} {arch}: {}", ops.sass_fma);
+            assert!(cubin.mma_sass.is_empty(), "{name} {arch}");
+            let mut symbols: Vec<&str> = cubin.entries.iter().map(|e| e.symbol.as_str()).collect();
+            symbols.sort_unstable();
+            assert_eq!(symbols, entries, "{name} {arch}");
+        }
+    }
+}
+
+/// The fast profile's attention at head dimension 256: FlashInfer's FA2 (`HMMA`, no
+/// tcgen05), its split instances at query tiles 16 and 64 and the d256 merge.
+#[test]
+fn qwen_fa2_d256_is_the_mma_sync_path() {
+    let manifest = Manifest::embedded();
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        let name = "flashinfer_fa2_sink_paged_d256";
+        assert!(mma(manifest, name, arch, "HMMA") > 0, "{arch}");
+        assert_eq!(mma(manifest, name, arch, "UTC"), 0, "{arch}");
+        let cubin = manifest.cubin(name, arch).expect("cubin");
+        let mut metas: Vec<&str> = cubin.meta.iter().map(String::as_str).collect();
+        metas.sort_unstable();
+        assert_eq!(
+            metas,
+            [
+                "eidola_fa2_merge_states_bf16_d256_meta",
+                "eidola_fa2_sink_paged_d256_bf16_q16_meta",
+                "eidola_fa2_sink_paged_d256_bf16_q64_meta",
+            ],
+            "{arch}"
+        );
+    }
+}

@@ -1,6 +1,6 @@
 # eidola-engine-cuda
 
-The CUDA executors of the engine, one module per architecture: `src/mimo/` (MiMo-V2.6, `CudaExecutor`) and `src/deepseek/` (DeepSeek-V4.1, `DsCudaExecutor`, *DeepSeek-V4.1* below). The root modules are shared by both: `device.rs`, `module.rs`, `launch.rs`, `kv_cipher.rs`, `sampler.rs`, `bf16.rs`, `ops.rs` (the RMSNorm smoke kernel) and `lib.rs` (`CudaError`, `Unsupported`, `narrow`). Everything before *DeepSeek-V4.1* describes MiMo-V2.6's executor: the serving core's `Executor` on one Blackwell GPU, running the kernels `eidola-engine-kernels` builds ahead of time, through the CUDA driver API. It is held to the seam contract (`eidola-engine/src/executor.rs`, normative) and diffed against the CPU reference executor and the model crate's f32 reference forward. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
+The CUDA executors of the engine, one module per architecture: `src/mimo/` (MiMo-V2.6, `CudaExecutor`), `src/deepseek/` (DeepSeek-V4.1, `DsCudaExecutor`, *DeepSeek-V4.1* below) and `src/qwen/` (Qwen3.8, `QwenCudaExecutor`, *Qwen3.8* below). The root modules are shared by both: `device.rs`, `module.rs`, `launch.rs`, `kv_cipher.rs`, `sampler.rs`, `bf16.rs`, `ops.rs` (the RMSNorm smoke kernel) and `lib.rs` (`CudaError`, `Unsupported`, `narrow`). Everything before *DeepSeek-V4.1* describes MiMo-V2.6's executor: the serving core's `Executor` on one Blackwell GPU, running the kernels `eidola-engine-kernels` builds ahead of time, through the CUDA driver API. It is held to the seam contract (`eidola-engine/src/executor.rs`, normative) and diffed against the CPU reference executor and the model crate's f32 reference forward. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
 
 | Module | Contents |
 |---|---|
@@ -18,6 +18,7 @@ The CUDA executors of the engine, one module per architecture: `src/mimo/` (MiMo
 | `mimo/engine_ops.rs` | Wrappers for our own kernels (`engine_ops.cu`), and the decode path's launch geometry (`RouterForm`, `executor_router` and its bound `ROUTER_PER_TOKEN_MAX`, the one-token form's `router_grid` and the split form's `router_scores_grid` and `router_select_grid`, `permute_grid`, `gather_grid`, `swiglu_grid` and the dense `swiglu_f32scale_grid`, `quant_grid`, `combine_grid`, `qkv_grid`, `copy_grid`). |
 | `mimo/support.rs` | `check_supported` and `check_drafting`: the one model configuration the kernels can run; `Unsupported` (in `lib.rs`) names the field. |
 | `deepseek/` | DeepSeek-V4.1 (*DeepSeek-V4.1*): the kernels' parameter structs (`abi.rs`); the launch wrappers of the kernel images (`ops.rs`, `gemm_ref.rs`, `head.rs`, `attention.rs`, `index.rs`) with their grids, precondition checks and host forms; the launches the executor makes through them (`kernels.rs`); and the second executor: `executor.rs`, `half.rs`, `model.rs`, `plan.rs`, `kv.rs`, `weights.rs`, `boundary.rs`, `support.rs`, `host.rs`; dev-only, behind the `dev-staged-experts` feature, `staged.rs` (the whole model on one GPU, its routed experts cached from host memory). |
+| `qwen/` | Qwen3.8 (*Qwen3.8*): the kernels' parameter structs (`abi.rs`), the kernel families and their grids (`kernels.rs`), the device trait and the profiles (`device.rs`), the GPU (`cuda.rs`) and the host-memory device for the tests (`host.rs`), the weights (`weights.rs`) and the executor (`executor.rs`). |
 | `mimo/tma.rs` | `cuTensorMapEncodeTiled` specs, CuTe's descriptor fix-up. |
 | `device.rs`, `module.rs`, `launch.rs`, `ops.rs`, `bf16.rs` | Shared: device, verified image loading and launch, argument lists, the RMSNorm smoke kernel, BF16 bits. |
 
@@ -273,6 +274,48 @@ Each loading phase first lays its configuration out on two `DryDevice`s of one B
 | `summary` | `summary.json` and `summary.txt`: our results, the node's, the yardstick's, and agreement of the most likely token and of greedy tokens between the stacks |
 
 None of it has run on a device. The node runs the form its configuration fixes (exact), so its timings are not a speed figure; the speed figures are `two_serving`'s (the executor under the engine, no HTTP) against vLLM's over HTTP.
+
+## Qwen3.8
+
+`src/qwen/` is Qwen3.8-27B's module tree, a sibling of `src/mimo/` and `src/deepseek/`; it shares the root modules, and in the fast profile MiMo's CUTLASS GEMM wrapper (`mimo::gemm::Gemm`), whose kernels it runs as they are. `QwenCudaExecutor<D: QwenDevice>` implements the seam for the hybrid model as the CPU reference executor does (`eidola-engine-cpu/AGENTS.md` → Qwen3.8): the same groups, state pool, tails, drafter rows, draft chain, canonical rewrite, taps and kept normed states, the same maintenance (`SaveState` included), and **state images byte for byte the reference executor's** (per DeltaNet layer its conv history then `S`, f32, then the tag; plaintext and ciphertext alike, since the cipher pieces are the same).
+
+**Two profiles** (`QwenProfile`, fixed when the device is opened):
+
+- **Exact** (the verification mode): every kernel equal to the model crate bit for bit, so the executor equals the CPU reference executor bit for bit through the scheduler.
+- **Fast** (the serving mode): the FP8 linears on CUTLASS's blockwise tcgen05 GEMM (the checkpoint's BF16 block scales widened to f32 at load, exactly; the kernels' activation and weight layouts are its SFA and SFB) and the large BF16 linears (the head, the drafter's input projection) on CUTLASS's BF16 GEMM, rounded to BF16 by `eidola_qwen_round`. Everything else is the exact kernels. Its contract is reproducibility between calls: greedy tokens and every logit's bits the same whatever shares the batch, however the prompt is chunked, decoded or prefilled, from a cache hit or fresh, at every draft width. That holds because every launch computes a row from its own inputs with a geometry that depends on the rows only through their count and CUTLASS's per-element arithmetic does not depend on M (one instance; the GPU tests assert both). Its distance from the exact profile is measured, not asserted: per GEMM (units in the last place) and per model (top-1, KL).
+- **Attention is the exact kernel in both profiles for now.** The FA2 head-dim-256 images are built (`flashinfer_fa2_sink_paged_d256`); wiring them (a work-list plan like MiMo's, at d256) is outstanding.
+
+**A step**, batched over its rows: maintenance, then pass A (every row's host tokens in one forward; a DeltaNet layer's recurrence starts each row from its source, folds the kept positions after it, runs the host tokens, stores every named write as it passes and the state after the host tokens into the slot's live image), the drafter over the host positions, the draft chain depth by depth, pass B (the drafts, from the live images, storing nothing), sampling and chain acceptance on the host (`eidola_engine::sampling`), the canonical rewrite, taps, kept states and the tail.
+
+**State strategy** (`StateStrategy`): `Live` (the default) keeps a live image per slot at its last row's host-token end, so a row folds only the drafts accepted since; `Lagging` loads the base and folds the whole tail every row, as the reference executor does. Both store the same bytes; `Lagging` is for measurement (`EIDOLA_QWEN_STRATEGY` in the real-weights example).
+
+**Devices** (`QwenDevice`): `CudaDevice` (one GPU, the images verified against the manifest) and `HostDevice` (host memory, each launch handed to a host function after its grid function: the tests give it the kernels' own bodies compiled for the host, `oracle/qwen_launch_host.cc`). Every family's `*_grid` function refuses what its kernel cannot take before anything launches.
+
+**Not yet**: CUDA graphs (scratch is allocated per forward and per-step arrays are uploaded per launch; the capture contract of *Decode graphs* needs fixed scratch and a step table); FA2 in the fast profile; device sampling (logits are read back and sampled on the host); the tuning the profiles will direct. `dense_logits` (one sequence's logits at every position, from a borrowed slot) is a measurement aid the serving path never calls.
+
+**Verification.**
+
+| File | What it proves |
+|---|---|
+| `tests/qwen_kernels_host.rs` | Every family's body, compiled for the host, against the model crate bit for bit (`qwen_common::cases`): norms with the residual add and RoPE, the quantiser and exact FP8 linear, the BF16 linear, both gates, the KV write and exact attention (target and drafter key ranges), the DeltaNet's preparation, recurrence (writes, live store, a resume with a fold) and gated norm. |
+| `tests/qwen_host.rs` | The executor on `HostDevice` with the compiled bodies against the CPU reference executor through the real engine (`qwen_common::pair`, `scenarios`): every step's tokens, every produced token's logits bit for bit, every state image byte for byte and every encryption flag, the memory scan after every step; chunkings 1 to whole with and without drafts under both strategies, shared prefixes over small pools with and without a host tier and a follow-up turn, a request alone and crowded; then reproducibility between calls (`qwen_common::invariance`) and `dense_logits` against the model crate's forward. About 20 s. Each of these, planted, fails it: a write one position early, the drafter's keys from position 0, the live store one position early, a tail entry dropped. |
+| `tests/qwen_ops.rs` (device) | The per-kernel cases on the GPU; the fast linears against the exact ones (deviation recorded) and a row's bits alone and in batches of 5 to 64 (asserted). |
+| `tests/qwen_tiny.rs` (device) | The scenarios on the GPU in the exact profile against the CPU reference executor. |
+| `tests/qwen_fast.rs` (device) | The fast profile's reproducibility between calls, asserted (tokens and logits bits): alone and beside traffic of varied sizes, prefilled in one chunk and several, decoded and prefilled, from a cache hit and fresh, greedy at every draft width; the exact profile the same; the fast profile's deviation from the exact one, recorded. |
+
+The device tests print `SKIPPED` and pass without a device or `EIDOLA_ENGINE_KERNELS_DIR`; the session scripts fail a step that skipped. `EIDOLA_QWEN_SUMMARY_DIR` receives the recorded measurements.
+
+**Real weights** (`examples/qwen_whole.rs <compare|health|generate|bench> <kernels> <checkpoint> <out>`): the goldens' passage through the model crate's forward on the CPU and through both profiles (exact required equal bit for bit; fast's deviation recorded), health in both profiles (licence accuracy at least 0.95, "Paris"), greedy generation equal at draft widths 0 to 3, and the fast profile's throughput and time to first token. `examples/qwen_kernel_bench.rs` times the kernels at the released shapes (copy bandwidth, both GEMM forms, the head, the recurrence, the cipher on a 157 MB image, host copies).
+
+**GPU sessions** (`scripts/qwen_*_session.sh` over `scripts/qwen_session_lib.sh`; markers, logs, `DRY_RUN=1`, resumable on a fresh machine with `$OUT` copied back; `setup`, `build`, `kernels_build` and `fetch` are never marked; a step that printed `SKIPPED` fails; `scripts/qwen_session_test.sh` holds the failure paths and dry runs without a GPU):
+
+| Script | Steps |
+|---|---|
+| `qwen_probe_session.sh` | facts, setup, build, `kernels_build` (the kernel set built on the box's x86_64 and held to the committed manifest), kernels, `qwen_kernels`, `qwen_bench` |
+| `qwen_gpu_session.sh` | the above, `qwen_host`, `qwen_tiny`, `qwen_fast`, `regressions` (MiMo's and DeepSeek's checkpoint-free device suites); named only `qwen_profile` (Nsight Compute) |
+| `qwen_real_session.sh` | `fetch` and `golden_tokens` through `eidola-engine-model`'s `golden/qwen/full_session.sh`, `whole_compare`, `whole_health`, `whole_generate`, `whole_bench`, `golden_gpu` (the reference as released on the GPU), and vLLM 0.33.0 on the same files (`scripts/qwen_vllm.py`: greedy replies, and the decode workload without and with its MTP drafter) |
+
+None has run on a device.
 
 ## The dev-only oracle
 

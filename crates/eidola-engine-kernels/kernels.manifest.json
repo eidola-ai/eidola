@@ -206,12 +206,36 @@
       "sha256": "76d32d6b0330f474ed3b79530704d24532983b5abbecbe8b19f75c0749f7d0fb"
     },
     {
+      "path": "csrc/flashinfer_fa2_sink_paged_d256.cu",
+      "sha256": "eda1cdfd14d7d6a36e19e4356f21f7065fe2dfb187f12c179f774a13540ac052"
+    },
+    {
       "path": "csrc/kernels.json",
-      "sha256": "ae1069805d8c4bc997b7b3edabaf2424f178bb2f0c5f7b6a382eeec9a97ceb7e"
+      "sha256": "07de608199fdea601f1df64739939c4a73518782313aa9fa6b960ba744e96a60"
     },
     {
       "path": "csrc/kv_cipher.cu",
       "sha256": "598d31479050e0f6ee151a37fabdbf185cfc674eb8a57aff65b3b1a81784b4a5"
+    },
+    {
+      "path": "csrc/qwen_abi.cuh",
+      "sha256": "65a524bf86dc99de8d2ded4c7cd506c61e582300441e5a30f49473d3e93c27d8"
+    },
+    {
+      "path": "csrc/qwen_deltanet.cu",
+      "sha256": "4f03898a07b9cd816b16ccb976a936c4bdb20b43e5a47711bd2855ff773794c5"
+    },
+    {
+      "path": "csrc/qwen_ops.cu",
+      "sha256": "b752f8f2765d7bd9346063b281a9285f42e017ff3f96bfdceb4d466c7387ce48"
+    },
+    {
+      "path": "csrc/qwen_ops.cuh",
+      "sha256": "e9b198a5b66b6afd4316deafa976a8e303c7afe24dc59e21dd3d4b9f30eed6eb"
+    },
+    {
+      "path": "csrc/qwen_ops_div.cu",
+      "sha256": "e0679c74e0eb88f459e0b451d0f81b14182fa7d567739ba69f5757276729c9ce"
     },
     {
       "path": "csrc/rmsnorm.cu",
@@ -2473,6 +2497,108 @@
       }
     },
     {
+      "name": "flashinfer_fa2_sink_paged_d256",
+      "arch": "sm_100a",
+      "source": "csrc/flashinfer_fa2_sink_paged_d256.cu",
+      "profile": "flashinfer",
+      "file": "cubin/flashinfer_fa2_sink_paged_d256.sm_100a.cubin",
+      "sha256": "e9f99f15b6af11c1861f25456ced2b892b0acac7bbba2bf9e33c51f6411ee44d",
+      "size": 202064,
+      "entries": [
+        {
+          "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj32ELj4ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
+          "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)32, (unsigned int)4, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
+          "meta": "eidola_fa2_merge_states_bf16_d256_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_d256_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_d256_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_d256_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_d256_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_d256_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_d256_bf16_q64_meta"
+        }
+      ],
+      "meta": [
+        "eidola_fa2_merge_states_bf16_d256_meta",
+        "eidola_fa2_sink_paged_d256_bf16_q16_meta",
+        "eidola_fa2_sink_paged_d256_bf16_q64_meta"
+      ],
+      "mma_sass": {
+        "HMMA": 520
+      }
+    },
+    {
+      "name": "flashinfer_fa2_sink_paged_d256",
+      "arch": "sm_100f",
+      "source": "csrc/flashinfer_fa2_sink_paged_d256.cu",
+      "profile": "flashinfer",
+      "file": "cubin/flashinfer_fa2_sink_paged_d256.sm_100f.cubin",
+      "sha256": "e89938f90f6bd54502cde84986b8f2fc9362b8da74392dfe864d3394e918fa93",
+      "size": 202064,
+      "entries": [
+        {
+          "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj32ELj4ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
+          "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)32, (unsigned int)4, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
+          "meta": "eidola_fa2_merge_states_bf16_d256_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_d256_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_d256_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_d256_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_d256_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_d256_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_d256_bf16_q64_meta"
+        }
+      ],
+      "meta": [
+        "eidola_fa2_merge_states_bf16_d256_meta",
+        "eidola_fa2_sink_paged_d256_bf16_q16_meta",
+        "eidola_fa2_sink_paged_d256_bf16_q64_meta"
+      ],
+      "mma_sass": {
+        "HMMA": 520
+      }
+    },
+    {
+      "name": "flashinfer_fa2_sink_paged_d256",
+      "arch": "sm_103a",
+      "source": "csrc/flashinfer_fa2_sink_paged_d256.cu",
+      "profile": "flashinfer",
+      "file": "cubin/flashinfer_fa2_sink_paged_d256.sm_103a.cubin",
+      "sha256": "96c4996d55ac6b186fa77b05d47a622642a2822a8e274391eac1bde2f37b4f21",
+      "size": 202488,
+      "entries": [
+        {
+          "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj32ELj4ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
+          "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)32, (unsigned int)4, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
+          "meta": "eidola_fa2_merge_states_bf16_d256_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_d256_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_d256_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_d256_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_d256_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_d256_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_d256_bf16_q64_meta"
+        }
+      ],
+      "meta": [
+        "eidola_fa2_merge_states_bf16_d256_meta",
+        "eidola_fa2_sink_paged_d256_bf16_q16_meta",
+        "eidola_fa2_sink_paged_d256_bf16_q64_meta"
+      ],
+      "mma_sass": {
+        "HMMA": 520
+      }
+    },
+    {
       "name": "kv_cipher",
       "arch": "sm_100a",
       "source": "csrc/kv_cipher.cu",
@@ -2531,6 +2657,420 @@
         "eidola_kv_chacha20_meta"
       ],
       "mma_sass": {}
+    },
+    {
+      "name": "qwen_deltanet",
+      "arch": "sm_100a",
+      "source": "csrc/qwen_deltanet.cu",
+      "profile": "exact",
+      "file": "cubin/qwen_deltanet.sm_100a.cubin",
+      "sha256": "9e8c94e8fa3c30c70c55f71e7233817dad2d761817062a53187383511074b97f",
+      "size": 172512,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_dn_rec",
+          "demangled": "eidola_qwen_dn_rec",
+          "meta": "eidola_qwen_dn_rec_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_dn_rec_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 930,
+        "sass_fma": 0
+      }
+    },
+    {
+      "name": "qwen_deltanet",
+      "arch": "sm_100f",
+      "source": "csrc/qwen_deltanet.cu",
+      "profile": "exact",
+      "file": "cubin/qwen_deltanet.sm_100f.cubin",
+      "sha256": "eb7da423617e53fb2e73b26cd8fe91bf2f9d0851fb51b5d78f6e7989bdd744ff",
+      "size": 172512,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_dn_rec",
+          "demangled": "eidola_qwen_dn_rec",
+          "meta": "eidola_qwen_dn_rec_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_dn_rec_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 930,
+        "sass_fma": 0
+      }
+    },
+    {
+      "name": "qwen_deltanet",
+      "arch": "sm_103a",
+      "source": "csrc/qwen_deltanet.cu",
+      "profile": "exact",
+      "file": "cubin/qwen_deltanet.sm_103a.cubin",
+      "sha256": "a9c800e8379b8a8c22bdea648182f4edb819372639d2c0988a8e8c0dbae0ef9a",
+      "size": 172512,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_dn_rec",
+          "demangled": "eidola_qwen_dn_rec",
+          "meta": "eidola_qwen_dn_rec_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_dn_rec_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 930,
+        "sass_fma": 0
+      }
+    },
+    {
+      "name": "qwen_ops",
+      "arch": "sm_100a",
+      "source": "csrc/qwen_ops.cu",
+      "profile": "exact",
+      "file": "cubin/qwen_ops.sm_100a.cubin",
+      "sha256": "f23e96946d32b67cd31737c62c20713169ed56a90229caaa44afd83084c36c64",
+      "size": 70632,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_embed",
+          "demangled": "eidola_qwen_embed",
+          "meta": "eidola_qwen_embed_meta"
+        },
+        {
+          "symbol": "eidola_qwen_kv_write",
+          "demangled": "eidola_qwen_kv_write",
+          "meta": "eidola_qwen_kv_write_meta"
+        },
+        {
+          "symbol": "eidola_qwen_lin8",
+          "demangled": "eidola_qwen_lin8",
+          "meta": "eidola_qwen_lin8_meta"
+        },
+        {
+          "symbol": "eidola_qwen_linear",
+          "demangled": "eidola_qwen_linear",
+          "meta": "eidola_qwen_linear_meta"
+        },
+        {
+          "symbol": "eidola_qwen_round",
+          "demangled": "eidola_qwen_round",
+          "meta": "eidola_qwen_round_meta"
+        },
+        {
+          "symbol": "eidola_qwen_widen",
+          "demangled": "eidola_qwen_widen",
+          "meta": "eidola_qwen_widen_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_embed_meta",
+        "eidola_qwen_kv_write_meta",
+        "eidola_qwen_lin8_meta",
+        "eidola_qwen_linear_meta",
+        "eidola_qwen_round_meta",
+        "eidola_qwen_widen_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 346,
+        "sass_fma": 0
+      }
+    },
+    {
+      "name": "qwen_ops",
+      "arch": "sm_100f",
+      "source": "csrc/qwen_ops.cu",
+      "profile": "exact",
+      "file": "cubin/qwen_ops.sm_100f.cubin",
+      "sha256": "8d7328db026603a407ea15ab87beb9699acf7149af996eb4a173cc39ca5ed934",
+      "size": 70632,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_embed",
+          "demangled": "eidola_qwen_embed",
+          "meta": "eidola_qwen_embed_meta"
+        },
+        {
+          "symbol": "eidola_qwen_kv_write",
+          "demangled": "eidola_qwen_kv_write",
+          "meta": "eidola_qwen_kv_write_meta"
+        },
+        {
+          "symbol": "eidola_qwen_lin8",
+          "demangled": "eidola_qwen_lin8",
+          "meta": "eidola_qwen_lin8_meta"
+        },
+        {
+          "symbol": "eidola_qwen_linear",
+          "demangled": "eidola_qwen_linear",
+          "meta": "eidola_qwen_linear_meta"
+        },
+        {
+          "symbol": "eidola_qwen_round",
+          "demangled": "eidola_qwen_round",
+          "meta": "eidola_qwen_round_meta"
+        },
+        {
+          "symbol": "eidola_qwen_widen",
+          "demangled": "eidola_qwen_widen",
+          "meta": "eidola_qwen_widen_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_embed_meta",
+        "eidola_qwen_kv_write_meta",
+        "eidola_qwen_lin8_meta",
+        "eidola_qwen_linear_meta",
+        "eidola_qwen_round_meta",
+        "eidola_qwen_widen_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 346,
+        "sass_fma": 0
+      }
+    },
+    {
+      "name": "qwen_ops",
+      "arch": "sm_103a",
+      "source": "csrc/qwen_ops.cu",
+      "profile": "exact",
+      "file": "cubin/qwen_ops.sm_103a.cubin",
+      "sha256": "3d6266b4f4a4fac997f768b9be819ebf39646e0d8e35c13e06b036861daabf46",
+      "size": 71784,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_embed",
+          "demangled": "eidola_qwen_embed",
+          "meta": "eidola_qwen_embed_meta"
+        },
+        {
+          "symbol": "eidola_qwen_kv_write",
+          "demangled": "eidola_qwen_kv_write",
+          "meta": "eidola_qwen_kv_write_meta"
+        },
+        {
+          "symbol": "eidola_qwen_lin8",
+          "demangled": "eidola_qwen_lin8",
+          "meta": "eidola_qwen_lin8_meta"
+        },
+        {
+          "symbol": "eidola_qwen_linear",
+          "demangled": "eidola_qwen_linear",
+          "meta": "eidola_qwen_linear_meta"
+        },
+        {
+          "symbol": "eidola_qwen_round",
+          "demangled": "eidola_qwen_round",
+          "meta": "eidola_qwen_round_meta"
+        },
+        {
+          "symbol": "eidola_qwen_widen",
+          "demangled": "eidola_qwen_widen",
+          "meta": "eidola_qwen_widen_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_embed_meta",
+        "eidola_qwen_kv_write_meta",
+        "eidola_qwen_lin8_meta",
+        "eidola_qwen_linear_meta",
+        "eidola_qwen_round_meta",
+        "eidola_qwen_widen_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 346,
+        "sass_fma": 0
+      }
+    },
+    {
+      "name": "qwen_ops_div",
+      "arch": "sm_100a",
+      "source": "csrc/qwen_ops_div.cu",
+      "profile": "exact",
+      "file": "cubin/qwen_ops_div.sm_100a.cubin",
+      "sha256": "07973ac26bb5f8947a99d6d0a25bcc97f9398b6d47a0917be135c74dbf4ddb65",
+      "size": 157648,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_attn",
+          "demangled": "eidola_qwen_attn",
+          "meta": "eidola_qwen_attn_meta"
+        },
+        {
+          "symbol": "eidola_qwen_dn_norm",
+          "demangled": "eidola_qwen_dn_norm",
+          "meta": "eidola_qwen_dn_norm_meta"
+        },
+        {
+          "symbol": "eidola_qwen_dn_prep",
+          "demangled": "eidola_qwen_dn_prep",
+          "meta": "eidola_qwen_dn_prep_meta"
+        },
+        {
+          "symbol": "eidola_qwen_gate",
+          "demangled": "eidola_qwen_gate",
+          "meta": "eidola_qwen_gate_meta"
+        },
+        {
+          "symbol": "eidola_qwen_norm",
+          "demangled": "eidola_qwen_norm",
+          "meta": "eidola_qwen_norm_meta"
+        },
+        {
+          "symbol": "eidola_qwen_quant",
+          "demangled": "eidola_qwen_quant",
+          "meta": "eidola_qwen_quant_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_attn_meta",
+        "eidola_qwen_dn_norm_meta",
+        "eidola_qwen_dn_prep_meta",
+        "eidola_qwen_gate_meta",
+        "eidola_qwen_norm_meta",
+        "eidola_qwen_quant_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 1524,
+        "sass_fma": 307
+      }
+    },
+    {
+      "name": "qwen_ops_div",
+      "arch": "sm_100f",
+      "source": "csrc/qwen_ops_div.cu",
+      "profile": "exact",
+      "file": "cubin/qwen_ops_div.sm_100f.cubin",
+      "sha256": "65fe814ff97eb3f28edbd9e2b67af62e456504789dfcc747c8463e47ddb37308",
+      "size": 157648,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_attn",
+          "demangled": "eidola_qwen_attn",
+          "meta": "eidola_qwen_attn_meta"
+        },
+        {
+          "symbol": "eidola_qwen_dn_norm",
+          "demangled": "eidola_qwen_dn_norm",
+          "meta": "eidola_qwen_dn_norm_meta"
+        },
+        {
+          "symbol": "eidola_qwen_dn_prep",
+          "demangled": "eidola_qwen_dn_prep",
+          "meta": "eidola_qwen_dn_prep_meta"
+        },
+        {
+          "symbol": "eidola_qwen_gate",
+          "demangled": "eidola_qwen_gate",
+          "meta": "eidola_qwen_gate_meta"
+        },
+        {
+          "symbol": "eidola_qwen_norm",
+          "demangled": "eidola_qwen_norm",
+          "meta": "eidola_qwen_norm_meta"
+        },
+        {
+          "symbol": "eidola_qwen_quant",
+          "demangled": "eidola_qwen_quant",
+          "meta": "eidola_qwen_quant_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_attn_meta",
+        "eidola_qwen_dn_norm_meta",
+        "eidola_qwen_dn_prep_meta",
+        "eidola_qwen_gate_meta",
+        "eidola_qwen_norm_meta",
+        "eidola_qwen_quant_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 1524,
+        "sass_fma": 307
+      }
+    },
+    {
+      "name": "qwen_ops_div",
+      "arch": "sm_103a",
+      "source": "csrc/qwen_ops_div.cu",
+      "profile": "exact",
+      "file": "cubin/qwen_ops_div.sm_103a.cubin",
+      "sha256": "5467577b56ad9cf9c070b81c0ab7ded9dd1180521518c1c824461a4792b6a298",
+      "size": 201392,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_attn",
+          "demangled": "eidola_qwen_attn",
+          "meta": "eidola_qwen_attn_meta"
+        },
+        {
+          "symbol": "eidola_qwen_dn_norm",
+          "demangled": "eidola_qwen_dn_norm",
+          "meta": "eidola_qwen_dn_norm_meta"
+        },
+        {
+          "symbol": "eidola_qwen_dn_prep",
+          "demangled": "eidola_qwen_dn_prep",
+          "meta": "eidola_qwen_dn_prep_meta"
+        },
+        {
+          "symbol": "eidola_qwen_gate",
+          "demangled": "eidola_qwen_gate",
+          "meta": "eidola_qwen_gate_meta"
+        },
+        {
+          "symbol": "eidola_qwen_norm",
+          "demangled": "eidola_qwen_norm",
+          "meta": "eidola_qwen_norm_meta"
+        },
+        {
+          "symbol": "eidola_qwen_quant",
+          "demangled": "eidola_qwen_quant",
+          "meta": "eidola_qwen_quant_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_attn_meta",
+        "eidola_qwen_dn_norm_meta",
+        "eidola_qwen_dn_prep_meta",
+        "eidola_qwen_gate_meta",
+        "eidola_qwen_norm_meta",
+        "eidola_qwen_quant_meta"
+      ],
+      "mma_sass": {},
+      "float_ops": {
+        "ptx_fma": 0,
+        "ptx_unrounded": 0,
+        "ptx_rounded": 1524,
+        "sass_fma": 307
+      }
     },
     {
       "name": "rmsnorm",
@@ -2823,10 +3363,50 @@
       ]
     },
     {
+      "name": "flashinfer_fa2_sink_paged_d256",
+      "file": "fatbin/flashinfer_fa2_sink_paged_d256.fatbin",
+      "sha256": "929a231506c42cc500919b8d791aa6681d318581e564e436999e9ab19268aa98",
+      "size": 404784,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
       "name": "kv_cipher",
       "file": "fatbin/kv_cipher.fatbin",
       "sha256": "34de69d72b3be811d779c7604f939b132e2aa00281abc6f5f1badf0b8d4732b8",
       "size": 63912,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "qwen_deltanet",
+      "file": "fatbin/qwen_deltanet.fatbin",
+      "sha256": "0c18749fdde9350a871725e480007e2465f99661de0f0b3fa99133fc2892fadd",
+      "size": 345256,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "qwen_ops",
+      "file": "fatbin/qwen_ops.fatbin",
+      "sha256": "83b828bbcdc18ffe1f190df4a1c00b6ec558679cef83cff3ea6eb03faa08d53d",
+      "size": 142648,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "qwen_ops_div",
+      "file": "fatbin/qwen_ops_div.fatbin",
+      "sha256": "3e8dd9e5c5a88a3263059535442ae661e14952d48c9d9eb32a23b8bda7640f9a",
+      "size": 359272,
       "archs": [
         "sm_100a",
         "sm_103a"

@@ -25,6 +25,7 @@ pub mod launch;
 pub mod mimo;
 pub mod module;
 pub mod ops;
+pub mod qwen;
 pub mod sampler;
 
 use std::fmt;

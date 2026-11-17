@@ -75,6 +75,18 @@
         "eidola_fa2_merge_states_bf16_d128_meta":
           "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj"
       }
+    },
+    { "name": "qwen_ops", "source": "qwen_ops.cu", "profile": "exact" },
+    { "name": "qwen_ops_div", "source": "qwen_ops_div.cu", "profile": "exact" },
+    { "name": "qwen_deltanet", "source": "qwen_deltanet.cu", "profile": "exact" },
+    {
+      "name": "flashinfer_fa2_sink_paged_d256",
+      "source": "flashinfer_fa2_sink_paged_d256.cu",
+      "profile": "flashinfer",
+      "meta_aliases": {
+        "eidola_fa2_merge_states_bf16_d256_meta":
+          "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj32ELj4ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj"
+      }
     }
   ]
 }
