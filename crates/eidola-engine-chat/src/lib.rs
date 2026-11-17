@@ -1,7 +1,7 @@
 //! Chat layer of the inference engine: tokenizer, prompt rendering, and
 //! streaming reasoning / tool-call output parsing, for each model architecture
-//! the engine serves ([`ChatFormat`]): MiMo-V2.6 (Flash and Pro) and
-//! DeepSeek-V4.1.
+//! the engine serves ([`ChatFormat`]): MiMo-V2.6 (Flash and Pro),
+//! DeepSeek-V4.1 and Qwen3.8.
 //!
 //! A MiMo request flows through it in this order:
 //!
@@ -29,16 +29,23 @@
 //! in, and takes tool-call arguments as the request sent them), a
 //! [`Tokenizer`] loaded with [`Tokenizer::for_format`], and an
 //! [`OutputParser`] configured with [`OutputConfig::deepseek_v4_1`].
+//!
+//! A Qwen3.8 request takes MiMo's steps through [`qwen`]: the model's own
+//! template ([`qwen::ChatTemplate`], which decodes string tool-call arguments
+//! itself), a [`Tokenizer`] loaded with [`Tokenizer::for_format`], and an
+//! [`OutputParser`] configured with [`OutputConfig::qwen3_8`].
 
 pub mod args;
 pub mod deepseek;
 pub mod error;
 pub mod format;
+mod jinja;
 pub mod json;
 pub mod mimo;
 pub mod output;
 pub mod prompt;
 pub mod pysem;
+pub mod qwen;
 pub mod reasoning;
 pub mod tokenizer;
 pub mod tool_call;

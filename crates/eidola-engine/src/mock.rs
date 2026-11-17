@@ -24,19 +24,27 @@
 //! fails on a block that is not encrypted; `Promote` copies back and fails unless the host
 //! block holds ciphertext and the device block is zero (its zero ran first); `ZeroHost`
 //! scrubs. So a plaintext block can never reach the host tier through a passing step.
+//!
+//! A spec with a recurrent state ([`qwen_like_spec`]) adds the state model of
+//! [`recurrent`]: its pool takes the same maintenance, under the state pool's index.
 
 use std::collections::HashMap;
 
 mod chain;
+pub mod recurrent;
 
 pub use chain::Reference;
+pub use recurrent::{RecState, recurrent_state};
 
-use crate::executor::{Executor, ExecutorError, Maintenance, SeqEntry, StepInput, StepOutput};
+use crate::executor::{
+    Executor, ExecutorError, Maintenance, SeqEntry, StateWrite, StepInput, StepOutput,
+};
 use crate::kv_cipher::{KvKeystream, KvNonce};
 use crate::sampling::{self, SamplingParams, Stream, mix64};
 use crate::secret::KvKey;
 use crate::spec::{
-    AttentionKind, Bucket, Coverage, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK, WindowChain,
+    AttentionKind, Bucket, Coverage, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK, NULL_STATE,
+    StateGroupSpec, StateSpec, WindowChain,
 };
 
 /// Mock model parameters.
@@ -126,6 +134,7 @@ pub fn mimo_like_spec(
         ],
         window_chain: None,
         token_history: 0,
+        state: None,
     }
 }
 
@@ -196,16 +205,65 @@ pub fn deepseek_like_spec(
         max_draft_tokens: k,
         window_chain: Some(WindowChain { depth, window }),
         token_history: 3,
+        state: None,
         max_model_len: 16384,
         ..mimo_like_spec(vocab, block_size, window, window, num_blocks, slots, k)
     }
 }
 
+/// A small Qwen3.8-shaped spec: one full-attention target group and a full-attention
+/// drafter group (an MTP layer), beside a recurrent state of `state_buffers` buffers (the
+/// null buffer included) whose slots keep the tail the seam requires.
+pub fn qwen_like_spec(
+    vocab: u32,
+    block_size: u32,
+    num_blocks: u32,
+    state_buffers: u32,
+    slots: u32,
+    k: u32,
+) -> ModelSpec {
+    let group = |name: &str, role| KvGroupSpec {
+        name: name.into(),
+        role,
+        attention: AttentionKind::Full,
+        num_layers: 1,
+        num_kv_heads: 4,
+        head_dim_qk: 256,
+        head_dim_v: 256,
+        num_blocks,
+        host_blocks: 0,
+        ratio: 1,
+        device: 0,
+        coverage: Coverage::All,
+    };
+    ModelSpec {
+        kv_groups: vec![
+            group("attention", KvRole::Target),
+            group("mtp", KvRole::Drafter),
+        ],
+        state: Some(StateSpec {
+            groups: vec![StateGroupSpec {
+                name: "deltanet".into(),
+                num_layers: 3,
+                device: 0,
+                image_bytes: (recurrent::IMAGE_WORDS * 8) as u64,
+            }],
+            num_buffers: state_buffers,
+            host_buffers: 0,
+            tail_positions: block_size - 1 + k,
+        }),
+        ..mimo_like_spec(vocab, block_size, 1, 1, num_blocks, slots, k)
+    }
+}
+
 /// `spec` with a host tier of `host_blocks` blocks (the null block included) in every
-/// group.
+/// group, and as many buffers for its state pool if it has one.
 pub fn with_host_tier(mut spec: ModelSpec, host_blocks: u32) -> ModelSpec {
     for g in &mut spec.kv_groups {
         g.host_blocks = host_blocks;
+    }
+    if let Some(state) = &mut spec.state {
+        state.host_buffers = host_blocks;
     }
     spec
 }
@@ -256,7 +314,11 @@ pub fn reference_logits(spec: &ModelSpec, cfg: &MockConfig, tokens: &[u32], q: u
     let state = fold_state(spec, KvRole::Target, q, |g, p| {
         kv_value(cfg, tokens[p as usize], p, g)
     });
-    logits_from_state(cfg, spec.vocab_size, state)
+    let recurrent = match spec.state {
+        Some(_) => recurrent_state(cfg, &tokens[..=q as usize]).output(),
+        None => 0,
+    };
+    logits_from_state(cfg, spec.vocab_size, state ^ recurrent)
 }
 
 /// Non-speculative generation straight from [`reference_logits`]: what every engine run must
@@ -299,7 +361,7 @@ pub fn reference_generate(
 
 /// A stand-in for "which key": the first keystream words under a fixed nonce no block
 /// hash yields in practice. Test instrumentation only.
-fn fingerprint(key: &KvKey) -> u64 {
+pub(crate) fn fingerprint(key: &KvKey) -> u64 {
     let mut w = [0u32; 2];
     KvKeystream::new(key, &KvNonce::from_words([u32::MAX; 3])).apply_words(&mut w);
     u64::from(w[0]) | (u64::from(w[1]) << 32)
@@ -343,6 +405,8 @@ pub struct MockExecutor {
     steps: u64,
     buckets_used: Vec<Bucket>,
     rows_used: Vec<Vec<SeqEntry>>,
+    /// The recurrent state, when the spec has one.
+    recurrent: Option<recurrent::Pool>,
 }
 
 impl MockExecutor {
@@ -398,9 +462,30 @@ impl MockExecutor {
             steps: 0,
             buckets_used: Vec::new(),
             rows_used: Vec::new(),
+            recurrent: recurrent::Pool::new(&spec),
             spec,
             cfg,
         }
+    }
+
+    /// The recurrent state pool, if `group` names it.
+    fn state_pool(&self, group: u32) -> Option<&recurrent::Pool> {
+        self.recurrent.as_ref().filter(|p| p.index == group)
+    }
+
+    /// A state buffer's stored image, as it is.
+    pub fn state_image(&self, buffer: u32) -> recurrent::Image {
+        self.recurrent.as_ref().expect("a state pool").buffers[buffer as usize]
+    }
+
+    /// A host-tier state buffer's stored image, as it is.
+    pub fn host_state_image(&self, host: u32) -> recurrent::Image {
+        self.recurrent.as_ref().expect("a state pool").host[host as usize]
+    }
+
+    /// Every state image stored by a row or by `SaveState` so far, in order.
+    pub fn stored_states(&self) -> &[recurrent::Image] {
+        self.recurrent.as_ref().map_or(&[], |p| &p.stored)
     }
 
     /// Every executed zero as `(step, group, block)`.
@@ -413,15 +498,18 @@ impl MockExecutor {
         &self.crypt_log
     }
 
-    /// Whether a block is held encrypted.
+    /// Whether a block (or state buffer) is held encrypted.
     pub fn block_is_encrypted(&self, group: u32, block: u32) -> bool {
-        self.encrypted[group as usize][block as usize].is_some()
+        self.encrypted_under(group, block).is_some()
     }
 
-    /// The keystream fingerprint of the key a block is encrypted under (`None`: plaintext).
-    /// Equal fingerprints mean the same key.
+    /// The keystream fingerprint of the key a block (or state buffer) is encrypted under
+    /// (`None`: plaintext). Equal fingerprints mean the same key.
     pub fn encrypted_under(&self, group: u32, block: u32) -> Option<u64> {
-        self.encrypted[group as usize][block as usize]
+        match self.state_pool(group) {
+            Some(p) => p.encrypted[block as usize],
+            None => self.encrypted[group as usize][block as usize],
+        }
     }
 
     /// Every executed encrypt's nonce words as `(step, group, block, words)`.
@@ -434,9 +522,14 @@ impl MockExecutor {
         self.chain_writes
     }
 
-    /// Whether the chain model holds no open pooled entry for `slot`.
+    /// Whether the slot holds no per-sequence state: no open pooled entry of the chain
+    /// model, and no recurrent base or tail.
     pub fn slot_state_is_clear(&self, slot: u32) -> bool {
         self.pairs[slot as usize].is_empty()
+            && self
+                .recurrent
+                .as_ref()
+                .is_none_or(|p| p.slot_is_clear(slot))
     }
 
     /// Every executed demote (`true`) or promote as `(step, group, block, host, demote)`.
@@ -449,17 +542,23 @@ impl MockExecutor {
         &self.host_zero_log
     }
 
-    /// Whether every byte of a host block is zero.
+    /// Whether every byte of a host block (or host state buffer) is zero.
     pub fn host_block_is_zero(&self, group: u32, host: u32) -> bool {
+        if let Some(p) = self.state_pool(group) {
+            return p.host_is_zero(host);
+        }
         self.host_block(group, host)
             .iter()
             .all(|&(v, p)| v == 0 && p == 0)
     }
 
-    /// The keystream fingerprint a host block's ciphertext is under (`None`: it holds
-    /// none).
+    /// The keystream fingerprint a host block's (or host state buffer's) ciphertext is
+    /// under (`None`: it holds none).
     pub fn host_encrypted_under(&self, group: u32, host: u32) -> Option<u64> {
-        self.host_encrypted[group as usize][host as usize]
+        match self.state_pool(group) {
+            Some(p) => p.host_encrypted[host as usize],
+            None => self.host_encrypted[group as usize][host as usize],
+        }
     }
 
     /// A host block's stored entries, `(value, position)` per offset, as they are.
@@ -491,8 +590,11 @@ impl MockExecutor {
         &self.rows_used
     }
 
-    /// Whether every byte of a block is zero.
+    /// Whether every byte of a block (or state buffer) is zero.
     pub fn block_is_zero(&self, group: u32, block: u32) -> bool {
+        if let Some(p) = self.state_pool(group) {
+            return p.is_zero(block);
+        }
         self.device_block(group, block)
             .iter()
             .all(|&(v, p)| v == 0 && p == 0)
@@ -689,16 +791,19 @@ impl MockExecutor {
         }
     }
 
+    /// The target's distribution at `q`; `recurrent` is what a recurrent state at `q + 1`
+    /// contributes (0 without one).
     fn target_probs(
         &self,
         slot: u32,
         q: u32,
+        recurrent: u64,
         params: &SamplingParams,
     ) -> Result<(Vec<f32>, Vec<f64>), ExecutorError> {
         let logits = logits_from_state(
             &self.cfg,
             self.spec.vocab_size,
-            self.state(slot, KvRole::Target, q)?,
+            self.state(slot, KvRole::Target, q)? ^ recurrent,
         );
         let probs = sampling::processed_probs(self.spec.logits(&logits), params);
         Ok((logits, probs))
@@ -754,6 +859,138 @@ impl MockExecutor {
     }
 }
 
+impl MockExecutor {
+    /// Runs `m` if it names the state pool or saves a state; `false` if it is the KV's.
+    fn state_maintenance(
+        &mut self,
+        step: &StepInput,
+        m: &Maintenance,
+    ) -> Result<bool, ExecutorError> {
+        let Some(index) = self.recurrent.as_ref().map(|p| p.index) else {
+            return Ok(false);
+        };
+        let (cfg, bs, steps) = (self.cfg, self.spec.block_size, self.steps);
+        let pool = self.recurrent.as_mut().expect("a state pool");
+        match *m {
+            Maintenance::SaveState { slot, len, buffer } => {
+                pool.save(&cfg, bs, slot, len, buffer)?
+            }
+            Maintenance::Zero { group, block } if group == index => {
+                pool.zero(block);
+                self.zero_log.push((steps, group, block));
+            }
+            Maintenance::Encrypt {
+                group,
+                block,
+                key,
+                nonce,
+            }
+            | Maintenance::Decrypt {
+                group,
+                block,
+                key,
+                nonce,
+            } if group == index => {
+                let encrypt = matches!(m, Maintenance::Encrypt { .. });
+                let key = step.kv_keys.get(key as usize).ok_or_else(|| {
+                    ExecutorError(format!("maintenance names key {key}, not in the step"))
+                })?;
+                pool.crypt(block, key, &nonce, encrypt)?;
+                if encrypt {
+                    self.nonce_log.push((steps, group, block, nonce.words()));
+                }
+                self.crypt_log.push((steps, group, block, encrypt));
+            }
+            Maintenance::Demote { group, block, host } if group == index => {
+                pool.demote(block, host)?;
+                self.transfer_log.push((steps, group, block, host, true));
+            }
+            Maintenance::Promote { group, host, block } if group == index => {
+                pool.promote(host, block)?;
+                self.transfer_log.push((steps, group, block, host, false));
+            }
+            Maintenance::ZeroHost { group, host } if group == index => {
+                pool.zero_host(host);
+                self.host_zero_log.push((steps, group, host));
+            }
+            Maintenance::Copy { group, .. } if group == index => {
+                return Err(ExecutorError("a copy names the state pool".into()));
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Checks a step's state rows and writes as a whole: one base per row, and no buffer
+    /// written twice.
+    fn check_state_step(&self, step: &StepInput) -> Result<(), ExecutorError> {
+        let aux = &step.aux;
+        if self.recurrent.is_none() {
+            if !aux.state_rows.is_empty() || !aux.state_writes.is_empty() {
+                return Err(ExecutorError("state rows for a model without state".into()));
+            }
+            return Ok(());
+        }
+        if aux.state_rows.len() != step.seqs.len() {
+            return Err(ExecutorError("every row needs its state base".into()));
+        }
+        let mut written = std::collections::HashSet::new();
+        for w in &aux.state_writes {
+            if w.row as usize >= step.seqs.len() {
+                return Err(ExecutorError(format!("a state write names row {}", w.row)));
+            }
+            if !written.insert(w.buffer) {
+                return Err(ExecutorError(format!(
+                    "state buffer {} written twice in a step",
+                    w.buffer
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks and folds a row's state up to its `context_len`, when the model has one.
+    fn begin_state_row(
+        &mut self,
+        step: &StepInput,
+        row: usize,
+        e: &SeqEntry,
+    ) -> Result<Option<recurrent::RowState>, ExecutorError> {
+        let cfg = self.cfg;
+        let bs = self.spec.block_size;
+        let Some(pool) = self.recurrent.as_mut() else {
+            return Ok(None);
+        };
+        let writes: Vec<StateWrite> = step
+            .aux
+            .state_writes
+            .iter()
+            .filter(|w| w.row as usize == row)
+            .copied()
+            .collect();
+        let others: Vec<u32> = step
+            .aux
+            .state_rows
+            .iter()
+            .enumerate()
+            .filter(|&(i, r)| i != row && r.base != NULL_STATE)
+            .map(|(_, r)| r.base)
+            .collect();
+        pool.begin_row(
+            &cfg,
+            bs,
+            e.slot,
+            row,
+            e.context_len,
+            e.num_tokens,
+            step.aux.state_rows[row],
+            writes,
+            &others,
+        )
+        .map(Some)
+    }
+}
+
 impl Executor for MockExecutor {
     fn spec(&self) -> &ModelSpec {
         &self.spec
@@ -769,6 +1006,9 @@ impl Executor for MockExecutor {
         self.buckets_used.push(step.bucket);
         self.rows_used.push(step.seqs.clone());
         for m in &step.maintenance {
+            if self.state_maintenance(step, m)? {
+                continue;
+            }
             let bs = match *m {
                 Maintenance::Copy { group, .. }
                 | Maintenance::Zero { group, .. }
@@ -777,7 +1017,7 @@ impl Executor for MockExecutor {
                 | Maintenance::Demote { group, .. }
                 | Maintenance::Promote { group, .. }
                 | Maintenance::ZeroHost { group, .. } => self.cells[group as usize],
-                Maintenance::ResetSlot { .. } => 0,
+                Maintenance::ResetSlot { .. } | Maintenance::SaveState { .. } => 0,
             };
             match *m {
                 Maintenance::Zero { group, block } => {
@@ -850,8 +1090,14 @@ impl Executor for MockExecutor {
                     self.host_encrypted[g][h] = None;
                     self.host_zero_log.push((self.steps, group, host));
                 }
+                Maintenance::SaveState { .. } => {
+                    return Err(ExecutorError("a state saved without a state pool".into()));
+                }
                 Maintenance::ResetSlot { slot } => {
                     self.pairs[slot as usize].clear();
+                    if let Some(p) = self.recurrent.as_mut() {
+                        p.reset(slot);
+                    }
                     for g in 0..self.spec.kv_groups.len() {
                         for idx in 0..self.tables[slot as usize][g].len() {
                             if self.tables[slot as usize][g][idx] != NULL_BLOCK {
@@ -863,8 +1109,12 @@ impl Executor for MockExecutor {
             }
         }
         for u in &step.table_updates {
+            if self.state_pool(u.group).is_some() {
+                return Err(ExecutorError("a table update names the state pool".into()));
+            }
             self.set_table(u.slot, u.group, u.index, u.block);
         }
+        self.check_state_step(step)?;
 
         let stride = self.spec.max_draft_tokens + 1;
         let mut out = StepOutput {
@@ -886,19 +1136,29 @@ impl Executor for MockExecutor {
             }
             let toks =
                 &step.token_ids[e.token_start as usize..(e.token_start + e.num_tokens) as usize];
+            let mut rec = self.begin_state_row(step, row, e)?;
             for (i, &t) in toks.iter().enumerate() {
                 let pos = e.context_len + i as u32;
                 if step.positions[e.token_start as usize + i] != pos {
                     return Err(ExecutorError("positions disagree with context_len".into()));
                 }
                 self.write(e.slot, pos, t)?;
+                if let (Some(pool), Some(rs)) = (self.recurrent.as_mut(), rec.as_mut()) {
+                    pool.advance(&self.cfg, rs, t);
+                }
             }
+            // What the state at `last + 1` contributes, and the state the drafts run on.
+            let mut spec_state = rec.as_ref().map(|rs| rs.state);
+            let recurrent = spec_state.map_or(0, |st| st.output());
             // Every query must see a complete window (validates the tables).
             for i in 0..e.num_tokens {
                 self.state(e.slot, KvRole::Target, e.context_len + i)?;
             }
             let mut row_logits = Vec::new();
             if !e.sample {
+                if let (Some(pool), Some(rs)) = (self.recurrent.as_mut(), rec) {
+                    pool.end_row(rs, &[])?;
+                }
                 if let Some(l) = out.logits.as_mut() {
                     l.push(row_logits);
                 }
@@ -911,18 +1171,21 @@ impl Executor for MockExecutor {
                 ));
             }
             let params = e.sampling;
+            let mut drafts = Vec::new();
             let produced = if e.num_drafts == 0 {
-                let (logits, _) = self.target_probs(e.slot, last, &params)?;
+                let (logits, _) = self.target_probs(e.slot, last, recurrent, &params)?;
                 let t = sampling::sample(self.spec.logits(&logits), &params, last as u64 + 1);
                 row_logits.push(logits);
                 vec![t]
             } else {
                 let k = e.num_drafts as usize;
-                let mut drafts = Vec::with_capacity(k);
                 let mut q_rows = Vec::with_capacity(k);
+                // What the state contributes at each verified position: speculative,
+                // never stored.
+                let mut recurrents = vec![recurrent];
                 for j in 0..k {
                     let q = last + j as u32;
-                    let (_, p) = self.target_probs(e.slot, q, &params)?;
+                    let (_, p) = self.target_probs(e.slot, q, recurrents[j], &params)?;
                     let qd = self.draft_probs(e.slot, q, &p, &params)?;
                     let d = if params.is_greedy() {
                         qd.iter().position(|&v| v == 1.0).expect("one-hot") as u32
@@ -933,12 +1196,17 @@ impl Executor for MockExecutor {
                         )
                     };
                     self.write(e.slot, q + 1, d)?;
+                    if let Some(st) = spec_state.as_mut() {
+                        *st = st.step(&self.cfg, d, q + 1);
+                    }
+                    recurrents.push(spec_state.map_or(0, |st| st.output()));
                     drafts.push(d);
                     q_rows.push(qd);
                 }
                 let mut p_rows = Vec::with_capacity(k + 1);
-                for j in 0..=k {
-                    let (logits, p) = self.target_probs(e.slot, last + j as u32, &params)?;
+                for (j, &recurrent) in recurrents.iter().enumerate() {
+                    let (logits, p) =
+                        self.target_probs(e.slot, last + j as u32, recurrent, &params)?;
                     row_logits.push(logits);
                     p_rows.push(p);
                 }
@@ -947,6 +1215,9 @@ impl Executor for MockExecutor {
                 row_logits.truncate(accepted.len());
                 accepted
             };
+            if let (Some(pool), Some(rs)) = (self.recurrent.as_mut(), rec) {
+                pool.end_row(rs, &drafts)?;
+            }
             let base = row * stride as usize;
             out.tokens[base..base + produced.len()].copy_from_slice(&produced);
             out.num_tokens[row] = produced.len() as u32;

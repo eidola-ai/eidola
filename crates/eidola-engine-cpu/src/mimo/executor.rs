@@ -373,6 +373,7 @@ impl CpuExecutor {
             buckets: cfg.buckets.clone(),
             window_chain: None,
             token_history: 0,
+            state: None,
         };
         spec.validate().expect("valid model spec");
         let host_pools: Vec<Pool> = if cfg.host_blocks > 0 {
@@ -967,6 +968,7 @@ impl Executor for CpuExecutor {
                 Maintenance::Copy { group, src, dst } => {
                     self.pools[group as usize].copy(src, dst);
                 }
+                Maintenance::SaveState { .. } => panic!("a state saved for a model without state"),
                 Maintenance::ResetSlot { slot } => self.reset_slot(slot),
                 Maintenance::Encrypt {
                     group,

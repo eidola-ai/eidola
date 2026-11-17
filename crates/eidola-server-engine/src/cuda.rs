@@ -783,6 +783,7 @@ mod tests {
             }],
             window_chain: None,
             token_history: 0,
+            state: None,
         }
     }
 

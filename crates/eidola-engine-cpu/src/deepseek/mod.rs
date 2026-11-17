@@ -270,6 +270,7 @@ impl DsCpuExecutor {
                 window,
             }),
             token_history: shape.history as u32,
+            state: None,
         };
         spec.validate().expect("valid model spec");
         let encoder = Encoder::new(model.clone(), &shape, &spec, &cfg);
@@ -425,6 +426,7 @@ impl DsCpuExecutor {
                     let (mem, g) = self.memory_mut(group);
                     mem.groups[g].pool.copy(src, dst);
                 }
+                Maintenance::SaveState { .. } => panic!("a state saved for a model without state"),
                 Maintenance::ResetSlot { slot } => {
                     self.encoder.mem.reset_slot(slot);
                     self.decoder.mem.reset_slot(slot);
