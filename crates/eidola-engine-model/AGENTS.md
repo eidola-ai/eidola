@@ -1,6 +1,6 @@
 # eidola-engine-model — Agent Development Guide
 
-This crate holds the engine's model definitions, text only, one module per architecture: the MiMo-V2.6 family (Flash-MOPD and Pro-MOPD) under `src/mimo/`, and DeepSeek-V4.1 under `src/deepseek/` ([DeepSeek-V4.1](#deepseek-v41) below). The two share the root modules (the weight set, the scalar decoders, the matrix kernels and the comparison metrics) and nothing else: neither architecture's modules know the other exists.
+This crate holds the engine's model definitions, text only, one module per architecture: the MiMo-V2.6 family (Flash-MOPD and Pro-MOPD) under `src/mimo/`, DeepSeek-V4.1 under `src/deepseek/` ([DeepSeek-V4.1](#deepseek-v41) below) and Qwen3.8 under `src/qwen/` ([Qwen3.8](#qwen38) below). They share the root modules (the weight set, the scalar decoders, the matrix kernels and the comparison metrics) and nothing else: no architecture's modules know the others exist.
 
 For MiMo it covers four things:
 
@@ -26,7 +26,7 @@ The reference forward is the golden oracle. Every faster executor (paged CPU, GP
 | `mimo::attention` | RoPE tables, partial rotate-half, window visibility, and single-query attention with a sink. |
 | `mimo::forward` | `ReferenceModel::forward` (logits at chosen positions, plus optional per-layer residual streams), `mtp_forward`, `route` and `swiglu`. |
 | `compare` | Shared. Top-1 agreement, KL divergence and max-abs-diff for golden checks, and for certifying faster executors. Fail-closed: any NaN or infinity on either side is a `NonFinite` error, never a metric (a NaN off the winning logit would otherwise pass with perfect top-1, zero KL and zero max-abs-diff). |
-| `golden/mimo/`, `golden/deepseek/` | Dev-only Python that produces each architecture's goldens, one project per architecture. See `golden/mimo/README.md` and `golden/deepseek/README.md`. |
+| `golden/mimo/`, `golden/deepseek/`, `golden/qwen/` | Dev-only Python that produces each architecture's goldens, one project per architecture. See each one's `README.md`. |
 
 ## Numerics contract
 
@@ -280,4 +280,83 @@ The goldens are the released model code run over an **emulated kernel layer** (t
 - An acceptance procedure for drafts: the released code has none.
 - A replay that resumes the encoder half at a position above 0 with cached global KV (a KV-source layer must see every position from 0, or be given its bank).
 - Tensor-parallel ranks above one, which change the reference's rounding.
+- Any performance work.
+
+## Qwen3.8
+
+`src/qwen/` is the text model of Qwen3.8-27B (`Qwen/Qwen3.8-27B-FP8`, revision `c3a462cc`): 64 layers, three Gated DeltaNet layers then one gated full-attention layer sixteen times over, each with a SwiGLU MLP, and one MTP draft layer. The oracle is Transformers' `qwen3_5` modelling code (v5.23.0) with its unspecified operations pinned, and, for the drafter, vLLM's composition (`qwen3_5_mtp.py`, v0.33.0) rebuilt from Transformers' layer classes (`golden/qwen/README.md`). The reference keeps activations in BF16 and quantises them to FP8 at run time; its rounding points are reproduced as its source states them.
+
+### Layout
+
+| Module | Role |
+|---|---|
+| `config` | `config.json` (the text model nested under `text_config`, beside the vision tower and the quantisation block) → `QwenConfig`. Every key at every level is read and an unknown one refused; the per-layer table (`LayerSpec`: `DeltaNet` or `Attention`) comes from `layer_types`, which `full_attention_interval` must agree with. Floats are validated after conversion to f32. Refused: tied embeddings, an attention without its output gate, any `output_gate_type` but `swish`, a recurrent state dtype other than f32, MTP with its own embeddings, any RoPE but the interleaved M-RoPE of `rope_type: default` (with `mrope_section` tiling the rotary frequencies, and the two `partial_rotary_factor`s agreeing), and any quantisation but FP8 E4M3 with 128×128 blocks and dynamic activations. `truncated()` keeps any subset of layers (each layer's state is its own); `without_mtp()`. |
+| `numeric` | The rounding points (`bf16_round`, `round_e4m3`) and the deterministic transcendentals (`det_exp`, `det_ln`, `det_sin_cos`, and `exp32`, `sigmoid32`, `silu32`, `softplus32`, `pow32`, `rsqrt32`), plus `pinned_sum`. |
+| `linear` | `Fp8Linear` (E4M3 codes left in the mapped checkpoint, BF16 block scales widened at load), `Bf16Matrix` (likewise), `act_quant`, `fp8_block_dot`, `fp8_row_dot`, `lin8_rows`, `linear_bf16_rows`, `linear_bf16_dense`. |
+| `deltanet` | The DeltaNet kernels, one token at a time: `conv_step`, `gates`, `l2_normalise`, `scale_query`, `recurrent_step`, `gated_norm`, and `token_core` (all of them for one token, from the projections to the gated norm). `DeltaNetState` is a layer's convolution history and recurrent state. |
+| `attention` | `inv_freq`, `rope_cos_sin`, `apply_rope`, `attend`. |
+| `weights` | `QwenWeights::load`. FP8 projections, the embedding, the head and the drafter's `fc` stay in the mapped checkpoint and are decoded a row at a time as a product reads them (the whole model in f32 would be about 108 GB); norms (stored as `1 + w` where zero-centred), the convolution, `A_log`, `dt_bias`, the DeltaNet's small `a` and `b` projections and every block scale are decoded at load. Vision tensors are never read. |
+| `forward` | `QwenModel`: `embed`, `layer_forward` (one layer over a contiguous range of positions from its `LayerState`), `final_norm`, `head`, `forward` (logits at chosen positions, optional per-layer streams, the normed final state), `mtp_forward`; block-level `attention_mix`, `deltanet_mix`, `mlp`, `rms_norm_zc`, `residual_add`, and `KvCache`. |
+
+### Every token is a step from the state before it
+
+A layer's state between positions is a `LayerState`: for a DeltaNet layer the last three raw `mixed` rows its convolution reads and a 128×128 f32 matrix per value head (48 × 128 × 128 at the released size, 3 MB a layer); for an attention layer its KV. `SequenceState` holds one per layer, and cloning it is a snapshot. The DeltaNet is the token recurrence at every position, in a long call or a one-token one, so a call's result depends only on the tokens before it and the state they left: the full forward, any chunking of it, one token per call, and a resume from a clone taken after any token, mid-turn included, agree bit for bit (`a_saved_state_resumes_exactly`, `one_token_per_call_matches_the_reference_exactly`, `prefix_rows_are_bit_identical`). An executor that wants bit equality calls `token_core` (or its parts) for every token and never a chunked form.
+
+`mtp_forward` takes the hidden state it combines explicitly, so any drafting convention can be built on it: the goldens feed row `i` the token at `i + 1` and the target's normed final state at `i`, at RoPE position `i`; a recursive draft step feeds the previous step's normed output (`MtpOutput::normed`).
+
+### Numerics contract
+
+Where the reference's Python source determines the bits, they are reproduced; where it leaves them to PyTorch, a kernel or the C library, one rule is fixed, chosen so that a token's result is the same whatever else is in the batch and however the sequence is split.
+
+- **BF16 where the reference's tensors are BF16.** The residual stream, after each add (`bf16(a + b)` of the f32 sum). Every norm, rounded once: `bf16((x · rsqrt(Σx²/n + eps)) · (1 + w))`. Every linear's output. The DeltaNet's convolution (summed in f32, rounded, then `bf16(silu(·))`), β, the recurrence's output, the attention output, the gate's sigmoid and the gated product, the MLP's `bf16(bf16(silu(g)) · u)`, the logits.
+- **The FP8 GEMM** (`lin8_rows`): per token and 128 columns `s = amax / 448` in f32 and codes `e4m3(x / s)`, nearest with ties to the even code, saturating; an all-zero block has codes and scale 0 (the kernel's `0 / 0`, a NaN, casts to +0). A 128-term block dot of E4M3 values is exact in f64 in any order and rounded once to f32; blocks accumulate in ascending order in f32 as `(dot · s) · w_scale`; the sum is rounded to BF16. This is the released Hub kernel's arithmetic (`kernels-community/finegrained-fp8`) with the cast and the in-block order fixed.
+- **Plain products and sums** (`F.linear` of the BF16 weights: the DeltaNet's `a` and `b`, the drafter's `fc`, the head; and every `sum` or `mean`: norm statistics, the L2 norms, the recurrence's 128-term dots) are f32 in the crate's pinned order (`tensor::dot`, `pinned_sum`), a BF16 result rounded once. `rsqrt` is `1 / sqrt` (two correctly rounded operations).
+- **The DeltaNet recurrence**, per value head and token, in f32: `S ← α·S; r_j = Σ_i S_ij k_i; δ_j = (v_j − r_j)·β; S_ij ← S_ij + k_i δ_j; o_j = Σ_i S_ij q_i`, the sums over the key dimension in the pinned order, `α = exp(g)`, `g = −exp(A_log) · softplus(a + dt_bias)` (softplus is `x` above 20, else `ln(1 + eˣ)`), `β = bf16(σ(b))`; queries and keys are L2-normalised (`x · rsqrt(Σx² + 1e-6)`) and queries then divided by `sqrt(128)` rounded to f32. The state is `S[h][i][j]`, key dimension `i` major.
+- **The gated norm** (per value head, plain weight): `bf16( bf16(w · bf16(o · rsqrt(mean(o²) + eps))) · silu(z) )`, `silu` in f32.
+- **RoPE**: `inv_freq_i = 1 / θ^(2i/d)` through `pow32`, the angle the f32 product `position · inv_freq_i`, `det_sin_cos`, cosine and sine rounded to BF16; then `x' = bf16(bf16(x·cos) + bf16(rot(x)·sin))`, pairs `(j, j + d/2)` over the first `d` = 64 dimensions of each head.
+- **Attention** (`attend`): per query and head, scores are pinned-order dots of BF16 queries and keys times `head_dim^-½` over every visible key in ascending position; minus their maximum, `exp`; the normaliser summed left to right; output `Σ (w / Σw) · v` in ascending position, rounded once to BF16. Then `bf16(attn · bf16(σ(gate)))`.
+- **Transcendentals** come from the engine's deterministic functions (`numeric`): no platform `exp`, `log`, `sin` or `cos` is called. Their bits are pinned by `transcendentals_are_pinned`.
+- **Nothing is fused.**
+
+### Architecture quirks: each one is a silent-wrong-output trap
+
+Each item names the test that fails if it regresses; every one was checked by mutating the code and watching it fail. `one call`, `one per call`, `MTP` and `resume` are `one_call_matches_the_reference_exactly`, `one_token_per_call_matches_the_reference_exactly`, `mtp_matches_the_reference_exactly` and `a_saved_state_resumes_exactly` in `tests/qwen_tiny.rs`.
+
+1. **Norms are zero-centred (`1 + w`)**: the decoder's, the final one, the per-head query and key norms, the drafter's three. Read as plain `w`: one call, one per call, MTP.
+2. **The DeltaNet's gated norm is not**: its weight is plain `w` (the released values sit around 0.87). Read as `1 + w`: one call, one per call.
+3. **Two gates, two functions.** The attention output gate is a sigmoid; the DeltaNet's (`output_gate_type: swish`) is a SiLU of `z`. A SiLU on the attention: one call, one per call, MTP; a sigmoid on the DeltaNet: one call, one per call.
+4. **The query projection interleaves per head**: rows `2h·d..(2h+1)·d` are head `h`'s query and the next `d` its gate. Split as all queries then all gates: one call, one per call, MTP; with the halves swapped: the same.
+5. **Text M-RoPE is partial NeoX rotation** on the first 64 of 256 dimensions, pairs `(j, j + 32)`, every M-RoPE stream at the text position (so `mrope_section` and the interleave change nothing for text), rounded to BF16 at every operation. Adjacent pairs: one call, one per call, MTP; the rotation in f32 with one rounding: the same; positions restarting at each call: one per call, MTP, resume.
+6. **The convolution history starts at zero** and holds the raw projected rows (before the convolution); tap 3 multiplies the current token. A non-zero history at the start: one call, one per call; taps reversed: the same; the history dropped between calls: one per call, resume.
+7. **Grouping**: value head `h` reads key head `h / 3` (16 key heads, 48 value heads); attention query head `h` reads KV head `h / 6` (24 over 4). `h mod 16`: one call, one per call; `h mod 4`: one call, one per call, MTP.
+8. **β is BF16** (the sigmoid of a BF16 tensor), α is f32. β kept in f32: one call, one per call.
+9. **The state decays before it is read**, and queries are scaled by `128^-½` after their L2 norm (whose epsilon is inside the root). Decay after the read: one call, one per call; no query scale: the same; the epsilon outside the root: one call (it moves the state's last bits, not these logits); the state stored value-major: one call (the fixture's key and value dims differ, so a transposed state is caught); the state dropped between calls: one per call, resume.
+10. **BF16 rounding points**: the residual kept in f32, the gated norm's inner rounding dropped, the logits kept in f32: one call, one per call (and MTP for the residual and the logits).
+11. **The head is untied** from the embedding. Tied: one call, one per call, MTP.
+12. **The drafter's input is `[normed embedding ‖ normed hidden]`**, embedding first. Swapped: MTP.
+13. **The FP8 activation scale is `amax / 448`**, not rounded to a power of two. A power of two: one call, one per call, MTP.
+14. **Vision placeholders** (`image_token_id`, `video_token_id`) are refused: the vision path is not implemented (`vision_placeholders_and_out_of_range_tokens_are_refused`).
+
+Two rules no committed test can distinguish. **Softplus's threshold** (`x` above 20): above 20, `ln(1 + eˣ)` rounds to `x` in f32 anyway, so dropping the threshold changes nothing; it is kept as the reference states it. **A block dot computed exactly**, as against accumulated in f32: the fixture's codes agree either way; the real-weights truncation catches it (`tests/qwen_real.rs`: 38 million of 113 million logits differ, every layer's stream from the first).
+
+### What is verified against what
+
+**Agreement is not health.** Every real-weights test first checks each file against the recorded upstream SHA-256 (`golden/qwen/upstream-sha256.json`, `tests/qwen_upstream/`), and the whole-model test holds the model to facts outside the tooling (the health check, last).
+
+- **Committed synthetic fixture** (`tests/qwen_tiny.rs`, `tests/fixtures/qwen_tiny/`, about 3 MB). Three DeltaNet layers, one attention layer and one MTP layer at hidden size 128, in the real storage formats; 80 tokens. **Exact** (zero elements differ): every layer's stream, the normed final state, the logits and every DeltaNet layer's convolution history and recurrent state, against the reference's one call; the logits one token per call, against the reference's one-token calls and its one call (which the pinned reference also makes equal); the drafter's stream, normed state and logits, all rows in one call and one row per call. Prefix runs and resumes from a snapshot at any position are exact against our own full run.
+- **Real-weights truncation** (`tests/qwen_real.rs` with `EIDOLA_QWEN_LAYERS=4`, ignored): checkpoint layers 0–3 (three DeltaNet layers and one attention layer), the embedding, the head and the drafter, whole files of the checkpoint (about 7 GB); 454 tokens of prose and code.
+  - Against the pinned reference: **0 elements differ** in any layer's stream (2,324,480 each), any state, the 112,737,280 logits, the 96 positions of a 64-token call followed by 32 one-token calls, and the drafter's 453 rows. Measured on an Apple M4 Max: 12 s for the one call, about 30 s for the whole test, 11 GB peak RSS; the pinned reference took 4 minutes and 17 GB.
+  - Against the same reference with PyTorch's own CPU arithmetic, its `sdpa` attention and its chunked DeltaNet prefill (`native`): stream relative error 7.4e-4, 2.5e-3, 5.7e-3, 5.0e-3 after layers 0–3, logits top-1 454/454, KL mean 4.1e-5, max 2.8e-4; the native reference's own one-token calls (its recurrence) against its one call (its chunked form), over the 32 positions after a 64-token call: top-1 32/32, KL mean 1.5e-5, max 1.1e-4. Reported, not asserted: nothing bit-unequal reproduces an unpinned run.
+- **The whole model** (`tests/qwen_real.rs` with `EIDOLA_QWEN_LAYERS=64`, and `tests/qwen_health.rs`, ignored; the checkpoint as published, 31 GB).
+  - Against the pinned reference, 454 tokens: **0 elements differ** in any of the 64 layers' streams, the 48 DeltaNet layers' states, the 112,737,280 logits, the 32 positions run one token per call after a 64-token call, and the drafter's 453 rows. Measured on an M4 Max with the checkpoint in the page cache: 154 s for the one call and 219 s for the test (570 s on a first run), 37 GB peak RSS, most of it the mapped checkpoint; the pinned reference took 12.5 minutes and 38 GB.
+  - Against the same reference with PyTorch's own CPU arithmetic, its `sdpa` attention and its chunked DeltaNet (`native`; reported, not asserted): stream relative error 7.4e-4 after layer 0, 9.4e-3 after layer 7, 1.4e-2 after layer 15, 2.9e-2 after layer 31, 4.5e-2 after layer 47 and 4.7e-2 after the last; logits top-1 442/454 (97.4 %), KL mean 2.9e-3, max 8.4e-2; the drafter top-1 441/453, KL mean 4.2e-3. The native reference against itself, its eight one-token calls (the recurrence) after a 64-token call against the same positions of its one call (the chunked form): top-1 8/8, KL mean 2.4e-3, max 5.1e-3; our forward against those one-token calls: top-1 70/72, KL mean 2.7e-3. So on the CPU our forward, being the pinned reference, is about as far from the unpinned reference as that reference's two DeltaNet forms are from each other (eight positions are a small sample). How far the reference as released on a GPU is from both is the measurement still to make.
+- **Health of the released checkpoint** (every file matching its upstream SHA-256; `tests/qwen_health.rs`, our forward, all 64 layers): next-token accuracy 0.998 over the first 1,024 tokens of the checkpoint's `LICENSE` (the floor is 0.95; vLLM serving the same checkpoint measured 0.998) and 0.614 over the goldens' passage; the greedy reply to "What is the capital of France? Answer with one word." with thinking off is `Paris<|im_end|>`. The pinned reference (`golden/qwen/health_check.py`, all 64 layers on the CPU) measures the same, and our forward's most likely token equals the reference's at all 1,024 and all 454 positions, and its reply token for token; the test asserts that whenever the health file came from the pinned reference. Measured on an M4 Max: about 900 s for the test (the 1,024-token call about 640 s), 34 GB peak RSS, most of it the mapped checkpoint.
+- **On a GPU** (not yet run): the reference as released (FLA's DeltaNet kernels, Transformers' FP8 dispatch) and with the model code's own PyTorch DeltaNet, against the pinned reference and our forward, and the reference's health there (`golden/qwen/full_session.sh`). Our forward must be no further from the released GPU run than that run is from the reference's other forms. The drafter is still to be compared with vLLM's own.
+- Record new numbers here whenever numerics change.
+
+### Not here
+
+- Vision: the tower, image and video positions (which M-RoPE would give their own streams).
+- A chunked DeltaNet form, on any grid: the recurrence is the definition.
+- An acceptance procedure for drafts.
 - Any performance work.

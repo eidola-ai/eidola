@@ -2,7 +2,7 @@
 
 `Qwen/Qwen3.8-27B-FP8`, text only, on one Blackwell GPU. The architecture is `eidola_common::architecture::Architecture::Qwen38Dense27B`.
 
-**Status: in progress; nothing is implemented.** The variant is a stub: its shape is `unimplemented!`, and no catalog row or deployment may name it.
+**Status: in progress.** The reference forward is implemented and verified on the CPU; nothing else is. The variant is a stub: its shape is `unimplemented!`, and no catalog row or deployment may name it.
 
 ## The model
 
@@ -17,11 +17,11 @@
 
 Each level is held to the one before it, as for the other architectures:
 
-1. **The reference forward** (`eidola-engine-model`), an f32 forward with the released model's rounding points, against the released modelling code with its unspecified operations pinned, and a health check on the real checkpoint: a public reply reproduced token for token and a next-token accuracy floor.
+1. **The reference forward** (`eidola-engine-model`), an f32 forward with the released model's rounding points, against the released modelling code (Transformers' `qwen3_5`) with its unspecified operations pinned, and a health check on the real checkpoint: a next-token accuracy floor over the checkpoint's own licence text and a known one-word answer. **Done on the CPU:** exact on a synthetic fixture, on the first four real layers and on the whole released model; healthy (accuracy 0.998 on the licence text, as vLLM measured, and "Paris"). Still to run on a GPU: the reference as released there, against which ours must be no further than the reference is from itself, and the drafter against vLLM's own (`eidola-engine-model/AGENTS.md` → Qwen3.8).
 2. **The CPU executor** (`eidola-engine-cpu`) equal to that forward bit for bit through the real scheduler: chunk sizes, interleavings, prefix hits at recurrent-state snapshots, preemption, and drafts accepted and rejected.
 3. **The CUDA executor** (`eidola-engine-cuda`) held to the CPU executor, with greedy output identical whatever shares the batch.
 
-The Gated DeltaNet can be computed token by token or in chunks of tokens, and the two orders round differently. The executors' contract fixes one form, chosen so that a layer's state and output depend only on the token prefix, never on how a sequence was chunked; the reference forward documents it.
+The Gated DeltaNet can be computed token by token or in chunks of tokens, and the two orders round differently. The contract is the token recurrence: every token, in a prefill, a decode step or a draft check, runs one step from the state the token before it left, so a layer's state and output depend only on the token prefix, and a state saved after any token resumes exactly. The reference forward exposes the step as public kernels the executors call.
 
 ## Where the code will live
 
@@ -29,7 +29,7 @@ The Gated DeltaNet can be computed token by token or in chunks of tokens, and th
 |---|---|
 | `eidola-common` | `architecture.rs` (`Qwen38Dense27B`, a stub); then its `Shape`, `engine_deployment` (one device) and `weights_manifest` (required files) |
 | `eidola-engine` | the seam's recurrent-state groups and their snapshots in the prefix cache; a Qwen-shaped mock |
-| `eidola-engine-model` | `src/qwen/`; `tests/qwen_*`; `tests/fixtures/qwen_tiny/`; `golden/qwen/` (pinned reference tooling, upstream hashes, health check) |
+| `eidola-engine-model` | `src/qwen/`; `tests/qwen_*` (`qwen_tiny`, `qwen_config`, `qwen_real`, `qwen_health`, `qwen_upstream/`); `tests/fixtures/qwen_tiny/`; `tests/data/qwen3.8-27b.config.json`; `golden/qwen/` (pinned reference tooling, upstream hashes, health check, the whole-model session) |
 | `eidola-engine-chat` | `src/qwen/` (the template, `<think>` reasoning and `<tool_call>` parsers); `tests/qwen_*`; `tests/fixtures/qwen/`; `dev/qwen_*` |
 | `eidola-engine-cpu` | `src/qwen/`; `tests/qwen_*` |
 | `eidola-engine-kernels` | `csrc/qwen_*` and their `kernels.json` entries; `oracle/qwen_*`; `tests/qwen_*` |
@@ -39,9 +39,7 @@ The Gated DeltaNet can be computed token by token or in chunks of tokens, and th
 
 ## Outstanding work
 
-Everything:
-
-- the reference forward, its oracle tooling and the health check;
+- the reference forward against the reference as released on a GPU, and its drafter against vLLM's (prepared: `golden/qwen/full_session.sh`);
 - the chat template, rendered byte for byte, and the reasoning and tool-call parsers;
 - the seam's recurrent state and its place in the prefix cache: snapshots zeroed on free, encrypted when idle and demoted as ciphertext, like KV;
 - MTP drafting, including the recurrent state across rejected drafts;
