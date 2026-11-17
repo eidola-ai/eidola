@@ -58,8 +58,9 @@ const FIXTURE_TAG: &str = "v0.0.8";
 /// release and its attestation name them.
 const FIXTURE_COMMIT: &str = "bb7773fafbaa90d40e7c7634ff7f690b54dd9be9";
 const FIXTURE_PREVIOUS_COMMIT: &str = "7ba323817820a04948ffc70e78955201c96c733f";
-/// An installed version older than the fixture release.
-const OLD_INSTALLED: &str = "0.0.1";
+/// The installed version: the release v0.0.8 follows, so the fixture
+/// release is the next one along its history.
+const OLD_INSTALLED: &str = "0.0.6";
 
 /// Where a fixture release's index is served, under the releases location.
 const LATEST: &str = "/latest/download/release.json";
@@ -1378,4 +1379,312 @@ fn the_committed_manifest_is_held_to_its_own_cli_rows() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rows: continuity from the installed commit, and the walk to the next release
+// ---------------------------------------------------------------------------
+
+/// Unverifiable, naming `version` and a reason containing `reason_contains`.
+fn assert_unverifiable_naming(result: &UpdateCheckResult, version: &str, reason_contains: &str) {
+    let UpdateCheckResult::Unverifiable {
+        version: named,
+        tag,
+        reason,
+    } = result
+    else {
+        panic!("expected Unverifiable, got: {result:#?}");
+    };
+    assert_eq!(named, version);
+    assert_eq!(tag, &format!("v{version}"));
+    assert!(
+        reason.contains(reason_contains),
+        "expected reason to mention `{reason_contains}`, got: {reason}"
+    );
+}
+
+/// A context for an install the updater recorded: v0.0.6 at `commit`.
+fn installed_ctx(server: &MockServer, commit: &str) -> CheckContext {
+    let mut ctx = ctx(server, "0.0.6");
+    ctx.installed_git_commit = Some(commit.to_string());
+    ctx
+}
+
+/// Serve `index` as the latest release's `release.json`.
+async fn mount_latest_index(server: &MockServer, index: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path(LATEST))
+        .respond_with(ResponseTemplate::new(200).set_body_json(index))
+        .mount(server)
+        .await;
+}
+
+/// Serve the genuine v0.0.8 release under its tag, `release.json` included,
+/// as an earlier release than the one marked latest.
+async fn mount_fixture_release_under_its_tag(server: &MockServer, files: Files) {
+    let index = release_json(&server.uri(), FIXTURE_TAG);
+    Mock::given(method("GET"))
+        .and(path(format!("/download/{FIXTURE_TAG}/release.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(index))
+        .mount(server)
+        .await;
+    for (name, bytes) in [
+        ("artifact-manifest.json", files.manifest),
+        ("artifact-manifest.json.sigstore", files.bundle),
+        ("attestation-throwaway.json", files.attestation),
+        (
+            "attestation-throwaway.bundle.json",
+            files.attestation_bundle,
+        ),
+    ] {
+        if let Some(bytes) = bytes {
+            Mock::given(method("GET"))
+                .and(path(format!("/download/{FIXTURE_TAG}/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .mount(server)
+                .await;
+        }
+    }
+}
+
+/// A `release.json` for a release after v0.0.8, whose own files are never
+/// served: the walk reads it for its history and nothing else.
+fn later_index(version: &str, previous: (&str, &str)) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "version": version,
+        "git_commit": "9".repeat(40),
+        "git_tag": format!("v{version}"),
+        "released_at": "2026-06-30T00:00:00Z",
+        "previous_release": { "version": previous.0, "git_commit": previous.1 },
+        "artifact_manifest": {
+            "url": "https://unserved.invalid/artifact-manifest.json",
+            "sigstore_bundle_url": "https://unserved.invalid/artifact-manifest.json.sigstore",
+        },
+        "human_attestations": [],
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_continuing_from_the_installed_commit_is_offered() {
+    let server = MockServer::start().await;
+    mount_release(&server, FIXTURE_TAG, FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
+
+    let result = check_for_update(
+        &http_client(),
+        &installed_ctx(&server, FIXTURE_PREVIOUS_COMMIT),
+        None,
+    )
+    .await;
+    let UpdateCheckResult::UpdateAvailable { release } = result else {
+        panic!("expected UpdateAvailable, got: {result:#?}");
+    };
+    assert_eq!(release.version, "0.0.8");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_latest_release_that_does_not_descend_from_the_installed_commit_is_unverifiable() {
+    let server = MockServer::start().await;
+    mount_release(&server, FIXTURE_TAG, FIXTURE_MANIFEST, FIXTURE_BUNDLE).await;
+
+    // The latest names 0.0.6 at another commit than the one installed as
+    // 0.0.6: someone else's history.
+    let result = check_for_update(
+        &http_client(),
+        &installed_ctx(&server, &"d".repeat(40)),
+        None,
+    )
+    .await;
+    assert_unverifiable(&result, "continuity failure");
+    let UpdateCheckResult::Unverifiable { version, .. } = &result else {
+        unreachable!()
+    };
+    assert_eq!(version, "0.0.8");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_two_releases_behind_is_offered_the_next_one() {
+    // v0.0.9 is marked latest and follows v0.0.8, which follows the
+    // installed commit. v0.0.9's own files are never served: the client
+    // offers v0.0.8, verified under the pins of the release it replaces.
+    let server = MockServer::start().await;
+    mount_latest_index(&server, later_index("0.0.9", ("0.0.8", FIXTURE_COMMIT))).await;
+    mount_fixture_release_under_its_tag(&server, Files::genuine()).await;
+
+    let result = check_for_update(
+        &http_client(),
+        &installed_ctx(&server, FIXTURE_PREVIOUS_COMMIT),
+        None,
+    )
+    .await;
+    let UpdateCheckResult::UpdateAvailable { release } = result else {
+        panic!("expected UpdateAvailable, got: {result:#?}");
+    };
+    assert_eq!(release.version, "0.0.8");
+    assert_eq!(release.git_commit, FIXTURE_COMMIT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_release_this_build_cannot_parse_does_not_stop_the_next_one() {
+    // The walk reads only where a release sits in the history, so a latest
+    // in a schema from after this build still leads to the release it can
+    // take.
+    let server = MockServer::start().await;
+    let mut latest = later_index("0.0.9", ("0.0.8", FIXTURE_COMMIT));
+    latest["schema_version"] = 99.into();
+    latest["a_field_from_the_future"] = true.into();
+    mount_latest_index(&server, latest).await;
+    mount_fixture_release_under_its_tag(&server, Files::genuine()).await;
+
+    let result = check_for_update(
+        &http_client(),
+        &installed_ctx(&server, FIXTURE_PREVIOUS_COMMIT),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(&result, UpdateCheckResult::UpdateAvailable { release } if release.version == "0.0.8"),
+        "expected v0.0.8 to be offered, got: {result:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_next_release_has_to_verify_for_itself() {
+    let server = MockServer::start().await;
+    mount_latest_index(&server, later_index("0.0.9", ("0.0.8", FIXTURE_COMMIT))).await;
+    mount_fixture_release_under_its_tag(
+        &server,
+        Files {
+            attestation: None,
+            ..Files::genuine()
+        },
+    )
+    .await;
+
+    let result = check_for_update(
+        &http_client(),
+        &installed_ctx(&server, FIXTURE_PREVIOUS_COMMIT),
+        None,
+    )
+    .await;
+    let UpdateCheckResult::Unverifiable { version, .. } = &result else {
+        panic!("expected Unverifiable, got: {result:#?}");
+    };
+    assert_eq!(version, "0.0.8", "the refusal names the release offered");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_that_disagrees_with_itself_is_unverifiable() {
+    // v0.0.9 says v0.0.8 was cut from one commit; v0.0.8's own index says
+    // another.
+    let server = MockServer::start().await;
+    mount_latest_index(&server, later_index("0.0.9", ("0.0.8", &"e".repeat(40)))).await;
+    mount_fixture_release_under_its_tag(&server, Files::genuine()).await;
+
+    let result = check_for_update(
+        &http_client(),
+        &installed_ctx(&server, FIXTURE_PREVIOUS_COMMIT),
+        None,
+    )
+    .await;
+    // The refusal names the release that claimed an update.
+    assert_unverifiable_naming(&result, "0.0.9", "names its previous release as 0.0.8");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_missing_from_the_history_is_unverifiable() {
+    let server = MockServer::start().await;
+    mount_latest_index(&server, later_index("0.0.9", ("0.0.8", FIXTURE_COMMIT))).await;
+
+    let result = check_for_update(
+        &http_client(),
+        &installed_ctx(&server, FIXTURE_PREVIOUS_COMMIT),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(&result, UpdateCheckResult::Unverifiable { version, .. } if version == "0.0.9"),
+        "expected Unverifiable naming 0.0.9, got: {result:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_release_in_the_history_is_check_failed() {
+    let server = MockServer::start().await;
+    mount_latest_index(&server, later_index("0.0.9", ("0.0.8", FIXTURE_COMMIT))).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/download/{FIXTURE_TAG}/release.json")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let result = check_for_update(
+        &http_client(),
+        &installed_ctx(&server, FIXTURE_PREVIOUS_COMMIT),
+        None,
+    )
+    .await;
+    assert_check_failed(&result);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_longer_than_the_walk_is_unverifiable() {
+    // v0.0.1 … v0.0.70, each following the one before, with the installed
+    // release at 0.0.0. No real release is behind any of them; the walk
+    // stops before it would need one.
+    let server = MockServer::start().await;
+    let commit = |n: u32| format!("{n:040x}");
+    let index = |n: u32| {
+        let mut index = later_index(&format!("0.0.{n}"), ("", ""));
+        index["git_commit"] = commit(n).into();
+        index["previous_release"] = serde_json::json!({
+            "version": format!("0.0.{}", n - 1),
+            "git_commit": commit(n - 1),
+        });
+        index
+    };
+    mount_latest_index(&server, index(70)).await;
+    for n in 1..70 {
+        Mock::given(method("GET"))
+            .and(path(format!("/download/v0.0.{n}/release.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(index(n)))
+            .mount(&server)
+            .await;
+    }
+    let mut ctx = ctx(&server, "0.0.0");
+    ctx.installed_git_commit = Some(commit(0));
+
+    let result = check_for_update(&http_client(), &ctx, None).await;
+    assert_unverifiable_naming(&result, "0.0.70", "releases behind the latest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_install_two_releases_behind_is_offered_the_next_one() {
+    // No installed commit is known, but the latest is still reached one
+    // release at a time: v0.0.8 is the release whose clients' pins this
+    // build holds.
+    let server = MockServer::start().await;
+    mount_latest_index(&server, later_index("0.0.9", ("0.0.8", FIXTURE_COMMIT))).await;
+    mount_fixture_release_under_its_tag(&server, Files::genuine()).await;
+
+    let result = check(&server).await;
+    assert!(
+        matches!(&result, UpdateCheckResult::UpdateAvailable { release } if release.version == "0.0.8"),
+        "expected v0.0.8 to be offered, got: {result:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_install_between_releases_is_offered_the_oldest_newer_one() {
+    // 0.0.7 is no release's version. The walk stops at the first release
+    // whose predecessor is not newer than it.
+    let server = MockServer::start().await;
+    mount_latest_index(&server, later_index("0.0.9", ("0.0.8", FIXTURE_COMMIT))).await;
+    mount_fixture_release_under_its_tag(&server, Files::genuine()).await;
+
+    let result = check_for_update(&http_client(), &ctx(&server, "0.0.7"), None).await;
+    assert!(
+        matches!(&result, UpdateCheckResult::UpdateAvailable { release } if release.version == "0.0.8"),
+        "expected v0.0.8 to be offered, got: {result:#?}"
+    );
 }

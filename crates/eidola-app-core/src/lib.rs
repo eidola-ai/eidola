@@ -2797,10 +2797,20 @@ impl Inner {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let releases_url = self.load_config().update_releases_url();
+        // Hashing the install's main executable reads tens of megabytes the
+        // first time, so it runs where blocking is allowed.
+        let data_dir = self.data_dir.clone();
+        let installed_git_commit = tokio::task::spawn_blocking(move || {
+            updater::installed::running_install_commit(&data_dir)
+        })
+        .await
+        .ok()
+        .flatten();
 
         let outcome = match updater::build_http_client() {
             Ok(client) => {
-                let ctx = updates::CheckContext::new(releases_url, env!("CARGO_PKG_VERSION"));
+                let mut ctx = updates::CheckContext::new(releases_url, env!("CARGO_PKG_VERSION"));
+                ctx.installed_git_commit = installed_git_commit;
                 updates::check_outcome(&client, &ctx).await
             }
             Err(e) => updates::CheckOutcome::Settled(updates::UpdateCheckResult::CheckFailed {

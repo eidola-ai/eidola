@@ -539,6 +539,10 @@ pub struct CheckContext {
     pub releases_url: String,
     /// The running binary's semver.
     pub installed_version: String,
+    /// The commit the installed release was cut from, when the updater
+    /// installed it (`updater::installed`). `None` is a fresh install:
+    /// continuity is not checked, and the latest release is the one offered.
+    pub installed_git_commit: Option<String>,
     /// The trust pins every check runs against.
     pub pins: updater::ReleasePins,
     /// The expected structural claim set (see module docs).
@@ -611,6 +615,7 @@ impl CheckContext {
         Self {
             releases_url: releases_url.into(),
             installed_version: installed_version.into(),
+            installed_git_commit: None,
             pins: updater::ReleasePins::embedded(),
             expected_claims: expected_claims(),
         }
@@ -642,41 +647,47 @@ pub async fn check_outcome(client: &reqwest::Client, ctx: &CheckContext) -> Chec
     let settled = CheckOutcome::Settled;
     let fetcher = updater::Fetcher::Network(client.clone());
 
-    // ── discover: the release marked `latest` ───────────────────────────
-    let release_json = match fetcher.fetch_latest_release_json(&ctx.releases_url).await {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
+    // ── discover: the release marked `latest`, and the one to offer ─────
+    // With the installed commit known, that is the first release after it
+    // along the latest's history (`updater::discover_next_release`).
+    let release = match updater::discover_next_release(
+        &fetcher,
+        &ctx.releases_url,
+        &ctx.installed_version,
+        ctx.installed_git_commit.as_deref(),
+    )
+    .await
+    {
+        Ok(updater::Discovery::NothingMarked) => {
             return settled(UpdateCheckResult::UpToDate {
                 latest_version: None,
             });
         }
-        // Discovery reached nothing it could read, so nothing claimed an
-        // update. A body over the bound is the one `Rejected` discovery can
-        // produce, and it carries no version either.
-        Err(e) => {
-            return settled(UpdateCheckResult::CheckFailed {
-                message: e.message().to_string(),
-            });
-        }
-    };
-
-    // ── version gate, then the index's own shape ────────────────────────
-    // Continuity is not checked here: no build knows the commit it was
-    // released from (`docs/gaps.md` → First-install downgrade).
-    let release = match updater::gate_release(&release_json, &ctx.installed_version, None) {
-        Ok(updater::ReleaseGate::Newer(release)) => *release,
-        Ok(updater::ReleaseGate::NotNewer { version }) => {
+        Ok(updater::Discovery::NotNewer { version }) => {
             return settled(UpdateCheckResult::UpToDate {
                 latest_version: Some(version),
             });
         }
-        Err(updater::GateError {
+        Ok(updater::Discovery::Next { release, .. }) => *release,
+        // Nothing claimed an update, or what failed was the network: no
+        // security state either way. A body over the bound is the one
+        // `Rejected` discovery can produce before a version is read, and it
+        // carries no version.
+        Err(updater::DiscoveryError {
             newer_version: None,
-            reason,
-        }) => return settled(UpdateCheckResult::CheckFailed { message: reason }),
-        Err(updater::GateError {
+            error,
+        })
+        | Err(updater::DiscoveryError {
+            error: error @ updater::ReleaseCheckError::Unreachable(_),
+            ..
+        }) => {
+            return settled(UpdateCheckResult::CheckFailed {
+                message: error.message().to_string(),
+            });
+        }
+        Err(updater::DiscoveryError {
             newer_version: Some(version),
-            reason,
+            error: updater::ReleaseCheckError::Rejected(reason),
         }) => {
             return settled(UpdateCheckResult::Unverifiable {
                 tag: format!("v{version}"),
