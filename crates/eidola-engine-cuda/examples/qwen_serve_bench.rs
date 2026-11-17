@@ -2,16 +2,23 @@
 //! throughput and latency workloads a reference serving stack is measured on.
 //!
 //!     qwen_serve_bench <kernel dir> <checkpoint dir> <out.jsonl> <B|C>
-//!         [--concurrency 1,8,32,64,128] [--draft K] [--profile fast|exact]
+//!         [--concurrency 1,8,32,64] [--draft K] [--profile fast|exact]
 //!         [--graphs on|off] [--prompts prompts.json]
 //!
-//! - **B**: requests of 1,024 prompt tokens and 256 output tokens, greedy, `max(4, 2c)`
-//!   requests at concurrency `c`, every prompt unique.
+//! The workloads are `scripts/qwen_workloads.json`, the one definition `qwen_whole`'s
+//! bench and `scripts/qwen_vllm.py` read too:
+//!
+//! - **B**: unique prompts of 1,024 tokens, 256 output tokens, greedy, `max(4, 2c)`
+//!   requests at concurrency `c`.
 //! - **C**: conversations of 7 turns, `max(2, c)` at concurrency `c` (one turn of each in
 //!   flight at a time): turn 1 is 1,760 tokens; each later turn is the previous prompt,
-//!   its 256 generated tokens and 1,504 new tokens, so 75 % of the input is a previous
-//!   turn's prompt and output (the prefix cache's to hit). Sampled at temperature 1,
-//!   top-p 0.95, top-k 20, a seed per turn.
+//!   its 256 generated tokens and new tokens to 1,760 more, so most of the input is a
+//!   previous turn's prompt and output (the prefix cache's to hit). Sampled at
+//!   temperature 1, top-p 0.95, top-k 20, a seed per turn.
+//!
+//! Beside `qwen_whole bench`, this serves one workload at one draft width, profile and
+//! graph setting per run, from the reference runs' prompts when given, and reports the
+//! steps each path ran.
 //!
 //! Prompts come from `--prompts` (`{"b": [[ids]], "conversations": [{"first": [ids],
 //! "later": [[ids]]}]}`, text tokenised as the reference's runs were: acceptance of drafts
@@ -39,10 +46,71 @@ use eidola_engine_model::WeightSet;
 use eidola_engine_model::qwen::{QwenModel, QwenWeights, config_of};
 use serde_json::json;
 
-const B_IN: usize = 1024;
-const OUT: u32 = 256;
-const TURNS: usize = 7;
-const STEP: usize = 1760;
+/// The yardstick workloads.
+const WORKLOADS: &str = include_str!("../scripts/qwen_workloads.json");
+
+/// One workload of the file.
+struct Workload {
+    prompt: usize,
+    out: u32,
+    turns: usize,
+    concurrency: Vec<usize>,
+    per_concurrent: usize,
+    at_least: usize,
+    temperature: f32,
+    top_p: f32,
+    top_k: u32,
+}
+
+fn load_workload(name: &str) -> Workload {
+    let w: serde_json::Value = serde_json::from_str(WORKLOADS).unwrap_or_else(|e| fail(e));
+    let w = &w[name];
+    let count = |k: &str| -> usize {
+        w[k].as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or_else(|| fail(format!("qwen_workloads.json: {name}.{k} is a count")))
+    };
+    // Sampling parameters, which f32 holds as the file writes them.
+    #[allow(clippy::cast_possible_truncation)]
+    let real = |k: &str, default: f64| -> f32 { w[k].as_f64().unwrap_or(default) as f32 };
+    let sampled = name == "C";
+    let concurrency = w["concurrency"]
+        .as_array()
+        .unwrap_or_else(|| fail("qwen_workloads.json: no concurrency"))
+        .iter()
+        .map(|c| {
+            c.as_u64()
+                .and_then(|c| usize::try_from(c).ok())
+                .unwrap_or_else(|| fail("qwen_workloads.json: a concurrency"))
+        })
+        .collect();
+    Workload {
+        prompt: count(if sampled {
+            "turn_tokens"
+        } else {
+            "prompt_tokens"
+        }),
+        out: u32::try_from(count("output_tokens")).unwrap_or_else(|_| fail("an output length")),
+        turns: if sampled { count("turns") } else { 1 },
+        concurrency,
+        per_concurrent: count(if sampled {
+            "conversations_per_concurrent"
+        } else {
+            "requests_per_concurrent"
+        }),
+        at_least: count(if sampled {
+            "conversations_at_least"
+        } else {
+            "requests_at_least"
+        }),
+        temperature: real("temperature", 0.0),
+        top_p: real("top_p", 1.0),
+        top_k: w["top_k"]
+            .as_u64()
+            .and_then(|k| u32::try_from(k).ok())
+            .unwrap_or(0),
+    }
+}
 
 fn fail(what: impl std::fmt::Display) -> ! {
     eprintln!("FAILED: {what}");
@@ -119,19 +187,18 @@ fn main() {
         "C" => true,
         w => fail(format!("workload {w}: B or C")),
     };
-    let conc: Vec<usize> = opt
-        .get("concurrency")
-        .map_or(
-            if sampled {
-                "1,8,32,64"
-            } else {
-                "1,8,32,64,128"
-            },
-            String::as_str,
-        )
-        .split(',')
-        .map(|c| c.parse().unwrap_or_else(|_| fail("concurrency")))
-        .collect();
+    let wl = load_workload(&workload);
+    if wl.turns == 0 || (sampled && wl.prompt <= wl.out as usize) {
+        fail("qwen_workloads.json: a conversation's turns must each add more than a reply");
+    }
+    let conc: Vec<usize> = opt.get("concurrency").map_or_else(
+        || wl.concurrency.clone(),
+        |l| {
+            l.split(',')
+                .map(|c| c.parse().unwrap_or_else(|_| fail("concurrency")))
+                .collect()
+        },
+    );
     let k: u32 = opt
         .get("draft")
         .map_or(Ok(0), |s| s.parse())
@@ -166,7 +233,7 @@ fn main() {
         block_size: 16,
         num_blocks: if sampled { 49_152 } else { 12_288 },
         host_blocks: 0,
-        state_buffers: if sampled { 3 * seats + 8 } else { seats + 8 },
+        state_buffers: if sampled { 2 * seats + 8 } else { seats + 8 },
         host_state_buffers: 0,
         num_state_slots: seats,
         max_model_len: if sampled { 16_384 } else { 2048 },
@@ -210,7 +277,7 @@ fn main() {
     let mut next_id = 0u64;
     for &c in &conc {
         // The run's turns: B's requests are one-turn conversations.
-        let n = if sampled { c.max(2) } else { (2 * c).max(4) };
+        let n = (wl.per_concurrent * c).max(wl.at_least);
         let mut later: Vec<Vec<Vec<u32>>> = Vec::with_capacity(n);
         let mut queue: VecDeque<Pending> = VecDeque::new();
         for conv in 0..n {
@@ -235,10 +302,12 @@ fn main() {
                         .collect();
                     (ids_of(&cv["first"]), rest)
                 }
-                (None, false) => (rng.ids(B_IN), Vec::new()),
+                (None, false) => (rng.ids(wl.prompt), Vec::new()),
                 (None, true) => (
-                    rng.ids(STEP),
-                    (1..TURNS).map(|_| rng.ids(STEP - OUT as usize)).collect(),
+                    rng.ids(wl.prompt),
+                    (1..wl.turns)
+                        .map(|_| rng.ids(wl.prompt - wl.out as usize))
+                        .collect(),
                 ),
             };
             later.push(rest);
@@ -248,7 +317,7 @@ fn main() {
                 prompt: first,
             });
         }
-        let turns = if sampled { TURNS } else { 1 };
+        let turns = wl.turns;
         let stats0 = eng.executor().decode_stats();
         let t0 = Instant::now();
         let mut live: HashMap<u64, Live> = HashMap::new();
@@ -261,11 +330,8 @@ fn main() {
                 let id = next_id;
                 next_id += 1;
                 let seed = 7919 * c as u64 + 31 * p.conv as u64 + p.turn as u64;
-                let sampling = if sampled {
-                    SamplingParams::new(1.0, 20, 0.95, 0.0, seed).unwrap_or_else(|e| fail(e.0))
-                } else {
-                    SamplingParams::greedy()
-                };
+                let sampling = SamplingParams::new(wl.temperature, wl.top_k, wl.top_p, 0.0, seed)
+                    .unwrap_or_else(|e| fail(e.0));
                 let mut kb = [1u8; 32];
                 kb[..8].copy_from_slice(&(p.conv as u64 + 1000 * c as u64).to_le_bytes());
                 let key = deriver.lineage(&CacheKey::from_bytes(kb));
@@ -273,7 +339,7 @@ fn main() {
                     id,
                     prompt: p.prompt.clone(),
                     sampling,
-                    max_tokens: OUT,
+                    max_tokens: wl.out,
                     required_cached_tokens: 0,
                     stop_token_ids: Vec::new(),
                     cache: CacheScope::Keyed(key),

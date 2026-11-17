@@ -5,8 +5,9 @@
 # A session is a list of steps. A finished step leaves a marker under
 # $OUT/done/ and is skipped on a rerun, so a session resumes, on the same
 # machine or on a fresh one with $OUT copied back (a preempted instance).
-# `setup`, `build` and `kernels_build` are never marked: they rebuild what a
-# fresh machine lacks and cost little where it is already there. A step that
+# `setup`, `build` and `kernels_build` are never marked (nor is a step a
+# session adds to UNMARKED): they rebuild what a fresh machine lacks and cost
+# little where it is already there. A step that
 # fails exits non-zero, leaves no marker and stops the session; a device test
 # that printed `SKIPPED` fails its step. Everything a step prints is in
 # $OUT/logs/<step>.log, and `summary` writes $OUT/session.json.
@@ -58,10 +59,14 @@ x() {
 # Steps a rerun repeats (cheap where their output is already there).
 UNMARKED=" setup build kernels_build summary "
 
-# run_step <name>: skip when done, log, mark, fail loudly.
+# run_step <name>: skip when done, log, mark, fail loudly. An unmarked step
+# always runs, whatever marker $OUT holds.
 run_step() {
     local name="$1"
-    if [ -e "$OUT/done/$name" ]; then say "$name: already done"; return 0; fi
+    case "$UNMARKED" in
+        *" $name "*) ;;
+        *) if [ -e "$OUT/done/$name" ]; then say "$name: already done"; return 0; fi ;;
+    esac
     say "$name: start"
     local began=$SECONDS
     # A fresh shell, so that errexit is live in the step whatever called it.

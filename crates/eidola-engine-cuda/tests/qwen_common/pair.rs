@@ -271,9 +271,19 @@ pub struct Harness<D: QwenDevice> {
 
 impl<D: QwenDevice> Harness<D> {
     pub fn new(dev: D, g: &Geometry, sched: SchedulerConfig) -> Self {
+        Self::with_configs(dev, cpu_config(g), cuda_config(g), sched)
+    }
+
+    /// Both executors from configurations of their own, which must describe one geometry.
+    pub fn with_configs(
+        dev: D,
+        cpu: QwenCpuExecutorConfig,
+        cuda: QwenCudaExecutorConfig,
+        sched: SchedulerConfig,
+    ) -> Self {
         let model = fixture();
-        let cpu = QwenCpuExecutor::new(model.clone(), cpu_config(g));
-        let mut cuda = QwenCudaExecutor::new(dev, &model, cuda_config(g)).expect("the executor");
+        let cpu = QwenCpuExecutor::new(model.clone(), cpu);
+        let mut cuda = QwenCudaExecutor::new(dev, &model, cuda).expect("the executor");
         super::apply_path(&mut cuda);
         assert_eq!(
             cpu.spec(),

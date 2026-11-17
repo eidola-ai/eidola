@@ -31,6 +31,13 @@ fn prefix_hits_preemption_and_the_host_tier_match_the_reference() {
 }
 
 #[test]
+fn one_token_blocks_without_drafts_keep_no_tail() {
+    if let Some(lib) = qwen_common::library() {
+        scenarios::empty_tails(&|| qwen_common::host_device(lib.clone()));
+    }
+}
+
+#[test]
 fn a_request_alone_and_beside_others_gives_the_same_tokens() {
     if let Some(lib) = qwen_common::library() {
         scenarios::alone_and_crowded(&|| qwen_common::host_device(lib.clone()));
@@ -106,6 +113,7 @@ fn the_padded_rung_path_matches_the_reference() {
         scenarios::chunkings(&make);
         scenarios::hits_and_pressure(&make);
         scenarios::alone_and_crowded(&make);
+        scenarios::empty_tails(&make);
     });
     let n = qwen_common::rung_steps() - before;
     eprintln!("{n} steps ran a rung");

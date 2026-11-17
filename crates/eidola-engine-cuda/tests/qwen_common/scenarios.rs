@@ -63,15 +63,20 @@ pub fn chunkings<D: QwenDevice>(make: &dyn Fn() -> D) {
 }
 
 /// Shared prefixes over small pools (hits, preemption, shedding of snapshots), with and
-/// without a host tier, then a follow-up turn hitting a snapshot.
+/// without a host tier, then a follow-up turn hitting a snapshot. The reference
+/// executor locks its host tier, which counts against `RLIMIT_MEMLOCK` (small on a CI
+/// runner): the tier is sized to the snapshots this demotes, about 6 MB locked as in
+/// the CPU crate's host-tier tests, and the run asserts it demoted snapshots and
+/// promoted one back.
 pub fn hits_and_pressure<D: QwenDevice>(make: &dyn Fn() -> D) {
+    let _guard = super::memlock_guard();
     for strategy in [StateStrategy::Live, StateStrategy::Lagging] {
         for tiered in [false, true] {
             let g = Geometry {
                 blocks: 40,
                 buffers: 12,
                 host: if tiered { 64 } else { 0 },
-                host_buffers: if tiered { 24 } else { 0 },
+                host_buffers: if tiered { 8 } else { 0 },
                 k: 3,
                 strategy,
                 graphs: super::graphs_now(),
@@ -101,9 +106,50 @@ pub fn hits_and_pressure<D: QwenDevice>(make: &dyn Fn() -> D) {
             let mut turn = shared.clone();
             turn.extend(first);
             turn.extend(rng.tokens(3, VOCAB));
+            let mark = h.pair().cpu.transfer_log().len();
             h.run_one(request(100, turn, SamplingParams::greedy(), 5, keyed(0)));
+            if tiered {
+                let state = h.pair().cuda.state_pool_index();
+                let log = h.pair().cpu.transfer_log();
+                assert!(
+                    log[..mark].iter().any(|t| t.1 == state && t.4),
+                    "{strategy:?}: no snapshot demoted to the host tier"
+                );
+                assert!(
+                    log[mark..].iter().any(|t| t.1 == state && !t.4),
+                    "{strategy:?}: the follow-up turn promoted no snapshot"
+                );
+            }
         }
     }
+}
+
+/// One-token blocks without drafts, where a slot keeps no tail: requests of every
+/// sampling kind, then a follow-up turn hitting the first one's snapshot, each slot
+/// reset and scanned as the requests finish.
+pub fn empty_tails<D: QwenDevice>(make: &dyn Fn() -> D) {
+    let g = Geometry::plain(0);
+    let (mut cpu, mut cuda) = (cpu_config(&g), cuda_config(&g));
+    cpu.block_size = 1;
+    cuda.block_size = 1;
+    let mut h = Harness::with_configs(make(), cpu, cuda, sched(3, false));
+    let mut rng = TestRng(11);
+    let first = rng.tokens(9, VOCAB);
+    for id in 0..3u64 {
+        let prompt = if id == 0 {
+            first.clone()
+        } else {
+            rng.tokens(7, VOCAB)
+        };
+        h.submit(request(id, prompt, params(id), 5, keyed(1)));
+    }
+    h.run();
+    h.flush();
+    let mut turn = first;
+    turn.extend(h.outputs[&0].clone());
+    turn.extend(rng.tokens(2, VOCAB));
+    h.run_one(request(9, turn, SamplingParams::greedy(), 4, keyed(1)));
+    assert!(h.pair().compared_images > 0, "no state stored");
 }
 
 /// A greedy request alone and beside others: the same tokens.

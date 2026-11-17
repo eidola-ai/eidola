@@ -11,7 +11,7 @@ use eidola_engine_cuda::qwen::abi::*;
 use eidola_engine_model::Matrix;
 use eidola_engine_model::qwen::attention::{apply_rope, attend, inv_freq, rope_cos_sin};
 use eidola_engine_model::qwen::config::{AttentionSpec, DeltaNetSpec};
-use eidola_engine_model::qwen::deltanet::{CoreWeights, DeltaNetState, token_core};
+use eidola_engine_model::qwen::deltanet::{CoreWeights, DeltaNetState, recurrent_step, token_core};
 use eidola_engine_model::qwen::forward::rms_norm_zc;
 use eidola_engine_model::qwen::linear::{
     Bf16Matrix, Fp8Linear, Stored, act_quant, lin8_rows, linear_bf16_rows,
@@ -713,6 +713,186 @@ pub fn deltanet<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Uniform in `0 .. n`.
+fn below(g: &mut Lcg, n: usize) -> usize {
+    usize::try_from(g.below(n as u64)).expect("below a usize")
+}
+
+/// One recurrence launch over sequences of the given lengths, against `recurrent_step`
+/// per sequence, head and position: every output, every stored state. A sequence resumes
+/// from a source state or starts from zero, folds a prefix, and stores live and up to four
+/// writes at positions that cross the staged chunks.
+fn dn_rec_launch<D: QwenDevice>(
+    dev: &D,
+    g: &mut Lcg,
+    (k_heads, v_heads, v_dim): (usize, usize, usize),
+    lens: &[usize],
+) -> Result<(), String> {
+    let kd = 128usize;
+    let what = format!("dn rec {k_heads}/{v_heads}x{v_dim} over {lens:?}");
+    let group = v_heads / k_heads;
+    let state_len = v_heads * kd * v_dim;
+    let total: usize = lens.iter().sum();
+    // Unit-norm-sized keys and queries, values and gates of the shapes the prep makes, and
+    // exact zeros of both signs among them.
+    let mut q: Vec<f32> = (0..total * k_heads * kd).map(|_| g.f32() * 0.18).collect();
+    let mut k: Vec<f32> = (0..total * k_heads * kd).map(|_| g.f32() * 0.18).collect();
+    let mut v: Vec<f32> = (0..total * v_heads * v_dim).map(|_| g.bf16(2.0)).collect();
+    for x in [&mut q, &mut k, &mut v] {
+        for _ in 0..x.len() / 50 {
+            let i = below(g, x.len());
+            x[i] = if g.below(2) == 0 { 0.0 } else { -0.0 };
+        }
+    }
+    let beta: Vec<f32> = (0..total * v_heads)
+        .map(|_| bf16_round(0.5 + g.f32() * 0.5))
+        .collect();
+    let alpha: Vec<f32> = (0..total * v_heads)
+        .map(|_| 0.9 + g.f32().abs() * 0.1)
+        .collect();
+    let (qb, kb, vb) = (buf(dev, &q), buf(dev, &k), buf(dev, &v));
+    let (betab, alphab) = (buf(dev, &beta), buf(dev, &alpha));
+    let ob = zeros(dev, total * v_heads * v_dim * 4);
+    let mut seqs = Vec::new();
+    let mut keep = Vec::new();
+    // Per sequence: (descriptor, source state, live after, writes after).
+    let mut plans = Vec::new();
+    let mut first = 0usize;
+    for (r, &len) in lens.iter().enumerate() {
+        let src: Option<Vec<f32>> =
+            (r % 3 != 0).then(|| (0..state_len).map(|_| g.f32() * 0.5).collect::<Vec<f32>>());
+        let out_from = if r % 2 == 0 { 0 } else { below(g, len + 1) };
+        let live_after = below(g, len + 2);
+        let writes: Vec<usize> = (0..r % 5).map(|_| below(g, len + 1)).collect();
+        let src_buf = src.as_ref().map(|s| buf(dev, s));
+        let live = zeros(dev, state_len * 4);
+        let wbufs: Vec<super::Buf> = writes.iter().map(|_| zeros(dev, state_len * 4)).collect();
+        let mut d = DnSeq {
+            src: src_buf.as_ref().map_or(0, |b| b.addr),
+            live: live.addr,
+            first: u(first),
+            count: u(len),
+            out_from: u(out_from),
+            live_after: u(live_after),
+            writes: u(writes.len()),
+            ..DnSeq::default()
+        };
+        for (w, (&at, b)) in writes.iter().zip(&wbufs).enumerate() {
+            d.write_after[w] = u(at);
+            d.write_dst[w] = b.addr;
+        }
+        seqs.push(d);
+        plans.push((first, len, src, out_from, live_after, writes));
+        keep.push((src_buf, live, wbufs));
+        first += len;
+    }
+    let sb = buf(dev, &seqs);
+    let p = DnRecParams {
+        seqs: sb.addr,
+        q: qb.addr,
+        k: kb.addr,
+        v: vb.addr,
+        beta: betab.addr,
+        alpha: alphab.addr,
+        out: ob.addr,
+        state_offset: 0,
+        seq_count: u(lens.len()),
+        k_heads: u(k_heads),
+        v_heads: u(v_heads),
+        k_dim: 128,
+        v_dim: u(v_dim),
+        reserved: 0,
+    };
+    // SAFETY: the buffers hold what the struct names.
+    unsafe { dev.dn_rec(&p) }.map_err(|e| e.to_string())?;
+    let got_out = read::<D, f32>(dev, &ob, total * v_heads * v_dim);
+    for (r, (first, len, src, out_from, live_after, writes)) in plans.into_iter().enumerate() {
+        let mut st = src.unwrap_or_else(|| vec![0.0; state_len]);
+        let mut want_out = vec![0.0f32; len * v_heads * v_dim];
+        let mut want_live = (live_after == 0).then(|| st.clone());
+        let mut want_w: Vec<Option<Vec<f32>>> = writes
+            .iter()
+            .map(|&a| (a == 0).then(|| st.clone()))
+            .collect();
+        let mut raw = vec![0.0f32; v_dim];
+        for i in 0..len {
+            let pos = first + i;
+            for h in 0..v_heads {
+                let kh = h / group;
+                let at = (pos * k_heads + kh) * kd;
+                let vh = pos * v_heads + h;
+                recurrent_step(
+                    &mut st[h * kd * v_dim..(h + 1) * kd * v_dim],
+                    &q[at..at + kd],
+                    &k[at..at + kd],
+                    &v[vh * v_dim..(vh + 1) * v_dim],
+                    alpha[vh],
+                    beta[vh],
+                    &mut raw,
+                );
+                for (o, x) in want_out[(i * v_heads + h) * v_dim..][..v_dim]
+                    .iter_mut()
+                    .zip(&raw)
+                {
+                    *o = bf16_round(*x);
+                }
+            }
+            if live_after == i + 1 {
+                want_live = Some(st.clone());
+            }
+            for (w, &a) in writes.iter().enumerate() {
+                if a == i + 1 {
+                    want_w[w] = Some(st.clone());
+                }
+            }
+        }
+        let wide = v_heads * v_dim;
+        same(
+            &format!("{what}: sequence {r} outputs"),
+            &f32_bits(&got_out[(first + out_from) * wide..(first + len) * wide]),
+            &f32_bits(&want_out[out_from * wide..]),
+        )?;
+        // Positions before `out_from` are not written.
+        same(
+            &format!("{what}: sequence {r} folded positions"),
+            &f32_bits(&got_out[first * wide..(first + out_from) * wide]),
+            &vec![0u32; out_from * wide],
+        )?;
+        let (_, live, wbufs) = &keep[r];
+        same(
+            &format!("{what}: sequence {r} live state"),
+            &f32_bits(&read::<D, f32>(dev, live, state_len)),
+            &f32_bits(&want_live.unwrap_or_else(|| vec![0.0; state_len])),
+        )?;
+        for (w, b) in wbufs.iter().enumerate() {
+            let want = want_w[w].take().expect("a write at or before the end");
+            same(
+                &format!("{what}: sequence {r} write {w} after {}", writes[w]),
+                &f32_bits(&read::<D, f32>(dev, b, state_len)),
+                &f32_bits(&want),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The recurrence alone at every remainder of its column blocks and staged chunks: 1, 3
+/// and 64 sequences, prefills of 1, 63, 64, 65 and 2,048 positions, a value width that
+/// leaves a partial column block, at the released head grouping (three value heads a key
+/// head) and at a narrow one.
+pub fn dn_recurrence<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
+    let mut g = Lcg(seed);
+    dn_rec_launch(dev, &mut g, (2, 6, 128), &[1])?;
+    dn_rec_launch(dev, &mut g, (1, 3, 128), &[63, 1, 65])?;
+    dn_rec_launch(dev, &mut g, (2, 4, 80), &[64, 9, 17])?;
+    let lens: Vec<usize> = (0..64)
+        .map(|r| [1, 63, 64, 65, 2, 8, 9, 16][r % 8])
+        .collect();
+    dn_rec_launch(dev, &mut g, (1, 2, 128), &lens)?;
+    dn_rec_launch(dev, &mut g, (1, 2, 128), &[2048])?;
+    Ok(())
+}
+
 /// The quantiser against `act_quant`: every code and every scale's bits, over 4,096 rows
 /// of 128-blocks of every magnitude (zeros, ties, spikes).
 pub fn quant<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
@@ -835,6 +1015,7 @@ pub fn all<D: QwenDevice>(dev: &D) -> Vec<(&'static str, Result<(), String>)> {
         ("gate", gate(dev, 4)),
         ("attention", attention(dev, 5)),
         ("deltanet", deltanet(dev, 6)),
+        ("dn recurrence", dn_recurrence(dev, 9)),
     ]
 }
 

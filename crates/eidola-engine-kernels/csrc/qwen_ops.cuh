@@ -14,9 +14,10 @@
 //   attention, the DeltaNet's per-position preparation and gated norm. State
 //   that crosses a phase lives in the block's shared struct.
 //
-// The DeltaNet recurrence keeps each thread's state column in its own array
-// across tokens; its device and host drivers call the same per-token step
-// (`dn_rec_step`).
+// The DeltaNet recurrence keeps each thread's share of a state column in its
+// own array across tokens; its device and host drivers call the same staging
+// and per-token steps and differ only in how a column's four threads exchange
+// partial sums (shuffles on the device).
 //
 // Why a row's result is its own: a thread or block reads its own row's
 // arrays (and the weights) and writes its own row's outputs; no value of the
@@ -402,9 +403,92 @@ DS_FN void dn_prep_block(const QwDnPrepParams& p, uint32_t pos, uint32_t kh, con
 }
 
 // ---- DeltaNet: the recurrence (`deltanet::recurrent_step`) ----
+//
+// A block computes `kDnCols` value columns of one (sequence, value head), a
+// group of `kDnGroup` adjacent threads per column. Thread `l` of a group holds
+// the column's state values `i = l + 4n` (`n < kDnPer`): the reference's
+// accumulator lanes `l`, `l + 4`, `l + 8` and `l + 12`, each a run of 8 terms.
+// It adds its lanes from +0 in ascending `i` and takes them through the
+// halving tree's steps 8 and 4 (`dn_partial`); steps 2 and 1 combine the
+// group's threads (`dn_tree_step`, the operands in the reference's order on
+// every thread, so the whole group holds the same sum), and the +0 tail is
+// added last. Columns share nothing but the position's keys and queries, so a
+// head's columns split across blocks freely.
+//
+// Keys, queries, values and gates are staged `kDnChunk` positions at a time,
+// keys and queries rearranged so that thread `l`'s values are contiguous
+// (`DnRecShared`); a thread fetches its share of the next chunk while the
+// block runs this one (`DnFetch`).
 
-// State column `j` of value head `h` at the address `base` (the layer's
-// state), element `i`.
+constexpr uint32_t kDnThreads = 128;
+constexpr uint32_t kDnGroup = 4;
+constexpr uint32_t kDnCols = kDnThreads / kDnGroup;
+constexpr uint32_t kDnPer = kKeyDim / kDnGroup;
+constexpr uint32_t kDnChunk = 8;
+// A staged key or query row of one group thread, padded so that the four
+// rows a warp reads at once fall in distinct banks.
+constexpr uint32_t kDnRow = kDnPer + 4;
+// Four-value units of keys (or queries) per position, and per thread a chunk.
+constexpr uint32_t kDnQuads = kKeyDim / 4;
+constexpr uint32_t kDnQuadLoads = kDnChunk * kDnQuads / kDnThreads;
+constexpr uint32_t kDnValueLoads = kDnChunk * kDnCols / kDnThreads;
+static_assert(kDnChunk * kDnQuads % kDnThreads == 0, "whole quads per thread");
+static_assert(kDnChunk * kDnCols % kDnThreads == 0, "whole values per thread");
+static_assert(kDnChunk <= kDnThreads, "a gate per thread");
+
+#if defined(__CUDACC__)
+#define QW_ALIGN16 __align__(16)
+#else
+#define QW_ALIGN16 alignas(16)
+#endif
+// A loop over a thread's state values unrolled, so they stay in registers.
+#if defined(__CUDA_ARCH__)
+#define QW_UNROLL _Pragma("unroll")
+#else
+#define QW_UNROLL
+#endif
+
+struct QW_ALIGN16 DnRecShared {
+  float k[2][kDnChunk][kDnGroup][kDnRow];
+  float q[2][kDnChunk][kDnGroup][kDnRow];
+  float v[2][kDnChunk][kDnCols];
+  float alpha[2][kDnChunk];
+  float beta[2][kDnChunk];
+};
+
+// One thread's share of a chunk, between its loads and its stores to shared
+// memory.
+struct DnFetch {
+  float k[kDnQuadLoads][4];
+  float q[kDnQuadLoads][4];
+  float v[kDnValueLoads];
+  float alpha;
+  float beta;
+};
+
+// The blocks a (sequence, value head) takes.
+DS_FN uint32_t dn_rec_slices(uint32_t v_dim) { return (v_dim + kDnCols - 1) / kDnCols; }
+
+// Four consecutive f32 values, 16-byte aligned.
+DS_FN void dn_load4(const float* src, float* dst) {
+#if defined(__CUDACC__)
+  const float4 x = *reinterpret_cast<const float4*>(src);
+  dst[0] = x.x;
+  dst[1] = x.y;
+  dst[2] = x.z;
+  dst[3] = x.w;
+#else
+  for (uint32_t e = 0; e < 4; ++e) dst[e] = src[e];
+#endif
+}
+
+// A group thread's staged row (`kDnPer` values, 16-byte aligned).
+DS_FN void dn_row(const float* src, float* dst) {
+  QW_UNROLL
+  for (uint32_t n = 0; n < kDnPer; n += 4) dn_load4(src + n, dst + n);
+}
+
+// State value `i` of column `j` of value head `h` in a layer's state.
 DS_FN uint64_t dn_state_index(uint32_t h, uint32_t i, uint32_t j, uint32_t vd) {
   return (static_cast<uint64_t>(h) * kKeyDim + i) * vd + j;
 }
@@ -413,73 +497,142 @@ DS_FN float* dn_state_at(uint64_t addr, uint64_t offset) {
   return reinterpret_cast<float*>(addr + offset);
 }
 
-// One token of one column: `S ← α·S; r = Σ_i S_ij k_i; δ = (v_j − r)·β;
-// S_ij ← S_ij + k_i δ; o = Σ_i S_ij q_i` (the sums pinned-order from +0, the
-// tail +0 added last), `o` when `out` is set.
-DS_FN void dn_rec_step(float* st, const float* k, const float* q, float vj, float alpha,
-                       float beta, bool want_out, float* out) {
-  for (uint32_t i = 0; i < kKeyDim; ++i) st[i] = st[i] * alpha;
-  float acc[16];
-  for (uint32_t l = 0; l < 16; ++l) acc[l] = 0.0f;
-  for (uint32_t c = 0; c < kKeyDim; c += 16) {
-    for (uint32_t l = 0; l < 16; ++l) acc[l] = acc[l] + st[c + l] * k[c + l];
+// Thread `l`'s lanes of the dot of `st` and the row `x` (both its values
+// `i = l + 4n`), each from +0 in ascending `i`, through the tree's steps 8 and
+// 4: the tree's value at index `l`.
+DS_FN float dn_partial(const float* st, const float* x) {
+  float acc[4];
+  QW_UNROLL
+  for (uint32_t a = 0; a < 4; ++a) acc[a] = 0.0f;
+  QW_UNROLL
+  for (uint32_t m = 0; m < kDnPer / 4; ++m) {
+    QW_UNROLL
+    for (uint32_t a = 0; a < 4; ++a) acc[a] = acc[a] + st[4 * m + a] * x[4 * m + a];
   }
-  const float r = ds::pinned_reduce(acc, 0.0f);
+  return (acc[0] + acc[2]) + (acc[1] + acc[3]);
+}
+
+// Step `w` (2 or 1) of the tree on group thread `l`, holding index `l`'s value
+// `own`, given index `l ^ w`'s `other`: index `min` plus index `max`, the
+// reference's operands in its order on both threads.
+DS_FN float dn_tree_step(float own, float other, uint32_t l, uint32_t w) {
+  const bool upper = (l & w) != 0;
+  return (upper ? other : own) + (upper ? own : other);
+}
+
+// Decay the state by `alpha`, then the partial of `r = Σ_i S_ij k_i`.
+DS_FN float dn_rec_decay(float* st, const float* k, float alpha) {
+  QW_UNROLL
+  for (uint32_t n = 0; n < kDnPer; ++n) st[n] = st[n] * alpha;
+  return dn_partial(st, k);
+}
+
+// `δ = (v_j − r)·β` and `S_ij ← S_ij + k_i δ`.
+DS_FN void dn_rec_update(float* st, const float* k, float vj, float beta, float r) {
   const float delta = (vj - r) * beta;
-  for (uint32_t i = 0; i < kKeyDim; ++i) st[i] = st[i] + k[i] * delta;
-  if (!want_out) return;
-  for (uint32_t l = 0; l < 16; ++l) acc[l] = 0.0f;
-  for (uint32_t c = 0; c < kKeyDim; c += 16) {
-    for (uint32_t l = 0; l < 16; ++l) acc[l] = acc[l] + st[c + l] * q[c + l];
-  }
-  *out = ds::bf16_round(ds::pinned_reduce(acc, 0.0f));
+  QW_UNROLL
+  for (uint32_t n = 0; n < kDnPer; ++n) st[n] = st[n] + k[n] * delta;
 }
 
+// Group thread `l`'s values of column `j` from the sequence's source state
+// (zeros for none, or a column past `v_dim`).
 DS_FN void dn_rec_load(const QwDnRecParams& p, const QwDnSeq& s, uint32_t h, uint32_t j,
-                       float* st) {
-  for (uint32_t i = 0; i < kKeyDim; ++i) {
-    st[i] = s.src == 0 ? 0.0f
-                       : dn_state_at(s.src, p.state_offset)[dn_state_index(h, i, j, p.v_dim)];
+                       uint32_t l, float* st) {
+  QW_UNROLL
+  for (uint32_t n = 0; n < kDnPer; ++n) {
+    st[n] = s.src == 0 || j >= p.v_dim
+                ? 0.0f
+                : dn_state_at(s.src, p.state_offset)[dn_state_index(h, l + 4 * n, j, p.v_dim)];
   }
 }
 
-DS_FN void dn_rec_store(const QwDnRecParams& p, uint64_t dst, uint32_t h, uint32_t j,
+// A store's address and stride, opaque to the compiler: stores are rare, and
+// their 32 addresses hoisted out of the token loop would take 64 registers.
+DS_FN uint64_t dn_opaque(uint64_t x) {
+#if defined(__CUDA_ARCH__)
+  asm volatile("" : "+l"(x));
+#endif
+  return x;
+}
+
+DS_FN void dn_rec_store(const QwDnRecParams& p, uint64_t dst, uint32_t h, uint32_t j, uint32_t l,
                         const float* st) {
-  for (uint32_t i = 0; i < kKeyDim; ++i) {
-    dn_state_at(dst, p.state_offset)[dn_state_index(h, i, j, p.v_dim)] = st[i];
+  float* at = reinterpret_cast<float*>(
+      dn_opaque(dst + p.state_offset + dn_state_index(h, l, j, p.v_dim) * sizeof(float)));
+  const uint64_t step = dn_opaque(static_cast<uint64_t>(kDnGroup) * p.v_dim);
+  QW_UNROLL
+  for (uint32_t n = 0; n < kDnPer; ++n) {
+    *at = st[n];
+    at += step;
   }
 }
 
 // After the step that leaves `done` positions run: the stores due then.
 DS_FN void dn_rec_stores(const QwDnRecParams& p, const QwDnSeq& s, uint32_t done, uint32_t h,
-                         uint32_t j, const float* st) {
-  if (s.live != 0 && s.live_after == done) dn_rec_store(p, s.live, h, j, st);
+                         uint32_t j, uint32_t l, const float* st) {
+  if (j >= p.v_dim) return;
+  if (s.live != 0 && s.live_after == done) dn_rec_store(p, s.live, h, j, l, st);
   for (uint32_t w = 0; w < s.writes && w < 4; ++w) {
-    if (s.write_after[w] == done) dn_rec_store(p, s.write_dst[w], h, j, st);
+    if (s.write_after[w] == done) dn_rec_store(p, s.write_dst[w], h, j, l, st);
   }
 }
 
-// One token of column `j`: the step and its output and stores.
-DS_FN void dn_rec_token(const QwDnRecParams& p, const QwDnSeq& s, uint32_t h, uint32_t j,
-                        uint32_t i, const float* k, const float* q, float* st) {
-  const uint32_t pos = s.first + i;
-  const uint64_t vh = static_cast<uint64_t>(pos) * p.v_heads + h;
-  const bool want = i >= s.out_from;
-  float o = 0.0f;
-  dn_rec_step(st, k, q, p.v[vh * p.v_dim + j], p.alpha[vh], p.beta[vh], want, &o);
-  if (want) p.out[vh * p.v_dim + j] = o;
-  dn_rec_stores(p, s, i + 1, h, j, st);
-}
-
-// The key head's keys and queries of position `pos`, as a block stages them.
-DS_FN void dn_rec_stage(const QwDnRecParams& p, uint32_t pos, uint32_t h, uint32_t t,
-                        uint32_t threads, float* k, float* q) {
+// Thread `t`'s share of the chunk of positions `base ..` (relative) of
+// column block `slice`; zeros past the sequence's positions or `v_dim`.
+DS_FN void dn_rec_fetch(const QwDnRecParams& p, const QwDnSeq& s, uint32_t h, uint32_t slice,
+                        uint32_t base, uint32_t t, DnFetch& f) {
   const uint32_t kh = h / (p.v_heads / p.k_heads);
-  const uint64_t at = static_cast<uint64_t>(pos) * p.k_heads * kKeyDim + kh * kKeyDim;
-  for (uint32_t i = t; i < kKeyDim; i += threads) {
-    k[i] = p.k[at + i];
-    q[i] = p.q[at + i];
+  for (uint32_t r = 0; r < kDnQuadLoads; ++r) {
+    const uint32_t x = t + r * kDnThreads;
+    const uint32_t u = x / kDnQuads;
+    if (base + u < s.count) {
+      const uint64_t at = (static_cast<uint64_t>(s.first + base + u) * p.k_heads + kh) * kKeyDim +
+                          (x % kDnQuads) * 4;
+      dn_load4(p.k + at, f.k[r]);
+      dn_load4(p.q + at, f.q[r]);
+    } else {
+      for (uint32_t e = 0; e < 4; ++e) f.k[r][e] = f.q[r][e] = 0.0f;
+    }
   }
+  for (uint32_t r = 0; r < kDnValueLoads; ++r) {
+    const uint32_t x = t + r * kDnThreads;
+    const uint32_t u = x / kDnCols;
+    const uint32_t j = slice * kDnCols + x % kDnCols;
+    f.v[r] = base + u < s.count && j < p.v_dim
+                 ? p.v[(static_cast<uint64_t>(s.first + base + u) * p.v_heads + h) * p.v_dim + j]
+                 : 0.0f;
+  }
+  const bool gate = t < kDnChunk && base + t < s.count;
+  const uint64_t vh = static_cast<uint64_t>(s.first + base + t) * p.v_heads + h;
+  f.alpha = gate ? p.alpha[vh] : 0.0f;
+  f.beta = gate ? p.beta[vh] : 0.0f;
+}
+
+// Thread `t`'s share into buffer `b`: key and query element `4c + e` of a
+// position to group thread `e`'s row at `c`.
+DS_FN void dn_rec_put(const DnFetch& f, uint32_t t, DnRecShared& sh, uint32_t b) {
+  for (uint32_t r = 0; r < kDnQuadLoads; ++r) {
+    const uint32_t x = t + r * kDnThreads;
+    const uint32_t u = x / kDnQuads;
+    const uint32_t c = x % kDnQuads;
+    for (uint32_t e = 0; e < 4; ++e) {
+      sh.k[b][u][e][c] = f.k[r][e];
+      sh.q[b][u][e][c] = f.q[r][e];
+    }
+  }
+  for (uint32_t r = 0; r < kDnValueLoads; ++r) {
+    const uint32_t x = t + r * kDnThreads;
+    sh.v[b][x / kDnCols][x % kDnCols] = f.v[r];
+  }
+  if (t < kDnChunk) {
+    sh.alpha[b][t] = f.alpha;
+    sh.beta[b][t] = f.beta;
+  }
+}
+
+// The output of position `pos` for column `j`: `o` rounded to BF16.
+DS_FN void dn_rec_out(const QwDnRecParams& p, uint32_t pos, uint32_t h, uint32_t j, float o) {
+  p.out[(static_cast<uint64_t>(pos) * p.v_heads + h) * p.v_dim + j] = ds::bf16_round(o);
 }
 
 // ---- DeltaNet: the gated norm (`deltanet::gated_norm`) ----
