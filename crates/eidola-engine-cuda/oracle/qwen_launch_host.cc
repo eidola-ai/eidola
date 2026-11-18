@@ -44,7 +44,30 @@ void qwen_host_norm(const QwNormParams* p, uint32_t gx, uint32_t gy) {
     }
 }
 
+// `eidola_qwen_quant`'s entry: a warp per block, its lanes' amaxes combined by
+// the butterfly the device's shuffles run, in the same operand order.
 void qwen_host_quant(const QwQuantParams* p, uint32_t gx, uint32_t gy) {
+  constexpr uint32_t kW = qwk::kWarp;
+  float v[kW][qwk::kQuantLane];
+  float m[kW];
+  for (uint32_t y = gy; y-- > 0;)
+    for (uint32_t x = gx; x-- > 0;)
+      for (uint32_t w = qwk::kQuantWarps; w-- > 0;) {
+        uint32_t b;
+        if (!qwk::quant_block_of(*p, x, y, w, &b)) continue;
+        for (uint32_t l = kW; l-- > 0;) m[l] = qwk::quant_lane_load(*p, y, b, l, v[l]);
+        for (uint32_t off = kW / 2; off > 0; off >>= 1) {
+          float next[kW];
+          for (uint32_t l = kW; l-- > 0;) next[l] = ds::max32(m[l], m[l ^ off]);
+          std::memcpy(m, next, sizeof m);
+        }
+        for (uint32_t l = kW; l-- > 0;) qwk::quant_lane_store(*p, y, b, l, v[l], m[l]);
+      }
+}
+
+// The reference form (`quant_thread`) over its own grid: a thread per block,
+// `kBlockThreads` blocks of a row per CTA. The warp form is held to it.
+void qwen_host_quant_thread(const QwQuantParams* p, uint32_t gx, uint32_t gy) {
   for (uint32_t y = gy; y-- > 0;)
     for (uint32_t x = gx; x-- > 0;)
       for (uint32_t t = qwk::kBlockThreads; t-- > 0;) qwk::quant_thread(*p, x, y, t);

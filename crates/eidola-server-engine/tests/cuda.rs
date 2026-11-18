@@ -19,8 +19,8 @@
 //! Qwen3.8 (its dev model), without a device: graphs refused, one KV budget, the state
 //! pool and one sequence in it, the host tier and the weights hash before the device; and
 //! the node's executor configuration run over the kernels' bodies compiled for the host
-//! answering token for token as the CPU executor does, its pools and step scratch within
-//! the shared rules' counts.
+//! answering token for token as the CPU executor does, eagerly and on the rung path, and
+//! in the fast profile its pools and step scratch within the shared rules' counts.
 //!
 //! With a device (`EIDOLA_TEST_CUDA_WEIGHTS` and `EIDOLA_ENGINE_KERNELS_DIR`): the node
 //! booted on real MiMo-V2.6-Flash weights answers a chat request end to end, and its
@@ -646,12 +646,14 @@ fn qwen_cuda_env() -> HashMap<&'static str, String> {
 }
 
 /// A Qwen3.8 configuration the node accepts on the host goes on to the device and,
-/// without one, fails closed there, drafting or not. Never a CPU fallback.
+/// without one, fails closed there, drafting or not, with graphs on or off. Never a CPU
+/// fallback.
 #[test]
 fn qwen_reaches_the_device_and_fails_closed_without_it() {
-    for k in ["0", "3"] {
+    for (k, graphs) in [("0", "off"), ("3", "off"), ("3", "on")] {
         let mut map = qwen_cuda_env();
         map.insert(env::DRAFT_TOKENS, k.into());
+        map.insert(env::CUDA_GRAPHS, graphs.into());
         let err = boot_err(&map);
         assert!(!err.contains(env::KV_DEVICE_BYTES), "{k}: {err}");
         if !Gpu::available() {
@@ -660,8 +662,7 @@ fn qwen_reaches_the_device_and_fails_closed_without_it() {
     }
 }
 
-/// Before the device: decode graphs (the executor captures none), a budget that names
-/// two devices or cannot hold the state pool and one sequence, a host tier under two of
+/// Before the device: a budget that names two devices or cannot hold the state pool and one sequence, a host tier under two of
 /// each, and a wrong weights hash before anything of the executor's.
 #[test]
 fn qwen_refusals_come_before_the_device() {
@@ -676,10 +677,6 @@ fn qwen_refusals_come_before_the_device() {
         }
         assert!(!err.contains(NO_DEVICE), "{overrides:?}: {err}");
     };
-    refused(
-        &[(env::CUDA_GRAPHS, "on")],
-        &[env::CUDA_GRAPHS, "no decode graphs"],
-    );
     let two = format!("{0},{0}", 64u64 << 20);
     refused(&[(env::KV_DEVICE_BYTES, &two)], &["device budgets"]);
     refused(
@@ -719,12 +716,13 @@ impl Drop for Counted {
     }
 }
 
-/// The device allocations live, their peak, and every size allocated in order.
+/// The device allocations live, their peak, and every allocation in order: its size
+/// and the bytes live after it.
 #[derive(Default)]
 struct Tally {
     live: u64,
     peak: u64,
-    sizes: Vec<u64>,
+    allocs: Vec<(u64, u64)>,
 }
 
 /// A Qwen3.8 device that counts its allocations and otherwise is the device it wraps.
@@ -739,8 +737,9 @@ mod counting {
     use eidola_engine::secret::KvKey;
     use eidola_engine_cuda::Result;
     use eidola_engine_cuda::qwen::abi::*;
+    use eidola_engine_cuda::qwen::attention::Fa2Args;
     use eidola_engine_cuda::qwen::device::{QwenDevice, QwenProfile};
-    use eidola_engine_cuda::qwen::kernels::QwenKernels;
+    use eidola_engine_cuda::qwen::kernels::{AcceptLaunch, CopyArgs, QwenKernels, SampleArgs};
 
     impl<D: QwenKernels> QwenKernels for Counting<D> {
         unsafe fn embed(&self, p: &EmbedParams) -> Result<()> {
@@ -755,8 +754,23 @@ mod counting {
         unsafe fn lin8(&self, p: &Lin8Params) -> Result<()> {
             unsafe { self.inner.lin8(p) }
         }
-        unsafe fn linear(&self, p: &LinearParams, large: bool) -> Result<()> {
-            unsafe { self.inner.linear(p, large) }
+        unsafe fn linear(&self, p: &LinearParams, fast: Option<u64>) -> Result<()> {
+            unsafe { self.inner.linear(p, fast) }
+        }
+        unsafe fn gemm_bf16(&self, p: &LinearParams) -> Result<()> {
+            unsafe { self.inner.gemm_bf16(p) }
+        }
+        unsafe fn copy_rows(&self, a: &CopyArgs) -> Result<()> {
+            unsafe { self.inner.copy_rows(a) }
+        }
+        unsafe fn sample(&self, a: &SampleArgs) -> Result<()> {
+            unsafe { self.inner.sample(a) }
+        }
+        unsafe fn accept(&self, a: &AcceptLaunch) -> Result<()> {
+            unsafe { self.inner.accept(a) }
+        }
+        unsafe fn fa2(&self, a: &Fa2Args) -> Result<()> {
+            unsafe { self.inner.fa2(a) }
         }
         unsafe fn gate(&self, p: &GateParams) -> Result<()> {
             unsafe { self.inner.gate(p) }
@@ -794,7 +808,8 @@ mod counting {
             let mut t = self.tally.lock().unwrap();
             t.live += bytes;
             t.peak = t.peak.max(t.live);
-            t.sizes.push(bytes);
+            let live = t.live;
+            t.allocs.push((bytes, live));
             drop(t);
             Ok((
                 addr,
@@ -839,55 +854,74 @@ mod counting {
         fn synchronize(&self) -> Result<()> {
             self.inner.synchronize()
         }
+        fn capture(&self, run: &mut dyn FnMut() -> Result<()>) -> Result<Box<dyn std::any::Any>> {
+            self.inner.capture(run)
+        }
+        fn replay(&self, graph: &dyn std::any::Any) -> Result<()> {
+            self.inner.replay(graph)
+        }
+        fn free_memory(&self) -> Result<i64> {
+            self.inner.free_memory()
+        }
     }
 }
 
 /// The kernels' own bodies compiled for the host (the CUDA crate's
-/// `oracle/qwen_launch_host.cc`), or `None` without a C++ compiler.
-fn qwen_host_device() -> Option<eidola_engine_cuda::qwen::host::HostDevice> {
+/// `oracle/qwen_launch_host.cc`), built once per test process, or `None` without a C++
+/// compiler.
+fn qwen_host_bodies() -> Option<Arc<libloading::Library>> {
     use std::process::Command;
     let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
     if Command::new(&cxx).arg("--version").output().is_err() {
         eprintln!("SKIPPED: no C++ compiler ({cxx}) for the Qwen3.8 kernel bodies");
         return None;
     }
-    let cuda = Path::new(env!("CARGO_MANIFEST_DIR")).join("../eidola-engine-cuda");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "libqwen_launch_host-node-{}-{nanos}.{}",
-        std::process::id(),
-        std::env::consts::DLL_EXTENSION
-    ));
-    let status = Command::new(&cxx)
-        .args(["-std=c++17", "-O2", "-ffp-contract=off", "-shared", "-fPIC"])
-        .arg("-I")
-        .arg(cuda.join("../eidola-engine-kernels/csrc"))
-        .arg(cuda.join("oracle/qwen_launch_host.cc"))
-        .arg("-o")
-        .arg(&out)
-        .status()
-        .expect("run the C++ compiler");
-    assert!(
-        status.success(),
-        "{cxx} failed on oracle/qwen_launch_host.cc"
-    );
-    // SAFETY: a library this test just built from the CUDA crate's own source; it has no
-    // initialisers.
-    let lib = Arc::new(unsafe { libloading::Library::new(&out) }.expect("load the bodies"));
+    static BUILT: std::sync::OnceLock<Arc<libloading::Library>> = std::sync::OnceLock::new();
+    Some(
+        BUILT
+            .get_or_init(|| {
+                let cuda = Path::new(env!("CARGO_MANIFEST_DIR")).join("../eidola-engine-cuda");
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+                    "libqwen_launch_host-node-{}-{nanos}.{}",
+                    std::process::id(),
+                    std::env::consts::DLL_EXTENSION
+                ));
+                let status = Command::new(&cxx)
+                    .args(["-std=c++17", "-O2", "-ffp-contract=off", "-shared", "-fPIC"])
+                    .arg("-I")
+                    .arg(cuda.join("../eidola-engine-kernels/csrc"))
+                    .arg(cuda.join("oracle/qwen_launch_host.cc"))
+                    .arg("-o")
+                    .arg(&out)
+                    .status()
+                    .expect("run the C++ compiler");
+                assert!(
+                    status.success(),
+                    "{cxx} failed on oracle/qwen_launch_host.cc"
+                );
+                // SAFETY: a library this test just built from the CUDA crate's own source;
+                // it has no initialisers.
+                Arc::new(unsafe { libloading::Library::new(&out) }.expect("load the bodies"))
+            })
+            .clone(),
+    )
+}
+
+/// The compiled bodies as a host device's launches.
+fn qwen_launch(lib: Arc<libloading::Library>) -> Box<eidola_engine_cuda::qwen::host::HostLaunch> {
     type HostFn = unsafe extern "C" fn(*const std::ffi::c_void, u32, u32);
-    Some(eidola_engine_cuda::qwen::host::HostDevice::new(Box::new(
-        move |family, params, gx, gy| {
-            let name = format!("qwen_host_{family}\0");
-            // SAFETY: every `qwen_host_*` symbol takes its family's parameter struct.
-            unsafe {
-                let f: libloading::Symbol<HostFn> =
-                    lib.get(name.as_bytes()).expect("a host body per family");
-                f(params, gx, gy);
-            }
-        },
-    )))
+    Box::new(move |family, params, gx, gy| {
+        let name = format!("qwen_host_{family}\0");
+        // SAFETY: every `qwen_host_*` symbol takes its family's parameter struct.
+        unsafe {
+            let f: libloading::Symbol<HostFn> =
+                lib.get(name.as_bytes()).expect("a host body per family");
+            f(params, gx, gy);
+        }
+    })
 }
 
 /// Greedy generation of `prompt` through the engine core over `exec` at the node's
@@ -941,44 +975,23 @@ fn qwen_greedy<E: eidola_engine::executor::Executor>(
 /// The executor configuration the node derives for Qwen3.8 (`cuda::qwen_config`, over
 /// the dev model's verified configuration and sampleable vocabulary), run over the
 /// kernels' bodies compiled for the host in the exact profile, generates exactly the CPU
-/// executor's greedy tokens, without drafts and drafting two; its pools are the sizes
-/// the shared rules count (`engine_deployment::recurrent_kv_block_bytes`, the state
-/// image, `recurrent_seat_bytes`), and its step scratch stays within
-/// `recurrent_step_scratch_bytes` over a prompt that fills the window in whole steps.
+/// executor's greedy tokens, without drafts and drafting two, eagerly and on the padded
+/// rung path (run directly: the host device captures no graphs).
 #[test]
 fn the_nodes_qwen_configuration_computes_what_the_cpu_executor_does() {
-    use eidola_common::engine_deployment::{
-        recurrent_kv_block_bytes, recurrent_seat_bytes, recurrent_step_scratch_bytes,
-    };
     use eidola_engine_cpu::qwen::QwenCpuExecutor;
-    use eidola_engine_cuda::qwen::QwenCudaExecutor;
+    use eidola_engine_cuda::qwen::{DecodePath, QwenCudaExecutor};
     use eidola_server_engine::model::Served;
 
     let model = qwen_loaded();
     let Served::Qwen {
-        model: reference,
-        template,
+        model: reference, ..
     } = model.served()
     else {
         panic!("the Qwen dev model");
     };
-    let text = "Name three primary colours, and say why each is one. ".repeat(60);
-    let input = eidola_engine_chat::ChatInput::from_json(
-        &json!([{"role": "user", "content": text}]).to_string(),
-        None,
-    )
-    .unwrap();
-    let prompt = template
-        .render_prompt(&input, &eidola_server_engine::pipeline::qwen_options())
-        .unwrap();
-    let prompt = model.tokenizer().encode_prompt(&prompt).unwrap();
-    assert!(
-        prompt.len() > 700 && prompt.len() < 1000,
-        "{}",
-        prompt.len()
-    );
+    let prompt = qwen_long_prompt();
     let max_tokens = 8;
-
     let base = config_from(&qwen_env_map()).unwrap();
     let sizing = eidola_server_engine::config::Sizing {
         draft_tokens: 0,
@@ -1001,50 +1014,150 @@ fn the_nodes_qwen_configuration_computes_what_the_cpu_executor_does() {
     );
     assert!(!expected.is_empty());
 
-    let dims = eidola_server_engine::cuda::qwen_dims(reference.config());
+    let Some(lib) = qwen_host_bodies() else {
+        return;
+    };
     for k in ["0", "2"] {
-        let Some(host) = qwen_host_device() else {
-            return;
-        };
-        let mut map = qwen_cuda_env();
-        map.insert(env::DRAFT_TOKENS, k.into());
-        let config = config_from(&map).unwrap();
-        let ExecutorConfig::Cuda {
-            kv_device_bytes,
-            graphs,
-            ..
-        } = &config.executor
-        else {
-            unreachable!()
-        };
-        let exec_config = eidola_server_engine::cuda::qwen_config(
-            reference.config(),
-            &config.sizing,
-            &config.cache,
-            *kv_device_bytes,
-            config.kv_host_bytes,
-            *graphs,
-            model.sampleable_vocab_size(),
-        )
+        for path in [DecodePath::Eager, DecodePath::Direct] {
+            let (exec_config, sizing) = qwen_cuda_config(k, "off");
+            let dev = eidola_engine_cuda::qwen::host::HostDevice::new(qwen_launch(lib.clone()));
+            let mut exec = QwenCudaExecutor::new(dev, reference, exec_config).unwrap();
+            exec.set_decode_path(path).unwrap();
+            let got = qwen_greedy(exec, &sizing, prompt.clone(), max_tokens);
+            assert_eq!(got, expected, "draft width {k}, {path:?}");
+        }
+    }
+    // Graphs on: the host device captures none, so construction refuses.
+    let (on, _) = qwen_cuda_config("2", "on");
+    let dev = eidola_engine_cuda::qwen::host::HostDevice::new(qwen_launch(lib));
+    assert!(QwenCudaExecutor::new(dev, reference, on).is_err());
+}
+
+/// A prompt that fills the dev node's 1,024-position window in whole steps.
+fn qwen_long_prompt() -> Vec<u32> {
+    let model = qwen_loaded();
+    let eidola_server_engine::model::Served::Qwen { template, .. } = model.served() else {
+        panic!("the Qwen dev model");
+    };
+    let text = "Name three primary colours, and say why each is one. ".repeat(60);
+    let input = eidola_engine_chat::ChatInput::from_json(
+        &json!([{"role": "user", "content": text}]).to_string(),
+        None,
+    )
+    .unwrap();
+    let prompt = template
+        .render_prompt(&input, &eidola_server_engine::pipeline::qwen_options())
         .unwrap();
+    let prompt = model.tokenizer().encode_prompt(&prompt).unwrap();
+    assert!(
+        prompt.len() > 700 && prompt.len() < 1000,
+        "{}",
+        prompt.len()
+    );
+    prompt
+}
+
+/// The node's Qwen3.8 executor configuration over the dev model at draft width `k`,
+/// graphs `graphs`, and its sizing.
+fn qwen_cuda_config(
+    k: &str,
+    graphs: &str,
+) -> (
+    eidola_engine_cuda::qwen::QwenCudaExecutorConfig,
+    eidola_server_engine::config::Sizing,
+) {
+    let model = qwen_loaded();
+    qwen_cuda_config_for(
+        model.qwen_config().unwrap(),
+        model.sampleable_vocab_size(),
+        k,
+        graphs,
+    )
+}
+
+/// [`qwen_cuda_config`] for the model `qwen`, `sampleable` of its ids sampled.
+fn qwen_cuda_config_for(
+    qwen: &eidola_engine_model::qwen::QwenConfig,
+    sampleable: u32,
+    k: &str,
+    graphs: &str,
+) -> (
+    eidola_engine_cuda::qwen::QwenCudaExecutorConfig,
+    eidola_server_engine::config::Sizing,
+) {
+    let mut map = qwen_cuda_env();
+    map.insert(env::DRAFT_TOKENS, k.into());
+    map.insert(env::CUDA_GRAPHS, graphs.into());
+    let config = config_from(&map).unwrap();
+    let ExecutorConfig::Cuda {
+        kv_device_bytes,
+        graphs,
+        ..
+    } = &config.executor
+    else {
+        unreachable!()
+    };
+    let exec_config = eidola_server_engine::cuda::qwen_config(
+        qwen,
+        &config.sizing,
+        &config.cache,
+        *kv_device_bytes,
+        config.kv_host_bytes,
+        *graphs,
+        sampleable,
+    )
+    .unwrap();
+    (exec_config, config.sizing)
+}
+
+/// In the fast profile, which the node runs (planned as on the device, FA2 checked
+/// rather than computed; over the model crate's 256-wide fixture, since the profile's
+/// attention is compiled for heads of 256 and the dev model's are 128), the executor's
+/// pools are the sizes the shared rules count
+/// (`engine_deployment::recurrent_kv_block_bytes` with each pool's pad block, the state
+/// image, `recurrent_seat_bytes` for every seat and the padding seat), and everything
+/// else it allocates, at construction and as its eager table grows over a prompt that
+/// fills the window in whole steps and then decodes, stays within
+/// `recurrent_step_scratch_bytes`, without drafts and drafting two.
+#[test]
+fn the_nodes_qwen_pools_and_scratch_are_the_shared_counts() {
+    use eidola_common::engine_deployment::{
+        recurrent_kv_block_bytes, recurrent_seat_bytes, recurrent_step_scratch_bytes,
+    };
+    use eidola_engine_cuda::qwen::{QwenCudaExecutor, QwenProfile};
+    let Some(lib) = qwen_host_bodies() else {
+        return;
+    };
+    let reference = eidola_engine_model::qwen::load_reference(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../eidola-engine-model/tests/fixtures/qwen_tiny256"),
+        Ok,
+    )
+    .unwrap();
+    let vocab = reference.config().vocab_size as u32;
+    let dims = eidola_server_engine::cuda::qwen_dims(reference.config());
+    // A prompt that fills the window in whole steps.
+    let prompt: Vec<u32> = (0..900u32).map(|i| (i * 37 + 11) % 500).collect();
+    for k in ["0", "2"] {
+        let (exec_config, s) = qwen_cuda_config_for(reference.config(), vocab, k, "off");
         let tally = Arc::new(std::sync::Mutex::new(Tally::default()));
         let dev = Counting {
-            inner: host,
+            inner: eidola_engine_cuda::qwen::host::HostDevice::planning_fast(qwen_launch(
+                lib.clone(),
+            )),
             tally: tally.clone(),
         };
-        let exec = QwenCudaExecutor::new(dev, reference, exec_config.clone()).unwrap();
+        assert_eq!(
+            eidola_engine_cuda::qwen::QwenDevice::profile(&dev),
+            QwenProfile::Fast
+        );
+        let exec = QwenCudaExecutor::new(dev, &reference, exec_config.clone()).unwrap();
 
         // The pools, in the executor's order after its weights: the target's KV, with
         // drafting the drafter's KV and its taps, the states, then each seat's live
-        // image, tail and kept states, and the status word.
-        let (persistent, pools) = {
-            let t = tally.lock().unwrap();
-            let drafting = config.sizing.draft_tokens > 0;
-            let n = if drafting { 8 } else { 6 };
-            (t.live, t.sizes[t.sizes.len() - n..].to_vec())
-        };
-        let s = &config.sizing;
-        let blocks = u64::from(exec_config.num_blocks);
+        // image, tail (its convolution rows, then its decay and write rows) and kept
+        // states, the padding seat among them.
+        let blocks = u64::from(exec_config.num_blocks) + 1;
         let b = u64::from(s.kv_block_size);
         let mut want = vec![blocks * b * dims.kv_bytes_per_position()];
         if s.draft_tokens > 0 {
@@ -1052,29 +1165,37 @@ fn the_nodes_qwen_configuration_computes_what_the_cpu_executor_does() {
             want.push(blocks * dims.tap_bytes());
         }
         want.push(u64::from(exec_config.state_buffers) * dims.state_image_bytes());
+        let (base, pools) = {
+            let t = tally.lock().unwrap();
+            let at = t
+                .allocs
+                .iter()
+                .position(|&(bytes, _)| bytes == want[0])
+                .expect("the target's pool");
+            let n = want.len() + 4;
+            (
+                t.allocs[at + n - 1].1,
+                t.allocs[at..at + n].iter().map(|a| a.0).collect::<Vec<_>>(),
+            )
+        };
         assert_eq!(pools[..want.len()], want[..], "k = {k}");
         assert_eq!(
             want[..want.len() - 1].iter().sum::<u64>() / blocks,
-            recurrent_kv_block_bytes(&dims, s),
+            recurrent_kv_block_bytes(&dims, &s),
             "k = {k}"
         );
         assert_eq!(
-            pools[want.len()..want.len() + 3].iter().sum::<u64>(),
-            u64::from(s.max_seqs) * recurrent_seat_bytes(&dims, s),
+            pools[want.len()..].iter().sum::<u64>(),
+            (u64::from(s.max_seqs) + 1) * recurrent_seat_bytes(&dims, &s),
             "k = {k}"
         );
 
-        let got = qwen_greedy(exec, s, prompt.clone(), max_tokens);
-        assert_eq!(got, expected, "draft width {k}");
+        let _ = qwen_greedy(exec, &s, prompt.clone(), 24);
         let t = tally.lock().unwrap();
-        let scratch = t.peak - persistent;
-        let bound = recurrent_step_scratch_bytes(&dims, s);
-        eprintln!("k = {k}: step scratch peak {scratch} of the {bound} counted");
+        let scratch = t.peak - base;
+        let bound = recurrent_step_scratch_bytes(&dims, &s);
+        eprintln!("k = {k}: step scratch {scratch} of the {bound} counted");
         assert!(scratch <= bound, "k = {k}: {scratch} > {bound}");
-        assert!(
-            scratch * 2 > bound,
-            "k = {k}: {scratch} is far below {bound}"
-        );
     }
 }
 

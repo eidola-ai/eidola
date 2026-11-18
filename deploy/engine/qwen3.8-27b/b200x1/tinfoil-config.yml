@@ -18,10 +18,10 @@
 # modelwrap schema 1 pack of the repo below, which has not been built. Until
 # it is, this deployment is not pinned and the gateway's build refuses it.
 #
-# The sizing is the whole 262,144-position context at 32 seats and steps of
-# 128 tokens, which is what one B200 holds beside the weights and the CUDA
-# executor's step scratch (eidola-common's
-# `qwen_fits_one_b200_at_its_whole_context`).
+# The sizing is the whole 262,144-position context at 64 seats and steps of
+# 2,048 tokens, decode graphs on: what one B200 holds beside the weights and
+# the CUDA executor's reserve, the state pool growing with the seats
+# (eidola-common's `qwen_fits_one_b200_at_its_whole_context`).
 cvm-version: 0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f
 cpus: 24
 memory: 196608
@@ -35,7 +35,7 @@ models:
 
 containers:
   - name: "eidola-server-engine"
-    image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:3b553f70e2cbff2163af8143b6d64579ee17ae0fd75593307982e1262a75e318"
+    image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:da8bed767da86538a44edf41f6616a72451cbf8b06c7bc388894f183ef7aad77"
     runtime: nvidia
     models: ["weights"]
     gpus: all
@@ -50,16 +50,16 @@ containers:
       - EIDOLA_ENGINE_EXECUTOR: "cuda"
       - EIDOLA_ENGINE_BIND_ADDR: "0.0.0.0:8080"
       - EIDOLA_ENGINE_KV_BLOCK_SIZE: "16"
-      - EIDOLA_ENGINE_KV_DEVICE_BYTES: "85899345920"
+      - EIDOLA_ENGINE_KV_DEVICE_BYTES: "123480309760"
       - EIDOLA_ENGINE_KERNELS_DIR: "/opt/eidola/kernels"
-      - EIDOLA_ENGINE_CUDA_GRAPHS: "off"
+      - EIDOLA_ENGINE_CUDA_GRAPHS: "on"
       - EIDOLA_ENGINE_GPU_CC: "required"
       - EIDOLA_ENGINE_MAX_MODEL_LEN: "262144"
-      - EIDOLA_ENGINE_MAX_SEQS: "32"
-      - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "128"
-      - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "128"
+      - EIDOLA_ENGINE_MAX_SEQS: "64"
+      - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "2048"
+      - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "2048"
       - EIDOLA_ENGINE_DRAFT_TOKENS: "3"
-      - EIDOLA_ENGINE_MAX_REQUESTS: "32"
+      - EIDOLA_ENGINE_MAX_REQUESTS: "64"
       - EIDOLA_ENGINE_PREFIX_CACHE: "true"
       - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
       - EIDOLA_ENGINE_CACHE_MAX_AGE_SECS: "7200"

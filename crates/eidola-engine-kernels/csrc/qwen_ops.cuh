@@ -17,7 +17,9 @@
 // The DeltaNet recurrence keeps each thread's share of a state column in its
 // own array across tokens; its device and host drivers call the same staging
 // and per-token steps and differ only in how a column's four threads exchange
-// partial sums (shuffles on the device).
+// partial sums (shuffles on the device). The quantiser is a warp per block the
+// same way: per-lane load and store steps, the lanes' amaxes combined by
+// shuffles on the device and by the same butterfly on the host.
 //
 // Why a row's result is its own: a thread or block reads its own row's
 // arrays (and the weights) and writes its own row's outputs; no value of the
@@ -87,12 +89,17 @@ DS_FN void embed_thread(const QwEmbedParams& p, uint32_t bx, uint32_t row, uint3
 // ---- the zero-centred RMS norm (`forward::rms_norm_zc`, `residual_add`,
 // `attention::apply_rope`) ----
 
-constexpr uint32_t kRopeMax = 512;  // widest unit a rotated norm stages
+constexpr uint32_t kRopeMax = 512;   // widest unit a rotated norm stages
+constexpr uint32_t kNormMax = 8192;  // widest unit a norm stages
 
+// A unit's BF16 inputs (after the residual add) are staged in shared memory by
+// every thread at once, so the sum's 16 serial lanes, in the reference's order,
+// read them at shared-memory latency.
 struct NormShared {
   float lanes[16];
   float tail;
   float r;
+  uint16_t row[kNormMax];
   float staged[kRopeMax];
 };
 
@@ -104,27 +111,31 @@ DS_FN void norm_block(const QwNormParams& p, uint32_t row, uint32_t unit, const 
   uint16_t* out = p.out + static_cast<uint64_t>(row) * p.out_stride +
                   static_cast<uint64_t>(unit) * p.out_unit_stride;
   const uint32_t threads = kElementThreads;
-  if (p.add != nullptr) {
-    const uint16_t* add = p.add + static_cast<uint64_t>(row) * p.add_stride;
-    par.run([&](uint32_t t) {
-      for (uint32_t i = t; i < p.n; i += threads) {
-        x[i] = ds::bf16_store(ds::bf16_round(ds::bf16_value(x[i]) + ds::bf16_value(add[i])));
+  const uint16_t* add =
+      p.add != nullptr ? p.add + static_cast<uint64_t>(row) * p.add_stride : nullptr;
+  par.run([&](uint32_t t) {
+    for (uint32_t i = t; i < p.n; i += threads) {
+      uint16_t v = x[i];
+      if (add != nullptr) {
+        v = ds::bf16_store(ds::bf16_round(ds::bf16_value(v) + ds::bf16_value(add[i])));
+        x[i] = v;
       }
-    });
-  }
+      sh.row[i] = v;
+    }
+  });
   const uint32_t full = p.n & ~15u;
   par.run([&](uint32_t t) {
     if (t < 16) {
       float acc = 0.0f;
       for (uint32_t i = t; i < full; i += 16) {
-        const float v = ds::bf16_value(x[i]);
+        const float v = ds::bf16_value(sh.row[i]);
         acc = acc + v * v;
       }
       sh.lanes[t] = acc;
     } else if (t == 16) {
       float tail = 0.0f;
       for (uint32_t i = full; i < p.n; ++i) {
-        const float v = ds::bf16_value(x[i]);
+        const float v = ds::bf16_value(sh.row[i]);
         tail = tail + v * v;
       }
       sh.tail = tail;
@@ -140,14 +151,14 @@ DS_FN void norm_block(const QwNormParams& p, uint32_t row, uint32_t unit, const 
   if (p.rotary == 0) {
     par.run([&](uint32_t t) {
       for (uint32_t i = t; i < p.n; i += threads) {
-        out[i] = ds::bf16_store(ds::rms_element(ds::bf16_value(x[i]), sh.r, p.weight[i]));
+        out[i] = ds::bf16_store(ds::rms_element(ds::bf16_value(sh.row[i]), sh.r, p.weight[i]));
       }
     });
     return;
   }
   par.run([&](uint32_t t) {
     for (uint32_t i = t; i < p.n; i += threads) {
-      sh.staged[i] = ds::rms_element(ds::bf16_value(x[i]), sh.r, p.weight[i]);
+      sh.staged[i] = ds::rms_element(ds::bf16_value(sh.row[i]), sh.r, p.weight[i]);
     }
   });
   const uint64_t at = static_cast<uint64_t>(p.positions[row]) * p.rotary;
@@ -167,7 +178,9 @@ DS_FN void norm_block(const QwNormParams& p, uint32_t row, uint32_t unit, const 
 
 // ---- the FP8 activation quantiser (`linear::act_quant`) ----
 
-// One 128-wide block of one row.
+// The reference form: one thread quantises one 128-wide block of one row, in
+// the model crate's order. The kernel runs the warp form below; the host check
+// holds that form to this one bit for bit (`qwen_host_quant_thread`).
 DS_FN void quant_thread(const QwQuantParams& p, uint32_t bx, uint32_t row, uint32_t t) {
   const uint32_t b = bx * kBlockThreads + t;
   if (row >= p.rows || b >= p.k / QW_BLOCK) return;
@@ -178,6 +191,67 @@ DS_FN void quant_thread(const QwQuantParams& p, uint32_t bx, uint32_t row, uint3
   uint8_t* codes = p.codes + static_cast<uint64_t>(row) * p.k + b * QW_BLOCK;
   for (uint32_t j = 0; j < QW_BLOCK; ++j) codes[j] = ds::e4m3_encode(ds::bf16_value(x[j]) / s);
   p.scales[static_cast<uint64_t>(b) * p.m_pad + row] = s;
+}
+
+// The warp form (`eidola_qwen_quant`): a warp per 128-wide block, lane `l`
+// holding the block's elements `4l .. 4l + 4`, `kQuantWarps` blocks of a row
+// per CTA. Lane amaxes start from +0 like the reference's, and the warp
+// combines them by `max32` across a butterfly. That is the reference's amax
+// bit for bit in any order: every operand is a magnitude (no sign bit, so +0
+// and -0 never meet) and `max32` drops a NaN operand, so the result is the
+// largest non-NaN magnitude, or +0. Each code is then its own element divided
+// by the block's scale, exactly as there.
+constexpr uint32_t kWarp = 32;
+constexpr uint32_t kQuantLane = QW_BLOCK / kWarp;
+constexpr uint32_t kQuantWarps = kBlockThreads / kWarp;
+static_assert(kQuantLane == 4, "four elements a lane: one 8-byte load, one 4-byte store");
+
+// The block warp `w` of CTA (`bx`, `row`) quantises, or false past the row's.
+DS_FN bool quant_block_of(const QwQuantParams& p, uint32_t bx, uint32_t row, uint32_t w,
+                          uint32_t* b) {
+  *b = bx * kQuantWarps + w;
+  return row < p.rows && *b < p.k / QW_BLOCK;
+}
+
+// Lane `l`'s elements of block `b` into `v`, and the amax of their magnitudes
+// from +0 in ascending order.
+DS_FN float quant_lane_load(const QwQuantParams& p, uint32_t row, uint32_t b, uint32_t l,
+                            float* v) {
+  const uint16_t* x =
+      p.x + static_cast<uint64_t>(row) * p.x_stride + b * QW_BLOCK + l * kQuantLane;
+#if defined(__CUDACC__)
+  const uint2 u = *reinterpret_cast<const uint2*>(x);
+  const uint16_t h[kQuantLane] = {
+      static_cast<uint16_t>(u.x & 0xffffu), static_cast<uint16_t>(u.x >> 16),
+      static_cast<uint16_t>(u.y & 0xffffu), static_cast<uint16_t>(u.y >> 16)};
+#else
+  const uint16_t* h = x;
+#endif
+  float amax = 0.0f;
+  for (uint32_t j = 0; j < kQuantLane; ++j) {
+    v[j] = ds::bf16_value(h[j]);
+    amax = ds::amax_step(amax, v[j]);
+  }
+  return amax;
+}
+
+// Lane `l`'s codes of block `b` given the block's amax; lane 0 stores the
+// scale.
+DS_FN void quant_lane_store(const QwQuantParams& p, uint32_t row, uint32_t b, uint32_t l,
+                            const float* v, float amax) {
+  const float s = amax / 448.0f;
+  uint8_t c[kQuantLane];
+  for (uint32_t j = 0; j < kQuantLane; ++j) c[j] = ds::e4m3_encode(v[j] / s);
+  uint8_t* codes = p.codes + static_cast<uint64_t>(row) * p.k + b * QW_BLOCK + l * kQuantLane;
+#if defined(__CUDACC__)
+  *reinterpret_cast<uint32_t*>(codes) = static_cast<uint32_t>(c[0]) |
+                                        (static_cast<uint32_t>(c[1]) << 8) |
+                                        (static_cast<uint32_t>(c[2]) << 16) |
+                                        (static_cast<uint32_t>(c[3]) << 24);
+#else
+  for (uint32_t j = 0; j < kQuantLane; ++j) codes[j] = c[j];
+#endif
+  if (l == 0) p.scales[static_cast<uint64_t>(b) * p.m_pad + row] = s;
 }
 
 // ---- the FP8 linear (`linear::fp8_block_dot`, `fp8_row_dot`) ----

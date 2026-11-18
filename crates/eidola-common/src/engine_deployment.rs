@@ -425,92 +425,126 @@ pub fn recurrent_seat_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
         .saturating_add((k + 1).saturating_mul(dims.kept_row_bytes()))
 }
 
-/// Bounds the allocations of a recurrent model's step scratch beside its
-/// rows' own terms (each forward's minimum and pad, the status word).
+/// Bounds the program's allocations of no row (the sink, the status and
+/// zero rows, each allocation's eight-byte floor).
 const RECURRENT_SCRATCH_FIXED_BYTES: u64 = 64 << 10;
 
-/// The DeltaNet's per-sequence descriptor in a forward
-/// (`eidola-engine-cuda`'s `qwen::abi::DnSeq`).
-const DN_SEQ_BYTES: u64 = 88;
+/// Step-table words a row of a forward takes besides its attention's pages:
+/// its token, positions, KV target, DeltaNet sequence and copy items, its
+/// FA2 request and work items, sampling and acceptance words. Bounded from
+/// above by the node's `cuda::tests`, which hold the executor's tables to it.
+pub const RECURRENT_TABLE_ROW_WORDS: u64 = 1024;
 
-/// A recurrent model's step scratch on its device, bounded from above by the
-/// executor's own allocations (`eidola-engine-cuda`'s `QwenCudaExecutor`,
-/// which allocates every forward's scratch as it goes and holds it until the
-/// forward's results are read). With `N` = `MAX_BATCHED_TOKENS`, `S` =
-/// `MAX_SEQS`, `k` = `DRAFT_TOKENS`, `L` = `MAX_MODEL_LEN`, `B` =
-/// `KV_BLOCK_SIZE` and `W` = ⌈`L` / `B`⌉:
+/// Words of one step table at its largest, for a recurrent model's executor
+/// (`eidola-engine-cuda`'s `qwen::plan`): per target row (the `N` host
+/// tokens and drafts of passes A and B) the pages of a `MAX_MODEL_LEN + k +
+/// 1`-position sequence, a word a block, and per drafter row (with drafting,
+/// `N + 2Sk`: the host positions, the chain and the accepted drafts'
+/// rewrite) a word a position (the drafter's pages are positions), each with
+/// [`RECURRENT_TABLE_ROW_WORDS`]. Saturates.
+pub fn recurrent_table_words(sizing: &Sizing) -> u64 {
+    let n = u64::from(sizing.max_batched_tokens);
+    let s = u64::from(sizing.max_seqs);
+    let k = u64::from(sizing.draft_tokens);
+    let positions = u64::from(sizing.max_model_len) + k + 1;
+    let blocks = positions.div_ceil(u64::from(sizing.kv_block_size.max(1)));
+    let target = n.saturating_mul(blocks.saturating_add(RECURRENT_TABLE_ROW_WORDS));
+    let drafter = if k > 0 {
+        n.saturating_add(s.saturating_mul(2 * k))
+            .saturating_mul(positions.saturating_add(RECURRENT_TABLE_ROW_WORDS))
+    } else {
+        0
+    };
+    target.saturating_add(drafter)
+}
+
+/// Keys per chunk of FA2's split attention (`eidola-engine-cuda`'s
+/// `qwen::plan::SPLIT_KEYS`): a row's keys are reduced in chunks of this
+/// many positions, each a partial row.
+pub const RECURRENT_SPLIT_KEYS: u64 = 1024;
+
+/// A recurrent model's step scratch in the fast profile (the executor's
+/// `capacities` and `program::alloc_scratch`, sized once at construction,
+/// plus its step tables), bounded from above. With `N` =
+/// `MAX_BATCHED_TOKENS`, `S` = `MAX_SEQS`, `k` = `DRAFT_TOKENS`, `B` =
+/// `KV_BLOCK_SIZE`, the tail `T` = `B − 1 + k`, the forward's rows `R` =
+/// max(`N`, `Sk`), padded to 4, and the head's rows `H` = max(`S`, `Sk`, 64):
 ///
-/// - **target forwards** (the step's host tokens, then its drafts: `N` rows
-///   together, `N + 8` padded): per padded row
-///   [`HybridDims::target_row_bytes`] and a `W`-word block table; the
-///   attention scores, every attention layer's for the whole forward,
-///   [`HybridDims::score_bytes`] per row and visible position, at most
-///   `L + k`; the DeltaNet's staging of `N` new positions and, for rows
-///   resumed from their base, up to `B − 1 + k` folded ones each
-///   ([`HybridDims::staged_position_bytes`]), its convolution rows (three
-///   of history per sequence and forward) and sequence descriptors;
-/// - with drafting, **drafter forwards** (the host positions, the chain and
-///   the accepted drafts' rewrite: `N + 2Sk` rows, `k + 1` forwards, each
-///   padded by up to four): [`HybridDims::drafter_row_bytes`], a block table
-///   and one layer's scores per row;
-/// - the **head**, one call at a time: at most `S × max(k, 1)` rows plus
-///   padding, [`HybridDims::head_row_bytes`] each;
-/// - `RECURRENT_SCRATCH_FIXED_BYTES` (64 KiB) for the rest.
+/// - per row of `R`, [`HybridDims::program_row_bytes`]; pass A's and pass
+///   B's normed rows;
+/// - the DeltaNet's staging: max(`N + ST`, `Sk`) staged positions
+///   ([`HybridDims::staged_position_bytes`]) and three more convolution rows a
+///   seat;
+/// - FA2's partial rows: `R` rows times the chunks of [`RECURRENT_SPLIT_KEYS`]
+///   of `MAX_MODEL_LEN + k + 1` positions ([`HybridDims::partial_row_bytes`]):
+///   about 12 bytes per row and position of the context at Qwen3.8's shape,
+///   where the exact profile's scores, which this profile does not allocate,
+///   take 96 a layer;
+/// - the head's input, its f32 output (or the drafter's and the stacked
+///   `a`/`b` projections', the largest), the target's logit rows, max(`S`,
+///   64) and `Sk` more, and the drafter's (`H`), f32 over the head's rows, and the
+///   sampler's f64 distributions: `S` plain, `S(k + 1)` target, `Sk` draft and
+///   `S` acceptance rows;
+/// - the padding rows of the row copies, the draft lanes and the read-back;
+/// - the step tables: the rungs' fixed table and the eager table, which grows
+///   to a power of two, together at most three times
+///   [`recurrent_table_words`] words;
+/// - `RECURRENT_SCRATCH_FIXED_BYTES` (64 KiB).
 ///
-/// The scores are what grows with step tokens times the context: about
-/// 1.6 KB per row and position at Qwen3.8's shape. Saturates.
+/// Saturates.
 pub fn recurrent_step_scratch_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
+    let pad4 = |x: u64| x.next_multiple_of(4).max(4);
     let n = u64::from(sizing.max_batched_tokens);
     let s = u64::from(sizing.max_seqs);
     let k = u64::from(sizing.draft_tokens);
     let b = u64::from(sizing.kv_block_size.max(1));
-    let visible = u64::from(sizing.max_model_len).saturating_add(k);
-    let table = u64::from(sizing.max_model_len)
-        .div_ceil(b)
-        .saturating_mul(4);
-    let target_rows = n.saturating_add(8);
-    let staged = n.saturating_add(s.saturating_mul(b - 1 + k));
-    let conv_rows = staged.saturating_add(s.saturating_mul(6));
-    let target = target_rows
-        .saturating_mul(dims.target_row_bytes().saturating_add(table))
-        .saturating_add(
-            n.saturating_mul(dims.attention_layers)
-                .saturating_mul(dims.score_bytes())
-                .saturating_mul(visible),
-        )
+    let tail = b - 1 + k;
+    let positions = u64::from(sizing.max_model_len).saturating_add(k + 1);
+    let (h, v) = (dims.hidden, dims.vocab);
+    let rows = n.max(s * k);
+    let r = pad4(rows);
+    let head = s.max(s * k).max(64);
+    let staged = n.saturating_add(s.saturating_mul(tail)).max(s * k);
+    let conv_rows = 3 * s + staged;
+    let partial_rows = rows.saturating_mul(positions.div_ceil(RECURRENT_SPLIT_KEYS).max(1));
+    let head_tmp = (pad4(head) * v).max(r * h).max(r * dims.ab_rows()) * 4;
+    let logit_rows = s.max(64) + s * k + head;
+    let distributions = s + s * (k + 1) + (s * k).max(1) + s;
+    let pad_conv = 3 * s + s * (1 + tail) + 3 * 4 * s + 4 * s;
+    let pad_ab = s * (1 + tail) + s;
+    let pad_h = s * (k + 1) + s * ((k + 1) / b + 1) + s * k + s;
+    let readback = 1 + s + s * (k + 1) + s;
+    r.saturating_mul(dims.program_row_bytes())
+        .saturating_add((pad4(n) + pad4((s * k).max(1))) * h * 2)
         .saturating_add(staged.saturating_mul(dims.staged_position_bytes()))
         .saturating_add(conv_rows.saturating_mul(dims.conv_row_bytes()))
-        .saturating_add(s.saturating_mul(2).saturating_mul(DN_SEQ_BYTES));
-    let drafter = if k > 0 {
-        let rows = n.saturating_add(s.saturating_mul(2 * k));
-        rows.saturating_add(4 * (k + 1))
-            .saturating_mul(dims.drafter_row_bytes().saturating_add(table))
-            .saturating_add(
-                rows.saturating_mul(dims.score_bytes())
-                    .saturating_mul(visible),
-            )
-    } else {
-        0
-    };
-    let head = s
-        .saturating_mul(k.max(1))
-        .saturating_add(4)
-        .saturating_mul(dims.head_row_bytes());
-    target
-        .saturating_add(drafter)
-        .saturating_add(head)
+        .saturating_add(partial_rows.saturating_mul(dims.partial_row_bytes()))
+        .saturating_add(pad4(head) * h * 2 + head_tmp)
+        .saturating_add(logit_rows.saturating_mul(v * 4))
+        .saturating_add(distributions.saturating_mul(v * 8))
+        .saturating_add(
+            pad_conv * dims.conv_row_bytes()
+                + pad_ab * dims.ab_row_bytes()
+                + s.max(s * k) * dims.value_row_bytes()
+                + pad_h * h * 2
+                + (s * k + s) * 4
+                + (s * k).max(1) * 4
+                + n.max(s * k) * 4
+                + readback * 4,
+        )
+        .saturating_add(recurrent_table_words(sizing).saturating_mul(3 * 4))
         .saturating_add(RECURRENT_SCRATCH_FIXED_BYTES)
 }
 
 /// [`cuda_device_reserve_bytes`] for a recurrent model: [`DEVICE_FIXED_RESERVE_BYTES`],
-/// per seat [`recurrent_seat_bytes`], the RoPE tables over `MAX_MODEL_LEN +
-/// DRAFT_TOKENS + 1` positions, and [`recurrent_step_scratch_bytes`]. Its
-/// block tables are uploaded per forward, inside the step scratch. Saturates.
+/// [`recurrent_seat_bytes`] for every seat and the padding rows' seat, the RoPE
+/// tables over `MAX_MODEL_LEN + DRAFT_TOKENS + 1` positions, and
+/// [`recurrent_step_scratch_bytes`]. Saturates.
 fn recurrent_device_reserve_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
     let rope_positions = u64::from(sizing.max_model_len) + u64::from(sizing.draft_tokens) + 1;
     DEVICE_FIXED_RESERVE_BYTES
         .saturating_add(
-            u64::from(sizing.max_seqs).saturating_mul(recurrent_seat_bytes(dims, sizing)),
+            (u64::from(sizing.max_seqs) + 1).saturating_mul(recurrent_seat_bytes(dims, sizing)),
         )
         .saturating_add(rope_positions.saturating_mul(dims.rope_bytes_per_position()))
         .saturating_add(recurrent_step_scratch_bytes(dims, sizing))
@@ -713,12 +747,12 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
 /// [`HybridDims::state_image_bytes`], and every KV group one count of blocks,
 /// which must hold one `MAX_MODEL_LEN` sequence and the null block, so the
 /// device needs ⌈`MAX_MODEL_LEN` / `B`⌉ + 1 blocks of
-/// [`recurrent_kv_block_bytes`] beside the state pool. No pool holds a pad
-/// block (the executor captures no graphs).
+/// [`recurrent_kv_block_bytes`] and each pool's pad block (where a decode
+/// rung's padding rows write) beside the state pool.
 pub fn cuda_kv_min_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig) -> u64 {
     let b = u64::from(sizing.kv_block_size.max(1));
     if let Some(dims) = &shape.recurrent {
-        return (u64::from(sizing.max_model_len).div_ceil(b) + 1)
+        return (u64::from(sizing.max_model_len).div_ceil(b) + 2)
             .saturating_mul(recurrent_kv_block_bytes(dims, sizing))
             .saturating_add(
                 recurrent_state_buffers(sizing, cache).saturating_mul(dims.state_image_bytes()),
@@ -857,7 +891,7 @@ fn cuda_windowed_pools_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig
 ///
 /// A shape with a [`Shape::recurrent`] state scales the same way over its two
 /// pools (`cuda::derive_qwen_host_pools`): the KV blocks `kv_device_bytes`
-/// leaves beside the state pool (at most `i32::MAX`), of
+/// leaves beside the state pool, less the pad block (at most `i32::MAX`), of
 /// [`recurrent_kv_block_bytes`], and the [`recurrent_state_buffers`] state
 /// images, each needing two on the host.
 pub fn cuda_kv_host_min_bytes(
@@ -873,7 +907,9 @@ pub fn cuda_kv_host_min_bytes(
         let block = recurrent_kv_block_bytes(dims, sizing).max(1);
         let states = recurrent_state_buffers(sizing, cache);
         let state_bytes = states.saturating_mul(dims.state_image_bytes());
-        let blocks = (kv_device_bytes.saturating_sub(state_bytes) / block).min(i32::MAX as u64);
+        let blocks = (kv_device_bytes.saturating_sub(state_bytes) / block)
+            .saturating_sub(1)
+            .min(i32::MAX as u64);
         let device = u128::from(blocks) * u128::from(block) + u128::from(state_bytes);
         let smallest = u128::from(blocks.min(states).max(1));
         return u64::try_from((2 * device).div_ceil(smallest)).unwrap_or(u64::MAX);
@@ -2268,13 +2304,13 @@ mod tests {
         max_age_secs: 7200,
     };
 
-    /// Qwen3.8-27B on one B200 at its whole 262,144-position context: 32
-    /// seats, steps of 128 tokens (a decode row of each seat with three drafts),
-    /// the cache on. The executor's step scratch (every layer's, held to the
-    /// forward's end, the exact attention's scores among it) is what bounds
-    /// the step: about 42.5 GB at this step, so the reserve is about 72 GB,
-    /// and beside the weights an 80 GiB budget holds the state pool's 161
-    /// buffers and about 862,000 positions of KV.
+    /// Qwen3.8-27B on one B200 at its whole 262,144-position context: 64
+    /// seats, steps of 2,048 tokens, three drafts, the cache on. The reserve
+    /// beside the KV budget is the fixed 4 GiB, 65 seats' state, the RoPE
+    /// tables and the fast profile's step scratch; a 115 GiB budget then holds
+    /// the state pool's 321 buffers and about 1,040,000 positions of KV. The
+    /// state pool is what limits the seats: at 128 the KV would hold about
+    /// 150,000 positions.
     #[test]
     fn qwen_fits_one_b200_at_its_whole_context() {
         use crate::architecture::Architecture;
@@ -2283,25 +2319,25 @@ mod tests {
         let sizing = Sizing {
             kv_block_size: 16,
             max_model_len: 262_144,
-            max_seqs: 32,
-            max_batched_tokens: 128,
-            max_prefill_chunk: 128,
+            max_seqs: 64,
+            max_batched_tokens: 2048,
+            max_prefill_chunk: 2048,
             draft_tokens: 3,
-            max_requests: 32,
+            max_requests: 64,
         };
-        assert_eq!(decode_step_tokens(&sizing), 128);
         let reserve = cuda_device_reserve_bytes(shape, &sizing);
-        assert_eq!(reserve / 1_000_000_000, 71, "{reserve}");
+        assert_eq!(reserve / 100_000_000, 346, "{reserve}");
         let scratch = recurrent_step_scratch_bytes(&dims, &sizing);
-        assert_eq!(scratch / 1_000_000_000, 61, "{scratch}");
+        assert_eq!(scratch / 100_000_000, 177, "{scratch}");
         // Every covered file of the checkpoint is 30.88 GB; the pack holds its
         // other files too.
         let pack = 31_000_000_000;
-        let budget = 80u64 << 30;
-        assert_eq!(recurrent_state_buffers(&sizing, &DS_CACHE), 161);
-        let blocks =
-            (budget - 161 * dims.state_image_bytes()) / recurrent_kv_block_bytes(&dims, &sizing);
-        assert_eq!(blocks * 16 / 1000, 862, "{blocks}");
+        let budget = 115u64 << 30;
+        assert_eq!(recurrent_state_buffers(&sizing, &DS_CACHE), 321);
+        let blocks = (budget - 321 * dims.state_image_bytes())
+            / recurrent_kv_block_bytes(&dims, &sizing)
+            - 1;
+        assert_eq!(blocks * 16 / 10_000, 104, "{blocks}");
         assert!(budget >= cuda_kv_min_bytes(shape, &sizing, &DS_CACHE));
         let check = |budget: u64, host: u64, gpu: &SupportedGpu| {
             check_resources(
@@ -2323,26 +2359,17 @@ mod tests {
         let err = check(room + 1, 0, &SupportedGpu::B200).unwrap_err();
         assert!(err.contains("NVIDIA B200"), "{err}");
         check(room + 1, 0, &SupportedGpu::B300).unwrap();
-        // Steps of twice the tokens do not fit at this context.
+        // At 128 seats the state pool leaves the KV about 150,000 positions.
         let wide = Sizing {
-            max_batched_tokens: 256,
-            max_prefill_chunk: 256,
+            max_seqs: 128,
+            max_requests: 128,
             ..sizing
         };
-        assert!(
-            check_resources(
-                shape,
-                &wide,
-                &DS_CACHE,
-                &cuda_on(&[cuda_kv_min_bytes(shape, &wide, &DS_CACHE)]),
-                0,
-                pack,
-                196_608,
-                1,
-                &SupportedGpu::B200,
-            )
-            .is_err()
-        );
+        let room = SupportedGpu::B200.memory_bytes - pack - cuda_device_reserve_bytes(shape, &wide);
+        let kv = (room - recurrent_state_buffers(&wide, &DS_CACHE) * dims.state_image_bytes())
+            / recurrent_kv_block_bytes(&dims, &wide)
+            * 16;
+        assert_eq!(kv / 10_000, 14, "{kv}");
     }
 
     /// The published text-only pack, bounded: the shards and files of the

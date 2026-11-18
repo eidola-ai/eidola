@@ -786,10 +786,12 @@ pub struct QwenPools {
 /// * every **KV group** gets what is left, `floor((kv_device_bytes − state bytes) / K)`
 ///   blocks, `K` the bytes of one block of every group together
 ///   (`recurrent_kv_block_bytes`: BF16 K and V of the target's attention layers and,
-///   drafting, of the drafter's layer with its boundary tap), and must hold one
-///   `MAX_MODEL_LEN` sequence and the null block; it stops at the tables' `i32` range.
+///   drafting, of the drafter's layer with its boundary tap), less one: every pool also
+///   holds a pad block past its count, where a decode rung's padding rows write. It must
+///   hold one `MAX_MODEL_LEN` sequence and the null block; it stops at the tables' `i32`
+///   range.
 ///
-/// No pool holds a pad block (the executor captures no graphs). Measured values only,
+/// Measured values only,
 /// never the device. The least accepted budget is
 /// `eidola_common::engine_deployment::cuda_kv_min_bytes` of the shape, kept equal by a
 /// test here.
@@ -818,7 +820,8 @@ pub fn derive_qwen_pools(
         ))
     })?;
     let block = recurrent_kv_block_bytes(dims, sizing).max(1);
-    let blocks = rest / block;
+    // What fits, less the pad block.
+    let blocks = (rest / block).saturating_sub(1);
     let needed = u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size)) + 1;
     if blocks < needed {
         return Err(BootError(format!(
@@ -882,7 +885,9 @@ pub fn derive_qwen_host_pools(
 /// one step shape (`MAX_SEQS` × `MAX_BATCHED_TOKENS`), as on the CPU executor; the pools
 /// from the device budget ([`derive_qwen_pools`]) and the host tier's
 /// ([`derive_qwen_host_pools`]); `DRAFT_TOKENS` drafts from the model's MTP layer; the
-/// live state strategy. `graphs` must be `off`: this executor captures no decode graphs.
+/// live state strategy; `graphs` as configured: with `on`, construction captures a graph
+/// for every rung of the decode ladders of that one step shape (draft width 0, and
+/// `DRAFT_TOKENS` when drafting), and uniform decode steps replay them.
 #[allow(clippy::too_many_arguments)]
 pub fn qwen_config(
     qwen: &QwenConfig,
@@ -893,12 +898,6 @@ pub fn qwen_config(
     graphs: CudaGraphs,
     sampleable_vocab_size: u32,
 ) -> Result<QwenCudaExecutorConfig, BootError> {
-    if graphs == CudaGraphs::On {
-        return Err(BootError(format!(
-            "{} must be off: the Qwen3.8 cuda executor captures no decode graphs",
-            env::CUDA_GRAPHS
-        )));
-    }
     if sizing.draft_tokens > 0 && qwen.mtp_layers == 0 {
         return Err(BootError(format!(
             "{} ({}) needs the model's MTP layer, and it has none",
@@ -924,6 +923,7 @@ pub fn qwen_config(
         draft_tokens: sizing.draft_tokens,
         sampleable_vocab_size,
         strategy: StateStrategy::Live,
+        graphs,
     })
 }
 
@@ -971,8 +971,8 @@ impl QwenPrepared {
     }
 }
 
-/// Qwen3.8's refusals that need no device, in order ([`qwen_config`]: graphs off, the
-/// MTP layer for the draft width, the pools from the budget and the host tier's), then,
+/// Qwen3.8's refusals that need no device, in order ([`qwen_config`]: the MTP layer for
+/// the draft width, the pools from the budget and the host tier's), then,
 /// with `gpu_cc` required, the GPUs' confidential-computing state (`crate::gpu_cc`), then
 /// the device, whose memory the budget must be less than. Nothing is allocated on the
 /// device here.
@@ -1967,8 +1967,9 @@ mod tests {
         let pools = derive_qwen_pools(&dims, budget, &sizing, &cache(true)).unwrap();
         assert_eq!(pools.state_buffers, 1 + 32 * 5);
         let block = 16 * 65_536 + 16 * 4096 + 10_240;
-        let states = 161 * 156_893_440u64;
-        assert_eq!(u64::from(pools.kv_blocks), (budget - states) / block);
+        let states = 161 * 156_917_760u64;
+        // Less the pad block.
+        assert_eq!(u64::from(pools.kv_blocks), (budget - states) / block - 1);
         let undrafted = Sizing {
             draft_tokens: 0,
             ..sizing
@@ -1977,7 +1978,7 @@ mod tests {
         assert_eq!(pools.state_buffers, 1 + 32 * 2);
         assert_eq!(
             u64::from(pools.kv_blocks),
-            (budget - 65 * 156_893_440) / (16 * 65_536)
+            (budget - 65 * 156_917_760) / (16 * 65_536) - 1
         );
     }
 
@@ -2069,8 +2070,8 @@ mod tests {
         assert!(e.0.contains("fewer than two"), "{e}");
     }
 
-    /// The configuration is the node's sizing; decode graphs and drafting without the
-    /// MTP layer are refused before any device.
+    /// The configuration is the node's sizing, its decode graphs as configured; drafting
+    /// without the MTP layer is refused before any device.
     #[test]
     fn the_qwen_configuration_is_the_nodes() {
         let qwen = qwen_tiny();
@@ -2106,7 +2107,8 @@ mod tests {
         );
         assert_eq!(c.strategy, StateStrategy::Live);
         assert_eq!((c.host_blocks, c.host_state_buffers), (0, 0));
-        let e = qwen_config(
+        assert_eq!(c.graphs, CudaGraphs::Off);
+        let on = qwen_config(
             &qwen,
             &sizing,
             &cache(true),
@@ -2115,8 +2117,8 @@ mod tests {
             CudaGraphs::On,
             512,
         )
-        .unwrap_err();
-        assert!(e.0.contains("decode graphs"), "{e}");
+        .unwrap();
+        assert_eq!(on.graphs, CudaGraphs::On);
         let e = qwen_config(
             &qwen.clone().without_mtp(),
             &sizing,
