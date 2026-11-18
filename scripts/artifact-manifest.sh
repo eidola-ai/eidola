@@ -31,7 +31,8 @@ Options:
                                `server-engine` (the inference node's image, with the
                                `engine-kernels` image it is built from, which must be
                                the image its Containerfile pins), `engine-kernels`
-                               (the GPU kernel image alone). Both push
+                               (the GPU kernel image alone), `billing` (the
+                               billing receiver/worker image). Both push
                                and non-push modes accept the split selectors so CI can
                                build and push each phase independently.
                                For `print`/`verify`: space-separated list of target names
@@ -126,6 +127,15 @@ ENGINE_IMAGE_SCHEMA=4
 # schema, and stays one linux/amd64 image.
 CLI_ARTIFACT_SET_SCHEMA=5
 
+# The schema at which the billing image (`eidola-billing`, built by the
+# `billing` bake target) is recorded: the same schema as the CLI's artifact
+# set, for a different reason, so it has a name of its own. Below it the
+# image is still built on every CI run and pushed on push events, like the
+# inference node's, but no row is emitted for it. The image runs outside the attested boundary
+# and nothing in this repository deploys or pins it; the row ties the digest
+# an operator deploys to a reproducible build of the release's source.
+BILLING_IMAGE_SCHEMA=5
+
 # The node's Containerfile pins the GPU kernel image it copies the kernels
 # from; this is that line. The bake targets build the input from this tree
 # instead (`engine-kernels`), so a build of the node also checks that build
@@ -153,6 +163,9 @@ required_artifact_keys() {
   )
   if records_engine_image; then
     keys+=(eidola-server-engine)
+  fi
+  if records_billing_image; then
+    keys+=(eidola-billing)
   fi
   if records_static_cli; then
     keys+=("$(static_cli_key amd64)" "$(static_cli_key arm64)")
@@ -235,7 +248,7 @@ BUILDER_NAME="eidola"
 ENSURE_BUILDER=0
 CLI_PATH=""
 GUI_PATH=""
-CONFIG_FILE="$REPO_ROOT/tinfoil-config.yml"
+CONFIG_FILE="$REPO_ROOT/deploy/gateway/tinfoil-config.yml"
 VERIFY_ATTESTATIONS=0
 PUSH_MODE=0
 ARTIFACT_DIR=""
@@ -339,7 +352,7 @@ compute_sha256() {
   fi
 }
 
-# Read the cvm-version field from tinfoil-config.yml into CVM_VERSION and its
+# Read the cvm-version field from deploy/gateway/tinfoil-config.yml into CVM_VERSION and its
 # inline release-manifest pin into CVM_MANIFEST_PIN. The pin is required:
 # it is what names the image the config launches. measure-enclave applies the
 # same grammar (`eidola_common::engine_deployment::parse_cvm_version`) to the
@@ -445,7 +458,7 @@ fetch_cvm_artifacts() {
 
 # ── Enclave measurement ──────────────────────────────────────────────────────
 
-# Update the gateway image digest in tinfoil-config.yml from build metadata.
+# Update the gateway image digest in deploy/gateway/tinfoil-config.yml from build metadata.
 # (Only the gateway runs inside the enclave; the database is hosted
 # externally, so eidola-postgres's digest doesn't feed the measurement.)
 # The gateway is built by the `server` bake target — see
@@ -560,9 +573,10 @@ build_metadata() {
   # --push.
   if [[ "$PUSH_MODE" -eq 1 ]]; then
     case "$TARGETS" in
-      all)    bake_targets=(ci-server ci-cli ci-postgres ci-engine-kernels ci-server-engine) ;;
+      all)    bake_targets=(ci-server ci-cli ci-postgres ci-billing ci-engine-kernels ci-server-engine) ;;
       server) bake_targets=(ci-server ci-postgres) ;;
       cli)    bake_targets=(ci-cli) ;;
+      billing) bake_targets=(ci-billing) ;;
       # Never pushed: the dev target, built as the non-push mode builds it.
       cli-arm64)
         bake_targets=(cli-arm64)
@@ -571,20 +585,21 @@ build_metadata() {
       server-engine) bake_targets=(ci-engine-kernels ci-server-engine) ;;
       engine-kernels) bake_targets=(ci-engine-kernels) ;;
       *)
-        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, cli-arm64, server-engine, engine-kernels)" >&2
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, cli-arm64, billing, server-engine, engine-kernels)" >&2
         exit 1
         ;;
     esac
   else
     case "$TARGETS" in
-      all)    bake_targets=(server cli postgres engine-kernels server-engine) ;;
+      all)    bake_targets=(server cli postgres billing engine-kernels server-engine) ;;
       server) bake_targets=(server postgres) ;;
       cli)    bake_targets=(cli) ;;
+      billing) bake_targets=(billing) ;;
       cli-arm64) bake_targets=(cli-arm64) ;;
       server-engine) bake_targets=(engine-kernels server-engine) ;;
       engine-kernels) bake_targets=(engine-kernels) ;;
       *)
-        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, cli-arm64, server-engine, engine-kernels)" >&2
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, cli-arm64, billing, server-engine, engine-kernels)" >&2
         exit 1
         ;;
     esac
@@ -940,6 +955,11 @@ records_engine_image() {
   ((MANIFEST_SCHEMA_VERSION >= ENGINE_IMAGE_SCHEMA))
 }
 
+# Does the emitted schema record the billing image?
+records_billing_image() {
+  ((MANIFEST_SCHEMA_VERSION >= BILLING_IMAGE_SCHEMA))
+}
+
 # Does the emitted schema record the static Linux CLI as a file of its own —
 # and, the other side of the same boundary, no standalone macOS CLI?
 records_static_cli() {
@@ -974,10 +994,12 @@ static_cli_target() {
 }
 
 # Does the emitted schema record this OCI bake target's image? Every target
-# but the engine's is recorded by every schema this script emits.
+# but the engine's and billing's is recorded by every schema this script
+# emits.
 records_oci_target() {
   case "$1" in
     server-engine) records_engine_image ;;
+    billing) records_billing_image ;;
     *) return 0 ;;
   esac
 }
@@ -1094,7 +1116,7 @@ build_linux_deb_artifact() {
 # whether built natively on CI's x86_64 runner or emulated under linux/amd64
 # on an arm64 Mac — the same emulation determinism the StageX OCI digests
 # already depend on. The build reads the *working tree* (dirty or not) exactly
-# as CI does — CI writes the stamped tinfoil-config.yml + server-enclave.json
+# as CI does — CI writes the stamped deploy/gateway/tinfoil-config.yml + server-enclave.json
 # into its checkout before building — so the freshly stamped files from the
 # earlier phases are what get built.
 #
@@ -1515,7 +1537,7 @@ verify_full_manifest() {
 
   # Consistency check: the committed `releases/trust/server-enclave.json`
   # must match the enclave block we just recomputed from
-  # `tinfoil-config.yml`. CI overwrites the committed file with the
+  # `deploy/gateway/tinfoil-config.yml`. CI overwrites the committed file with the
   # recomputed value before the cli builds run (see the `enclave` job in
   # ci.yml), so the merged partials already contain reliable cli digests
   # even when the committed file is stale; this check is what surfaces
@@ -1625,8 +1647,9 @@ verify_oci_manifest() {
 #
 #   Phase 1: build {server, postgres}. Neither image consumes the enclave
 #            measurement, so they can be built first.
-#   Phase 2: stamp the new gateway digest into `tinfoil-config.yml`, recompute
-#            the enclave block, and write `releases/trust/server-enclave.json`.
+#   Phase 2: stamp the new gateway digest into
+#            `deploy/gateway/tinfoil-config.yml`, recompute the enclave
+#            block, and write `releases/trust/server-enclave.json`.
 #   Phase 3: build the cli OCI image, take the static Linux CLI out of it,
 #            and build the current host's native desktop artifacts — the
 #            macOS GUI .app (and, below CLI_ARTIFACT_SET_SCHEMA, the macOS
@@ -1636,9 +1659,10 @@ verify_oci_manifest() {
 #            entries are carried over from the committed manifest (no single
 #            host can build both; CI's linux-gui + apple jobs are the
 #            cross-platform authority and verify the full set).
-#   Phase 4: from the schema that records it, build the inference node's
-#            image. It consumes no enclave measurement and nothing above
-#            consumes its digest, so its place in the order is free.
+#   Phase 4: from the schema that records each, build the inference node's
+#            image and the billing image. Neither consumes the enclave
+#            measurement and nothing above consumes their digests, so their
+#            place in the order is free.
 #   Phase 5: compose `artifact-manifest.json` from all of the above.
 #
 # This breaks the previous self-reference (the cli build's OCI digest is
@@ -1647,7 +1671,7 @@ verify_oci_manifest() {
 update_manifest() {
   local server_oci_partial cli_oci_partial static_cli_partial static_cli_arm64_partial macos_partial linux_gui_partial actual_manifest
   local server_oci_partial_file cli_oci_partial_file static_cli_partial_file static_cli_arm64_partial_file macos_partial_file linux_gui_partial_file
-  local server_metadata cli_metadata cli_arm64_metadata engine_metadata original_metadata original_targets original_arch host_os
+  local server_metadata cli_metadata cli_arm64_metadata engine_metadata billing_metadata original_metadata original_targets original_arch host_os
 
   if [[ -z "$OUTPUT_FILE" ]]; then
     OUTPUT_FILE="$REPO_ROOT/artifact-manifest.json"
@@ -1725,8 +1749,8 @@ update_manifest() {
     echo "note: darwin narHash/archiveSha256 and the ${other_arch} .deb carried over from committed manifest (not buildable on this host); CI verifies them" >&2
   fi
 
-  # ── Phase 4: the inference node's image, once a schema records it ──────
-  local engine_oci_partial engine_oci_partial_file
+  # ── Phase 4: the node's and billing images, once a schema records each ─
+  local engine_oci_partial engine_oci_partial_file billing_oci_partial billing_oci_partial_file
   engine_oci_partial="$(jq -n --argjson schema "$MANIFEST_SCHEMA_VERSION" '{ schema_version: $schema, artifacts: {} }')"
   if records_engine_image; then
     engine_metadata="${TMPDIR:-/tmp}/bake-metadata-server-engine.json"
@@ -1734,6 +1758,14 @@ update_manifest() {
     TARGETS="server-engine"
     build_metadata
     engine_oci_partial="$(print_oci_partial_for_targets server-engine)"
+  fi
+  billing_oci_partial="$(jq -n --argjson schema "$MANIFEST_SCHEMA_VERSION" '{ schema_version: $schema, artifacts: {} }')"
+  if records_billing_image; then
+    billing_metadata="${TMPDIR:-/tmp}/bake-metadata-billing.json"
+    METADATA_FILE="$billing_metadata"
+    TARGETS="billing"
+    build_metadata
+    billing_oci_partial="$(print_oci_partial_for_targets billing)"
   fi
 
   # ── Phase 5: compose final artifact-manifest.json ───────────────────────
@@ -1747,12 +1779,13 @@ update_manifest() {
   static_cli_partial_file="$(write_temp_file "$static_cli_partial")"
   static_cli_arm64_partial_file="$(write_temp_file "$static_cli_arm64_partial")"
   engine_oci_partial_file="$(write_temp_file "$engine_oci_partial")"
+  billing_oci_partial_file="$(write_temp_file "$billing_oci_partial")"
   macos_partial_file="$(write_temp_file "$macos_partial")"
   linux_gui_partial_file="$(write_temp_file "$linux_gui_partial")"
-  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$static_cli_partial_file" "$static_cli_arm64_partial_file" "$engine_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file")
+  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$static_cli_partial_file" "$static_cli_arm64_partial_file" "$engine_oci_partial_file" "$billing_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file")
 
   actual_manifest="$(merge_partials)"
-  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$static_cli_partial_file" "$static_cli_arm64_partial_file" "$engine_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
+  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$static_cli_partial_file" "$static_cli_arm64_partial_file" "$engine_oci_partial_file" "$billing_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
 
   # Nothing is written until the composition is whole. A short manifest is
   # not a smaller version of a good one — every installed client reads the
@@ -1806,8 +1839,8 @@ case "$COMMAND" in
     ;;
   stamp-config)
     # Stamp the freshly-built gateway digest from --metadata-file into
-    # tinfoil-config.yml. Used by CI's two-phase oci job after the gateway
-    # bake completes and before the enclave is recomputed.
+    # deploy/gateway/tinfoil-config.yml. Used by CI's two-phase oci job after
+    # the gateway bake completes and before the enclave is recomputed.
     stamp_config_digests
     echo "Stamped $CONFIG_FILE with server digest from $METADATA_FILE"
     ;;

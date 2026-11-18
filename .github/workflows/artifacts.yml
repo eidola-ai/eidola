@@ -66,7 +66,7 @@ jobs:
   # freshly-built gateway image:
   #
   #   Phase 1: bake server + postgres → gateway digest.
-  #   Phase 2: stamp the gateway digest into tinfoil-config.yml.
+  #   Phase 2: stamp the gateway digest into deploy/gateway/tinfoil-config.yml.
   #   Phase 3: recompute the enclave from the stamped config and overwrite
   #            releases/trust/server-enclave.json in the workspace.
   #   Phase 4: bake cli (its OCI Containerfile COPYs server-enclave.json
@@ -80,7 +80,7 @@ jobs:
   #            OCI partial as job outputs for apple + artifact-manifest.
   #
   # Closing the chain end-to-end inside one job means CI's view of
-  # tinfoil-config.yml ↔ server-enclave.json ↔ cli-digest ↔ manifest is
+  # deploy/gateway/tinfoil-config.yml ↔ server-enclave.json ↔ cli-digest ↔ manifest is
   # always internally consistent — so the PR-comment suggestion is too.
   oci:
     name: Build OCI images + recompute enclave
@@ -133,7 +133,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/eidola/cvm
-          key: cvm-${{ hashFiles('tinfoil-config.yml') }}
+          key: cvm-${{ hashFiles('deploy/gateway/tinfoil-config.yml') }}
 
       - name: Set up Docker Buildx # zizmor: ignore[cache-poisoning]
         # v* tag (release) builds skip the GHA cache entirely so Sigstore-
@@ -227,7 +227,7 @@ jobs:
             ${PUSH_FLAG} --targets server \
             --metadata-file "${SERVER_BAKE_METADATA_FILE}"
 
-      - name: Phase 2 — stamp tinfoil-config.yml with built gateway digest
+      - name: Phase 2 — stamp deploy/gateway/tinfoil-config.yml with built gateway digest
         id: stamp
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -240,7 +240,7 @@ jobs:
             --metadata-file "${SERVER_BAKE_METADATA_FILE}"
           {
             echo 'config<<__EIDOLA_EOF__'
-            cat tinfoil-config.yml
+            cat deploy/gateway/tinfoil-config.yml
             echo '__EIDOLA_EOF__'
           } >> "$GITHUB_OUTPUT"
 
@@ -574,6 +574,143 @@ jobs:
             --manifest artifact-manifest.json \
             || echo "::warning::the committed manifest does not record this engine image; the artifact-manifest job will fail"
 
+  # ── The billing image (cheap ubuntu runner) ───────────────────────────────
+  # The Stripe webhook receiver, billing workers and private support CLI in one
+  # static image, built and pushed exactly as the gateway's is. Its own job
+  # because nothing in the `oci` chain consumes it: it runs outside the
+  # attested boundary, so no config is stamped with its digest and no enclave
+  # is measured from it. Built on every run and pushed on push events, so the
+  # build is exercised before the manifest schema that records its digest is
+  # emitted; below that schema its partial is empty and `verify` checks
+  # nothing for it.
+  oci-billing:
+    name: Build the billing image
+    needs: guard
+    runs-on: ubuntu-24.04
+    # One release-profile static build, cold on a release tag.
+    timeout-minutes: 60
+    env:
+      BILLING_BAKE_METADATA_FILE: ${{ github.workspace }}/.bake-billing.json
+    outputs:
+      artifact_manifest: ${{ steps.partial.outputs.actual }}
+    permissions:
+      contents: read
+      packages: write # push OCI images to ghcr.io on push events
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx # zizmor: ignore[cache-poisoning]
+        # Same pinned buildx and BuildKit as the `oci` job, for the same
+        # reasons (see there).
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.31.1
+          platforms: linux/amd64
+          cache-binary: false
+          driver-opts: |
+            image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
+
+      - name: Log in to GHCR
+        # Same gating as the `oci` job.
+        if: github.event_name == 'push' || (github.event.pull_request.head.ref == 'next' && github.event.pull_request.head.repo.full_name == github.repository)
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine tags
+        if: github.event_name == 'push'
+        id: tags
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          COMMIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          OWNER=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
+          REGISTRY="ghcr.io/${OWNER}"
+          SHORT_SHA=$(echo "${COMMIT_SHA}" | cut -c1-7)
+
+          TAGS="sha-${SHORT_SHA}"
+
+          if [ "${GIT_REF}" = "refs/heads/main" ]; then
+            TAGS="${TAGS},main"
+          elif [[ "${GIT_REF}" == refs/tags/v* ]]; then
+            VERSION="${GIT_REF#refs/tags/}"
+            TAGS="${TAGS},${VERSION}"
+          fi
+
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the billing image
+        env:
+          REGISTRY: ${{ steps.tags.outputs.registry || '' }}
+          TAGS: ${{ steps.tags.outputs.tags || 'dev' }}
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          PUSH_FLAG=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+
+          # Same trusted-producer gating of the shared registry cache as the
+          # `oci` job's phases. Empty on v* release tags for a clean
+          # attested build.
+          if [[ "${GIT_REF}" == refs/tags/v* ]]; then
+            export CACHE_REGISTRY=""
+          elif [[ "${EVENT_NAME}" == "push" ]] || { [[ "${PR_HEAD_REF}" == "next" ]] && [[ "${PR_HEAD_REPO}" == "${REPO}" ]]; }; then
+            export CACHE_REGISTRY="ghcr.io/$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          else
+            export CACHE_REGISTRY=""
+          fi
+
+          ./scripts/artifact-manifest.sh build \
+            ${PUSH_FLAG} --targets billing \
+            --metadata-file "${BILLING_BAKE_METADATA_FILE}"
+
+      - name: Record the billing OCI partial
+        id: partial
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          PUSH_FLAG=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+          jq . "${BILLING_BAKE_METADATA_FILE}"
+          {
+            echo 'actual<<__EIDOLA_EOF__'
+            ./scripts/artifact-manifest.sh print ${PUSH_FLAG} \
+              --metadata-file "${BILLING_BAKE_METADATA_FILE}" --targets billing
+            echo '__EIDOLA_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify the billing OCI artifact
+        # Reported, not fatal, like the `oci` job's subset check: the
+        # `artifact-manifest` job composes every partial, fails on any
+        # mismatch, and on a PR posts the regenerated files.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          PUSH_FLAG=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+          ./scripts/artifact-manifest.sh verify ${PUSH_FLAG} \
+            --metadata-file "${BILLING_BAKE_METADATA_FILE}" --targets billing \
+            --manifest artifact-manifest.json \
+            || echo "::warning::the committed manifest does not record this billing image; the artifact-manifest job will fail"
+
   # ── Engine pins, re-measured from the platform's images (cheap ubuntu) ──────
   # Every gateway build holds each engine pin's MRTD to the platform release
   # manifest its config pins, vendored under releases/trust/cvm-releases/.
@@ -671,7 +808,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install stamped tinfoil-config.yml + recomputed server-enclave.json
+      - name: Install stamped deploy/gateway/tinfoil-config.yml + recomputed server-enclave.json
         env:
           STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
           SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
@@ -682,7 +819,7 @@ jobs:
           # working-tree content (both files are git-tracked), so this
           # makes the macOS cli embed exactly the same trust root the
           # linux cli OCI image was built against.
-          printf '%s\n' "$STAMPED_CONFIG" > tinfoil-config.yml
+          printf '%s\n' "$STAMPED_CONFIG" > deploy/gateway/tinfoil-config.yml
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
@@ -814,7 +951,7 @@ jobs:
             /usr/share/swift
           echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
 
-      - name: Install stamped tinfoil-config.yml + recomputed server-enclave.json
+      - name: Install stamped deploy/gateway/tinfoil-config.yml + recomputed server-enclave.json
         env:
           STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
           SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
@@ -823,7 +960,7 @@ jobs:
           # eidola-app-core, whose build.rs embeds the trust root from
           # releases/, so the Linux GUI must be built against exactly the
           # trust root the oci job produced.
-          printf '%s\n' "$STAMPED_CONFIG" > tinfoil-config.yml
+          printf '%s\n' "$STAMPED_CONFIG" > deploy/gateway/tinfoil-config.yml
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
@@ -913,14 +1050,14 @@ jobs:
             /usr/share/swift
           echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
 
-      - name: Install stamped tinfoil-config.yml + recomputed server-enclave.json
+      - name: Install stamped deploy/gateway/tinfoil-config.yml + recomputed server-enclave.json
         env:
           STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
           SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
         run: |
           # The package embeds app-core's trust root, so it must be built
           # against exactly the trust root the oci job produced.
-          printf '%s\n' "$STAMPED_CONFIG" > tinfoil-config.yml
+          printf '%s\n' "$STAMPED_CONFIG" > deploy/gateway/tinfoil-config.yml
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
@@ -976,6 +1113,7 @@ jobs:
       - guard
       - oci
       - oci-engine
+      - oci-billing
       - engine-enclaves
       - apple
       - linux-gui
@@ -1018,7 +1156,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/eidola/cvm
-          key: cvm-${{ hashFiles('tinfoil-config.yml') }}
+          key: cvm-${{ hashFiles('deploy/gateway/tinfoil-config.yml') }}
 
       - name: Materialize oci outputs and build partials
         id: materialize
@@ -1029,11 +1167,12 @@ jobs:
           STATIC_CLI_MANIFEST: ${{ needs.oci.outputs.static_cli_manifest }}
           STATIC_CLI_ARM64_MANIFEST: ${{ needs.oci.outputs.static_cli_arm64_manifest }}
           ENGINE_MANIFEST: ${{ needs.oci-engine.outputs.artifact_manifest }}
+          BILLING_MANIFEST: ${{ needs.oci-billing.outputs.artifact_manifest }}
           APPLE_MANIFEST: ${{ needs.apple.outputs.artifact_manifest }}
           LINUX_GUI_MANIFEST: ${{ needs.linux-gui.outputs.artifact_manifest }}
           LINUX_DEB_MANIFEST: ${{ needs.linux-deb-arm64.outputs.artifact_manifest }}
         run: |
-          # The committed tinfoil-config.yml and server-enclave.json must be
+          # The committed deploy/gateway/tinfoil-config.yml and server-enclave.json must be
           # exactly what the oci job recomputed: the stamped config (the
           # committed one with the built gateway's digest) and the enclave
           # measured from it. Nothing below reads the committed copies, and
@@ -1044,9 +1183,9 @@ jobs:
           printf '%s\n' "$STAMPED_CONFIG" > /tmp/stamped-tinfoil-config.yml
           printf '%s\n' "$SERVER_ENCLAVE" > /tmp/recomputed-server-enclave.json
           committed=true
-          if ! cmp -s tinfoil-config.yml /tmp/stamped-tinfoil-config.yml; then
-            echo "::error::the committed tinfoil-config.yml is not the config this build stamped"
-            diff -u tinfoil-config.yml /tmp/stamped-tinfoil-config.yml || true
+          if ! cmp -s deploy/gateway/tinfoil-config.yml /tmp/stamped-tinfoil-config.yml; then
+            echo "::error::the committed deploy/gateway/tinfoil-config.yml is not the config this build stamped"
+            diff -u deploy/gateway/tinfoil-config.yml /tmp/stamped-tinfoil-config.yml || true
             committed=false
           fi
           if ! cmp -s releases/trust/server-enclave.json /tmp/recomputed-server-enclave.json; then
@@ -1056,19 +1195,20 @@ jobs:
           fi
           echo "committed=$committed" >> "$GITHUB_OUTPUT"
 
-          # Overwrite the workspace tinfoil-config.yml and server-enclave.json
+          # Overwrite the workspace deploy/gateway/tinfoil-config.yml and server-enclave.json
           # with the authoritative values the oci job produced. verify-full
           # below reads both via --config / --server-enclave and recomputes
           # the enclave from the stamped config — by construction the
           # recompute equals the server-enclave we just installed, so what
           # it verifies is "does the committed artifact-manifest.json equal
           # what the build actually produced?"
-          printf '%s\n' "$STAMPED_CONFIG" > tinfoil-config.yml
+          printf '%s\n' "$STAMPED_CONFIG" > deploy/gateway/tinfoil-config.yml
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
           printf '%s' "$OCI_MANIFEST" > /tmp/oci-artifact-manifest.json
           printf '%s' "$STATIC_CLI_MANIFEST" > /tmp/static-cli-artifact-manifest.json
           printf '%s' "$STATIC_CLI_ARM64_MANIFEST" > /tmp/static-cli-arm64-artifact-manifest.json
           printf '%s' "$ENGINE_MANIFEST" > /tmp/engine-artifact-manifest.json
+          printf '%s' "$BILLING_MANIFEST" > /tmp/billing-artifact-manifest.json
           printf '%s' "$APPLE_MANIFEST" > /tmp/apple-artifact-manifest.json
           printf '%s' "$LINUX_GUI_MANIFEST" > /tmp/linux-gui-artifact-manifest.json
           printf '%s' "$LINUX_DEB_MANIFEST" > /tmp/linux-deb-artifact-manifest.json
@@ -1083,11 +1223,12 @@ jobs:
             --partial /tmp/static-cli-artifact-manifest.json \
             --partial /tmp/static-cli-arm64-artifact-manifest.json \
             --partial /tmp/engine-artifact-manifest.json \
+            --partial /tmp/billing-artifact-manifest.json \
             --partial /tmp/apple-artifact-manifest.json \
             --partial /tmp/linux-gui-artifact-manifest.json \
             --partial /tmp/linux-deb-artifact-manifest.json \
             --manifest artifact-manifest.json \
-            --config tinfoil-config.yml \
+            --config deploy/gateway/tinfoil-config.yml \
             --server-enclave releases/trust/server-enclave.json \
             --output /tmp/artifact-manifest-actual.json \
             --verify-attestations; then
@@ -1110,14 +1251,14 @@ jobs:
 
           # Post a REQUEST_CHANGES review with all three expected files.
           # The oci job built the gateway, stamped its digest into
-          # tinfoil-config.yml, recomputed the enclave, then built the cli
+          # deploy/gateway/tinfoil-config.yml, recomputed the enclave, then built the cli
           # against that — and apple did the same — so the three files
           # below form an internally-consistent set: committing them
           # verbatim is guaranteed to pass the next CI run. We avoid
           # line-level suggestions because GitHub's UI cannot apply them
           # when the diff contains deleted-and-replaced lines, which
           # happens on virtually every manifest update.
-          BODY=$(printf '**Artifact Manifest Update Required**\n\nCI built the server, stamped its digest into `tinfoil-config.yml`, recomputed the enclave, then built the cli (OCI + macOS) against that. The three files below are the result and are internally consistent — committing them verbatim will pass the next CI run. Locally, `just update-manifest` produces the same set.\n\n`tinfoil-config.yml`:\n\n```yaml\n%s\n```\n\n`releases/trust/server-enclave.json`:\n\n```json\n%s\n```\n\n`artifact-manifest.json`:\n\n```json\n%s\n```' "$STAMPED_CONFIG" "$SERVER_ENCLAVE_FORMATTED" "$MANIFEST_FORMATTED")
+          BODY=$(printf '**Artifact Manifest Update Required**\n\nCI built the server, stamped its digest into `deploy/gateway/tinfoil-config.yml`, recomputed the enclave, then built the cli (OCI + macOS) against that. The three files below are the result and are internally consistent — committing them verbatim will pass the next CI run. Locally, `just update-manifest` produces the same set.\n\n`deploy/gateway/tinfoil-config.yml`:\n\n```yaml\n%s\n```\n\n`releases/trust/server-enclave.json`:\n\n```json\n%s\n```\n\n`artifact-manifest.json`:\n\n```json\n%s\n```' "$STAMPED_CONFIG" "$SERVER_ENCLAVE_FORMATTED" "$MANIFEST_FORMATTED")
 
           jq -n \
             --arg body "$BODY" \

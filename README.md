@@ -34,7 +34,7 @@ All Rust workspace packages live under `crates/`, including the code generation 
 
 ### Server
 
-The server requires environment variables to work correctly. See .env.example. For local development, `DATABASE_URL=postgres://eidola@localhost/eidola` uses the plain Postgres container from `compose.yaml`. For production, you can point `DATABASE_URL` at an external Postgres, set `DATABASE_PASSWORD` as a secret, and optionally provide `DATABASE_SSL_CERT` with the PEM-encoded root CA certificate if the database does not chain to the default WebPKI roots.
+The server requires environment variables to work correctly. See .env.example. Every database connection is verified TLS; `sslmode=disable` is refused. For local development, `DATABASE_URL=postgres://eidola@localhost/eidola?sslmode=verify-full` reaches the Postgres container from `compose.yaml`, which serves only TLS with a certificate from a private root that `scripts/dev-postgres-tls.sh` makes; `DATABASE_SSL_CERT` is that root (`.dev-certs/postgres/ca.pem`), which `just services` writes into `.env.local`. For production, point `DATABASE_URL` at an external Postgres with `sslmode=verify-full`, and provide `DATABASE_SSL_CERT` only if the database's certificate does not chain to the default WebPKI roots.
 
 There are two supported development workflows:
 
@@ -179,7 +179,7 @@ just update-openapi    # OpenAPI spec
 just update-manifest   # artifact-manifest.json (OCI images, desktop binaries, enclave measurements)
 ```
 
-This uses the pinned amd64 BuildKit builder configuration for the OCI images, the local Nix build for the host platform's native desktop payloads (the macOS universal CLI and GUI `.app` on macOS; the Linux GUI on Linux) plus their flake-built `.tar.gz` archives, and the `measure-enclave` binary to compute SEV-SNP and TDX measurements from `tinfoil-config.yml`. The Linux GUI `narHash` / `archiveSha256` are always regenerated: natively on Linux, and on macOS by reproducing CI's native `x86_64-linux` build inside a pinned `linux/amd64` Nix container (`docker` required — the same assumption the StageX pipeline already makes). Only the macOS hashes are host-exclusive (they can't be cross-built from Linux), so on a Linux host they're carried over from the committed manifest; CI verifies the full set on both platforms. How to check a published download: [`docs/verification.md`](docs/verification.md).
+This uses the pinned amd64 BuildKit builder configuration for the OCI images, the local Nix build for the host platform's native desktop payloads (the macOS universal CLI and GUI `.app` on macOS; the Linux GUI on Linux) plus their flake-built `.tar.gz` archives, and the `measure-enclave` binary to compute SEV-SNP and TDX measurements from `deploy/gateway/tinfoil-config.yml`. The Linux GUI `narHash` / `archiveSha256` are always regenerated: natively on Linux, and on macOS by reproducing CI's native `x86_64-linux` build inside a pinned `linux/amd64` Nix container (`docker` required — the same assumption the StageX pipeline already makes). Only the macOS hashes are host-exclusive (they can't be cross-built from Linux), so on a Linux host they're carried over from the committed manifest; CI verifies the full set on both platforms. How to check a published download: [`docs/verification.md`](docs/verification.md).
 
 To compute enclave measurements independently (without rebuilding images):
 

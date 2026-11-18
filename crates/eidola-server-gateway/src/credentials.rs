@@ -2540,7 +2540,7 @@ pub(crate) mod tests {
         // An unreachable database: reaching the slow path would answer with a
         // pool error, never the refusal asserted here.
         let pool = db::create_pool(
-            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            "postgres://nobody@127.0.0.1:1/none?sslmode=verify-full",
             None,
             None,
         )
@@ -2680,7 +2680,7 @@ pub(crate) mod tests {
     #[ignore]
     async fn pruning_and_lookup_honour_the_retention_margin() {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        let pool = db::create_pool(&url, None, None).unwrap();
+        let pool = db::create_pool(&url, None, db::test_ssl_cert().as_deref()).unwrap();
         let master_key = [0u8; 32];
         let now = SystemTime::now();
         // This exercises the database's own filters, which read the plain
@@ -3425,7 +3425,7 @@ pub(crate) mod tests {
         let pool = db::create_pool(
             &std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
             None,
-            None,
+            db::test_ssl_cert().as_deref(),
         )
         .unwrap();
         let master_key: [u8; 32] =
@@ -3631,7 +3631,7 @@ pub(crate) mod tests {
     /// An `AppState` holding `keys`, whose database is unreachable.
     pub(crate) fn unreachable_state(keys: Cache) -> AppState {
         let pool = db::create_pool(
-            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            "postgres://nobody@127.0.0.1:1/none?sslmode=verify-full",
             None,
             None,
         )
@@ -3854,7 +3854,7 @@ pub(crate) mod tests {
         let pool = db::create_pool(
             &std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
             None,
-            None,
+            db::test_ssl_cert().as_deref(),
         )
         .unwrap();
         let master_key: [u8; 32] =
@@ -4172,7 +4172,7 @@ pub(crate) mod tests {
 
     async fn recovery_refuses_an_unverified_proof() {
         let pool = db::create_pool(
-            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            "postgres://nobody@127.0.0.1:1/none?sslmode=verify-full",
             None,
             None,
         )
@@ -4310,7 +4310,7 @@ pub(crate) mod tests {
 
     async fn a_chat_spend_is_verified_twice() {
         let pool = db::create_pool(
-            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            "postgres://nobody@127.0.0.1:1/none?sslmode=verify-full",
             None,
             None,
         )
@@ -4391,7 +4391,7 @@ pub(crate) mod tests {
     #[ignore]
     async fn concurrent_issuances_cannot_spend_one_balance_twice() {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        let pool = db::create_pool(&url, None, None).unwrap();
+        let pool = db::create_pool(&url, None, db::test_ssl_cert().as_deref()).unwrap();
         let master_key = [0u8; 32];
         // Any key the ledger can name; a far-future epoch of its own, so it
         // cannot collide with the epoch's real key in a shared database.
@@ -4476,7 +4476,7 @@ pub(crate) mod tests {
     #[ignore]
     async fn keys_stay_on_the_calendar_across_restarts_and_an_edited_row_is_refused() {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        let pool = db::create_pool(&url, None, None).unwrap();
+        let pool = db::create_pool(&url, None, db::test_ssl_cert().as_deref()).unwrap();
         let master_key: [u8; 32] =
             hex::decode(std::env::var("CREDENTIAL_MASTER_KEY").unwrap_or_else(|_| "00".repeat(32)))
                 .unwrap()
@@ -4616,7 +4616,7 @@ pub(crate) mod tests {
         let pool = db::create_pool(
             &std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
             None,
-            None,
+            db::test_ssl_cert().as_deref(),
         )
         .unwrap();
         let master_key: [u8; 32] =
@@ -4764,7 +4764,7 @@ pub(crate) mod tests {
     #[ignore]
     async fn an_issuance_racing_its_own_retry_is_debited_once() {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        let pool = db::create_pool(&url, None, None).unwrap();
+        let pool = db::create_pool(&url, None, db::test_ssl_cert().as_deref()).unwrap();
         let master_key = [0u8; 32];
         // A far-future epoch of its own, clear of the real current key.
         let key = generate_key(
@@ -4840,7 +4840,7 @@ pub(crate) mod tests {
     #[ignore]
     async fn stored_issuances_are_pruned_on_their_keys_deadline() {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        let pool = db::create_pool(&url, None, None).unwrap();
+        let pool = db::create_pool(&url, None, db::test_ssl_cert().as_deref()).unwrap();
         let master_key = [0u8; 32];
         // One key of an epoch in the 1970s, long retired, and one of an epoch far
         // in the future, still accepting; each its own, clear of the real keys.
@@ -4928,7 +4928,7 @@ pub(crate) mod tests {
     async fn an_attempt_stalled_past_its_keys_window_never_debits_after_a_retry_is_refused() {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        let pool = db::create_pool(&url, None, None).unwrap();
+        let pool = db::create_pool(&url, None, db::test_ssl_cert().as_deref()).unwrap();
         // A key of its own whose issue window closes two seconds from now,
         // on an issue_from no calendar key uses.
         let mut public_key = [0u8; 32];

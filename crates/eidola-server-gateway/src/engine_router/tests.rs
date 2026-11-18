@@ -907,7 +907,7 @@ async fn a_stream_dropped_before_it_opens_is_settled() {
         crate::backend::Catalog::new(None).unwrap(),
         Some(router),
         crate::db::create_pool(
-            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            "postgres://nobody@127.0.0.1:1/none?sslmode=verify-full",
             None,
             None,
         )
@@ -1481,7 +1481,7 @@ fn catalog_model() -> Model {
 async fn placement_reads_the_schemas_table() {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let pool = crate::db::create_pool(&url, None, None).unwrap();
+    let pool = crate::db::create_pool(&url, None, crate::db::test_ssl_cert().as_deref()).unwrap();
     let model = format!("placement-test-{}", uuid::Uuid::new_v4());
     let client = pool.get().await.unwrap();
     for (url, enabled) in [("https://b.test", true), ("https://a.test", false)] {
@@ -1832,7 +1832,7 @@ async fn paid_handler_for(
         crate::backend::Catalog::new(None).unwrap(),
         Some(router.clone()),
         crate::db::create_pool(
-            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            "postgres://nobody@127.0.0.1:1/none?sslmode=verify-full",
             None,
             None,
         )

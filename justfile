@@ -10,7 +10,7 @@ default:
 dev:
     ./scripts/dev.sh --container
 
-# Run backing services for host-mode dev; writes .env.local with BIND_ADDR.
+# Run backing services for host-mode dev; writes .env.local with BIND_ADDR and DATABASE_SSL_CERT.
 services:
     ./scripts/dev.sh --host
 
@@ -260,11 +260,18 @@ test:
 
 # Run integration tests (requires: just services && just db-reset)
 test-integration:
-    BILLING_TEST_DATABASE_URL="${BILLING_TEST_DATABASE_URL:-${DATABASE_URL:-postgres://eidola@localhost/eidola}}" DATABASE_URL="${DATABASE_URL:-postgres://eidola@localhost/eidola}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidola-server-gateway -- --ignored
+    BILLING_TEST_DATABASE_URL="${BILLING_TEST_DATABASE_URL:-${DATABASE_URL:-postgres://eidola@localhost/eidola?sslmode=verify-full}}" DATABASE_URL="${DATABASE_URL:-postgres://eidola@localhost/eidola?sslmode=verify-full}" DATABASE_SSL_CERT="${DATABASE_SSL_CERT:-$(cat .dev-certs/postgres/ca.pem)}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidola-server-gateway -- --ignored
 
 # Billing tests create isolated schemas; set BILLING_TEST_DATABASE_URL explicitly.
 test-billing:
+    #!/usr/bin/env bash
+    set -euo pipefail
     : "${BILLING_TEST_DATABASE_URL:?set BILLING_TEST_DATABASE_URL to a disposable Postgres database}"
+    # The local database's root, unless DATABASE_SSL_CERT names another.
+    if [ -z "${DATABASE_SSL_CERT:-}" ] && [ -f .dev-certs/postgres/ca.pem ]; then
+        DATABASE_SSL_CERT="$(cat .dev-certs/postgres/ca.pem)"
+        export DATABASE_SSL_CERT
+    fi
     cargo test -p eidola-billing -- --ignored --test-threads=1
     cargo test -p eidola-billing-cli -- --ignored --test-threads=1
     cargo test -p eidola-server-gateway --test billing_support -- --ignored --test-threads=1
@@ -345,7 +352,7 @@ test-release-assets:
     ./scripts/test-release-assets.sh
     ./scripts/test-weights-hash.sh
 
-# Compute enclave measurements from tinfoil-config.yml and CVM artifacts
+# Compute enclave measurements from deploy/gateway/tinfoil-config.yml and CVM artifacts
 measure:
     ./scripts/artifact-manifest.sh measure
 
@@ -353,7 +360,7 @@ measure:
 # Builds the OCI images plus the current host's Nix-built desktop payloads
 # and flake-built archives (macOS universal CLI + GUI .app on Darwin; the
 # Linux GUI on Linux), then records OCI digest / narHash / archiveSha256.
-# Also stamps image digests into tinfoil-config.yml and computes enclave
+# Also stamps image digests into deploy/gateway/tinfoil-config.yml and computes enclave
 # measurements. The *other* platform's desktop entries are carried over
 # from the committed manifest — no single host builds both; CI's apple +
 # linux-gui jobs verify the full set.

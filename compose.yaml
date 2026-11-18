@@ -14,6 +14,9 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./crates/eidola-server-gateway/schema:/docker-entrypoint-initdb.d:ro
+      # TLS-only: its certificate, key and hba rules, from
+      # scripts/dev-postgres-tls.sh (which scripts/dev.sh runs).
+      - ./.dev-certs/postgres:/tls:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "eidola"]
       interval: 5s
@@ -26,7 +29,9 @@ services:
       context: .
       dockerfile: oci/eidola-server-gateway/Containerfile
     environment:
-      DATABASE_URL: postgres://eidola@postgres/eidola
+      DATABASE_URL: postgres://eidola@postgres/eidola?sslmode=verify-full
+      # The root of the database's certificate; scripts/dev.sh exports it.
+      DATABASE_SSL_CERT: ${DATABASE_SSL_CERT:-}
       CREDENTIAL_MASTER_KEY: ${CREDENTIAL_MASTER_KEY}
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
@@ -98,7 +103,9 @@ services:
       dockerfile: oci/eidola-billing/Containerfile
     command: ["serve-webhooks", "--bind", "0.0.0.0:8080"]
     environment:
-      DATABASE_URL: postgres://eidola@postgres/eidola
+      DATABASE_URL: postgres://eidola@postgres/eidola?sslmode=verify-full
+      # The root of the database's certificate; scripts/dev.sh exports it.
+      DATABASE_SSL_CERT: ${DATABASE_SSL_CERT:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
     ports:
       - "127.0.0.1:8081:8080"
@@ -115,7 +122,9 @@ services:
       dockerfile: oci/eidola-billing/Containerfile
     command: ["work"]
     environment:
-      DATABASE_URL: postgres://eidola@postgres/eidola
+      DATABASE_URL: postgres://eidola@postgres/eidola?sslmode=verify-full
+      # The root of the database's certificate; scripts/dev.sh exports it.
+      DATABASE_SSL_CERT: ${DATABASE_SSL_CERT:-}
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
     profiles: ["billing"]
     depends_on:

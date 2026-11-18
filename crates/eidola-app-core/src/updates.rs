@@ -83,6 +83,7 @@
 //! | `artifacts.eidola-server-engine` | `oci (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_4`] — the inference node's image, the one every Eidola-hosted engine deployment pins by digest |
 //! | `artifacts.eidola-cli-linux-static-amd64` | `file (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_5`] — the static Linux CLI binary, the one file of the `eidola-cli` image, published on its own so a host binary needs no container runtime |
 //! | `artifacts.eidola-cli-linux-static-arm64` | `file (linux/arm64) or absent` | ditto, 64-bit ARM: the same client cross-compiled for `aarch64-unknown-linux-musl` by StageX's toolchain, taken out of the image that build produces |
+//! | `artifacts.eidola-billing` | `oci (linux/amd64) or absent` | [`EXPECTED_BILLING_IMAGE_SINCE_SCHEMA_5`] — the billing receiver/worker image, outside the attested boundary and recorded so its digest is tied to a reproducible build of the release's source |
 //!
 //! The `or absent` rows are the schema-conditional half: absent from the
 //! older manifests this build also accepts, required of any manifest
@@ -115,7 +116,8 @@
 //! without a rename: the standalone macOS CLI archive, which every GUI
 //! payload makes redundant, retires, and the static Linux CLI arrives as a
 //! file of its own for each architecture — one retiring row and two
-//! arriving rows, each held to the schema a manifest declares.
+//! arriving rows, each held to the schema a manifest declares. The billing
+//! image arrives at schema 5 too, as a slice of its own.
 //!
 //! That two-sided tolerance is the shape of every manifest schema rotation:
 //! a build **accepts** the new schema one release before any release
@@ -156,6 +158,12 @@ const ENGINE_IMAGE_SCHEMA: u64 = 4;
 /// at: [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_5`] rows become required at it, and
 /// [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4`] rows retire at it.
 const CLI_ARTIFACT_SET_SCHEMA: u64 = 5;
+
+/// The schema the billing image arrives at:
+/// [`EXPECTED_BILLING_IMAGE_SINCE_SCHEMA_5`] rows become required at it.
+/// Its own name although it equals [`CLI_ARTIFACT_SET_SCHEMA`]: the two
+/// slices share a schema, not a reason.
+const BILLING_IMAGE_SCHEMA: u64 = 5;
 
 /// The artifact entries every accepted `artifact-manifest.json` records, as
 /// `(name, type, platform)`. Structure only — digests / narHashes /
@@ -256,6 +264,18 @@ pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_5: &[(&str, &str, &str)] = &[
 pub const EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4: &[(&str, &str, &str)] =
     &[("eidola-cli-macos-universal", "nix", "darwin/universal")];
 
+/// The other slice schema 5 adds: the billing image
+/// (`ghcr.io/eidola-ai/eidola-billing`), which runs the Stripe webhook
+/// receiver and the billing workers. It runs outside the attested boundary
+/// and no client talks to it, so nothing pins it; the row is what ties a
+/// published digest to a reproducible build of the release's source, the
+/// way `eidola-server` does for the gateway.
+///
+/// The same tolerance as [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_5`], at the same
+/// schema.
+pub const EXPECTED_BILLING_IMAGE_SINCE_SCHEMA_5: &[(&str, &str, &str)] =
+    &[("eidola-billing", "oci", "linux/amd64")];
+
 /// One slice of the artifact set, as `(name, type, platform)` rows.
 type ArtifactRows = &'static [(&'static str, &'static str, &'static str)];
 
@@ -266,6 +286,7 @@ const ARRIVING_ARTIFACTS: &[(u64, ArtifactRows)] = &[
     (ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_3),
     (ENGINE_IMAGE_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_4),
     (CLI_ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_5),
+    (BILLING_IMAGE_SCHEMA, EXPECTED_BILLING_IMAGE_SINCE_SCHEMA_5),
 ];
 
 /// Every retiring slice, with the first schema that no longer records it.
@@ -539,6 +560,10 @@ pub struct CheckContext {
     pub releases_url: String,
     /// The running binary's semver.
     pub installed_version: String,
+    /// The commit the installed release was cut from, when the updater
+    /// installed it (`updater::installed`). `None` is a fresh install:
+    /// continuity is not checked, and the latest release is the one offered.
+    pub installed_git_commit: Option<String>,
     /// The trust pins every check runs against.
     pub pins: updater::ReleasePins,
     /// The expected structural claim set (see module docs).
@@ -611,6 +636,7 @@ impl CheckContext {
         Self {
             releases_url: releases_url.into(),
             installed_version: installed_version.into(),
+            installed_git_commit: None,
             pins: updater::ReleasePins::embedded(),
             expected_claims: expected_claims(),
         }
@@ -642,41 +668,47 @@ pub async fn check_outcome(client: &reqwest::Client, ctx: &CheckContext) -> Chec
     let settled = CheckOutcome::Settled;
     let fetcher = updater::Fetcher::Network(client.clone());
 
-    // ── discover: the release marked `latest` ───────────────────────────
-    let release_json = match fetcher.fetch_latest_release_json(&ctx.releases_url).await {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
+    // ── discover: the release marked `latest`, and the one to offer ─────
+    // With the installed commit known, that is the first release after it
+    // along the latest's history (`updater::discover_next_release`).
+    let release = match updater::discover_next_release(
+        &fetcher,
+        &ctx.releases_url,
+        &ctx.installed_version,
+        ctx.installed_git_commit.as_deref(),
+    )
+    .await
+    {
+        Ok(updater::Discovery::NothingMarked) => {
             return settled(UpdateCheckResult::UpToDate {
                 latest_version: None,
             });
         }
-        // Discovery reached nothing it could read, so nothing claimed an
-        // update. A body over the bound is the one `Rejected` discovery can
-        // produce, and it carries no version either.
-        Err(e) => {
-            return settled(UpdateCheckResult::CheckFailed {
-                message: e.message().to_string(),
-            });
-        }
-    };
-
-    // ── version gate, then the index's own shape ────────────────────────
-    // Continuity is not checked here: no build knows the commit it was
-    // released from (`docs/gaps.md` → First-install downgrade).
-    let release = match updater::gate_release(&release_json, &ctx.installed_version, None) {
-        Ok(updater::ReleaseGate::Newer(release)) => *release,
-        Ok(updater::ReleaseGate::NotNewer { version }) => {
+        Ok(updater::Discovery::NotNewer { version }) => {
             return settled(UpdateCheckResult::UpToDate {
                 latest_version: Some(version),
             });
         }
-        Err(updater::GateError {
+        Ok(updater::Discovery::Next { release, .. }) => *release,
+        // Nothing claimed an update, or what failed was the network: no
+        // security state either way. A body over the bound is the one
+        // `Rejected` discovery can produce before a version is read, and it
+        // carries no version.
+        Err(updater::DiscoveryError {
             newer_version: None,
-            reason,
-        }) => return settled(UpdateCheckResult::CheckFailed { message: reason }),
-        Err(updater::GateError {
+            error,
+        })
+        | Err(updater::DiscoveryError {
+            error: error @ updater::ReleaseCheckError::Unreachable(_),
+            ..
+        }) => {
+            return settled(UpdateCheckResult::CheckFailed {
+                message: error.message().to_string(),
+            });
+        }
+        Err(updater::DiscoveryError {
             newer_version: Some(version),
-            reason,
+            error: updater::ReleaseCheckError::Rejected(reason),
         }) => {
             return settled(UpdateCheckResult::Unverifiable {
                 tag: format!("v{version}"),
@@ -1384,6 +1416,7 @@ mod tests {
                 "artifacts.eidola-server-engine",
                 "artifacts.eidola-cli-linux-static-amd64",
                 "artifacts.eidola-cli-linux-static-arm64",
+                "artifacts.eidola-billing",
             ]
         );
     }
@@ -1486,6 +1519,17 @@ mod tests {
             value(&only_5, "artifacts.eidola-cli").as_deref(),
             Some("oci (linux/amd64)")
         );
+
+        // The billing image arrives at the same boundary, from its own side.
+        assert_eq!(value(&only_4, "artifacts.eidola-billing"), None);
+        assert_eq!(
+            value(&four_and_five, "artifacts.eidola-billing").as_deref(),
+            Some("oci (linux/amd64) or absent")
+        );
+        assert_eq!(
+            value(&only_5, "artifacts.eidola-billing").as_deref(),
+            Some("oci (linux/amd64)")
+        );
     }
 
     /// A schema-3 manifest — the shape a later release will emit. It adds
@@ -1540,13 +1584,17 @@ mod tests {
     }
 
     /// A schema-5 manifest: schema 4's shape without the standalone macOS
-    /// CLI archive, and with the static Linux CLI, for each architecture, as
-    /// a file of its own.
+    /// CLI archive, with the static Linux CLI, for each architecture, as a
+    /// file of its own, and with the billing image.
     fn schema_5_manifest() -> serde_json::Value {
         let mut manifest = schema_4_manifest();
         manifest["schema_version"] = serde_json::json!(5);
         let artifacts = manifest["artifacts"].as_object_mut().unwrap();
         artifacts.remove("eidola-cli-macos-universal");
+        artifacts.insert(
+            "eidola-billing".into(),
+            serde_json::json!({"digest": "sha256:ee", "platform": "linux/amd64", "type": "oci"}),
+        );
         for (key, platform) in [
             ("eidola-cli-linux-static-amd64", "linux/amd64"),
             ("eidola-cli-linux-static-arm64", "linux/arm64"),
@@ -1716,7 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cli_rows_swapped_without_the_bump_are_each_a_delta() {
+    fn the_schema_5_rows_without_the_bump_are_each_a_delta() {
         // The whole schema-5 artifact set under schema 4's number: the
         // retirement and each arrival read as a claim out of shape, so no
         // part of the rotation can be emitted alone.
@@ -1732,6 +1780,10 @@ mod tests {
             got,
             [
                 (
+                    "artifacts.eidola-billing",
+                    Some("present, but schema 4 records it only from schema 5 on")
+                ),
+                (
                     "artifacts.eidola-cli-linux-static-amd64",
                     Some("present, but schema 4 records it only from schema 5 on")
                 ),
@@ -1745,6 +1797,45 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn schema_5_manifest_missing_the_billing_image_is_a_delta() {
+        let mut manifest = schema_5_manifest();
+        manifest["artifacts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("eidola-billing");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-billing");
+        assert_eq!(
+            deltas[0].attested.as_deref(),
+            Some("missing (recorded from schema 5 on)")
+        );
+    }
+
+    #[test]
+    fn the_billing_image_before_schema_5_is_a_delta() {
+        // Emission without the bump, at every older schema this build reads.
+        for (mut manifest, declared) in [
+            (current_manifest(), 2),
+            (schema_3_manifest(), 3),
+            (schema_4_manifest(), 4),
+        ] {
+            manifest["artifacts"]["eidola-billing"] =
+                schema_5_manifest()["artifacts"]["eidola-billing"].clone();
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "schema {declared}: deltas {deltas:#?}");
+            assert_eq!(deltas[0].key, "artifacts.eidola-billing");
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some(
+                    format!("present, but schema {declared} records it only from schema 5 on")
+                        .as_str()
+                )
+            );
+        }
     }
 
     #[test]

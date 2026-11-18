@@ -2797,10 +2797,20 @@ impl Inner {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let releases_url = self.load_config().update_releases_url();
+        // Hashing the install's main executable reads tens of megabytes the
+        // first time, so it runs where blocking is allowed.
+        let data_dir = self.data_dir.clone();
+        let installed_git_commit = tokio::task::spawn_blocking(move || {
+            updater::installed::running_install_commit(&data_dir)
+        })
+        .await
+        .ok()
+        .flatten();
 
         let outcome = match updater::build_http_client() {
             Ok(client) => {
-                let ctx = updates::CheckContext::new(releases_url, env!("CARGO_PKG_VERSION"));
+                let mut ctx = updates::CheckContext::new(releases_url, env!("CARGO_PKG_VERSION"));
+                ctx.installed_git_commit = installed_git_commit;
                 updates::check_outcome(&client, &ctx).await
             }
             Err(e) => updates::CheckOutcome::Settled(updates::UpdateCheckResult::CheckFailed {
@@ -11639,6 +11649,19 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// **Test-only seam.** Stop the clock the prefix-cache rotation rule reads
+    /// at its current reading: from then on it moves only by
+    /// [`Self::test_advance_cache_clock`] and
+    /// [`Self::test_delay_cache_clock_at_each_send`], never by the time a turn
+    /// takes, so a test that puts a request one second inside a bound keeps
+    /// it inside however slowly the machine runs. Holding a held clock again
+    /// changes nothing. Posts, requests and every other stamp keep real time.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_cache_clock(&self) {
+        let _ = self.inner.cache_clock.held_at_ms.set(now_ms());
+    }
+
     /// **Test-only seam.** Move the clock the prefix-cache rotation rule reads
     /// by `delta_ms` (negative sets it back). Cumulative. Nothing else reads
     /// this offset, so posts, requests and every other stamp keep real time.
@@ -14804,11 +14827,15 @@ impl ModelListEntry {
 }
 
 /// The clock the prefix-cache rotation rule reads: this client's own wall
-/// clock. Under the test-support feature a test can offset it, or advance it
-/// at each send to stand a request's setup past a retention bound; see
-/// [`prefix_cache::decide`] for what a clock that moves backwards does.
+/// clock. Under the test-support feature a test can hold it at one reading,
+/// offset it, or advance it at each send to stand a request's setup past a
+/// retention bound; see [`prefix_cache::decide`] for what a clock that moves
+/// backwards does.
 #[derive(Clone, Default)]
 struct CacheClock {
+    /// The wall-clock reading the clock stands at, once a test holds it.
+    #[cfg(feature = "test-support")]
+    held_at_ms: Arc<std::sync::OnceLock<i64>>,
     #[cfg(feature = "test-support")]
     offset_ms: Arc<std::sync::atomic::AtomicI64>,
     #[cfg(feature = "test-support")]
@@ -14819,7 +14846,8 @@ impl CacheClock {
     fn now_ms(&self) -> i64 {
         #[cfg(feature = "test-support")]
         {
-            now_ms().saturating_add(self.offset_ms.load(std::sync::atomic::Ordering::Relaxed))
+            let base = self.held_at_ms.get().copied().unwrap_or_else(now_ms);
+            base.saturating_add(self.offset_ms.load(std::sync::atomic::Ordering::Relaxed))
         }
         #[cfg(not(feature = "test-support"))]
         {

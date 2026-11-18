@@ -10837,6 +10837,9 @@ fn cache_setup(chat: ChatBehavior) -> (MockServer, AppCore, tempfile::TempDir) {
         ..MockConfig::default()
     });
     with_account(&core);
+    // The rotation clock moves only when a test moves it: a test that stands
+    // a request one second inside a bound keeps it there on a loaded machine.
+    core.test_hold_cache_clock();
     (mock, core, dir)
 }
 

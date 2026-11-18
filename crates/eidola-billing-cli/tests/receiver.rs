@@ -11,7 +11,6 @@ use hmac::{Hmac, KeyInit, Mac};
 use reqwest::{Client, StatusCode};
 use serde_json::json;
 use sha2::Sha256;
-use tokio_postgres::NoTls;
 use uuid::Uuid;
 
 const SECRET: &str = "whsec_receiver_test";
@@ -27,7 +26,15 @@ impl TestDb {
         let _ = rustls_rustcrypto::provider().install_default();
         let url = std::env::var("BILLING_TEST_DATABASE_URL")
             .expect("set BILLING_TEST_DATABASE_URL to a dedicated test database");
-        let (admin, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        let tls = eidola_billing::connection::tls_connector(
+            std::env::var("DATABASE_SSL_CERT").ok().as_deref(),
+        )
+        .unwrap();
+        let (admin, connection) = eidola_billing::connection::parse_database_url(&url)
+            .unwrap()
+            .connect(tls.clone())
+            .await
+            .unwrap();
         tokio::spawn(async move { connection.await.unwrap() });
         admin.batch_execute("SELECT pg_advisory_lock(812441); CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public; SELECT pg_advisory_unlock(812441)")
             .await.unwrap();
@@ -36,9 +43,9 @@ impl TestDb {
             .batch_execute(&format!("CREATE SCHEMA {schema}"))
             .await
             .unwrap();
-        let mut config: tokio_postgres::Config = url.parse().unwrap();
+        let mut config = eidola_billing::connection::parse_database_url(&url).unwrap();
         config.options(format!("-c search_path={schema},public"));
-        let pool = Pool::builder(Manager::new(config, NoTls))
+        let pool = Pool::builder(Manager::new(config, tls))
             .max_size(8)
             .build()
             .unwrap();

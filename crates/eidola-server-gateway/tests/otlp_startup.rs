@@ -1,7 +1,7 @@
 //! The server must start with an HTTPS OTLP endpoint and no system trust store.
 //!
 //! Production runs `FROM scratch` — there is no CA bundle anywhere in the image
-//! — and `tinfoil-config.yml` points `OTEL_EXPORTER_OTLP_ENDPOINT` at an HTTPS
+//! — and production points `OTEL_EXPORTER_OTLP_ENDPOINT` at an HTTPS
 //! collector. Left to their default client, the OTLP exporters verify against
 //! the platform store, cannot build a client over an empty one, and panic
 //! inside `telemetry::init()` before configuration is even read.

@@ -47,12 +47,12 @@ These claims are recorded verbatim in the attestation document, hashed into the 
 
 Before the client tells anyone that an update exists, and again before it installs one, it:
 
-1. **Downloads** the release index of the release marked latest, then the manifest and the attestation bundles it names. None of these locations is trusted, and the marker is only a pointer: whoever can edit the release listing can change which release is checked, and nothing more.
+1. **Finds the next release.** It downloads the release index of the release marked latest and, when the installed release is more than one behind, reads back through each index's `previous_release` to the release that follows the installed one. That release, not the latest, is the one checked and offered (see [Release continuity](#release-continuity)). It then downloads the manifest and the attestation bundles that release names. None of these locations is trusted, and the marker is only a pointer: whoever can edit the release listing can change which release is checked, and nothing more.
 2. **Verifies CI's manifest signature** against the pinned Fulcio identity pattern and the embedded Sigstore trusted root, and requires that signature to be bound to this release's own tag.
 3. **Verifies each human attestation**: cosign signature against the pinned attestant fingerprint, Sigstore bundle integrity, Rekor inclusion proof.
 4. **Counts independent attestations** and fails if fewer than `MIN_HUMAN_ATTESTATIONS` (pinned in the *current* client) have verified.
 5. **Re-renders each claim** from the pinned template and checks character equality with the attestation's recorded claim text.
-6. **Checks continuity**: the new release's `previous_release.git_commit` must equal the currently-installed `git_commit`.
+6. **Checks continuity**: the new release's `previous_release.git_commit` must equal the currently-installed `git_commit`, when the client knows it.
 7. **Surfaces the verified prose** to the user before approving the install.
 
 If any step fails, the update is rejected. There is no override prompt. A release that CI signed and that no trusted attestant has attested is never announced as an update. The client reports it as unverifiable, because a release pipeline that has been compromised can produce exactly that.
@@ -76,7 +76,9 @@ The client's update path requires that each release's claimed `previous_release.
 1. **Stale-release substitution.** An attacker serving a real but older release cannot route an updating client onto it; the continuity check fails.
 2. **Rollback to a known-bad past release.** Even if a past release was later discovered to have a vulnerability and was superseded, the continuity check prevents an attacker from walking an updating client *backwards* into it. The only release the verifier will accept is the one whose `previous_release.git_commit` matches the installed commit.
 
-The first-install case (no prior installed commit) is the residual gap; see [gaps.md](gaps.md#first-install-downgrade).
+**One release at a time.** A client several releases behind is offered the release after the one it runs, not the latest, and reaches the latest by installing each in turn. A release is verified by the clients of the release before it, against the pins they embed, so this is the only order in which every release is checked by a client holding the pins it was signed under, including across a change of those pins. The client finds that release by reading each release's `previous_release` back from the latest; those documents are unsigned and only locate the release, which is then held to every check above.
+
+**Where the installed commit comes from.** No build can contain the commit it was released from, because that commit records the build's own hashes. The client records the commit when it installs a release, keyed by the hash of the installed executable, so installing a download by hand over the top makes the client a fresh install again. A client with no recorded commit is offered the oldest release newer than its own version, without the continuity check. That first-install case is the residual gap; see [gaps.md](gaps.md#first-install-downgrade).
 
 ## For the technical specification
 

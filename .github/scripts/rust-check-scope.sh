@@ -29,11 +29,16 @@ while IFS= read -r path; do
     # `eval` stage reads is the kernel crate, which is Rust scope.
     scripts/check-oci-stub-workspace.sh|oci/*/Containerfile|.dockerignore)
       oci=true ;;
+    # The database tests' server serves the TLS this script makes.
+    scripts/dev-postgres-tls.sh)
+      rust=true ;;
     *.md|.rumdl.toml) : ;;
     .github/*|docs/*|www/*|scripts/*|*.sh|justfile) : ;;
     compose*.yaml|compose*.yml|Containerfile*|*.hcl|.dockerignore) : ;;
     flake.nix|flake.lock|*.swift-format) : ;;
-    tinfoil-config.yml|artifact-manifest.json) : ;;
+    # The gateway's deployment config is compiled into nothing: its hash
+    # reaches the clients through server-enclave.json, which is Rust scope.
+    deploy/gateway/*|artifact-manifest.json) : ;;
     .env.example|.env.release) : ;;
     .envrc|.gitignore|.gitattributes|.editorconfig) : ;;
     LICENSE*|SECURITY.md|GEMINI.md|CLA-SIGNERS.txt) : ;;
