@@ -425,7 +425,12 @@ pub fn recurrent_table_words(sizing: &Sizing) -> u64 {
 /// Keys per chunk of FA2's split attention (`eidola-engine-cuda`'s
 /// `qwen::plan::SPLIT_KEYS`): a row's keys are reduced in chunks of this
 /// many positions, each a partial row.
-pub const RECURRENT_SPLIT_KEYS: u64 = 1024;
+pub const RECURRENT_SPLIT_KEYS: u64 = 512;
+
+/// Keys a forward row's partial rows are counted at for FA2's scratch
+/// (`qwen::plan::PARTIAL_KEYS`): a prefill whose rows need more partial
+/// rows runs its attention in passes.
+pub const RECURRENT_PARTIAL_KEYS: u64 = 1024;
 
 /// A recurrent model's step scratch in the fast profile (the executor's
 /// `capacities` and `program::alloc_scratch`, sized once at construction,
@@ -439,8 +444,10 @@ pub const RECURRENT_SPLIT_KEYS: u64 = 1024;
 /// - the DeltaNet's staging: max(`N + ST`, `Sk`) staged positions
 ///   ([`HybridDims::staged_position_bytes`]) and three more convolution rows a
 ///   seat;
-/// - FA2's partial rows: `R` rows times the chunks of [`RECURRENT_SPLIT_KEYS`]
-///   of `MAX_MODEL_LEN + k + 1` positions ([`HybridDims::partial_row_bytes`]):
+/// - FA2's partial rows: `R` rows times the `MAX_MODEL_LEN + k + 1` positions
+///   over [`RECURRENT_PARTIAL_KEYS`], or a decode rung's `S(k + 1)` rows times
+///   the chunks of [`RECURRENT_SPLIT_KEYS`], the more
+///   ([`HybridDims::partial_row_bytes`]):
 ///   about 12 bytes per row and position of the context at Qwen3.8's shape,
 ///   where the exact profile's scores, which this profile does not allocate,
 ///   take 96 a layer;
@@ -470,7 +477,9 @@ pub fn recurrent_step_scratch_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
     let head = s.max(s * k).max(64);
     let staged = n.saturating_add(s.saturating_mul(tail)).max(s * k);
     let conv_rows = 3 * s + staged;
-    let partial_rows = rows.saturating_mul(positions.div_ceil(RECURRENT_SPLIT_KEYS).max(1));
+    let partial_rows = rows
+        .saturating_mul(positions.div_ceil(RECURRENT_PARTIAL_KEYS).max(1))
+        .max((s * (k + 1)).saturating_mul(positions.div_ceil(RECURRENT_SPLIT_KEYS).max(1)));
     let head_tmp = (pad4(head) * v).max(r * h).max(r * dims.ab_rows()) * 4;
     let logit_rows = s.max(64) + s * k + head;
     let distributions = s + s * (k + 1) + (s * k).max(1) + s;

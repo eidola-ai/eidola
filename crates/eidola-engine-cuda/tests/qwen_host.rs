@@ -176,7 +176,8 @@ fn the_rung_path_and_the_eager_path_agree() {
 
 /// The fast profile's plans on every path without a device, on the fixture with 256-wide
 /// heads: FA2's work lists built and packed for every step (prefill chunks, decode rows,
-/// the drafter's position pages, the rungs' reservations) and each launch checked,
+/// the drafter's position pages, the rungs' reservations, a long prompt's attention in
+/// several passes) and each launch checked,
 /// computing nothing. Its attention reads as zeros, so the logits are not the model's,
 /// but they are one function of the requests on the eager and rung paths alike, which
 /// must agree bit for bit.
@@ -192,8 +193,13 @@ fn fast_profile_plans_pack_on_every_path() {
         (CudaGraphs::Off, DecodePath::Direct),
     ];
     let mut failed = Vec::new();
-    let results =
+    let mut results =
         qwen_common::with_fixture_256(|| qwen_common::invariance::across_paths(&make, &paths));
+    // Past several 512-key chunks, a prefill attention in two passes.
+    results.push((
+        "long_context".to_string(),
+        qwen_common::with_fixture_256(|| qwen_common::invariance::long_context(&make)),
+    ));
     for (name, r) in results {
         match r {
             Ok(what) => eprintln!("ok      {name}: {what}"),

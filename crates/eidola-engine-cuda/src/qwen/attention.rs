@@ -2,8 +2,8 @@
 //! (`flashinfer_fa2_sink_paged_d256`), batch-invariant by MiMo's structure
 //! ([`crate::mimo::attention`]): one KV warp over 64-key tiles, requests cut at
 //! multiples of 64 query positions, every row's keys split at absolute multiples of
-//! 1,024 positions and the partials merged in chunk order, work lists walked by fixed
-//! grids. The model has no sinks: every head's sink is `-inf`. The image has query tiles
+//! [`super::plan::SPLIT_KEYS`] (512) positions and the partials merged in chunk order,
+//! work lists walked by fixed grids. The model has no sinks: every head's sink is `-inf`. The image has query tiles
 //! 16 and 64 only, so a plan's tile is at most [`MAX_TILE`].
 //!
 //! **Two KV groups, one reduction.** The target's layers list their pages from position
@@ -17,7 +17,8 @@
 use std::ffi::c_void;
 
 use crate::mimo::attention::{
-    AttnLayer, AttnParams, PagedKv, PagedParams, Partials, PlanView, UintFastdiv,
+    AttnLayer, AttnParams, HostPlan, PagedKv, PagedParams, Partials, PassCaps, PlanView,
+    UintFastdiv,
 };
 use crate::module::{Kernel, KernelModule};
 use crate::{CudaError, Gpu, Result, narrow};
@@ -55,6 +56,51 @@ pub struct Fa2Args {
     pub o: u64,
     pub partials: Partials,
     pub scale: f32,
+}
+
+/// Pass `index` of `plan`, padded to `caps` ([`HostPlan::padded_pass`]), as one table of
+/// words in the order a launch's view reads them, and that view over the table at
+/// `base` (a device address): what the step table holds for one FA2 launch, for a bench
+/// or test that runs one pass alone.
+pub fn pass_words(
+    plan: &HostPlan,
+    index: usize,
+    caps: &PassCaps,
+    base: u64,
+) -> Result<(Vec<u32>, PlanView)> {
+    let p = plan.padded_pass(index, caps)?;
+    let mut w = Vec::new();
+    let mut put = |v: &[u32]| {
+        let at = base + 4 * w.len() as u64;
+        w.extend_from_slice(v);
+        at
+    };
+    let q_indptr = put(&p.q_indptr);
+    let indices = put(&p.indices);
+    let indptr = put(&p.indptr);
+    let last_page_len = put(&p.last_page_len);
+    let request_indices = put(&p.request_indices);
+    let qo_tile_indices = put(&p.qo_tile_indices);
+    let kv_tile_indices = put(&p.kv_tile_indices);
+    let o_indptr = put(&p.o_indptr);
+    let merge_indptr = put(&p.merge_indptr);
+    let work_items = put(&[p.work_items, plan.split_keys()]);
+    let view = PlanView {
+        shape: caps.shape,
+        out_row: p.out_row,
+        q_indptr,
+        indices,
+        indptr,
+        last_page_len,
+        request_indices,
+        qo_tile_indices,
+        kv_tile_indices,
+        o_indptr,
+        merge_indptr,
+        work_items,
+        kv_chunk_size: work_items + 4,
+    };
+    Ok((w, view))
 }
 
 /// The d256 instances and their merge.
