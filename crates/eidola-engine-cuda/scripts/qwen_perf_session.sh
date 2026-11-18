@@ -45,6 +45,8 @@
 #   projection,
 #   the norm, quantiser, gates, DeltaNet preparation and gated norm at 1, 8, 64
 #   and 2,048 rows, the recurrence, the cipher and the host copies;
+# - the serving steps prefill in chunks of 256 positions, the bench's default
+#   (`qwen::SERVING_PREFILL_CHUNK`, the chunk Qwen3.8 is served at);
 # - `serve_b`, `serve_b_mtp`: workload B (1,024 in, 256 out, greedy) at
 #   concurrency 1, 8, 32, 64 and 128, without drafts and with three, graphs
 #   on: $OUT/serve_b*.jsonl;

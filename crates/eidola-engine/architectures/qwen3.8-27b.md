@@ -23,6 +23,10 @@ Each level is held to the one before it, as for the other architectures:
 
 The Gated DeltaNet can be computed token by token or in chunks of tokens, and the two orders round differently. The contract is the token recurrence: every token, in a prefill, a decode step or a draft check, runs one step from the state the token before it left, so a layer's state and output depend only on the token prefix, and a state saved after any token resumes exactly. The reference forward exposes the step as public kernels the executors call.
 
+## Serving
+
+Qwen3.8 is served with prefill chunks of 256 positions (`eidola_engine_cuda::qwen::SERVING_PREFILL_CHUNK`, the node's `EIDOLA_ENGINE_MAX_PREFILL_CHUNK`). The DeltaNet's token recurrence is serial within a run, so a step's prefill cost follows its longest run: a smaller chunk spreads a long prompt over more steps while several sequences prefill side by side, and the steps that carry decode rows stay short. A position's bits do not depend on the chunking, which the executors' invariance is asserted over, so the chunk is a choice of speed alone (`eidola-engine-cuda/AGENTS.md` → Qwen3.8).
+
 ## The recurrent state in the serving core
 
 The DeltaNet layers' state is a pool of state buffers beside the KV groups (`eidola-engine/AGENTS.md` → Recurrent state): a sequence keeps a base buffer at its last block boundary and its executor slot the inputs after it; drafts never reach a stored state; and the prefix cache keeps snapshots only at a sequence's branch, regeneration and continuation points, with every guarantee its KV blocks get. `mock::qwen_like_spec` is the shape the serving core's tests run (`tests/recurrent_state.rs`).

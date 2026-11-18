@@ -18,7 +18,9 @@
 //!
 //! Beside `qwen_whole bench`, this serves one workload at one draft width, profile and
 //! graph setting per run, from the reference runs' prompts when given, and reports the
-//! steps each path ran.
+//! steps each path ran. The scheduler takes a step of 2,048 tokens and prefill chunks of
+//! `--prefill-chunk` positions, by default the one Qwen3.8 is served at
+//! (`qwen::SERVING_PREFILL_CHUNK`, 256).
 //!
 //! Prompts come from `--prompts` (`{"b": [[ids]], "conversations": [{"first": [ids],
 //! "later": [[ids]]}]}`, text tokenised as the reference's runs were: acceptance of drafts
@@ -209,7 +211,9 @@ fn main() {
         .unwrap_or_else(|e| fail(e));
     let prefill_chunk: u32 = opt
         .get("prefill-chunk")
-        .map_or(Ok(2048), |s| s.parse())
+        .map_or(Ok(eidola_engine_cuda::qwen::SERVING_PREFILL_CHUNK), |s| {
+            s.parse()
+        })
         .unwrap_or_else(|_| fail("prefill-chunk"));
     let prompts: Option<serde_json::Value> = opt.get("prompts").map(|p| {
         serde_json::from_slice(&std::fs::read(p).unwrap_or_else(|e| fail(e)))
