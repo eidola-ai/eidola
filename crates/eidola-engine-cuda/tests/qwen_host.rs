@@ -279,6 +279,77 @@ fn blocked_deltanet_prepares_only_new_positions() {
     });
 }
 
+/// In blocks a launch whose every run fits the tail cache ring (a decode step's, every
+/// rung's) takes the fused form, and any other (a prefill's) the unfused one: on the eager
+/// and the rung path, at blocks of 16 and widths 0 and 3, each form exactly where it
+/// should, the fused form on every path and width and the unfused one among them. (The
+/// host device's fused form holds its intra body to the unfused one's scratch bit for bit,
+/// so the suites above check its arithmetic.)
+#[test]
+fn blocked_deltanet_decodes_in_one_launch() {
+    use eidola_engine_cuda::qwen::abi::{DnChunkParams, DnSeq};
+    use eidola_engine_cuda::qwen::host::HostDevice;
+    use eidola_engine_cuda::qwen::{CudaGraphs, DecodePath};
+    use std::sync::{Arc, Mutex};
+    let Some(lib) = qwen_common::library() else {
+        return;
+    };
+    // (fused, the longest run, the ring) a launch.
+    let seen = Arc::new(Mutex::new(Vec::<(bool, u32, u32)>::new()));
+    let make = || {
+        let inner = qwen_common::host_launch(lib.clone());
+        let seen = seen.clone();
+        let fused = Mutex::new(false);
+        HostDevice::block_deltanet(Box::new(move |family, params, gx, gy| {
+            if family == "dn_fused" {
+                *fused.lock().expect("lock") = true;
+            }
+            if family == "dn_state" {
+                // SAFETY: the host device hands `dn_state` its `DnChunkParams`, whose runs
+                // are a host array of `seq_count` descriptors.
+                let (longest, ring) = unsafe {
+                    let p = &*params.cast::<DnChunkParams>();
+                    let runs =
+                        std::slice::from_raw_parts(p.seqs as *const DnSeq, p.seq_count as usize);
+                    (runs.iter().map(|s| s.count).max().unwrap_or(0), p.ring)
+                };
+                let f = std::mem::take(&mut *fused.lock().expect("lock"));
+                seen.lock().expect("lock").push((f, longest, ring));
+            }
+            inner(family, params, gx, gy);
+        }))
+    };
+    let mut unfused = 0usize;
+    qwen_common::with_block_size(16, || {
+        for path in [DecodePath::Eager, DecodePath::Direct] {
+            for k in [0u32, 3] {
+                seen.lock().expect("lock").clear();
+                qwen_common::with_path(CudaGraphs::Off, path, || {
+                    qwen_common::invariance::workload(&make, k)
+                });
+                let seen = seen.lock().expect("lock");
+                let wrong: Vec<_> = seen
+                    .iter()
+                    .filter(|&&(f, longest, ring)| f != (longest <= ring))
+                    .collect();
+                assert!(
+                    wrong.is_empty(),
+                    "{path:?} at width {k}: {} of {} launches in the wrong form, e.g. {:?}",
+                    wrong.len(),
+                    seen.len(),
+                    &wrong[..wrong.len().min(4)]
+                );
+                assert!(
+                    seen.iter().any(|l| l.0),
+                    "{path:?} at width {k}: no fused launch"
+                );
+                unfused += seen.iter().filter(|l| !l.0).count();
+            }
+        }
+    });
+    assert!(unfused > 0, "no launch took the unfused form");
+}
+
 /// The padded rung path (a decode rung's launch sequence over its table, as a graph
 /// records it, run directly: the host captures no graphs) against the CPU reference
 /// executor: the same scenarios, and rungs must have run.

@@ -198,7 +198,9 @@ fn qwen_kernels_on_the_device() {
 /// block's row the same with 1 to 16 of its positions present (served as the executor
 /// serves it, the earlier ones from the tail cache and the later ones zeros in every
 /// operand, against prefilled with them real), the run in chunks of 1 to 65 positions,
-/// drafts accepted and rejected, and beside other runs.
+/// drafts accepted and rejected, and beside other runs; and the fused form the unfused
+/// one's bits (1, 8 and 64 sequences a launch decoding with drafts, every fold: outputs,
+/// states and the tail cache).
 fn blocked_deltanet(fast: &CudaDevice) -> Vec<(&'static str, Result<String, String>)> {
     use qwen_common::chunk;
     let mut out = Vec::new();
@@ -232,6 +234,10 @@ fn blocked_deltanet(fast: &CudaDevice) -> Vec<(&'static str, Result<String, Stri
     out.push((
         "blocked deltanet reproducible",
         chunk::invariant(fast, 23, 70),
+    ));
+    out.push((
+        "blocked deltanet fused form",
+        chunk::fused_equals_unfused(fast, 24, &[1, 8, 64]),
     ));
     out
 }

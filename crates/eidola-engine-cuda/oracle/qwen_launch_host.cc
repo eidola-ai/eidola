@@ -11,6 +11,8 @@
 // engine.
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -302,6 +304,86 @@ void qwen_host_dn_intra(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
 void qwen_host_dn_state(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
   for (uint32_t y = gy; y-- > 0;)
     for (uint32_t x = gx; x-- > 0;) qwd::dn_state_host(*p, x, y);
+}
+
+// The fused form's intra body and keeping, CTA by CTA of its grid (`gx` runs by
+// slices, `gy` value heads), after the intra kernel's body filled the scratch: each
+// block's shared memory held to the scratch bit for bit where the state step reads it
+// (a mismatch aborts, naming it), then its kept positions into the tail cache. The
+// state kernel's host form runs after, as for the unfused form.
+void qwen_host_dn_fused(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
+  static thread_local qwd::FusedShared sh;
+  const ds::Par par{qwd::kThreads, true};
+  const uint32_t slices = (p->v_dim + qwd::kSlice - 1) / qwd::kSlice;
+  auto bits = [](float x) {
+    uint32_t u;
+    std::memcpy(&u, &x, 4);
+    return u;
+  };
+  auto check = [&](bool ok, const char* what, uint32_t seq, uint32_t b, uint32_t h, uint32_t r,
+                   uint32_t c) {
+    if (ok) return;
+    std::fprintf(stderr, "fused intra differs: %s, run %u block %u head %u row %u column %u\n",
+                 what, seq, b, h, r, c);
+    std::abort();
+  };
+  for (uint32_t h = gy; h-- > 0;)
+    for (uint32_t x = gx; x-- > 0;) {
+      const uint32_t seq = x / slices;
+      const uint32_t vbase = x % slices * qwd::kSlice;
+      if (seq >= p->seq_count) continue;
+      const QwDnSeq& s = p->seqs[seq];
+      const uint32_t nb = qwd::run_tiles(s, p->chunk);
+      if (s.tile + nb > p->tiles) continue;
+      const uint32_t cols = p->v_dim - vbase < qwd::kSlice ? p->v_dim - vbase : qwd::kSlice;
+      const uint32_t kh = h / (p->v_heads / p->k_heads);
+      for (uint32_t b = 0; b < nb; ++b) {
+        garbage(&sh);
+        qwd::fused_intra(*p, s, b, h, vbase, par, sh);
+        const uint32_t tile = s.tile + b;
+        const uint32_t from = b * p->chunk;
+        const uint32_t n = s.count - from < p->chunk ? s.count - from : p->chunk;
+        const uint32_t lo = qwd::cached_rows(s, from, n);
+        const uint64_t th = qwd::tile_head(*p, tile, h);
+        const uint64_t tk = qwd::tile_key(*p, tile, kh);
+        for (uint32_t r = 0; r < qwd::kTile; ++r) {
+          const bool fresh = r >= lo && r < n;
+          for (uint32_t i = 0; i < qwd::kKey; ++i) {
+            const uint64_t at = (tk * qwd::kTile + r) * qwd::kKey + i;
+            if (fresh) {
+              check(bits(sh.w[r][i]) == bits(p->w[(th * qwd::kTile + r) * qwd::kKey + i]), "W",
+                    seq, b, h, r, i);
+              check(bits(qwd::tf32_rna(sh.in.q[r][i])) == bits(p->qr[at]), "queries", seq, b, h,
+                    r, i);
+            } else {
+              check(bits(sh.w[r][i]) == 0 && bits(qwd::tf32_rna(sh.in.q[r][i])) == 0,
+                    "a row read as zeros", seq, b, h, r, i);
+            }
+            if (n == p->chunk)
+              check(bits(qwd::tf32_rna(sh.in.k[r][i])) == bits(p->kr[at]), "keys", seq, b, h, r, i);
+          }
+          for (uint32_t c = 0; c < cols; ++c) {
+            const float want = fresh ? p->u[(th * qwd::kTile + r) * p->v_dim + vbase + c] : 0.0f;
+            check(bits(sh.u[r][c]) == bits(want), "U", seq, b, h, r, c);
+            if (r < lo)
+              check(bits(sh.cd[r][c]) ==
+                        bits(qwd::rec_at(*p, qwd::entry_at(*p, s, from + r), h)[p->v_dim + vbase + c]),
+                    "cached delta", seq, b, h, r, c);
+          }
+          for (uint32_t j = 0; j < qwd::kTile; ++j)
+            check(bits(sh.pm[r][j]) == bits(p->pm[(th * qwd::kTile + r) * qwd::kTile + j]), "P", seq,
+                  b, h, r, j);
+          const float* rec = p->rec + (th * qwd::kTile + r) * qwd::kRec;
+          for (uint32_t j = 0; j < qwd::kTile; ++j)
+            check(bits(sh.in.t[0][r][j]) == bits(rec[j]), "T", seq, b, h, r, j);
+          check(bits(sh.in.beta[0][r]) == bits(rec[qwd::kTile]), "write strength", seq, b, h, r, 0);
+          check(bits(sh.in.gc[0][r]) == bits(rec[qwd::kTile + 1]), "decay", seq, b, h, r, 0);
+        }
+        for (uint32_t f = 0; f <= qwd::kFacGamma; ++f)
+          check(bits(sh.fac[f]) == bits(p->fac[th * qwd::kFac + f]), "factors", seq, b, h, f, 0);
+        qwd::fused_keep(*p, s, b, h, vbase, par, sh);
+      }
+    }
 }
 
 void qwen_host_dn_keep(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {

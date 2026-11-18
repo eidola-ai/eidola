@@ -110,6 +110,7 @@ struct Fast {
     dn_intra: Kernel,
     dn_state: Kernel,
     dn_keep: Kernel,
+    dn_fused: Kernel,
     attention: QwenAttention,
     _modules: Vec<KernelModule>,
 }
@@ -216,6 +217,11 @@ impl CudaDevice {
                         "eidola_qwen_fast_dn_state",
                     )?,
                     dn_keep: bound::<DnChunkParams>(&d, FAST_DN_IMAGE, "eidola_qwen_fast_dn_keep")?,
+                    dn_fused: bound::<DnChunkParams>(
+                        &d,
+                        FAST_DN_IMAGE,
+                        "eidola_qwen_fast_dn_fused",
+                    )?,
                     attention: QwenAttention::from_module(a)?,
                     _modules: vec![f, sw, sp, b, q, d],
                 })
@@ -644,6 +650,18 @@ impl QwenKernels for CudaDevice {
             self.dn_state(p)?;
             self.dn_keep(p)
         }
+    }
+    unsafe fn dn_chunk_fused(&self, p: &DnChunkParams) -> Result<()> {
+        if p.seq_count == 0 {
+            return Ok(());
+        }
+        let g = dn_state_grid(p)?;
+        let f = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the blocked DeltaNet runs in the fast profile"))?;
+        // SAFETY: the caller's.
+        unsafe { self.go(&f.dn_fused, p, g) }
     }
     unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()> {
         if p.seq_count == 0 {

@@ -569,6 +569,7 @@ fn qwen_fast_deltanet_is_unfused_on_mma_sync() {
         assert_eq!(
             symbols,
             [
+                "eidola_qwen_fast_dn_fused",
                 "eidola_qwen_fast_dn_intra",
                 "eidola_qwen_fast_dn_keep",
                 "eidola_qwen_fast_dn_state"

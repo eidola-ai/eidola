@@ -178,6 +178,20 @@ impl QwenKernels for HostDevice {
         self.run("dn_state", p, dn_state_grid(p))?;
         self.run("dn_keep", p, dn_intra_grid(p))
     }
+    /// The fused form: the intra kernel's body into the scratch, then the fused form's own
+    /// intra body and keeping CTA by CTA (`qwen_host_dn_fused`: each block's shared
+    /// memory held to the scratch bit for bit, its kept positions into the tail cache, on
+    /// the fused form's premise that no run is longer than the ring), then the state
+    /// kernel's host form. The device's fused kernel is held to the unfused one's bits on
+    /// the device.
+    unsafe fn dn_chunk_fused(&self, p: &DnChunkParams) -> Result<()> {
+        if p.seq_count == 0 {
+            return Ok(());
+        }
+        self.run("dn_intra", p, dn_intra_grid(p))?;
+        self.run("dn_fused", p, dn_state_grid(p))?;
+        self.run("dn_state", p, dn_state_grid(p))
+    }
     /// The short form computes the general form's bits: the same host body.
     unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()> {
         if p.seq_count == 0 {

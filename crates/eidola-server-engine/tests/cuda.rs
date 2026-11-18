@@ -793,6 +793,9 @@ mod counting {
         unsafe fn dn_chunk(&self, p: &DnChunkParams) -> Result<()> {
             unsafe { self.inner.dn_chunk(p) }
         }
+        unsafe fn dn_chunk_fused(&self, p: &DnChunkParams) -> Result<()> {
+            unsafe { self.inner.dn_chunk_fused(p) }
+        }
         unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()> {
             unsafe { self.inner.dn_norm(p) }
         }

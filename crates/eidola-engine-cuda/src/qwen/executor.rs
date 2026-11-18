@@ -411,10 +411,13 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let tail_rows = dn_layers * (slots_n + 1) * tail_cap.max(1) as usize;
         let tails_conv = Alloc::new(&dev, tail_rows * dims.conv_dim() as usize * 4)?;
         let tails_ab = Alloc::new(&dev, tail_rows * 2 * dims.v_heads as usize * 4)?;
+        // The tail cache's ring holds a decode row's whole run (its folded positions,
+        // host token and drafts), so no launch keeps a position where it reads another.
+        let dn_rows = dn_layers * (slots_n + 1) * (tail_cap + 1 + k) as usize;
         let tails_dn = Alloc::new(
             &dev,
             if dev.block_deltanet() {
-                tail_rows * dims.chunk_entry() * 4
+                dn_rows * dims.chunk_entry() * 4
             } else {
                 8
             },
@@ -565,17 +568,25 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let cap = self.tail_ring() as usize;
         let layer_rows = self.tail_layer_rows();
         let mut r = Vec::new();
-        let mut arrays = vec![
+        let arrays = [
             (&self.tails_conv, self.dims.conv_dim() as usize * 4),
             (&self.tails_ab, 2 * self.dims.v_heads as usize * 4),
         ];
-        if self.blocked() {
-            arrays.push((&self.tails_dn, self.dims.chunk_entry() * 4));
-        }
         for (arr, row) in arrays {
             for l in 0..self.dn_layers() {
                 let at = (l * layer_rows + slot as usize * cap) * row;
                 r.push((arr.addr + at as u64, cap * row));
+            }
+        }
+        if self.blocked() {
+            let (ring, rows, row) = (
+                self.dn_ring() as usize,
+                self.dn_layer_rows(),
+                self.dims.chunk_entry() * 4,
+            );
+            for l in 0..self.dn_layers() {
+                let at = (l * rows + slot as usize * ring) * row;
+                r.push((self.tails_dn.addr + at as u64, ring * row));
             }
         }
         r
@@ -979,6 +990,17 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         self.tail_cap.max(1)
     }
 
+    /// Rows of a slot's tail cache ring (blocked DeltaNet): the longest run a decode row
+    /// computes, its tail's positions, its host token and every draft.
+    pub(super) fn dn_ring(&self) -> u32 {
+        self.tail_cap + 1 + self.cfg.draft_tokens
+    }
+
+    /// Rows of one layer's tail cache: every slot's ring.
+    pub(super) fn dn_layer_rows(&self) -> usize {
+        self.slot_count() * self.dn_ring() as usize
+    }
+
     fn tail_index(&self, slot: Slot, pos: u32) -> u32 {
         slot * self.tail_ring() + pos % self.tail_ring()
     }
@@ -1114,6 +1136,9 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let (blocked, chunk) = (self.blocked(), self.chunk());
         let mut tp = TargetPass::default();
         let (mut t, mut st, mut cv, mut tile) = (0u32, 0u32, 0u32, 0u32);
+        // A run longer than the tail cache ring (a prefill's) keeps a position where
+        // another block of its reads one: the launch takes the unfused form.
+        let mut long = false;
         for r in runs {
             let (f, nh, n) = (r.fold(), r.n_host(), r.n());
             assert!(
@@ -1144,6 +1169,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             if blocked {
                 let (cvn, stn) = self.blocked_staging(r, &mut tp, t, st, cv, tile);
                 tile += (f + n).div_ceil(chunk);
+                long |= f + n > self.dn_ring();
                 for j in 0..n {
                     let pos = r.start + j;
                     if pos >= r.tail_from {
@@ -1241,6 +1267,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         }
         tp.conv_rows = cv;
         tp.tiles = tile;
+        tp.fused = blocked && !long;
         tp
     }
 
@@ -1325,7 +1352,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             writes: n32(r.writes.len()),
             tile,
             pos0: r.src_pos,
-            tail_row: r.slot * self.tail_ring(),
+            tail_row: r.slot * self.dn_ring(),
             keep_from: if r.tail_from == u32::MAX {
                 u32::MAX
             } else {
@@ -1701,6 +1728,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         // and every new position into the tail kept.
         let t = &mut s.target;
         t.tiles = r * (fold + 1 + wu).div_ceil(self.chunk() as usize);
+        // A rung's rows are decode rows: each run within the tail cache ring.
+        t.fused = self.blocked();
         t.staged = if self.blocked() {
             r * (1 + wu)
         } else {

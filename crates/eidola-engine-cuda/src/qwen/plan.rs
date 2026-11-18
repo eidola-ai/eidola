@@ -129,6 +129,9 @@ pub struct TargetPass {
     pub conv_rows: u32,
     /// Blocks of the blocked DeltaNet the runs take.
     pub tiles: u32,
+    /// Whether every run fits the blocked DeltaNet's tail cache ring, so the launch may
+    /// take the fused form.
+    pub fused: bool,
 }
 
 impl TargetPass {
@@ -240,6 +243,8 @@ pub struct TargetShape {
     pub conv_rows: usize,
     /// Blocks of the blocked DeltaNet the launch's scratch is numbered for.
     pub tiles: usize,
+    /// The blocked DeltaNet in its fused form: every run fits the tail cache ring.
+    pub fused: bool,
     pub stage_conv: usize,
     pub stage_ab: usize,
     pub post_conv: usize,
@@ -334,6 +339,7 @@ impl Shape {
                 staged: t.window.len(),
                 conv_rows: t.conv_rows as usize,
                 tiles: t.tiles as usize,
+                fused: t.fused,
                 stage_conv: t.stage_conv.len(),
                 stage_ab: t.stage_ab.len(),
                 post_conv: t.post_conv.len(),
@@ -432,6 +438,7 @@ pub struct TargetAt {
     pub seqs: Arr,
     pub runs: usize,
     pub tiles: usize,
+    pub fused: bool,
     pub window: Arr,
     pub conv_rows: usize,
     pub stage_conv: ItemsAt,
@@ -546,6 +553,7 @@ impl Arena {
             seqs: self.arr(s.runs * SEQ_WORDS),
             runs: s.runs,
             tiles: s.tiles,
+            fused: s.fused,
             window: self.arr(s.staged),
             conv_rows: s.conv_rows,
             stage_conv: self.items(s.stage_conv),
@@ -721,6 +729,9 @@ fn target(words: &mut [u32], at: &TargetAt, t: &TargetPass, geo: &Geo, what: &st
     }
     if t.tiles as usize > at.tiles {
         return Err(refuse(format!("{what}: blocks past the shape")));
+    }
+    if at.fused && !t.fused {
+        return Err(refuse(format!("{what}: a run past the tail cache ring")));
     }
     // Positions past the plan's stage from conv row 0: computed, never read.
     let mut window = t.window.clone();

@@ -78,8 +78,14 @@ pub trait QwenKernels {
     /// [`Self::dn_rec`] over the same grid, faster when every run is a few positions
     /// (at most about [`DN_SHORT_RUN`]: a decode step, a draft check).
     unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()>;
-    /// The fast profile's blocked DeltaNet: the intra kernel, then the state kernel.
+    /// The fast profile's blocked DeltaNet: the intra kernel, the state kernel, then
+    /// the keep kernel.
     unsafe fn dn_chunk(&self, p: &DnChunkParams) -> Result<()>;
+    /// The blocked DeltaNet in one launch (`eidola_qwen_fast_dn_fused`): the bits of
+    /// [`Self::dn_chunk`] (asserted on the device) for a launch whose every run is at
+    /// most `ring` positions, so no position it keeps is one it reads. The executor
+    /// takes it for decode launches.
+    unsafe fn dn_chunk_fused(&self, p: &DnChunkParams) -> Result<()>;
     unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()>;
     unsafe fn widen(&self, p: &WidenParams) -> Result<()>;
     unsafe fn round(&self, p: &RoundParams) -> Result<()>;

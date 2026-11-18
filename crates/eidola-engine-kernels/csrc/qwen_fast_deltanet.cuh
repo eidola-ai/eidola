@@ -244,46 +244,77 @@ constexpr uint32_t kQK = kKey + 1;
 // The most value heads a key head groups.
 constexpr uint32_t kMaxGroup = 4;
 
-struct QD_ALIGN32 IntraShared {
+template <uint32_t G>
+struct QD_ALIGN32 IntraSharedOf {
   float q[kTile][kQK];
   float k[kTile][kQK];
   float kk[kTile][kTile];
   float qk[kTile][kTile];
-  float a[kMaxGroup][kTile][kTile];
-  float t[kMaxGroup][kTile][kTile];
-  float tc[kMaxGroup][kTile][kTile];
-  float tb[kMaxGroup][kTile][kTile];
-  float beta[kMaxGroup][kTile];
-  float g[kMaxGroup][kTile];
-  float gc[kMaxGroup][kTile];
-  float c[kMaxGroup][kTile];
+  float a[G][kTile][kTile];
+  float t[G][kTile][kTile];
+  float tc[G][kTile][kTile];
+  float tb[G][kTile][kTile];
+  float beta[G][kTile];
+  float g[G][kTile];
+  float gc[G][kTile];
+  float c[G][kTile];
   uint32_t seq;
   uint32_t found;
 };
+using IntraShared = IntraSharedOf<kMaxGroup>;
 
-// CTA (`x`, key head `kh`): block `x` of the launch, its key head's queries and
-// keys (and their TF32 roundings, and the keys, into the scratch), then all of
-// the key head's value heads at once: `W` (rounded to TF32), `U`, `P`, the
-// factors, and the rows of `T`, write strengths and cumulative decays the state
-// kernel keeps in the tail cache.
-template <class P>
-DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, const P& par,
-                          IntraShared& sh) {
-  find_run(p, x, par, sh.seq, sh.found);
-  if (sh.found == 0 || x >= p.tiles) return;
-  const QwDnSeq& s = p.seqs[sh.seq];
-  const uint32_t from = (x - s.tile) * p.chunk;
-  const uint32_t n = s.count - from < p.chunk ? s.count - from : p.chunk;
-  const uint32_t lo = cached_rows(s, from, n);
+// What a block's intra body computes: `heads` value heads of the key head from
+// `h0`, and `U`'s columns `c0 .. c0 + cols`.
+struct IntraSpan {
+  uint32_t h0, heads, c0, cols;
+};
+
+// The intra kernel's outputs: the launch's scratch.
+struct ScratchOut {
+  const QwDnChunkParams& p;
+  uint32_t x, h0;
+  uint64_t tk;
+  DS_FN void qk(uint32_t e, float q, float k, bool fresh, bool whole) const {
+    if (fresh) {
+      p.qr[tk + e] = tf32_rna(q);
+      p.kraw[tk + e] = k;
+    }
+    if (whole) p.kr[tk + e] = tf32_rna(k);
+  }
+  DS_FN void pm(uint32_t gi, uint32_t r, uint32_t j, float v) const {
+    p.pm[(tile_head(p, x, h0 + gi) * kTile + r) * kTile + j] = v;
+  }
+  DS_FN void fac(uint32_t gi, uint32_t at, float v) const {
+    p.fac[tile_head(p, x, h0 + gi) * kFac + at] = v;
+  }
+  DS_FN void rec(uint32_t gi, uint32_t r, uint32_t j, float v) const {
+    p.rec[(tile_head(p, x, h0 + gi) * kTile + r) * kRec + j] = v;
+  }
+  DS_FN void w(uint32_t gi, uint32_t r, uint32_t i, float v) const {
+    p.w[(tile_head(p, x, h0 + gi) * kTile + r) * kKey + i] = v;
+  }
+  DS_FN void u(uint32_t gi, uint32_t r, uint32_t c, float v) const {
+    p.u[(tile_head(p, x, h0 + gi) * kTile + r) * p.v_dim + c] = v;
+  }
+};
+
+// A block (run `s`'s positions `from .. from + n`, the first `lo` cached) for key
+// head `kh`: its queries and keys, then the span's value heads at once: `W` (rounded
+// to TF32), `U`, `P`, the factors, and the rows of `T`, write strengths and
+// cumulative decays the tail cache keeps, each element by the same arithmetic
+// whichever span and outputs compute it.
+template <uint32_t G, class P, class Out>
+DS_FN void intra_body(const QwDnChunkParams& p, const QwDnSeq& s, uint32_t from, uint32_t n,
+                      uint32_t lo, uint32_t kh, IntraSpan sp, const P& par,
+                      IntraSharedOf<G>& sh, const Out& out) {
   const bool whole = n == p.chunk;
   const uint32_t key_dim = p.k_heads * kKey;
-  const uint32_t group = p.v_heads / p.k_heads;
+  const uint32_t heads = sp.heads;
   const uint32_t tr = 2 * p.v_dim;  // a record's row of `T`
   // The key head's queries and keys (a cached row's key from the cache), and each
   // value head's write strengths and log decays (a cached row's cumulative decay and
   // row of `T` from the cache).
   par.run([&](uint32_t t) {
-    const uint64_t tk = tile_key(p, x, kh) * kTile * kKey;
     for (uint32_t e = t; e < kTile * kKey; e += kThreads) {
       const uint32_t r = e / kKey;
       const uint32_t i = e % kKey;
@@ -298,16 +329,12 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
       }
       sh.q[r][i] = q;
       sh.k[r][i] = k;
-      if (r >= lo && r < n) {
-        p.qr[tk + e] = tf32_rna(q);
-        p.kraw[tk + e] = k;
-      }
-      if (whole) p.kr[tk + e] = tf32_rna(k);
+      out.qk(e, q, k, r >= lo && r < n, whole);
     }
-    for (uint32_t e = t; e < group * kTile; e += kThreads) {
+    for (uint32_t e = t; e < heads * kTile; e += kThreads) {
       const uint32_t gi = e / kTile;
       const uint32_t r = e % kTile;
-      const uint32_t h = kh * group + gi;
+      const uint32_t h = sp.h0 + gi;
       float beta = 0.0f;
       float g = 0.0f;
       if (r < lo) {
@@ -322,11 +349,11 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
       sh.beta[gi][r] = beta;
       sh.g[gi][r] = g;
     }
-    for (uint32_t e = t; e < group * lo * kTile; e += kThreads) {
+    for (uint32_t e = t; e < heads * lo * kTile; e += kThreads) {
       const uint32_t gi = e / (lo * kTile);
       const uint32_t r = e / kTile % lo;
       const uint32_t j = e % kTile;
-      sh.t[gi][r][j] = rec_at(p, entry_at(p, s, from + r), kh * group + gi)[tr + j];
+      sh.t[gi][r][j] = rec_at(p, entry_at(p, s, from + r), sp.h0 + gi)[tr + j];
     }
   });
   // The new rows' dots, pair `e` = (r, j ≤ r) in row order; and each value head's
@@ -339,7 +366,7 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
       sh.kk[r][j] = dot128(sh.k[r], sh.k[j]);
       sh.qk[r][j] = dot128(sh.q[r], sh.k[j]);
     }
-    if (t < group) {
+    if (t < heads) {
       float acc = 0.0f;
       for (uint32_t r = 0; r < kTile; ++r) {
         if (r < lo) {
@@ -354,7 +381,7 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
     }
   });
   par.run([&](uint32_t t) {
-    for (uint32_t e = t; e < group * kTile * kTile; e += kThreads) {
+    for (uint32_t e = t; e < heads * kTile * kTile; e += kThreads) {
       const uint32_t gi = e / (kTile * kTile);
       const uint32_t r = e / kTile % kTile;
       const uint32_t j = e % kTile;
@@ -367,24 +394,23 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
         if (j < r) a = (sh.beta[gi][r] * sh.kk[r][j]) * d;
       }
       sh.a[gi][r][j] = a;
-      p.pm[(tile_head(p, x, kh * group + gi) * kTile + r) * kTile + j] = pv;
+      out.pm(gi, r, j, pv);
     }
-    for (uint32_t e = t; e < group * kTile; e += kThreads) {
+    for (uint32_t e = t; e < heads * kTile; e += kThreads) {
       const uint32_t gi = e / kTile;
       const uint32_t r = e % kTile;
       const float* gc = sh.gc[gi];
-      float* fac = p.fac + tile_head(p, x, kh * group + gi) * kFac;
       const float eg = ds::exp32(gc[r]);
       sh.c[gi][r] = sh.beta[gi][r] * eg;
-      fac[kFacG + r] = eg;
-      fac[kFacGL + r] = ds::exp32(gc[p.chunk - 1] - gc[r]);
-      if (r == 0) fac[kFacGamma] = ds::exp32(gc[p.chunk - 1]);
+      out.fac(gi, kFacG + r, eg);
+      out.fac(gi, kFacGL + r, ds::exp32(gc[p.chunk - 1] - gc[r]));
+      if (r == 0) out.fac(gi, kFacGamma, ds::exp32(gc[p.chunk - 1]));
     }
   });
   // T, a column a thread for every value head: column j reads only its own entries
   // above (the cached rows' as they were computed).
   par.run([&](uint32_t t) {
-    if (t < group * kTile) {
+    if (t < heads * kTile) {
       const uint32_t gi = t / kTile;
       const uint32_t j = t % kTile;
       for (uint32_t r = lo; r < kTile; ++r) {
@@ -401,21 +427,20 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
     }
   });
   par.run([&](uint32_t t) {
-    for (uint32_t e = t; e < group * kTile * kTile; e += kThreads) {
+    for (uint32_t e = t; e < heads * kTile * kTile; e += kThreads) {
       const uint32_t gi = e / (kTile * kTile);
       const uint32_t r = e / kTile % kTile;
       const uint32_t j = e % kTile;
       const bool in = j <= r && r >= lo && r < n;
       sh.tc[gi][r][j] = in ? sh.t[gi][r][j] * sh.c[gi][j] : 0.0f;
       sh.tb[gi][r][j] = in ? sh.t[gi][r][j] * sh.beta[gi][j] : 0.0f;
-      p.rec[(tile_head(p, x, kh * group + gi) * kTile + r) * kRec + j] = sh.t[gi][r][j];
+      out.rec(gi, r, j, sh.t[gi][r][j]);
     }
-    for (uint32_t e = t; e < group * kTile; e += kThreads) {
+    for (uint32_t e = t; e < heads * kTile; e += kThreads) {
       const uint32_t gi = e / kTile;
       const uint32_t r = e % kTile;
-      float* rs = p.rec + (tile_head(p, x, kh * group + gi) * kTile + r) * kRec;
-      rs[kTile] = sh.beta[gi][r];
-      rs[kTile + 1] = sh.gc[gi][r];
+      out.rec(gi, r, kTile, sh.beta[gi][r]);
+      out.rec(gi, r, kTile + 1, sh.gc[gi][r]);
     }
   });
   // W and U a column a thread, the column's rows in registers (the key column once for
@@ -424,21 +449,19 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
     for (uint32_t i = t; i < kKey; i += kThreads) {
       float col[kTile];
       for (uint32_t j = 0; j < kTile; ++j) col[j] = sh.k[j][i];
-      for (uint32_t gi = 0; gi < group; ++gi) {
-        float* w = p.w + tile_head(p, x, kh * group + gi) * kTile * kKey;
+      for (uint32_t gi = 0; gi < heads; ++gi) {
         for (uint32_t r = 0; r < kTile; ++r) {
           if (r < lo || r >= n) continue;
           float acc = 0.0f;
           for (uint32_t j = 0; j <= r; ++j) acc = acc + sh.tc[gi][r][j] * col[j];
-          w[r * kKey + i] = tf32_rna(acc);
+          out.w(gi, r, i, tf32_rna(acc));
         }
       }
     }
-    for (uint32_t e = t; e < group * p.v_dim; e += kThreads) {
-      const uint32_t gi = e / p.v_dim;
-      const uint32_t c = e % p.v_dim;
-      const uint32_t h = kh * group + gi;
-      float* u = p.u + tile_head(p, x, h) * kTile * p.v_dim;
+    for (uint32_t e = t; e < heads * sp.cols; e += kThreads) {
+      const uint32_t gi = e / sp.cols;
+      const uint32_t c = sp.c0 + e % sp.cols;
+      const uint32_t h = sp.h0 + gi;
       float col[kTile];
       for (uint32_t j = 0; j < kTile; ++j) {
         float v = 0.0f;
@@ -453,10 +476,26 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
         if (r < lo || r >= n) continue;
         float acc = 0.0f;
         for (uint32_t j = 0; j <= r; ++j) acc = acc + sh.tb[gi][r][j] * col[j];
-        u[r * p.v_dim + c] = acc;
+        out.u(gi, r, c, acc);
       }
     }
   });
+}
+
+// CTA (`x`, key head `kh`) of the intra kernel: block `x` of the launch, its key
+// head's whole group of value heads and every column, into the scratch.
+template <class P>
+DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, const P& par,
+                          IntraShared& sh) {
+  find_run(p, x, par, sh.seq, sh.found);
+  if (sh.found == 0 || x >= p.tiles) return;
+  const QwDnSeq& s = p.seqs[sh.seq];
+  const uint32_t from = (x - s.tile) * p.chunk;
+  const uint32_t n = s.count - from < p.chunk ? s.count - from : p.chunk;
+  const uint32_t lo = cached_rows(s, from, n);
+  const uint32_t group = p.v_heads / p.k_heads;
+  const ScratchOut out{p, x, kh * group, tile_key(p, x, kh) * kTile * kKey};
+  intra_body(p, s, from, n, lo, kh, IntraSpan{kh * group, group, 0, p.v_dim}, par, sh, out);
 }
 
 // ---- the state kernel (`eidola_qwen_fast_dn_state`) ----
@@ -494,6 +533,91 @@ struct QD_ALIGN32 StateShared {
   float cd[kTile][kUP];  // the cached rows' `Δ`, the slice's columns
   float d[kThreads / 32][16][kDP];
 };
+
+// ---- the fused form (`eidola_qwen_fast_dn_fused`) ----
+//
+// One launch for a decode step: a CTA per (run, 64 value columns, value head), the
+// state kernel's, computes each of its run's blocks' intra body for its value head
+// and its columns of `U` (`intra_body`, one head, into shared memory), then the
+// state kernel's block (the same code), then keeps the block's kept positions in
+// the tail cache. Every element is the arithmetic of the unfused form's, so the
+// bits are the same. It is for launches whose every run is at most the ring's
+// positions: no position it keeps is one another CTA of the launch reads.
+
+struct QD_ALIGN32 FusedShared {
+  IntraSharedOf<1> in;
+  float w[kTile][kWP];
+  float u[kTile][kUP];
+  float pm[kTile][kTile];
+  float fac[kFac];
+  float cd[kTile][kUP];  // the cached rows' `Δ`, the slice's columns
+  float d[kThreads / 32][16][kDP];
+};
+
+// The fused form's intra outputs: its shared memory (`U`'s columns from `c0`).
+struct FusedOut {
+  FusedShared& sh;
+  uint32_t c0;
+  DS_FN void qk(uint32_t, float, float, bool, bool) const {}
+  DS_FN void pm(uint32_t, uint32_t r, uint32_t j, float v) const { sh.pm[r][j] = v; }
+  DS_FN void fac(uint32_t, uint32_t at, float v) const { sh.fac[at] = v; }
+  DS_FN void rec(uint32_t, uint32_t, uint32_t, float) const {}
+  DS_FN void w(uint32_t, uint32_t r, uint32_t i, float v) const { sh.w[r][i] = v; }
+  DS_FN void u(uint32_t, uint32_t r, uint32_t c, float v) const { sh.u[r][c - c0] = v; }
+};
+
+// Block `b` of run `s` for value head `h` and the columns from `vbase`: `W`'s and
+// `U`'s rows outside the new ones zero (the unfused state kernel's zero fill), the
+// cached rows' `Δ`, then the intra body.
+template <class P>
+DS_FN void fused_intra(const QwDnChunkParams& p, const QwDnSeq& s, uint32_t b, uint32_t h,
+                       uint32_t vbase, const P& par, FusedShared& sh) {
+  const uint32_t from = b * p.chunk;
+  const uint32_t n = s.count - from < p.chunk ? s.count - from : p.chunk;
+  const uint32_t lo = cached_rows(s, from, n);
+  const uint32_t cols = p.v_dim - vbase < kSlice ? p.v_dim - vbase : kSlice;
+  par.run([&](uint32_t t) {
+    for (uint32_t e = t; e < kTile * kWP; e += kThreads) sh.w[e / kWP][e % kWP] = 0.0f;
+    for (uint32_t e = t; e < kTile * kUP; e += kThreads) {
+      const uint32_t r = e / kUP;
+      const uint32_t c = e % kUP;
+      sh.u[r][c] = 0.0f;
+      if (r < lo && c < cols) sh.cd[r][c] = rec_at(p, entry_at(p, s, from + r), h)[p.v_dim + vbase + c];
+    }
+  });
+  intra_body(p, s, from, n, lo, h / (p.v_heads / p.k_heads), IntraSpan{h, 1, vbase, cols}, par,
+             sh.in, FusedOut{sh, vbase});
+}
+
+// After block `b`'s state step: its kept positions' value columns, and from the first
+// slice their row of `T`, `β`, `G` and (the key head's first value head) key, into
+// the tail cache, from the intra body's shared memory (the state step wrote `Δ`).
+template <class P>
+DS_FN void fused_keep(const QwDnChunkParams& p, const QwDnSeq& s, uint32_t b, uint32_t h,
+                      uint32_t vbase, const P& par, const FusedShared& sh) {
+  const uint32_t from = b * p.chunk;
+  const uint32_t n = s.count - from < p.chunk ? s.count - from : p.chunk;
+  const uint32_t lo = cached_rows(s, from, n);
+  const uint32_t cols = p.v_dim - vbase < kSlice ? p.v_dim - vbase : kSlice;
+  const uint32_t group = p.v_heads / p.k_heads;
+  const uint32_t kh = h / group;
+  par.run([&](uint32_t t) {
+    for (uint32_t r = lo; r < n; ++r) {
+      if (from + r < s.keep_from) continue;
+      float* entry = entry_at(p, s, from + r);
+      float* rec = rec_at(p, entry, h);
+      const uint64_t at = staged_at(s, from + r);
+      for (uint32_t c = t; c < cols; c += kThreads)
+        rec[vbase + c] = p.v[(at * p.v_heads + h) * p.v_dim + vbase + c];
+      if (vbase != 0) continue;
+      for (uint32_t j = t; j < kTile + 2; j += kThreads)
+        rec[2 * p.v_dim + j] = j < kTile ? sh.in.t[0][r][j]
+                                         : (j == kTile ? sh.in.beta[0][r] : sh.in.gc[0][r]);
+      if (h % group != 0) continue;
+      for (uint32_t i = t; i < kKey; i += kThreads) entry[kh * kKey + i] = sh.in.k[r][i];
+    }
+  });
+}
 
 // The stores due once `done` positions have run (`done` a block boundary: the
 // state exists nowhere else), from a host array `st[key][column]` of the

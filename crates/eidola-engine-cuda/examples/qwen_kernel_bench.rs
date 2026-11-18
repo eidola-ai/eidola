@@ -42,8 +42,9 @@
 //! - `dn_chunk`: the fast profile's blocked DeltaNet at the same width, blocks of 16
 //!   (both kernels, and the intra kernel alone): prefills of 2,048 positions as one, two
 //!   and four runs, one of 10,240 and 64 of 1,760 (tokens a second a layer, and the
-//!   48 layers' time); one and 64 decode rows of one new position each, with 0, 7 and 15
-//!   of its block's positions before it read from the tail cache;
+//!   48 layers' time); 1, 8 and 64 decode rows of one new position each, and of one and
+//!   three drafts, with 0, 7 and 15 of its block's positions before it read from the tail
+//!   cache, in the unfused form (its three kernels) and the fused one (`fused_us`);
 //! - `cipher`: the idle cipher over one 157 MB state image;
 //! - `host`: a 157 MB image to and from page-locked host memory.
 //!
@@ -413,9 +414,16 @@ fn main() {
         (1, 0, 10240),
         (64, 0, 1760),
         (1, 0, 1),
+        (1, 7, 1),
+        (1, 15, 1),
+        (1, 7, 4),
+        (8, 0, 1),
+        (8, 7, 1),
+        (8, 15, 1),
         (64, 0, 1),
         (64, 7, 1),
         (64, 15, 1),
+        (64, 7, 4),
     ] {
         let mut tile = 0;
         let seqs: Vec<DnSeq> = (0..rows)
@@ -493,9 +501,16 @@ fn main() {
         let state = time(&fast, n, || {
             unsafe { fast.dn_state(&p) }.unwrap_or_else(|e| fail(e))
         });
+        // The fused form, for runs within the ring.
+        let fused = (fold + outs <= ring).then(|| {
+            time(&fast, n, || {
+                unsafe { fast.dn_chunk_fused(&p) }.unwrap_or_else(|e| fail(e))
+            }) * 1e6
+        });
+        let fused = fused.map_or("null".to_string(), |f| format!("{f:.1}"));
         let tokens = f64::from(outs * rows);
         println!(
-            "{{\"bench\":\"dn_chunk\",\"rows\":{rows},\"fold\":{fold},\"outputs\":{outs},\"us_per_layer\":{:.1},\"intra_us\":{:.1},\"state_us\":{:.1},\"keep_us\":{:.1},\"tokens_per_s_per_layer\":{:.0},\"ms_48_layers\":{:.3}}}",
+            "{{\"bench\":\"dn_chunk\",\"rows\":{rows},\"fold\":{fold},\"outputs\":{outs},\"us_per_layer\":{:.1},\"intra_us\":{:.1},\"state_us\":{:.1},\"keep_us\":{:.1},\"fused_us\":{fused},\"tokens_per_s_per_layer\":{:.0},\"ms_48_layers\":{:.3}}}",
             s * 1e6,
             intra * 1e6,
             state * 1e6,

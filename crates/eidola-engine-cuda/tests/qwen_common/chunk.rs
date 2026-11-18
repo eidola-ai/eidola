@@ -338,6 +338,7 @@ impl HeadOwned {
 pub struct Tail {
     pub buf: Buf,
     pub ring: usize,
+    floats: usize,
 }
 
 impl Tail {
@@ -346,7 +347,13 @@ impl Tail {
         Tail {
             buf: zeros(dev, slots * ring * entry * 4),
             ring,
+            floats: slots * ring * entry,
         }
+    }
+
+    /// Floats the cache holds.
+    pub fn buf_floats(&self) -> usize {
+        self.floats
     }
 }
 
@@ -397,6 +404,19 @@ pub fn launch<D: QwenDevice>(
     runs: &[RunSpec],
     chunk: usize,
     tail: &Tail,
+) -> Result<Launched, String> {
+    launch_in(dev, inp, runs, chunk, tail, false)
+}
+
+/// [`launch`] in the form named: the fused one (`dn_chunk_fused`, for runs within the ring)
+/// or the unfused one.
+pub fn launch_in<D: QwenDevice>(
+    dev: &D,
+    inp: &Inputs,
+    runs: &[RunSpec],
+    chunk: usize,
+    tail: &Tail,
+    fused: bool,
 ) -> Result<Launched, String> {
     let positions = (inp.q.len() / (inp.k_heads * KD)).max(1);
     let sl = inp.state_len();
@@ -482,7 +502,11 @@ pub fn launch<D: QwenDevice>(
         ring: u(tail.ring),
     };
     // SAFETY: the buffers hold what the struct names.
-    unsafe { dev.dn_chunk(&p) }.map_err(|e| e.to_string())?;
+    if fused {
+        unsafe { dev.dn_chunk_fused(&p) }.map_err(|e| e.to_string())?;
+    } else {
+        unsafe { dev.dn_chunk(&p) }.map_err(|e| e.to_string())?;
+    }
     dev.synchronize().map_err(|e| e.to_string())?;
     Ok(Launched {
         out: read::<D, f32>(dev, &ob, positions * inp.v_heads * inp.vd),
@@ -969,6 +993,124 @@ pub fn invariant<D: QwenDevice>(dev: &D, seed: u64, len: usize) -> Result<String
             )?;
         }
         checked += len;
+    }
+    Ok(format!("{checked} positions"))
+}
+
+/// The fused form against the unfused one, bit for bit: `rows` sequences in one launch a
+/// step, each served as the executor serves it over its own slot (a committed position
+/// and three drafts a step, accepting none to all, so its folds take every value up to the
+/// tail's), at every geometry; once in each form over its own tail cache: every step's
+/// outputs, every state stored, and the two tail caches at the end.
+pub fn fused_equals_unfused<D: QwenDevice>(
+    dev: &D,
+    seed: u64,
+    rows: &[usize],
+) -> Result<String, String> {
+    struct Seq {
+        base: usize,
+        start: usize,
+        state: Option<Vec<f32>>,
+    }
+    let mut g = Lcg(seed);
+    let mut checked = 0usize;
+    for (dims, chunk) in GEOMETRIES {
+        for &rn in rows {
+            let len = 3 * chunk + 5;
+            let inp = Inputs::new(&mut g, len + rn, dims);
+            let wide = inp.v_heads * inp.vd;
+            // The executor's ring: a decode row's whole run (its tail, host token, drafts).
+            let ring = chunk - 1 + 3 + 1 + 3;
+            let what = format!("{dims:?} at {chunk}, {rn} rows");
+            let tails = [
+                Tail::new(dev, &inp, rn, ring),
+                Tail::new(dev, &inp, rn, ring),
+            ];
+            let mut seqs: [Vec<Seq>; 2] = std::array::from_fn(|_| {
+                (0..rn)
+                    .map(|_| Seq {
+                        base: 0,
+                        start: 0,
+                        state: None,
+                    })
+                    .collect()
+            });
+            let mut step = 0usize;
+            loop {
+                let live: Vec<usize> = (0..rn).filter(|&i| seqs[0][i].start < len).collect();
+                if live.is_empty() {
+                    break;
+                }
+                let mut outs = Vec::new();
+                let mut stored = Vec::new();
+                for form in 0..2 {
+                    let mut staged = inp_shape(&inp);
+                    let mut runs = Vec::new();
+                    let mut spans = Vec::new();
+                    for &i in &live {
+                        let sq = &seqs[form][i];
+                        let drafts = 3.min(len - sq.start - 1);
+                        let n = 1 + drafts;
+                        let host_end = sq.start + 1;
+                        let new_base = host_end / chunk * chunk;
+                        let first = staged.beta.len() / inp.v_heads;
+                        // Sequence `i` is the inputs from position `i` on.
+                        append(&mut staged, &inp, i + sq.start, n);
+                        runs.push(RunSpec {
+                            first,
+                            cached: sq.start - sq.base,
+                            new: n,
+                            src: sq.state.clone(),
+                            writes: if new_base > sq.base {
+                                vec![new_base - sq.base]
+                            } else {
+                                Vec::new()
+                            },
+                            pos0: sq.base,
+                            slot: i,
+                            keep_from: new_base - sq.base,
+                        });
+                        spans.push((first, n, new_base));
+                    }
+                    let r = launch_in(dev, &staged, &runs, chunk, &tails[form], form == 1)?;
+                    let mut o = Vec::new();
+                    let mut st = Vec::new();
+                    for (k, &i) in live.iter().enumerate() {
+                        let (first, n, new_base) = spans[k];
+                        o.push(r.out[first * wide..(first + n) * wide].to_vec());
+                        let sq = &mut seqs[form][i];
+                        if !runs[k].writes.is_empty() {
+                            sq.state = Some(r.states[k][0].clone());
+                            sq.base = new_base;
+                            st.push(sq.state.clone().expect("a state"));
+                        }
+                        // Accept none to all of the drafts, by step and sequence.
+                        let accepted = ((step + i) % 4).min(n - 1);
+                        sq.start += 1 + accepted;
+                    }
+                    outs.push(o);
+                    stored.push(st);
+                }
+                for (k, &i) in live.iter().enumerate() {
+                    same(
+                        &format!("{what}: step {step}, sequence {i}: outputs"),
+                        &outs[1][k],
+                        &outs[0][k],
+                    )?;
+                    checked += outs[0][k].len() / wide;
+                }
+                for (w, (a, b)) in stored[1].iter().zip(&stored[0]).enumerate() {
+                    same(&format!("{what}: step {step}: state {w}"), a, b)?;
+                }
+                step += 1;
+            }
+            let n = tails[0].buf_floats();
+            same(
+                &format!("{what}: the tail caches"),
+                &read::<D, f32>(dev, &tails[1].buf, n),
+                &read::<D, f32>(dev, &tails[0].buf, n),
+            )?;
+        }
     }
     Ok(format!("{checked} positions"))
 }

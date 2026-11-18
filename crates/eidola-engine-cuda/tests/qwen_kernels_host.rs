@@ -74,6 +74,10 @@ fn qwen_kernel_bodies_equal_the_model_crate() {
         "blocked deltanet reproducible",
         chunk::invariant(&dev, 23, 70),
     ));
+    outcomes.push((
+        "blocked deltanet fused form",
+        chunk::fused_equals_unfused(&dev, 24, &[1, 3]),
+    ));
     for (name, outcome) in outcomes {
         match outcome {
             Ok(report) => eprintln!("ok      {name} {report}"),

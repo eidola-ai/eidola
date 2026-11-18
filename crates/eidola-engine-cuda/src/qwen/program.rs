@@ -901,7 +901,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             let tiles = at.tiles;
             assert!(tiles <= s.caps.tiles, "the blocked DeltaNet's scratch");
             let entry = self.dims.chunk_entry() * 4;
-            let tail = self.tails_dn.addr + (dn * self.tail_layer_rows() * entry) as u64;
+            let tail = self.tails_dn.addr + (dn * self.dn_layer_rows() * entry) as u64;
             let ch = DnChunkParams {
                 seqs: self.tw(at.seqs),
                 q: s.dq.addr,
@@ -927,13 +927,18 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 k_dim: d.k_dim,
                 v_dim: d.v_dim,
                 chunk: self.chunk(),
-                ring: self.tail_ring(),
+                ring: self.dn_ring(),
             };
             // SAFETY: as below; the scratch holds `tiles` blocks (asserted), and every run's
-            // blocks are numbered within them by the pass.
+            // blocks are numbered within them by the pass; the fused form's runs are within
+            // the tail cache ring (the pass's, or the rung's by its rows, checked at pack).
             unsafe {
                 self.dev.dn_prep(&prep)?;
-                self.dev.dn_chunk(&ch)?;
+                if at.fused {
+                    self.dev.dn_chunk_fused(&ch)?;
+                } else {
+                    self.dev.dn_chunk(&ch)?;
+                }
             }
         }
         let rec = DnRecParams {

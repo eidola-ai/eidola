@@ -131,13 +131,148 @@ __device__ __forceinline__ void issue_rest(const QwDnChunkParams& p, const QwDnS
   }
 }
 
+// Xᵀ = Sᵀ Wᵀ and Yᵀ = Sᵀ qᵀ for a warp's 16 columns by the block's 16 rows: `wq(r, c,
+// w0, w1, q0, q1)` gives the right operands' TF32 bits at row `r`, columns `c, c + 1`.
+template <class WQ>
+__device__ __forceinline__ void xy_products(const float (&st)[16][4], uint32_t g, uint32_t q4,
+                                            float (&x)[2][4], float (&y)[2][4], const WQ& wq) {
+#pragma unroll
+  for (uint32_t ks = 0; ks < 16; ++ks) {
+    const uint32_t a[4] = {tf32(st[ks][0]), tf32(st[ks][2]), tf32(st[ks][1]), tf32(st[ks][3])};
+#pragma unroll
+    for (uint32_t nt = 0; nt < 2; ++nt) {
+      uint32_t w0, w1, q0, q1;
+      wq(8 * nt + g, 8 * ks + 2 * q4, w0, w1, q0, q1);
+      mma(x[nt], a, w0, w1);
+      mma(y[nt], a, q0, q1);
+    }
+  }
+}
+
+// The rest of a block for a warp's 16 columns: Δ = U − X (a cached row's from `cd`, a
+// kept new row's into the tail cache) into the warp's rows of `d`, the outputs, and for a
+// whole block the update; `kb(j, c)` gives the rounded keys' TF32 bits. `sh` holds `u`,
+// `cd`, `pm`, `fac` and `d`.
+template <class Sh, class KB>
+__device__ __forceinline__ void block_rest(const QwDnChunkParams& p, const QwDnSeq& s,
+                                           const Rows& rw, uint32_t h, uint32_t wp, uint32_t v0,
+                                           uint32_t g, uint32_t q4, float (&st)[16][4],
+                                           float (&x)[2][4], const float (&y)[2][4], Sh& sh,
+                                           const KB& kb) {
+  const uint32_t from = rw.from;
+  const uint32_t n = rw.n;
+  float(*dw)[qwd::kDP] = sh.d[wp];
+#pragma unroll
+  for (uint32_t nt = 0; nt < 2; ++nt) {
+    const uint32_t r = 8 * nt + 2 * q4;
+#pragma unroll
+    for (uint32_t e = 0; e < 4; ++e) {
+      const uint32_t rr = r + (e & 1);
+      const uint32_t vl = g + 8 * (e >> 1);
+      float d = sh.u[rr][16 * wp + vl] - x[nt][e];
+      if (rr < rw.lo) {
+        d = sh.cd[rr][16 * wp + vl];
+      } else if (rr < n && from + rr >= s.keep_from) {
+        qwd::rec_at(p, qwd::entry_at(p, s, from + rr), h)[p.v_dim + v0 + vl] = d;
+      }
+      x[nt][e] = d;
+    }
+    *reinterpret_cast<float2*>(&dw[g][r]) = make_float2(x[nt][0], x[nt][1]);
+    *reinterpret_cast<float2*>(&dw[g + 8][r]) = make_float2(x[nt][2], x[nt][3]);
+  }
+  __syncwarp();
+  // o = exp(G) · Y + Z for the rows that produce outputs.
+#pragma unroll
+  for (uint32_t nt = 0; nt < 2; ++nt)
+#pragma unroll
+    for (uint32_t e = 0; e < 4; ++e) {
+      const uint32_t r = 8 * nt + 2 * q4 + (e & 1);
+      const uint32_t vl = g + 8 * (e >> 1);
+      if (r < n && from + r >= s.out_from) {
+        const float o = sh.fac[qwd::kFacG + r] * y[nt][e] + qwd::ztree(sh.pm[r], dw[vl]);
+        const uint64_t pos = qwd::staged_at(s, from + r);
+        p.out[(pos * p.v_heads + h) * p.v_dim + v0 + vl] = ds::bf16_round(o);
+      }
+    }
+  if (n == p.chunk) {
+    // Sᵀ ← Sᵀ · γ + Δ′ᵀ K, Δ′ = exp(G_{L−1} − G) · Δ on the block's rows.
+    uint32_t a[2][4];
+#pragma unroll
+    for (uint32_t nt = 0; nt < 2; ++nt) {
+      float dl[4];
+#pragma unroll
+      for (uint32_t e = 0; e < 4; ++e) {
+        const uint32_t r = 8 * nt + 2 * q4 + (e & 1);
+        dl[e] = r < n ? sh.fac[qwd::kFacGL + r] * x[nt][e] : 0.0f;
+      }
+      a[nt][0] = tf32(dl[0]);
+      a[nt][1] = tf32(dl[2]);
+      a[nt][2] = tf32(dl[1]);
+      a[nt][3] = tf32(dl[3]);
+    }
+    const float gamma = sh.fac[qwd::kFacGamma];
+#pragma unroll
+    for (uint32_t nt = 0; nt < 16; ++nt) {
+      float dd[4] = {};
+#pragma unroll
+      for (uint32_t ks = 0; ks < 2; ++ks) {
+        const uint32_t j = 8 * ks + 2 * q4;
+        mma(dd, a[ks], kb(j, 8 * nt + g), kb(j + 1, 8 * nt + g));
+      }
+#pragma unroll
+      for (uint32_t e = 0; e < 4; ++e) st[nt][e] = st[nt][e] * gamma + dd[e];
+    }
+  }
+}
+
+// A slice of the state into registers (`st[nt][e]`: key `8 nt + 2t + (e & 1)`, column
+// `g + 8 (e >> 1)` of the warp's 16), zeros without a source.
+__device__ __forceinline__ void load_state(const QwDnChunkParams& p, const QwDnSeq& s, uint32_t h,
+                                           uint32_t v0, bool active, uint32_t g, uint32_t q4,
+                                           float (&st)[16][4]) {
+  const float* src = s.src != 0 ? qwd::state_at(s.src, p.state_offset) : nullptr;
+#pragma unroll
+  for (uint32_t nt = 0; nt < 16; ++nt)
+#pragma unroll
+    for (uint32_t e = 0; e < 4; ++e) {
+      const uint32_t k = 8 * nt + 2 * q4 + (e & 1);
+      const uint32_t v = v0 + g + 8 * (e >> 1);
+      st[nt][e] = active && src != nullptr ? src[qwd::state_index(h, k, v, p.v_dim)] : 0.0f;
+    }
+}
+
+// The stores due once `done` positions have run, of the warp's slice of the state. A
+// store's address and stride pass through an empty `asm volatile`: stores are rare, and
+// their 64 offsets hoisted out of the block loop would hold registers across it.
+__device__ __forceinline__ void state_stores(const QwDnChunkParams& p, const QwDnSeq& s,
+                                             uint32_t done, uint32_t h, uint32_t v0, bool active,
+                                             uint32_t g, uint32_t q4, const float (&st)[16][4]) {
+  auto store = [&](uint64_t addr) {
+    if (!active) return;
+    uint64_t at = addr + p.state_offset + qwd::state_index(h, 2 * q4, v0 + g, p.v_dim) * 4;
+    uint64_t row = static_cast<uint64_t>(p.v_dim) * 4;
+    asm volatile("" : "+l"(at), "+l"(row));
+#pragma unroll
+    for (uint32_t nt = 0; nt < 16; ++nt) {
+      float* r0 = reinterpret_cast<float*>(at);
+      float* r1 = reinterpret_cast<float*>(at + row);
+      r0[0] = st[nt][0];
+      r1[0] = st[nt][1];
+      r0[8] = st[nt][2];
+      r1[8] = st[nt][3];
+      at += 8 * row;
+    }
+  };
+  if (s.live != 0 && s.live_after == done) store(s.live);
+  for (uint32_t w = 0; w < s.writes && w < 4; ++w)
+    if (s.write_after[w] == done) store(s.write_dst[w]);
+}
+
 }  // namespace
 
 // A CTA per (run, 64 value columns, value head): four warps, each 16 columns of
-// the state slice in registers (`st[nt][e]`: key `8 nt + 2t + (e & 1)`, column
-// `g + 8 (e >> 1)` of the warp's 16), three barriers a block, the next block's
-// operands copied in while this one finishes; at most 128 registers a thread,
-// four CTAs an SM.
+// the state slice in registers, three barriers a block, the next block's operands
+// copied in while this one finishes; at most 128 registers a thread, four CTAs an SM.
 extern "C" __global__ void __launch_bounds__(qwd::kThreads, 4)
     eidola_qwen_fast_dn_state(const __grid_constant__ QwDnChunkParams p) {
   __shared__ qwd::StateShared sh;
@@ -163,63 +298,25 @@ extern "C" __global__ void __launch_bounds__(qwd::kThreads, 4)
     cp_commit();
   }
   float st[16][4];
-  {
-    const float* src = s.src != 0 ? qwd::state_at(s.src, p.state_offset) : nullptr;
-#pragma unroll
-    for (uint32_t nt = 0; nt < 16; ++nt)
-#pragma unroll
-      for (uint32_t e = 0; e < 4; ++e) {
-        const uint32_t k = 8 * nt + 2 * q4 + (e & 1);
-        const uint32_t v = v0 + g + 8 * (e >> 1);
-        st[nt][e] = active && src != nullptr ? src[qwd::state_index(h, k, v, p.v_dim)] : 0.0f;
-      }
-  }
-  // A store's address and stride pass through an empty `asm volatile`: stores are rare,
-  // and their 64 offsets hoisted out of the block loop would hold registers across it.
-  auto store = [&](uint64_t addr) {
-    if (!active) return;
-    uint64_t at = addr + p.state_offset + qwd::state_index(h, 2 * q4, v0 + g, p.v_dim) * 4;
-    uint64_t row = static_cast<uint64_t>(p.v_dim) * 4;
-    asm volatile("" : "+l"(at), "+l"(row));
-#pragma unroll
-    for (uint32_t nt = 0; nt < 16; ++nt) {
-      float* r0 = reinterpret_cast<float*>(at);
-      float* r1 = reinterpret_cast<float*>(at + row);
-      r0[0] = st[nt][0];
-      r1[0] = st[nt][1];
-      r0[8] = st[nt][2];
-      r1[8] = st[nt][3];
-      at += 8 * row;
-    }
-  };
-  auto stores = [&](uint32_t done) {
-    if (s.live != 0 && s.live_after == done) store(s.live);
-    for (uint32_t w = 0; w < s.writes && w < 4; ++w)
-      if (s.write_after[w] == done) store(s.write_dst[w]);
-  };
-  stores(0);
+  load_state(p, s, h, v0, active, g, q4, st);
+  state_stores(p, s, 0, h, v0, active, g, q4, st);
   for (uint32_t b = 0; b < nb; ++b) {
     const Rows rw = rows_of(p, s, b);
-    const uint32_t from = rw.from;
-    const uint32_t n = rw.n;
-    const bool whole = n == p.chunk;
     cp_wait();
     __syncthreads();
-    // Xᵀ = Sᵀ Wᵀ and Yᵀ = Sᵀ qᵀ: the warp's 16 columns by the block's 16 rows.
     float x[2][4] = {};
     float y[2][4] = {};
     if (active) {
-#pragma unroll
-      for (uint32_t ks = 0; ks < 16; ++ks) {
-        const uint32_t a[4] = {tf32(st[ks][0]), tf32(st[ks][2]), tf32(st[ks][1]), tf32(st[ks][3])};
-#pragma unroll
-        for (uint32_t nt = 0; nt < 2; ++nt) {
-          const float2 wv = *reinterpret_cast<const float2*>(&sh.w[8 * nt + g][8 * ks + 2 * q4]);
-          const float2 qv = *reinterpret_cast<const float2*>(&sh.q[8 * nt + g][8 * ks + 2 * q4]);
-          mma(x[nt], a, __float_as_uint(wv.x), __float_as_uint(wv.y));
-          mma(y[nt], a, __float_as_uint(qv.x), __float_as_uint(qv.y));
-        }
-      }
+      xy_products(st, g, q4, x, y,
+                  [&](uint32_t r, uint32_t c, uint32_t& w0, uint32_t& w1, uint32_t& q0,
+                      uint32_t& q1) {
+                    const float2 wv = *reinterpret_cast<const float2*>(&sh.w[r][c]);
+                    const float2 qv = *reinterpret_cast<const float2*>(&sh.q[r][c]);
+                    w0 = __float_as_uint(wv.x);
+                    w1 = __float_as_uint(wv.y);
+                    q0 = __float_as_uint(qv.x);
+                    q1 = __float_as_uint(qv.y);
+                  });
     }
     __syncthreads();
     if (b + 1 < nb) {
@@ -227,74 +324,11 @@ extern "C" __global__ void __launch_bounds__(qwd::kThreads, 4)
       cp_commit();
     }
     if (active) {
-      float(*dw)[qwd::kDP] = sh.d[wp];
-      // Δ = U − X (a cached row's as it was computed, a kept new row's into the tail
-      // cache), into the warp's rows of `d` (column-major there: `dw[v][r]`).
-#pragma unroll
-      for (uint32_t nt = 0; nt < 2; ++nt) {
-        const uint32_t r = 8 * nt + 2 * q4;
-#pragma unroll
-        for (uint32_t e = 0; e < 4; ++e) {
-          const uint32_t rr = r + (e & 1);
-          const uint32_t vl = g + 8 * (e >> 1);
-          float d = sh.u[rr][16 * wp + vl] - x[nt][e];
-          if (rr < rw.lo) {
-            d = sh.cd[rr][16 * wp + vl];
-          } else if (rr < n && from + rr >= s.keep_from) {
-            qwd::rec_at(p, qwd::entry_at(p, s, from + rr), h)[p.v_dim + v0 + vl] = d;
-          }
-          x[nt][e] = d;
-        }
-        *reinterpret_cast<float2*>(&dw[g][r]) = make_float2(x[nt][0], x[nt][1]);
-        *reinterpret_cast<float2*>(&dw[g + 8][r]) = make_float2(x[nt][2], x[nt][3]);
-      }
-      __syncwarp();
-      // o = exp(G) · Y + Z for the rows that produce outputs.
-#pragma unroll
-      for (uint32_t nt = 0; nt < 2; ++nt)
-#pragma unroll
-        for (uint32_t e = 0; e < 4; ++e) {
-          const uint32_t r = 8 * nt + 2 * q4 + (e & 1);
-          const uint32_t vl = g + 8 * (e >> 1);
-          if (r < n && from + r >= s.out_from) {
-            const float o = sh.fac[qwd::kFacG + r] * y[nt][e] + qwd::ztree(sh.pm[r], dw[vl]);
-            const uint64_t pos = qwd::staged_at(s, from + r);
-            p.out[(pos * p.v_heads + h) * p.v_dim + v0 + vl] = ds::bf16_round(o);
-          }
-        }
-      if (whole) {
-        // Sᵀ ← Sᵀ · γ + Δ′ᵀ K, Δ′ = exp(G_{L−1} − G) · Δ on the block's rows.
-        uint32_t a[2][4];
-#pragma unroll
-        for (uint32_t nt = 0; nt < 2; ++nt) {
-          float dl[4];
-#pragma unroll
-          for (uint32_t e = 0; e < 4; ++e) {
-            const uint32_t r = 8 * nt + 2 * q4 + (e & 1);
-            dl[e] = r < n ? sh.fac[qwd::kFacGL + r] * x[nt][e] : 0.0f;
-          }
-          a[nt][0] = tf32(dl[0]);
-          a[nt][1] = tf32(dl[2]);
-          a[nt][2] = tf32(dl[1]);
-          a[nt][3] = tf32(dl[3]);
-        }
-        const float gamma = sh.fac[qwd::kFacGamma];
-#pragma unroll
-        for (uint32_t nt = 0; nt < 16; ++nt) {
-          float dd[4] = {};
-#pragma unroll
-          for (uint32_t ks = 0; ks < 2; ++ks) {
-            const uint32_t j = 8 * ks + 2 * q4;
-            mma(dd, a[ks], __float_as_uint(sh.k[j][8 * nt + g]),
-                __float_as_uint(sh.k[j + 1][8 * nt + g]));
-          }
-#pragma unroll
-          for (uint32_t e = 0; e < 4; ++e) st[nt][e] = st[nt][e] * gamma + dd[e];
-        }
-      }
+      block_rest(p, s, rw, h, wp, v0, g, q4, st, x, y, sh,
+                 [&](uint32_t j, uint32_t c) { return __float_as_uint(sh.k[j][c]); });
     }
     __syncthreads();
-    if (whole) stores(from + n);
+    if (rw.n == p.chunk) state_stores(p, s, rw.from + rw.n, h, v0, active, g, q4, st);
     if (b + 1 < nb) {
       issue_rest(p, s, b + 1, h, kh, vbase, t, sh);
       cp_commit();
@@ -302,4 +336,57 @@ extern "C" __global__ void __launch_bounds__(qwd::kThreads, 4)
   }
 }
 EIDOLA_KERNEL_META(eidola_qwen_fast_dn_state, qwd::kThreads, 1, 1, 0, 1, 1, 1,
+                   sizeof(QwDnChunkParams));
+
+// The fused form, for a launch whose every run is at most the ring's positions: the
+// state kernel's grid, each block's intra body for the CTA's value head and columns in
+// shared memory (`qwd::fused_intra`), the state kernel's block on it, then the block's
+// kept positions into the tail cache (`qwd::fused_keep`). The queries and keys are read
+// as the intra body loaded them and rounded as the unfused scratch rounds them.
+extern "C" __global__ void __launch_bounds__(qwd::kThreads, 4)
+    eidola_qwen_fast_dn_fused(const __grid_constant__ QwDnChunkParams p) {
+  __shared__ qwd::FusedShared sh;
+  const uint32_t t = threadIdx.x;
+  const uint32_t lane = t % 32;
+  const uint32_t wp = t / 32;
+  const uint32_t g = lane / 4;
+  const uint32_t q4 = lane % 4;
+  const uint32_t slices = (p.v_dim + qwd::kSlice - 1) / qwd::kSlice;
+  const uint32_t seq = blockIdx.x / slices;
+  const uint32_t vbase = blockIdx.x % slices * qwd::kSlice;
+  const uint32_t h = blockIdx.y;
+  if (seq >= p.seq_count) return;
+  const QwDnSeq s = p.seqs[seq];
+  const uint32_t nb = qwd::run_tiles(s, p.chunk);
+  if (s.tile + nb > p.tiles) return;
+  const uint32_t v0 = vbase + 16 * wp;
+  const bool active = v0 < p.v_dim;
+  float st[16][4];
+  load_state(p, s, h, v0, active, g, q4, st);
+  state_stores(p, s, 0, h, v0, active, g, q4, st);
+  for (uint32_t b = 0; b < nb; ++b) {
+    const Rows rw = rows_of(p, s, b);
+    qwd::fused_intra(p, s, b, h, vbase, ds::Par{}, sh);
+    float x[2][4] = {};
+    float y[2][4] = {};
+    if (active) {
+      xy_products(st, g, q4, x, y,
+                  [&](uint32_t r, uint32_t c, uint32_t& w0, uint32_t& w1, uint32_t& q0,
+                      uint32_t& q1) {
+                    const float2 wv = *reinterpret_cast<const float2*>(&sh.w[r][c]);
+                    w0 = __float_as_uint(wv.x);
+                    w1 = __float_as_uint(wv.y);
+                    q0 = __float_as_uint(qwd::tf32_rna(sh.in.q[r][c]));
+                    q1 = __float_as_uint(qwd::tf32_rna(sh.in.q[r][c + 1]));
+                  });
+      block_rest(p, s, rw, h, wp, v0, g, q4, st, x, y, sh, [&](uint32_t j, uint32_t c) {
+        return __float_as_uint(qwd::tf32_rna(sh.in.k[j][c]));
+      });
+    }
+    __syncthreads();
+    qwd::fused_keep(p, s, b, h, vbase, ds::Par{}, sh);
+    if (rw.n == p.chunk) state_stores(p, s, rw.from + rw.n, h, v0, active, g, q4, st);
+  }
+}
+EIDOLA_KERNEL_META(eidola_qwen_fast_dn_fused, qwd::kThreads, 1, 1, 0, 1, 1, 1,
                    sizeof(QwDnChunkParams));
