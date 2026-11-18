@@ -745,9 +745,11 @@ fn dn_rec_launch<D: QwenDevice>(
     g: &mut Lcg,
     (k_heads, v_heads, v_dim): (usize, usize, usize),
     lens: &[usize],
+    short: bool,
 ) -> Result<(), String> {
     let kd = 128usize;
-    let what = format!("dn rec {k_heads}/{v_heads}x{v_dim} over {lens:?}");
+    let form = if short { "short" } else { "general" };
+    let what = format!("dn rec ({form}) {k_heads}/{v_heads}x{v_dim} over {lens:?}");
     let group = v_heads / k_heads;
     let state_len = v_heads * kd * v_dim;
     let total: usize = lens.iter().sum();
@@ -822,7 +824,11 @@ fn dn_rec_launch<D: QwenDevice>(
         reserved: 0,
     };
     // SAFETY: the buffers hold what the struct names.
-    unsafe { dev.dn_rec(&p) }.map_err(|e| e.to_string())?;
+    if short {
+        unsafe { dev.dn_rec_short(&p) }.map_err(|e| e.to_string())?;
+    } else {
+        unsafe { dev.dn_rec(&p) }.map_err(|e| e.to_string())?;
+    }
     let got_out = read::<D, f32>(dev, &ob, total * v_heads * v_dim);
     for (r, (first, len, src, out_from, live_after, writes)) in plans.into_iter().enumerate() {
         let mut st = src.unwrap_or_else(|| vec![0.0; state_len]);
@@ -897,17 +903,22 @@ fn dn_rec_launch<D: QwenDevice>(
 /// The recurrence alone at every remainder of its column blocks and staged chunks: 1, 3
 /// and 64 sequences, prefills of 1, 63, 64, 65 and 2,048 positions, a value width that
 /// leaves a partial column block, at the released head grouping (three value heads a key
-/// head) and at a narrow one.
+/// head) and at a narrow one; in both forms (the short one also over decode-size runs:
+/// 32 sequences of 1 to 9 positions, one of none).
 pub fn dn_recurrence<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
     let mut g = Lcg(seed);
-    dn_rec_launch(dev, &mut g, (2, 6, 128), &[1])?;
-    dn_rec_launch(dev, &mut g, (1, 3, 128), &[63, 1, 65])?;
-    dn_rec_launch(dev, &mut g, (2, 4, 80), &[64, 9, 17])?;
-    let lens: Vec<usize> = (0..64)
-        .map(|r| [1, 63, 64, 65, 2, 8, 9, 16][r % 8])
-        .collect();
-    dn_rec_launch(dev, &mut g, (1, 2, 128), &lens)?;
-    dn_rec_launch(dev, &mut g, (1, 2, 128), &[2048])?;
+    for short in [false, true] {
+        dn_rec_launch(dev, &mut g, (2, 6, 128), &[1], short)?;
+        dn_rec_launch(dev, &mut g, (1, 3, 128), &[63, 1, 65], short)?;
+        dn_rec_launch(dev, &mut g, (2, 4, 80), &[64, 9, 17], short)?;
+        let lens: Vec<usize> = (0..64)
+            .map(|r| [1, 63, 64, 65, 2, 8, 9, 16][r % 8])
+            .collect();
+        dn_rec_launch(dev, &mut g, (1, 2, 128), &lens, short)?;
+        dn_rec_launch(dev, &mut g, (1, 2, 128), &[2048], short)?;
+    }
+    let lens: Vec<usize> = (0..32).map(|r| [1, 4, 7, 8, 9, 0, 2, 3][r % 8]).collect();
+    dn_rec_launch(dev, &mut g, (2, 6, 128), &lens, true)?;
     Ok(())
 }
 
@@ -1062,10 +1073,14 @@ pub fn quant_forms<D: QwenDevice>(
     seed: u64,
 ) -> Result<(), String> {
     let mut g = Lcg(seed);
+    // Rows a CTA at decode sizes, and four a CTA (`quant_grid`) at 448 × 5,120 and
+    // 2,048 × 1,280.
     for &(rows, k, x_stride) in &[
         (1usize, 5120usize, 5120usize),
         (37, 640, 768),
         (300, 128, 128),
+        (448, 5120, 5120),
+        (2047, 1280, 1408),
     ] {
         let m_pad = rows.next_multiple_of(4) + 4;
         let x = quant_edge_rows(&mut g, rows, x_stride, k);
@@ -1160,9 +1175,133 @@ pub fn conversions<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// The grouped row copy against its reading: three groups of different widths (one of
+/// whole 16-byte units, an odd one, one word) in one launch, each over buffers of its
+/// width, its items copying between buffers and within one, onto their own rows (which
+/// copies nothing), and out of range (which copies nothing and raises the status bit);
+/// then a launch of one group whose rows are not 16-byte aligned.
+pub fn copies<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
+    let mut g = Lcg(seed);
+    let widths = [1028usize, 37, 1];
+    let rows_of = [5usize, 9, 3];
+    // Per group: three buffers (contents), and items (src buf, src row, dst buf, dst row).
+    let mut host: Vec<Vec<Vec<u32>>> = Vec::new();
+    let mut items: Vec<Vec<[u32; 4]>> = Vec::new();
+    for (gi, (&w, &rows)) in widths.iter().zip(&rows_of).enumerate() {
+        let bufs: Vec<Vec<u32>> = (0..3)
+            .map(|_| (0..w * rows).map(|_| (g.next_u64() >> 32) as u32).collect())
+            .collect();
+        // Destinations are distinct and never a source, so the launch has one outcome.
+        let mut it = vec![[0, 0, 1, 0], [2, 1, 1, 1], [0, 2, 2, 0], [1, 2, 1, 2]];
+        it.push([0, 1, 0, 1]); // onto its own row
+        it.push([3, 0, 2, 1]); // a buffer past the table
+        it.push([0, u(rows), 2, 2]); // a row past the buffer
+        if gi == 0 {
+            it.push([0, 3, 0, 4]); // within one buffer
+        }
+        host.push(bufs);
+        items.push(it);
+    }
+    let mut want = host.clone();
+    for (gi, it) in items.iter().enumerate() {
+        let w = widths[gi];
+        for &[sb, sr, db, dr] in it {
+            let (sb, sr, db, dr) = (sb as usize, sr as usize, db as usize, dr as usize);
+            if sb >= 3 || db >= 3 || sr >= rows_of[gi] || dr >= rows_of[gi] {
+                continue;
+            }
+            let row: Vec<u32> = want[gi][sb][sr * w..(sr + 1) * w].to_vec();
+            want[gi][db][dr * w..(dr + 1) * w].copy_from_slice(&row);
+        }
+    }
+    let dbufs: Vec<Vec<super::Buf>> = host
+        .iter()
+        .map(|bs| bs.iter().map(|b| buf(dev, b)).collect())
+        .collect();
+    let arrays: Vec<[super::Buf; 4]> = items
+        .iter()
+        .map(|it| {
+            let col = |c: usize| buf(dev, &it.iter().map(|x| x[c]).collect::<Vec<u32>>());
+            [col(0), col(1), col(2), col(3)]
+        })
+        .collect();
+    let status = zeros(dev, 4);
+    let mut p = CopyParams {
+        status: status.addr,
+        groups: 3,
+        ..CopyParams::default()
+    };
+    for gi in 0..3 {
+        let grp = &mut p.group[gi];
+        for (b, d) in dbufs[gi].iter().enumerate() {
+            grp.buf[b] = d.addr;
+            grp.rows[b] = rows_of[gi] as u64;
+        }
+        grp.src_buf = arrays[gi][0].addr;
+        grp.src_row = arrays[gi][1].addr;
+        grp.dst_buf = arrays[gi][2].addr;
+        grp.dst_row = arrays[gi][3].addr;
+        grp.width = u(widths[gi]);
+        grp.items = u(items[gi].len());
+    }
+    // SAFETY: the buffers hold what the struct names.
+    unsafe { dev.copy_rows(&p) }.map_err(|e| e.to_string())?;
+    for gi in 0..3 {
+        for b in 0..3 {
+            same(
+                &format!("copies: group {gi} buffer {b}"),
+                &read::<D, u32>(dev, &dbufs[gi][b], widths[gi] * rows_of[gi]),
+                &want[gi][b],
+            )?;
+        }
+    }
+    same(
+        "copies: status",
+        &read::<D, u32>(dev, &status, 1),
+        &[STATUS_BAD_INDEX],
+    )?;
+    // Rows one word off 16-byte alignment: the word-at-a-time path.
+    let w = 8usize;
+    let src: Vec<u32> = (0..w * 4 + 1)
+        .map(|_| (g.next_u64() >> 32) as u32)
+        .collect();
+    let sbuf = buf(dev, &src);
+    let dst = zeros(dev, (w * 4 + 1) * 4);
+    let one = |x: u32| buf(dev, &[x]);
+    let (s0, s1, d0, d1) = (one(0), one(2), one(1), one(3));
+    let mut q = CopyParams {
+        status: status.addr,
+        groups: 1,
+        ..CopyParams::default()
+    };
+    q.group[0] = CopyGroup {
+        src_buf: s0.addr,
+        src_row: s1.addr,
+        dst_buf: d0.addr,
+        dst_row: d1.addr,
+        width: u(w),
+        items: 1,
+        ..CopyGroup::default()
+    };
+    q.group[0].buf[0] = sbuf.addr + 4;
+    q.group[0].rows[0] = 4;
+    q.group[0].buf[1] = dst.addr + 4;
+    q.group[0].rows[1] = 4;
+    // SAFETY: as above.
+    unsafe { dev.copy_rows(&q) }.map_err(|e| e.to_string())?;
+    let got = read::<D, u32>(dev, &dst, w * 4 + 1);
+    same(
+        "copies: unaligned rows",
+        &got[1 + 3 * w..1 + 4 * w],
+        &src[1 + 2 * w..1 + 3 * w],
+    )?;
+    Ok(())
+}
+
 /// Every case, named.
 pub fn all<D: QwenDevice>(dev: &D) -> Vec<(&'static str, Result<(), String>)> {
     vec![
+        ("copies", copies(dev, 10)),
         ("norm", norm(dev, 1)),
         ("quant", quant(dev, 7)),
         ("conversions", conversions(dev, 8)),

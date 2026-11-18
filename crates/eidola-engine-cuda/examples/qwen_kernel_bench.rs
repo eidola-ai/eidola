@@ -10,11 +10,22 @@
 //! - `small_gemm`: the DeltaNet's stacked `a` and `b` projections (96 × 5,120) on the
 //!   small-N kernel and on CUTLASS's BF16 GEMM, at 1, 8, 64 and 2,048 rows;
 //! - `norm`, `quant`, `gate` (fast f32 and exact f64), `dn_prep`, `dn_norm`: one launch
-//!   at the released widths, at 1, 8, 64 and 2,048 rows;
+//!   at the released widths, at 1, 8, 64, 256 and 2,048 rows;
 //! - `head`: the BF16 head (248,320 × 5,120), fast;
-//! - `dn_rec`: one DeltaNet layer's recurrence at the released width, 1 to 64 rows, with
-//!   a fold of 0 and 9 positions before 4 outputs; one row prefilling 2,048 and 10,240
-//!   positions; 64 rows each prefilling 1,760 positions of their own;
+//! - `sample`: Qwen's sampler over the released vocabulary at 1, 8, 64 and 256 rows,
+//!   greedy, at temperature 1 alone, and with top-k 20 and top-p 0.95 (the conversation
+//!   workload's); the shared sampler at 1 and 64 rows of the last, for comparison;
+//! - `accept`: Qwen's chain acceptance of 3 drafts a sequence at 1, 8, 64 and 256
+//!   sequences, every draft accepted (the bonus draw) and the first rejected (the
+//!   residual's draw);
+//! - `copy_rows`: a DeltaNet layer's staging copies at decode sizes (four conv rows and
+//!   four `a`/`b` rows a sequence) for 1, 8, 64 and 256 sequences: the two groups in one
+//!   launch, with as many self-copies again (a rung's padding), one launch a group, and
+//!   MiMo's row copy (one launch a group);
+//! - `dn_rec`: one DeltaNet layer's recurrence at the released width in both forms
+//!   (`general`, `short`), 1 to 256 rows of one position, 1 to 64 rows with a fold of 0
+//!   and 9 positions before 4 outputs; one row prefilling 2,048 and 10,240 positions; 64
+//!   rows each prefilling 1,760 positions of their own;
 //! - `cipher`: the idle cipher over one 157 MB state image;
 //! - `host`: a 157 MB image to and from page-locked host memory.
 //!
@@ -29,7 +40,9 @@ use eidola_engine_cuda::qwen::QwenDevice;
 use eidola_engine_cuda::qwen::QwenProfile;
 use eidola_engine_cuda::qwen::abi::*;
 use eidola_engine_cuda::qwen::cuda::{CudaDevice, FP8_KINDS};
-use eidola_engine_cuda::qwen::kernels::QwenKernels;
+use eidola_engine_cuda::qwen::kernels::{AcceptLaunch, QwenKernels, SampleArgs};
+use eidola_engine_cuda::qwen::sampler::{accept_work_bytes, sample_work_bytes};
+use eidola_engine_cuda::sampler::SampleRow;
 
 fn fail(what: impl std::fmt::Display) -> ! {
     eprintln!("FAILED: {what}");
@@ -173,6 +186,8 @@ fn main() {
     }
 
     small_kernels(&fast, it, &mut keep);
+    sampler(&fast, &dir, it, &mut keep);
+    copies(&fast, &dir, it, &mut keep);
 
     let (vocab, hidden) = (248_320u32, 5120u32);
     let head = alloc(&fast, vocab as usize * hidden as usize * 2, &mut keep);
@@ -219,9 +234,14 @@ fn main() {
         .collect();
     // SAFETY: the decay array.
     unsafe { fast.upload(alpha, &al) }.unwrap_or_else(|e| fail(e));
-    let states = alloc(&fast, 64 * state, &mut keep);
+    let states = alloc(&fast, 256 * state, &mut keep);
     // (rows, fold, outputs, whether each row reads positions of its own).
     for (rows, fold, outs, own) in [
+        (1u32, 0u32, 1u32, false),
+        (8, 0, 1, false),
+        (64, 0, 1, false),
+        (256, 0, 1, false),
+        (64, 3, 4, false),
         (1u32, 0u32, 4u32, false),
         (1, 9, 4, false),
         (8, 0, 4, false),
@@ -275,16 +295,25 @@ fn main() {
             v_dim: vd,
             reserved: 0,
         };
-        // SAFETY: every position and state the descriptors name is allocated.
-        let s = time(&fast, if outs > 100 { 2 } else { it }, || {
-            unsafe { fast.dn_rec(&p) }.unwrap_or_else(|e| fail(e))
-        });
-        println!(
-            "{{\"bench\":\"dn_rec\",\"rows\":{rows},\"fold\":{fold},\"outputs\":{outs},\"us_per_layer\":{:.1},\"us_per_token_step\":{:.3},\"us_per_token\":{:.4}}}",
-            s * 1e6,
-            s * 1e6 / f64::from(fold + outs),
-            s * 1e6 / f64::from((fold + outs) * rows)
-        );
+        for short in [false, true] {
+            // SAFETY: every position and state the descriptors name is allocated.
+            let s = time(&fast, if outs > 100 { 2 } else { it }, || {
+                if short {
+                    unsafe { fast.dn_rec_short(&p) }
+                } else {
+                    unsafe { fast.dn_rec(&p) }
+                }
+                .unwrap_or_else(|e| fail(e))
+            });
+            let form = if short { "short" } else { "general" };
+            println!(
+                "{{\"bench\":\"dn_rec\",\"form\":\"{form}\",\"rows\":{rows},\"fold\":{fold},\"outputs\":{outs},\"us_per_layer\":{:.1},\"us_per_token_step\":{:.3},\"us_per_token\":{:.4},\"state_tb_per_s\":{:.2}}}",
+                s * 1e6,
+                s * 1e6 / f64::from(fold + outs),
+                s * 1e6 / f64::from((fold + outs) * rows),
+                2.0 * f64::from(rows) * state as f64 / s / 1e12
+            );
+        }
     }
 
     let image = 156_893_184usize;
@@ -343,7 +372,7 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
     let scales = alloc(fast, (inter as usize / 128) * rows_max * 4, keep);
     let ab_w = alloc(fast, 96 * hidden as usize * 2, keep);
     fill(fast, ab_w, 96 * hidden as usize * 2, 13);
-    for rows in [1u32, 8, 64, 2048] {
+    for rows in [1u32, 8, 64, 256, 2048] {
         let norm = NormParams {
             x,
             add: y,
@@ -472,5 +501,311 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
             unsafe { fast.dn_norm(&dn_norm) }.unwrap_or_else(|e| fail(e))
         });
         line("dn_norm", "exact", rows, s);
+    }
+}
+
+/// A count as the kernels' 32-bit word.
+fn w32(x: usize) -> u32 {
+    u32::try_from(x).unwrap_or_else(|_| fail("a count past 32 bits"))
+}
+
+/// Bytes of a host slice of plain values.
+fn bytes_of<T: Copy>(v: &[T]) -> Vec<u8> {
+    // SAFETY: plain `repr(C)` values' bytes.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+        .to_vec()
+}
+
+/// Qwen's sampler and chain acceptance at the released vocabulary, and the shared sampler
+/// for comparison.
+fn sampler(fast: &CudaDevice, dir: &KernelDir, it: u32, keep: &mut Vec<Box<dyn std::any::Any>>) {
+    use eidola_engine::sampling::{SamplingParams, Stream};
+    let (vocab, n) = (248_320usize, 248_077u32);
+    let rows_max = 256usize;
+    // Logits in [0, 8) with a spike a row, every row its own.
+    let mut s = 5u64;
+    let host: Vec<f32> = (0..rows_max * vocab)
+        .map(|i| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let x = (s >> 40) as f32 / (1u64 << 24) as f32 * 8.0;
+            if i % vocab == (i / vocab) * 997 % vocab {
+                x + 6.0
+            } else {
+                x
+            }
+        })
+        .collect();
+    let logits = alloc(fast, host.len() * 4, keep);
+    // SAFETY: the logits just allocated.
+    unsafe { fast.upload(logits, &bytes_of(&host)) }.unwrap_or_else(|e| fail(e));
+    let probs = alloc(fast, rows_max * n as usize * 8, keep);
+    let tokens = alloc(fast, rows_max * 4, keep);
+    let status = alloc(fast, 4, keep);
+    let work = alloc(fast, sample_work_bytes(rows_max), keep);
+    let rows_buf = alloc(fast, rows_max * 32, keep);
+    let conversation = SamplingParams::new(1.0, 20, 0.95, 0.0, 7).unwrap_or_else(|e| fail(e));
+    let forms = [
+        ("greedy", SamplingParams::greedy()),
+        (
+            "temperature",
+            SamplingParams::random(1.0, 3).unwrap_or_else(|e| fail(e)),
+        ),
+        ("top_k20_top_p0.95", conversation),
+    ];
+    let upload_rows = |p: &SamplingParams, rows: usize| {
+        let r: Vec<SampleRow> = (0..rows)
+            .map(|i| SampleRow::new(p, 1000 + w32(i), w32(i)))
+            .collect();
+        // SAFETY: the rows buffer holds 256.
+        unsafe { fast.upload(rows_buf, &bytes_of(&r)) }.unwrap_or_else(|e| fail(e));
+    };
+    for rows in [1u32, 8, 64, 256] {
+        for (form, p) in &forms {
+            upload_rows(p, rows as usize);
+            let a = SampleArgs {
+                logits,
+                logits_stride: vocab as u64,
+                n,
+                rows: rows_buf,
+                num_rows: rows,
+                draw: Some(Stream::Sample),
+                probs,
+                tokens,
+                status,
+                work,
+            };
+            // SAFETY: every buffer holds 256 rows.
+            let s = time(fast, it, || {
+                unsafe { fast.sample(&a) }.unwrap_or_else(|e| fail(e))
+            });
+            line("sample", form, rows, s);
+        }
+    }
+    // The shared sampler, on its own buffers.
+    {
+        let gpu = fast.gpu();
+        let shared =
+            eidola_engine_cuda::sampler::Sampler::load(gpu, dir).unwrap_or_else(|e| fail(e));
+        let st = gpu.stream();
+        let dl = st
+            .clone_htod(&host[..64 * vocab])
+            .unwrap_or_else(|e| fail(e));
+        for rows in [1usize, 64] {
+            let hr: Vec<SampleRow> = (0..rows)
+                .map(|i| SampleRow::new(&conversation, 1000 + w32(i), w32(i)))
+                .collect();
+            let mut dr = st.clone_htod(&hr).unwrap_or_else(|e| fail(e));
+            let mut dp = st
+                .alloc_zeros::<f64>(rows * n as usize)
+                .unwrap_or_else(|e| fail(e));
+            let mut dt = st.alloc_zeros::<u32>(rows).unwrap_or_else(|e| fail(e));
+            let mut ds = st.alloc_zeros::<u32>(1).unwrap_or_else(|e| fail(e));
+            let s = time(fast, 2, || {
+                shared
+                    .sample(
+                        gpu,
+                        &dl,
+                        vocab,
+                        n,
+                        &hr,
+                        &mut dr,
+                        Some(Stream::Sample),
+                        &mut dp,
+                        &mut dt,
+                        &mut ds,
+                    )
+                    .unwrap_or_else(|e| fail(e))
+            });
+            line("sample", "shared_top_k20_top_p0.95", w32(rows), s);
+        }
+    }
+    // Chain acceptance over the conversation workload's distributions: 64 rows sampled
+    // above, read as target rows (k + 1 a sequence) and draft rows, modulo 64.
+    upload_rows(&conversation, 64);
+    let a = SampleArgs {
+        logits,
+        logits_stride: vocab as u64,
+        n,
+        rows: rows_buf,
+        num_rows: 64,
+        draw: Some(Stream::Draft),
+        probs,
+        tokens,
+        status,
+        work,
+    };
+    // SAFETY: as above.
+    unsafe { fast.sample(&a) }.unwrap_or_else(|e| fail(e));
+    let mut drawn = vec![0u8; 64 * 4];
+    // SAFETY: the tokens of 64 rows.
+    unsafe { fast.download(tokens, &mut drawn) }.unwrap_or_else(|e| fail(e));
+    let drawn: Vec<u32> = drawn
+        .chunks(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let width = 3usize;
+    // Draft ids by draft row (`drafts[draft_row + i]`): each row's own draw.
+    let by_row: Vec<u32> = (0..64 + width).map(|j| drawn[j % 64]).collect();
+    let ids = alloc(fast, by_row.len() * 4, keep);
+    let acc_rows = alloc(fast, 256 * 32, keep);
+    let (trow, drow, nd) = (
+        alloc(fast, 256 * 4, keep),
+        alloc(fast, 256 * 4, keep),
+        alloc(fast, 256 * 4, keep),
+    );
+    let out = alloc(fast, 256 * (width + 1) * 4, keep);
+    let counts = alloc(fast, 256 * 4, keep);
+    let awork = alloc(fast, accept_work_bytes(256), keep);
+    // SAFETY: the arrays just allocated.
+    unsafe { fast.upload(ids, &bytes_of(&by_row)) }.unwrap_or_else(|e| fail(e));
+    for (form, rejecting) in [("bonus", false), ("residual", true)] {
+        for seqs in [1u32, 8, 64, 256] {
+            let sr = seqs as usize;
+            // Target rows t ..= t + 3; the drafts drawn from those rows (every one
+            // accepted) or from the next ones (rejected unless among the target's top 20).
+            let t: Vec<u32> = (0..sr).map(|r| w32((r * 4) % 60)).collect();
+            let d: Vec<u32> = t.iter().map(|&x| x + u32::from(rejecting)).collect();
+            let k: Vec<u32> = vec![w32(width); sr];
+            let rr: Vec<SampleRow> = (0..sr)
+                .map(|r| SampleRow::new(&conversation, 1000 + w32(r), 0))
+                .collect();
+            // SAFETY: each buffer holds 256 sequences.
+            unsafe {
+                fast.upload(acc_rows, &bytes_of(&rr))
+                    .unwrap_or_else(|e| fail(e));
+                fast.upload(trow, &bytes_of(&t)).unwrap_or_else(|e| fail(e));
+                fast.upload(drow, &bytes_of(&d)).unwrap_or_else(|e| fail(e));
+                fast.upload(nd, &bytes_of(&k)).unwrap_or_else(|e| fail(e));
+            }
+            let a = AcceptLaunch {
+                target: probs,
+                draft: probs,
+                n,
+                rows: acc_rows,
+                target_row: trow,
+                draft_row: drow,
+                draft_step: 1,
+                num_drafts: nd,
+                drafts: ids,
+                stride: w32(width + 1),
+                scratch: awork,
+                out,
+                counts,
+                status,
+                num_rows: seqs,
+            };
+            // SAFETY: every row named lies inside the 64 sampled distributions.
+            let s = time(fast, it, || {
+                unsafe { fast.accept(&a) }.unwrap_or_else(|e| fail(e))
+            });
+            line("accept", form, seqs, s);
+        }
+    }
+}
+
+/// A DeltaNet layer's staging copies at decode sizes: per sequence four conv rows (10,240
+/// f32) and four `a`/`b` rows (96 f32), from a state-like buffer into the staging buffers.
+fn copies(fast: &CudaDevice, dir: &KernelDir, it: u32, keep: &mut Vec<Box<dyn std::any::Any>>) {
+    let (cd, ab) = (10_240usize, 96usize);
+    let max = 256usize * 4;
+    let src_c = alloc(fast, max * cd * 4, keep);
+    let dst_c = alloc(fast, max * cd * 4, keep);
+    let src_a = alloc(fast, max * ab * 4, keep);
+    let dst_a = alloc(fast, max * ab * 4, keep);
+    let mimo = eidola_engine_cuda::mimo::engine_ops::EngineOps::load(fast.gpu(), dir)
+        .unwrap_or_else(|e| fail(e));
+    let status = alloc(fast, 4, keep);
+    for seqs in [1u32, 8, 64, 256] {
+        let items = seqs as usize * 4;
+        // Real items (buffer 0 row i to buffer 1 row i), then as many self-copies.
+        let mut sb = vec![0u32; items];
+        let mut db = vec![1u32; items];
+        let mut rows: Vec<u32> = (0..w32(items)).collect();
+        sb.extend(vec![1u32; items]);
+        db.extend(vec![1u32; items]);
+        rows.extend(0..w32(items));
+        let arr = |v: &[u32], keep: &mut Vec<Box<dyn std::any::Any>>| {
+            let a = alloc(fast, v.len() * 4, keep);
+            // SAFETY: the array just allocated.
+            unsafe { fast.upload(a, &bytes_of(v)) }.unwrap_or_else(|e| fail(e));
+            a
+        };
+        let (sba, dba, ra) = (arr(&sb, keep), arr(&db, keep), arr(&rows, keep));
+        let group = |src: u64, dst: u64, width: usize, n: usize| {
+            let mut g = CopyGroup {
+                src_buf: sba,
+                src_row: ra,
+                dst_buf: dba,
+                dst_row: ra,
+                width: w32(width),
+                items: w32(n),
+                ..CopyGroup::default()
+            };
+            g.buf[0] = src;
+            g.buf[1] = dst;
+            g.rows[0] = max as u64;
+            g.rows[1] = max as u64;
+            g
+        };
+        let params = |groups: &[CopyGroup]| {
+            let mut p = CopyParams {
+                status,
+                groups: w32(groups.len()),
+                ..CopyParams::default()
+            };
+            p.group[..groups.len()].copy_from_slice(groups);
+            p
+        };
+        let both = params(&[
+            group(src_c, dst_c, cd, items),
+            group(src_a, dst_a, ab, items),
+        ]);
+        let padded = params(&[
+            group(src_c, dst_c, cd, 2 * items),
+            group(src_a, dst_a, ab, 2 * items),
+        ]);
+        let (one_c, one_a) = (
+            params(&[group(src_c, dst_c, cd, items)]),
+            params(&[group(src_a, dst_a, ab, items)]),
+        );
+        // SAFETY: every buffer holds 1,024 rows of its width; the items name rows below.
+        unsafe {
+            let s = time(fast, it, || {
+                fast.copy_rows(&both).unwrap_or_else(|e| fail(e))
+            });
+            line("copy_rows", "grouped", seqs, s);
+            let s = time(fast, it, || {
+                fast.copy_rows(&padded).unwrap_or_else(|e| fail(e))
+            });
+            line("copy_rows", "grouped_padded", seqs, s);
+            let s = time(fast, it, || {
+                fast.copy_rows(&one_c).unwrap_or_else(|e| fail(e));
+                fast.copy_rows(&one_a).unwrap_or_else(|e| fail(e));
+            });
+            line("copy_rows", "separate", seqs, s);
+            let mimo_args = |g: &CopyGroup| {
+                let mut a = eidola_engine_cuda::mimo::engine_ops::CopyArgs {
+                    src_buf: g.src_buf,
+                    src_row: g.src_row,
+                    dst_buf: g.dst_buf,
+                    dst_row: g.dst_row,
+                    status,
+                    width: g.width,
+                    items: g.items,
+                    ..Default::default()
+                };
+                a.buf = g.buf;
+                a.rows = g.rows;
+                a
+            };
+            let (mc, ma) = (mimo_args(&padded.group[0]), mimo_args(&padded.group[1]));
+            let s = time(fast, it, || {
+                mimo.copy_rows(fast.gpu(), mc).unwrap_or_else(|e| fail(e));
+                mimo.copy_rows(fast.gpu(), ma).unwrap_or_else(|e| fail(e));
+            });
+            line("copy_rows", "mimo_padded", seqs, s);
+        }
     }
 }

@@ -66,3 +66,51 @@ extern "C" __global__ void __launch_bounds__(qwk::kDnThreads)
 }
 EIDOLA_KERNEL_META(eidola_qwen_dn_rec, qwk::kDnThreads, 1, 1, 0, 1, 1, 1,
                    sizeof(QwDnRecParams));
+
+// The short form: the general form's steps (fetch, load, the per-position
+// decay, update and partials, stores) in the same order, with each chunk
+// staged before it runs rather than while the last one runs (no chunk held in
+// registers across positions), the sequence's record read where it is used,
+// and the keys and queries passed to the steps where they lie in shared
+// memory. Bounded to 80 registers, six blocks share an SM where the general
+// form fits three, so twice the state is in flight: the form for runs of a few
+// positions (a decode step, a draft check), whose cost is the state's traffic.
+// Every value is the general form's, bit for bit.
+extern "C" __global__ void __launch_bounds__(qwk::kDnThreads, 6)
+    eidola_qwen_dn_rec_short(const __grid_constant__ QwDnRecParams p) {
+  __shared__ qwk::DnRecShared sh;
+  const uint32_t t = threadIdx.x;
+  const uint32_t slices = qwk::dn_rec_slices(p.v_dim);
+  const uint32_t slice = blockIdx.x % slices;
+  const uint32_t h = blockIdx.y;
+  // Read where used (it is the block's, and cached): not 22 registers held.
+  const QwDnSeq& s = p.seqs[blockIdx.x / slices];
+  const uint32_t l = t % qwk::kDnGroup;
+  const uint32_t c = t / qwk::kDnGroup;
+  const uint32_t j = slice * qwk::kDnCols + c;
+  float st[qwk::kDnPer];
+  qwk::dn_rec_load(p, s, h, j, l, st);
+  qwk::dn_rec_stores(p, s, 0, h, j, l, st);
+  for (uint32_t base = 0; base < s.count; base += qwk::kDnChunk) {
+    {
+      qwk::DnFetch f;
+      qwk::dn_rec_fetch(p, s, h, slice, base, t, f);
+      if (base > 0) __syncthreads();
+      qwk::dn_rec_put(f, t, sh, 0);
+    }
+    __syncthreads();
+    const uint32_t n = s.count - base < qwk::kDnChunk ? s.count - base : qwk::kDnChunk;
+    for (uint32_t u = 0; u < n; ++u) {
+      const uint32_t i = base + u;
+      const float r = group_sum(qwk::dn_rec_decay(st, sh.k[0][u][l], sh.alpha[0][u]), l);
+      qwk::dn_rec_update(st, sh.k[0][u][l], sh.v[0][u][c], sh.beta[0][u], r);
+      if (i >= s.out_from) {
+        const float o = group_sum(qwk::dn_partial(st, sh.q[0][u][l]), l);
+        if (l == 0 && j < p.v_dim) qwk::dn_rec_out(p, s.first + i, h, j, o);
+      }
+      qwk::dn_rec_stores(p, s, i + 1, h, j, l, st);
+    }
+  }
+}
+EIDOLA_KERNEL_META(eidola_qwen_dn_rec_short, qwk::kDnThreads, 1, 1, 0, 1, 1, 1,
+                   sizeof(QwDnRecParams));
