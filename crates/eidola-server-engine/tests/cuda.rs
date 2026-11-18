@@ -751,8 +751,8 @@ mod counting {
         unsafe fn quant(&self, p: &QuantParams) -> Result<()> {
             unsafe { self.inner.quant(p) }
         }
-        unsafe fn lin8(&self, p: &Lin8Params) -> Result<()> {
-            unsafe { self.inner.lin8(p) }
+        unsafe fn lin8(&self, p: &Lin8Params, parts: Option<u64>) -> Result<()> {
+            unsafe { self.inner.lin8(p, parts) }
         }
         unsafe fn linear(&self, p: &LinearParams, fast: Option<u64>) -> Result<()> {
             unsafe { self.inner.linear(p, fast) }
@@ -844,6 +844,12 @@ mod counting {
             nonce: &KvNonce,
         ) -> Result<()> {
             unsafe { self.inner.cipher(addr, words, counter, key, nonce) }
+        }
+        unsafe fn cipher_ranges(
+            &self,
+            ranges: &[eidola_engine_cuda::qwen::device::CipherRange<'_>],
+        ) -> Result<()> {
+            unsafe { self.inner.cipher_ranges(ranges) }
         }
         fn alloc_host(&self, bytes: usize) -> Result<(*mut u8, Box<dyn std::any::Any>)> {
             self.inner.alloc_host(bytes)

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use eidola_engine_cuda::qwen::QwenDevice;
 use eidola_engine_cuda::qwen::abi::*;
+use eidola_engine_cuda::qwen::kernels::MAX_SPLITS;
 use eidola_engine_model::Matrix;
 use eidola_engine_model::qwen::attention::{apply_rope, attend, inv_freq, rope_cos_sin};
 use eidola_engine_model::qwen::config::{AttentionSpec, DeltaNetSpec};
@@ -238,6 +239,7 @@ pub fn lin8<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
         let wb = buf(dev, &codes);
         let wsb = buf(dev, &transpose_scales(&scales, n, k));
         let ob = zeros(dev, m_pad * n * 2);
+        let pb = zeros(dev, MAX_SPLITS as usize * m_pad * n * 4);
         let l = Lin8Params {
             a: cb.addr,
             a_scales: sb.addr,
@@ -254,7 +256,7 @@ pub fn lin8<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
         // SAFETY: the buffers hold what the structs name.
         unsafe {
             dev.quant(&q).map_err(|e| e.to_string())?;
-            dev.lin8(&l).map_err(|e| e.to_string())?;
+            dev.lin8(&l, Some(pb.addr)).map_err(|e| e.to_string())?;
         }
         let want = lin8_rows(
             &Matrix::from_vec(rows, k, x.clone()),
@@ -1446,10 +1448,12 @@ pub fn fast_linears<E: QwenDevice, F: QwenDevice>(
 ) -> Result<String, String> {
     let mut g = Lcg(seed);
     let mut report = Vec::new();
-    for &(n, k) in &[(1024usize, 640usize), (512, 1536), (256, 128)] {
+    // The last splits K in three (`fp8_splits`).
+    for &(n, k) in &[(1024usize, 640usize), (512, 1536), (256, 128), (1024, 3072)] {
         let (codes, scales) = fp8_weight(&mut g, n, k);
         let ts = transpose_scales(&scales, n, k);
         let rows_max = 64usize;
+        let parts = zeros(fast, MAX_SPLITS as usize * rows_max * n * 4);
         let x: Vec<f32> = (0..rows_max * k).map(|_| g.bf16(3.0)).collect();
         let run = |dev: &dyn Fn(&QuantParams, &Lin8Params) -> Result<(), String>,
                    rows: usize,
@@ -1489,14 +1493,14 @@ pub fn fast_linears<E: QwenDevice, F: QwenDevice>(
             // SAFETY: the buffers below hold what the structs name.
             unsafe {
                 exact.quant(q).map_err(|e| e.to_string())?;
-                exact.lin8(l).map_err(|e| e.to_string())
+                exact.lin8(l, None).map_err(|e| e.to_string())
             }
         };
         let launch_f = |q: &QuantParams, l: &Lin8Params| -> Result<(), String> {
             // SAFETY: as above, on the fast device.
             unsafe {
                 fast.quant(q).map_err(|e| e.to_string())?;
-                fast.lin8(l).map_err(|e| e.to_string())
+                fast.lin8(l, Some(parts.addr)).map_err(|e| e.to_string())
             }
         };
         let (xe, we, wse) = (buf(exact, &bits(&x)), buf(exact, &codes), buf(exact, &ts));

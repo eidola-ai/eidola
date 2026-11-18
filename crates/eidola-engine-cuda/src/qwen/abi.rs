@@ -281,6 +281,23 @@ pub struct RoundParams {
 }
 layout!(RoundParams, 40, { out_f32: 32 });
 
+/// The fast profile's split FP8 GEMM's sum (`eidola_qwen_fast_split_sum`): `out[r][n] =
+/// bf16(((parts[0][r][n] + parts[1][r][n]) + …) + parts[splits - 1][r][n])`, each split's
+/// array `part_rows` rows of `n` f32 values.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitSumParams {
+    pub parts: u64,
+    pub out: u64,
+    pub rows: u32,
+    pub n: u32,
+    pub splits: u32,
+    pub part_rows: u32,
+    pub out_stride: u32,
+    pub reserved: u32,
+}
+layout!(SplitSumParams, 40, { splits: 24, out_stride: 32 });
+
 /// Groups one [`CopyParams`] launch carries.
 pub const COPY_GROUPS: usize = 3;
 /// Buffers of one [`CopyGroup`].

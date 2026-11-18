@@ -342,6 +342,25 @@ struct QwRoundParams {
 QW_ABI_STRUCT(QwRoundParams, 40);
 QW_ABI_FIELD(QwRoundParams, out_f32, 32);
 
+// The fast profile's split FP8 GEMM, its partial sums added
+// (`eidola_qwen_fast_split_sum`): `out[r][n] = bf16(((p[0][r][n] + p[1][r][n])
+// + …) + p[splits - 1][r][n])`, the splits in order from the first, each
+// split's array `part_rows` rows of `n` f32 values, rounded once to the
+// nearest BF16 (ties to even; a NaN as the one quiet NaN).
+struct QwSplitSumParams {
+  const float* parts;  // [splits][part_rows][n]
+  uint16_t* out;       // [rows, out_stride] BF16
+  uint32_t rows;
+  uint32_t n;
+  uint32_t splits;
+  uint32_t part_rows;
+  uint32_t out_stride;
+  uint32_t reserved;
+};
+QW_ABI_STRUCT(QwSplitSumParams, 40);
+QW_ABI_FIELD(QwSplitSumParams, splits, 24);
+QW_ABI_FIELD(QwSplitSumParams, out_stride, 32);
+
 // Row copies of 32-bit words (`eidola_qwen_copy_rows`): up to
 // `QW_COPY_GROUPS` groups in one launch, each a table of up to
 // `QW_COPY_BUFFERS` buffers of `width`-word rows and `items` copies (source

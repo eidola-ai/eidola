@@ -27,12 +27,12 @@ use eidola_engine::secret::KvKey;
 
 use super::abi::*;
 use super::attention::{Fa2Args, QwenAttention};
-use super::device::{QwenDevice, QwenProfile};
+use super::device::{CipherRange, QwenDevice, QwenProfile};
 use super::kernels::*;
 use super::sampler::QwenSampler;
 use crate::kv_cipher::{CipherItem, CipherItems, KvCipher};
 use crate::launch::dptr;
-use crate::mimo::gemm::{Gemm, GemmArgs, GemmKind, SwapTile};
+use crate::mimo::gemm::{Gemm, GemmArgs, GemmKind, SplitTile, SwapTile};
 use crate::module::{Kernel, KernelDir, KernelModule};
 use crate::{CudaError, Gpu, Result};
 
@@ -61,21 +61,30 @@ struct Kernels {
 }
 
 /// The fast profile's FP8 GEMM for `m` activation rows (the padded count the
-/// scales are laid out for): CUTLASS's blockwise kernel swapped, with the
-/// smallest activation tile that holds them, up to 64 rows; the unswapped
-/// kernel above. A row's bits are the same in every one of them
-/// (`tests/qwen_ops.rs`, `fast_fp8_configs_agree`), so the choice by row count
-/// keeps every row's result its own.
-pub fn fp8_kind(m: u32) -> GemmKind {
-    match m {
-        0..=16 => GemmKind::Fp8Swap(SwapTile::T16),
-        17..=32 => GemmKind::Fp8Swap(SwapTile::T32),
-        33..=64 => GemmKind::Fp8Swap(SwapTile::T64),
-        _ => GemmKind::Fp8Blockwise,
+/// scales are laid out for) of a weight `[n, k]`: CUTLASS's blockwise kernel
+/// swapped, with the smallest activation tile that holds them, up to 64 rows;
+/// the unswapped kernel above. A shape [`fp8_splits`] splits runs the split
+/// form of the same instance at every row count (`cutlass_fp8_blockwise_split`,
+/// its partials then added in order). A row's bits are the same in every
+/// instance of its shape's form (`tests/qwen_ops.rs`, `fast_fp8_configs_agree`
+/// and `fast_fp8_split_forms`), so the choice by row count keeps every row's
+/// result its own.
+pub fn fp8_kind(m: u32, n: u32, k: u32) -> GemmKind {
+    let tile = match m {
+        0..=16 => Some(SwapTile::T16),
+        17..=32 => Some(SwapTile::T32),
+        33..=64 => Some(SwapTile::T64),
+        _ => None,
+    };
+    match (fp8_splits(n, k), tile) {
+        (1, Some(t)) => GemmKind::Fp8Swap(t),
+        (1, None) => GemmKind::Fp8Blockwise,
+        (s, Some(t)) => GemmKind::Fp8Split(SplitTile::Swap(t), s),
+        (s, None) => GemmKind::Fp8Split(SplitTile::Wide, s),
     }
 }
 
-/// Every FP8 GEMM [`fp8_kind`] can choose.
+/// Every FP8 GEMM [`fp8_kind`] can choose for a shape that does not split.
 pub const FP8_KINDS: [GemmKind; 4] = [
     GemmKind::Fp8Swap(SwapTile::T16),
     GemmKind::Fp8Swap(SwapTile::T32),
@@ -87,6 +96,9 @@ pub const FP8_KINDS: [GemmKind; 4] = [
 struct Fast {
     fp8: Gemm,
     fp8_swap: [Gemm; 3],
+    /// [`SplitTile::ALL`]'s instances, each launched at any split.
+    fp8_split: [Gemm; 4],
+    split_sum: Kernel,
     bf16: Gemm,
     small: Kernel,
     small_tiled: Kernel,
@@ -152,7 +164,13 @@ impl CudaDevice {
                 let b = KernelModule::load(&gpu, dir, GemmKind::Bf16.kernel().0)?;
                 let q = KernelModule::load(&gpu, dir, FAST_IMAGE)?;
                 let a = KernelModule::load(&gpu, dir, super::attention::IMAGE)?;
+                let sp = KernelModule::load(
+                    &gpu,
+                    dir,
+                    GemmKind::Fp8Split(SplitTile::Wide, 2).kernel().0,
+                )?;
                 let swap = |t| Gemm::from_module(GemmKind::Fp8Swap(t), &sw);
+                let split = |t| Gemm::from_module(GemmKind::Fp8Split(t, 2), &sp);
                 Some(Fast {
                     fp8: Gemm::from_module(GemmKind::Fp8Blockwise, &f)?,
                     fp8_swap: [
@@ -160,6 +178,17 @@ impl CudaDevice {
                         swap(SwapTile::T32)?,
                         swap(SwapTile::T64)?,
                     ],
+                    fp8_split: [
+                        split(SplitTile::Swap(SwapTile::T16))?,
+                        split(SplitTile::Swap(SwapTile::T32))?,
+                        split(SplitTile::Swap(SwapTile::T64))?,
+                        split(SplitTile::Wide)?,
+                    ],
+                    split_sum: bound::<SplitSumParams>(
+                        &q,
+                        FAST_IMAGE,
+                        "eidola_qwen_fast_split_sum",
+                    )?,
                     bf16: Gemm::from_module(GemmKind::Bf16, &b)?,
                     small: bound::<LinearParams>(&q, FAST_IMAGE, "eidola_qwen_fast_gemm_bf16")?,
                     small_tiled: bound::<LinearParams>(
@@ -169,7 +198,7 @@ impl CudaDevice {
                     )?,
                     gate: bound::<GateParams>(&q, FAST_IMAGE, "eidola_qwen_fast_gate")?,
                     attention: QwenAttention::from_module(a)?,
-                    _modules: vec![f, sw, b, q],
+                    _modules: vec![f, sw, sp, b, q],
                 })
             }
         };
@@ -214,53 +243,123 @@ impl CudaDevice {
         Ok(a)
     }
 
-    /// Launches `kernel` with `p` by value over `grid`.
-    ///
-    /// # Safety
-    ///
-    /// `p` is the kernel's parameter struct and every address in it is valid for what the
-    /// kernel does with it.
-    /// The fast FP8 linear of `p` on the GEMM of `kind` (one of [`FP8_KINDS`]), whatever
-    /// [`fp8_kind`] would choose: for the tests that hold every kind to the others, and
-    /// the bench.
+    /// The fast FP8 linear of `p` on the GEMM of `kind` (one of [`FP8_KINDS`], or a split
+    /// kind at any split of `p.k`), whatever [`fp8_kind`] would choose: for the tests that
+    /// hold every kind to the others, and the bench. A split kind writes its partial sums
+    /// to `parts` (`splits · m_pad · n` f32) and adds them into `p.out`.
     ///
     /// # Safety
     ///
     /// As [`QwenKernels::lin8`].
-    pub unsafe fn lin8_on(&self, p: &Lin8Params, kind: GemmKind) -> Result<()> {
+    pub unsafe fn lin8_on(&self, p: &Lin8Params, kind: GemmKind, parts: Option<u64>) -> Result<()> {
         if p.rows == 0 {
             return Ok(());
         }
         lin8_grid(p)?;
-        let f = self
-            .fast
-            .as_ref()
-            .ok_or_else(|| CudaError::new("the FP8 GEMMs run in the fast profile"))?;
         if p.out_stride != p.n {
             return Err(CudaError::new("the fast FP8 linear writes dense rows"));
         }
+        if let GemmKind::Fp8Split(tile, splits) = kind {
+            let parts = parts.ok_or_else(|| {
+                CudaError::new("a split FP8 GEMM needs the partial sums' scratch")
+            })?;
+            let s = SplitSumParams {
+                parts,
+                out: p.out,
+                rows: p.rows,
+                n: p.n,
+                splits,
+                part_rows: p.m_pad,
+                out_stride: p.out_stride,
+                reserved: 0,
+            };
+            let g = split_sum_grid(&s)?;
+            // SAFETY: the caller's operands; `parts` holds every split's `m_pad · n` sums,
+            // which the sum then reads for the `rows` real rows.
+            return unsafe {
+                self.fp8_split_parts(p, tile, splits, parts)?;
+                self.split_sum(&s, g)
+            };
+        }
+        let f = self.fast()?;
         let gemm = match kind {
             GemmKind::Fp8Blockwise => &f.fp8,
             GemmKind::Fp8Swap(SwapTile::T16) => &f.fp8_swap[0],
             GemmKind::Fp8Swap(SwapTile::T32) => &f.fp8_swap[1],
             GemmKind::Fp8Swap(SwapTile::T64) => &f.fp8_swap[2],
-            GemmKind::Bf16 => return Err(CudaError::new("not an FP8 GEMM")),
+            GemmKind::Bf16 | GemmKind::Fp8Split(..) => {
+                return Err(CudaError::new("not an unsplit FP8 GEMM"));
+            }
         };
-        let a = GemmArgs {
+        let a = Self::fp8_args(p, p.out);
+        kind.check(&a)?;
+        // SAFETY: `m_pad` rows of codes and scales, the weight and `m_pad · n` outputs
+        // (the padding rows' outputs are written and never read).
+        unsafe { gemm.launch(&self.gpu, &a) }
+    }
+
+    /// The split FP8 GEMM of `p` alone on the instance of `tile` at `splits` ranges of K:
+    /// every range's f32 sums into `parts` (`[splits][m_pad][n]`), unadded. The tests
+    /// read the ranges' sums; [`Self::lin8_on`] adds them.
+    ///
+    /// # Safety
+    ///
+    /// As [`QwenKernels::lin8`], `parts` holding `splits · m_pad · n` f32.
+    pub unsafe fn fp8_split_parts(
+        &self,
+        p: &Lin8Params,
+        tile: SplitTile,
+        splits: u32,
+        parts: u64,
+    ) -> Result<()> {
+        if p.rows == 0 {
+            return Ok(());
+        }
+        lin8_grid(p)?;
+        let f = self.fast()?;
+        let gemm = match tile {
+            SplitTile::Swap(SwapTile::T16) => &f.fp8_split[0],
+            SplitTile::Swap(SwapTile::T32) => &f.fp8_split[1],
+            SplitTile::Swap(SwapTile::T64) => &f.fp8_split[2],
+            SplitTile::Wide => &f.fp8_split[3],
+        };
+        let a = Self::fp8_args(p, parts);
+        GemmKind::Fp8Split(tile, splits).check(&a)?;
+        // SAFETY: `m_pad` rows of codes and scales, the weight, and `splits` arrays of
+        // `m_pad · n` f32 at `parts`.
+        unsafe { gemm.launch_splits(&self.gpu, splits, &a) }
+    }
+
+    /// The split FP8 GEMM's sum alone (`eidola_qwen_fast_split_sum`).
+    ///
+    /// # Safety
+    ///
+    /// `p.parts` holds `splits · part_rows · n` f32; `p.out` the `rows` output rows.
+    pub unsafe fn split_sum(&self, p: &SplitSumParams, grid: [u32; 3]) -> Result<()> {
+        let f = self.fast()?;
+        // SAFETY: the caller's.
+        unsafe { self.go(&f.split_sum, p, grid) }
+    }
+
+    fn fast(&self) -> Result<&Fast> {
+        self.fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the FP8 GEMMs run in the fast profile"))
+    }
+
+    /// The CUTLASS arguments of the fast FP8 linear `p`, its output at `d`.
+    fn fp8_args(p: &Lin8Params, d: u64) -> GemmArgs {
+        GemmArgs {
             m: p.m_pad,
             n: p.n,
             k: p.k,
             a: p.a,
             b: p.w,
-            d: p.out,
+            d,
             sfa: p.a_scales,
             sfb: p.w_scales,
             alpha: 1.0,
-        };
-        kind.check(&a)?;
-        // SAFETY: `m_pad` rows of codes and scales, the weight and `m_pad · n` outputs
-        // (the padding rows' outputs are written and never read).
-        unsafe { gemm.launch(&self.gpu, &a) }
+        }
     }
 
     /// The exact gates of `p` (`eidola_qwen_gate`) whatever the profile: the test that
@@ -336,6 +435,12 @@ impl CudaDevice {
         }
     }
 
+    /// Launches `kernel` with `p` by value over `grid`.
+    ///
+    /// # Safety
+    ///
+    /// `p` is the kernel's parameter struct and every address in it is valid for what the
+    /// kernel does with it.
     unsafe fn go<P: Copy>(&self, kernel: &Kernel, p: &P, grid: [u32; 3]) -> Result<()> {
         let mut v = *p;
         let mut args = [(&mut v as *mut P).cast::<c_void>()];
@@ -366,7 +471,7 @@ impl QwenKernels for CudaDevice {
         let g = quant_grid(p)?;
         unsafe { self.go(&self.k.quant, p, g) }
     }
-    unsafe fn lin8(&self, p: &Lin8Params) -> Result<()> {
+    unsafe fn lin8(&self, p: &Lin8Params, parts: Option<u64>) -> Result<()> {
         if p.rows == 0 {
             return Ok(());
         }
@@ -374,7 +479,7 @@ impl QwenKernels for CudaDevice {
         match &self.fast {
             None => unsafe { self.go(&self.k.lin8, p, g) },
             // SAFETY: the caller's.
-            Some(_) => unsafe { self.lin8_on(p, fp8_kind(p.m_pad)) },
+            Some(_) => unsafe { self.lin8_on(p, fp8_kind(p.m_pad, p.n, p.k), parts) },
         }
     }
     unsafe fn linear(&self, p: &LinearParams, fast: Option<u64>) -> Result<()> {
@@ -595,6 +700,23 @@ impl QwenDevice for CudaDevice {
             .lock()
             .map_err(|_| CudaError::new("cipher lock"))?;
         // SAFETY: one range, the caller's.
+        unsafe { c.apply(&self.gpu, &mut items) }
+    }
+
+    unsafe fn cipher_ranges(&self, ranges: &[CipherRange<'_>]) -> Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        // Sized for every range at once, so the key-bearing list never grows.
+        let mut items = CipherItems::with_capacity(ranges.len());
+        for r in ranges {
+            items.push(CipherItem::new(r.addr, r.words, r.counter, r.key, &r.nonce));
+        }
+        let mut c = self
+            .cipher
+            .lock()
+            .map_err(|_| CudaError::new("cipher lock"))?;
+        // SAFETY: the caller's ranges, which do not overlap.
         unsafe { c.apply(&self.gpu, &mut items) }
     }
 

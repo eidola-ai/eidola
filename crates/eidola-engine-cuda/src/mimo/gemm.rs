@@ -1,7 +1,9 @@
 //! The CUTLASS GEMMs' launch parameters, built in Rust.
 //!
-//! The CUTLASS kernels (`cutlass_fp8_blockwise_gemm`, `cutlass_bf16_gemm`, and
-//! the swapped FP8 instances of `cutlass_fp8_blockwise_swap`) take CUTLASS 3.x's `GemmUniversal::Params` by value: 2048 bytes holding the
+//! The CUTLASS kernels (`cutlass_fp8_blockwise_gemm`, `cutlass_bf16_gemm`, the
+//! swapped FP8 instances of `cutlass_fp8_blockwise_swap`, and the split FP8
+//! instances of `cutlass_fp8_blockwise_split`) take CUTLASS 3.x's
+//! `GemmUniversal::Params` by value: 2048 bytes holding the
 //! problem shape, the mainloop's TMA descriptors (and, for the blockwise
 //! kernel, its scale-factor pointers and layouts), the epilogue's scalar and
 //! output descriptor, the cluster-launch-control tile scheduler's parameters,
@@ -40,6 +42,32 @@ pub enum GemmKind {
     /// a time, its D `[N, M]` column-major (the same bytes as `[M, N]`
     /// row-major). For few rows.
     Fp8Swap(SwapTile),
+    /// The FP8 product of [`GemmKind::Fp8Blockwise`] over `splits` equal ranges
+    /// of K at once (`cutlass_fp8_blockwise_split`), each range's sums left
+    /// unrounded: `D[s]` (f32 `[M, N]`, the ranges' arrays one after another)
+    /// is the product of K columns `s · K/splits .. (s + 1) · K/splits` of A and
+    /// B. CUTLASS runs each range as one batch of its problem (its L mode). The
+    /// tile names the instance: the swapped kernel's operands at 16, 32 or 64
+    /// activation rows, or the unswapped kernel's 128 × 128.
+    Fp8Split(SplitTile, u32),
+}
+
+/// The instance of a split FP8 GEMM ([`GemmKind::Fp8Split`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SplitTile {
+    /// Swapped, at [`SwapTile`]'s activation rows.
+    Swap(SwapTile),
+    /// Unswapped, 128 × 128 tiles.
+    Wide,
+}
+
+impl SplitTile {
+    pub const ALL: [SplitTile; 4] = [
+        SplitTile::Swap(SwapTile::T16),
+        SplitTile::Swap(SwapTile::T32),
+        SplitTile::Swap(SwapTile::T64),
+        SplitTile::Wide,
+    ];
 }
 
 /// The activation rows a swapped FP8 GEMM's tile holds.
@@ -117,21 +145,47 @@ impl GemmKind {
                     SwapTile::T64 => "eidola_cutlass_fp8_blockwise_swap64_bf16",
                 },
             ),
+            GemmKind::Fp8Split(t, _) => (
+                "cutlass_fp8_blockwise_split",
+                match t {
+                    SplitTile::Swap(SwapTile::T16) => "eidola_cutlass_fp8_blockwise_split16_f32",
+                    SplitTile::Swap(SwapTile::T32) => "eidola_cutlass_fp8_blockwise_split32_f32",
+                    SplitTile::Swap(SwapTile::T64) => "eidola_cutlass_fp8_blockwise_split64_f32",
+                    SplitTile::Wide => "eidola_cutlass_fp8_blockwise_split128_f32",
+                },
+            ),
         }
+    }
+
+    /// Batches of CUTLASS's problem (its L): a split kind's ranges of K, else 1.
+    pub fn splits(self) -> u32 {
+        match self {
+            GemmKind::Fp8Split(_, s) => s,
+            _ => 1,
+        }
+    }
+
+    /// Whether CUTLASS's A is the weight (the swapped instances).
+    fn swapped(self) -> bool {
+        matches!(
+            self,
+            GemmKind::Fp8Swap(_) | GemmKind::Fp8Split(SplitTile::Swap(_), _)
+        )
     }
 
     /// CUTLASS's own problem (M, N): the transposed one for a swapped kind.
     fn cutlass_mn(self, a: &GemmArgs) -> (u32, u32) {
-        match self {
-            GemmKind::Fp8Swap(_) => (a.n, a.m),
-            _ => (a.m, a.n),
+        if self.swapped() {
+            (a.n, a.m)
+        } else {
+            (a.m, a.n)
         }
     }
 
     /// CUTLASS's CTA tile (M, N).
     fn tile(self) -> (u32, u32) {
         match self {
-            GemmKind::Fp8Swap(t) => (TILE_M, t.rows()),
+            GemmKind::Fp8Swap(t) | GemmKind::Fp8Split(SplitTile::Swap(t), _) => (TILE_M, t.rows()),
             _ => (TILE_M, TILE_N),
         }
     }
@@ -202,6 +256,65 @@ impl GemmKind {
                     TmaSwizzle::B128,
                 ),
             ],
+            GemmKind::Fp8Split(t, splits) => {
+                // Each batch is one range of K: `k / splits` columns of the same rows,
+                // the next batch `k / splits` elements on; its output the next array.
+                let s = u64::from(splits.max(1));
+                let ks = k / s;
+                let split =
+                    |dtype, addr, rows: u64, row_bytes: u64, step: u64, box_dims, swizzle| {
+                        TmaSpec {
+                            dtype,
+                            addr,
+                            dims: vec![if dtype == TmaType::F32 { n } else { ks }, rows, s],
+                            // The output's packed stride is zero for one batch
+                            // (`make_cute_packed_stride`); the operands' is the range's.
+                            strides: vec![
+                                row_bytes,
+                                if s > 1 || dtype != TmaType::F32 {
+                                    step
+                                } else {
+                                    0
+                                },
+                            ],
+                            box_dims: Vec::from(box_dims),
+                            swizzle,
+                            l2: TmaL2::B128,
+                        }
+                    };
+                let rows = match t {
+                    SplitTile::Swap(t) => t.rows(),
+                    SplitTile::Wide => TILE_N,
+                };
+                let weight = split(TmaType::U8, a.b, n, k, ks, [128, 128, 1], TmaSwizzle::B128);
+                let act = split(TmaType::U8, a.a, m, k, ks, [128, rows, 1], TmaSwizzle::B128);
+                match t {
+                    SplitTile::Swap(_) => {
+                        let out = split(
+                            TmaType::F32,
+                            a.d,
+                            m,
+                            4 * n,
+                            4 * n * m,
+                            [32, rows.min(32), 1],
+                            TmaSwizzle::B128Atom32,
+                        );
+                        [weight, act, out]
+                    }
+                    SplitTile::Wide => {
+                        let out = split(
+                            TmaType::F32,
+                            a.d,
+                            m,
+                            4 * n,
+                            4 * n * m,
+                            [32, 128, 1],
+                            TmaSwizzle::B128,
+                        );
+                        [act, weight, out]
+                    }
+                }
+            }
             GemmKind::Bf16 => [
                 spec(
                     TmaType::Bf16,
@@ -249,6 +362,16 @@ impl GemmKind {
                     && a.n > 0
             }
             GemmKind::Bf16 => a.k.is_multiple_of(8) && a.n.is_multiple_of(8) && a.m > 0 && a.k > 0,
+            // Every range a whole number of 128-wide scale blocks; the unswapped
+            // instance's rows a multiple of 4, as for its BF16 form.
+            GemmKind::Fp8Split(t, splits) => {
+                splits > 0
+                    && a.k.is_multiple_of(128 * splits)
+                    && a.n.is_multiple_of(16)
+                    && a.m > 0
+                    && a.n > 0
+                    && (t != SplitTile::Wide || a.m.is_multiple_of(4))
+            }
         };
         if ok {
             Ok(())
@@ -263,10 +386,11 @@ impl GemmKind {
     pub fn grid(self, a: &GemmArgs) -> (bool, [u32; 3]) {
         let (tiles_m, tiles_n) = self.tiles(a);
         let along_n = tiles_n <= tiles_m && tiles_m <= 0xffff;
+        let l = self.splits();
         let grid = if along_n {
-            [tiles_n, tiles_m, 1]
+            [tiles_n, tiles_m, l]
         } else {
-            [tiles_m, tiles_n, 1]
+            [tiles_m, tiles_n, l]
         };
         (along_n, grid)
     }
@@ -297,7 +421,8 @@ impl GemmKind {
         // mode = kGemm (0); problem shape (M, N, K, L).
         put32(&mut p, OFF_MODE, 0);
         let (cm, cn) = self.cutlass_mn(a);
-        for (i, v) in [cm, cn, a.k, 1].into_iter().enumerate() {
+        let splits = self.splits();
+        for (i, v) in [cm, cn, a.k / splits, splits].into_iter().enumerate() {
             put32(&mut p, OFF_PROBLEM + 4 * i, v);
         }
         let [sa, sb, sd] = self.tma_specs(a);
@@ -334,6 +459,34 @@ impl GemmKind {
                 }
                 put32(&mut p, OFF_ALPHA, 1.0f32.to_bits());
             }
+            GemmKind::Fp8Split(SplitTile::Wide, _) => {
+                // A range's blocks: the K-block mode spans one range, the L mode
+                // steps from range to range (each scale array is K-block major).
+                let kb = a.k / 128 / splits;
+                let nb = a.n.div_ceil(128);
+                put64(&mut p, OFF_PTR_SFA, a.sfa);
+                for (i, v) in [a.m, kb, splits, a.m, a.m * kb].into_iter().enumerate() {
+                    put32(&mut p, OFF_LAYOUT_SFA + 4 * i, v);
+                }
+                put64(&mut p, OFF_PTR_SFB, a.sfb);
+                for (i, v) in [nb, kb, splits, nb, nb * kb].into_iter().enumerate() {
+                    put32(&mut p, OFF_LAYOUT_SFB + 4 * i, v);
+                }
+                put32(&mut p, OFF_ALPHA, 1.0f32.to_bits());
+            }
+            GemmKind::Fp8Split(SplitTile::Swap(_), _) => {
+                let kb = a.k / 128 / splits;
+                let nb = a.n.div_ceil(128);
+                put64(&mut p, OFF_PTR_SFA, a.sfb);
+                for (i, v) in [nb, kb, splits, nb, nb * kb].into_iter().enumerate() {
+                    put32(&mut p, OFF_LAYOUT_SFA + 4 * i, v);
+                }
+                put64(&mut p, OFF_PTR_SFB, a.sfa);
+                for (i, v) in [a.m, kb, splits, a.m, a.m * kb].into_iter().enumerate() {
+                    put32(&mut p, OFF_LAYOUT_SFB + 4 * i, v);
+                }
+                put32(&mut p, OFF_ALPHA, 1.0f32.to_bits());
+            }
             GemmKind::Fp8Swap(_) => {
                 let kb = a.k.div_ceil(128);
                 let nb = a.n.div_ceil(128);
@@ -360,7 +513,7 @@ impl GemmKind {
         let s = OFF_SCHEDULER;
         put32(&mut p, s, tiles_m);
         put32(&mut p, s + 4, tiles_n);
-        put32(&mut p, s + 8, 1);
+        put32(&mut p, s + 8, splits);
         put32(&mut p, s + 12, 1);
         put32(&mut p, s + 24, 1);
         put32(&mut p, s + 48, along_n as u32);
@@ -403,11 +556,35 @@ impl Gemm {
     /// (the blockwise kernel reads `M` rows of A and of `sfa`, rounded up to
     /// what its tiles touch through TMA, which clamps at the extents).
     pub unsafe fn launch(&self, gpu: &Gpu, a: &GemmArgs) -> Result<()> {
+        // SAFETY: the caller's.
+        unsafe { self.launch_as(gpu, self.kind, a) }
+    }
+
+    /// A split kind's launch at `splits` ranges of K: the instance is the loaded one,
+    /// the split a field of its Params.
+    ///
+    /// # Safety
+    ///
+    /// As [`Gemm::launch`], `D` holding `splits` arrays of `M × N` f32.
+    pub unsafe fn launch_splits(&self, gpu: &Gpu, splits: u32, a: &GemmArgs) -> Result<()> {
+        let GemmKind::Fp8Split(t, _) = self.kind else {
+            return Err(CudaError::new(format!(
+                "{:?} is not a split GEMM",
+                self.kind
+            )));
+        };
+        // SAFETY: the caller's.
+        unsafe { self.launch_as(gpu, GemmKind::Fp8Split(t, splits), a) }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Gemm::launch`]; `kind` names this kernel's image and entry.
+    unsafe fn launch_as(&self, gpu: &Gpu, kind: GemmKind, a: &GemmArgs) -> Result<()> {
+        debug_assert_eq!(kind.kernel(), self.kind.kernel());
         // Descriptor encoding needs this thread's current context.
         gpu.context().bind_to_thread()?;
-        let (mut params, grid) = self
-            .kind
-            .params_with(a, gpu.info().sm_count, |s| s.encode())?;
+        let (mut params, grid) = kind.params_with(a, gpu.info().sm_count, |s| s.encode())?;
         let mut args = [params.as_mut_ptr() as *mut c_void];
         // SAFETY: the single argument is the kernel's by-value Params, whose
         // size the launch contract confirmed; operands are the caller's.
