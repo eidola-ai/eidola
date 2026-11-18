@@ -24,7 +24,9 @@
 #   routes rows to (the swapped kernel's three tiles and the unswapped one,
 #   and the split instances at the split shapes) giving each row the same
 #   bits, the split's ranges and sum in their order, a stack's parts against
-#   each part alone, the small-N BF16 GEMM against its order and
+#   each part alone, the norm's fused partials and quantisation against the
+#   GEMM's sum, the norm and the quantiser, the small-N BF16 GEMM against its
+#   order and
 #   the f32 gates against the exact ones (asserted within two BF16 units;
 #   histogram in $OUT/qwen_ops_fast_gates.txt); then the exact profile on the
 #   device against the CPU reference executor, eagerly and replaying graphs

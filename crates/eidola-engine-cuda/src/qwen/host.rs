@@ -84,7 +84,12 @@ impl QwenKernels for HostDevice {
         if p.rows == 0 {
             return Ok(());
         }
-        self.run("norm", p, norm_grid(p))
+        let family = if norm_is_fused(p) {
+            "norm_fused"
+        } else {
+            "norm"
+        };
+        self.run(family, p, norm_grid(p))
     }
     unsafe fn quant(&self, p: &QuantParams) -> Result<()> {
         if p.rows == 0 {
@@ -104,6 +109,36 @@ impl QwenKernels for HostDevice {
             ));
         }
         self.run("lin8", p, lin8_grid(p))
+    }
+    /// Planning as the fast profile does: the exact linear's rows as the first split's
+    /// partials and zeros as the others, so the norm's sum of them is those rows.
+    unsafe fn lin8_parts(&self, p: &Lin8Params, parts: u64) -> Result<()> {
+        if p.rows == 0 {
+            return Ok(());
+        }
+        let splits = fp8_splits(p.n, p.k);
+        if self.profile != QwenProfile::Fast || splits < 2 {
+            return Err(CudaError::new(
+                "partial sums are the fast profile's split linears'",
+            ));
+        }
+        let (rows, n, m_pad) = (p.rows as usize, p.n as usize, p.m_pad as usize);
+        let mut out = vec![0u16; rows * n];
+        let q = Lin8Params {
+            out: out.as_mut_ptr() as u64,
+            out_stride: p.n,
+            ..*p
+        };
+        self.run("lin8", &q, lin8_grid(&q))?;
+        // SAFETY: the caller's `splits · m_pad · n` f32 at `parts`.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(parts as *mut f32, splits as usize * m_pad * n)
+        };
+        dst.fill(0.0);
+        for (d, &v) in dst.iter_mut().zip(&out) {
+            *d = f32::from_bits(u32::from(v) << 16);
+        }
+        Ok(())
     }
     unsafe fn linear(&self, p: &LinearParams, _fast: Option<u64>) -> Result<()> {
         if p.rows == 0 {

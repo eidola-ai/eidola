@@ -41,23 +41,42 @@ void qwen_host_embed(const QwEmbedParams* p, uint32_t gx, uint32_t gy) {
 // `eidola_qwen_norm`'s entry: a unit wider than `kNormWarpMax` a CTA over the
 // grid's (units, rows); narrower ones a warp each, eight a CTA, numbered row
 // by row over the grid's x.
-void qwen_host_norm(const QwNormParams* p, uint32_t gx, uint32_t gy) {
+// `eidola_qwen_norm_fused` (`fused`) or `eidola_qwen_norm`'s, over its grid.
+static void host_norm(const QwNormParams* p, uint32_t gx, uint32_t gy, bool fused) {
   qwk::NormShared sh;
   for (uint32_t y = gy; y-- > 0;)
     for (uint32_t x = gx; x-- > 0;) {
       garbage(&sh);
       if (p->n > qwk::kNormWarpMax) {
-        qwk::norm_item<qwk::kElementThreads>(*p, y, x, kPar, sh.ln[0], sh.row);
+        if (fused) {
+          qwk::norm_item<qwk::kElementThreads, true>(*p, y, x, kPar, sh.ln[0], sh.row, sh.gm);
+        } else {
+          qwk::norm_item<qwk::kElementThreads, false>(*p, y, x, kPar, sh.ln[0], sh.row, sh.gm);
+        }
         continue;
       }
       for (uint32_t w = qwk::kNormItems; w-- > 0;) {
         const uint64_t item = static_cast<uint64_t>(x) * qwk::kNormItems + w;
         if (item >= static_cast<uint64_t>(p->rows) * p->units) continue;
-        qwk::norm_item<qwk::kWarp>(*p, static_cast<uint32_t>(item / p->units),
-                                   static_cast<uint32_t>(item % p->units), qwk::WarpPar{},
-                                   sh.ln[w], sh.row + w * qwk::kNormWarpMax);
+        const uint32_t r = static_cast<uint32_t>(item / p->units);
+        const uint32_t u = static_cast<uint32_t>(item % p->units);
+        uint16_t* b = sh.row + w * qwk::kNormWarpMax;
+        uint32_t* g = sh.gm + w * (qwk::kNormWarpMax / 4);
+        if (fused) {
+          qwk::norm_item<qwk::kWarp, true>(*p, r, u, qwk::WarpPar{}, sh.ln[w], b, g);
+        } else {
+          qwk::norm_item<qwk::kWarp, false>(*p, r, u, qwk::WarpPar{}, sh.ln[w], b, g);
+        }
       }
     }
+}
+
+void qwen_host_norm(const QwNormParams* p, uint32_t gx, uint32_t gy) {
+  host_norm(p, gx, gy, false);
+}
+
+void qwen_host_norm_fused(const QwNormParams* p, uint32_t gx, uint32_t gy) {
+  host_norm(p, gx, gy, true);
 }
 
 // The norm's reference form over its own grid: a CTA a (unit, row).

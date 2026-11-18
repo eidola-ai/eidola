@@ -1,5 +1,6 @@
 // The Qwen3.8 executor's kernels that divide or take a square root: the
-// zero-centred RMS norm (with the residual add and RoPE), the FP8 activation
+// zero-centred RMS norm (with the residual add and RoPE, and its fused forms),
+// the FP8 activation
 // quantiser, the element-wise gates (their sigmoid and SiLU divide in f64),
 // the exact attention core, and the DeltaNet's per-position preparation and
 // gated norm. The fused multiply-adds in this image's SASS are ptxas's
@@ -12,22 +13,38 @@
 // A unit wider than `kNormWarpMax` a CTA (grid: units by rows); narrower
 // units a warp each, eight a CTA, numbered row by row (grid: their count
 // over eight). The choice is the launch's (its width), uniform over the CTA.
-extern "C" __global__ void __launch_bounds__(qwk::kElementThreads)
-    eidola_qwen_norm(const __grid_constant__ QwNormParams p) {
+template <bool Fused>
+__device__ __forceinline__ void norm_entry(const QwNormParams& p) {
   __shared__ qwk::NormShared sh;
   if (p.n > qwk::kNormWarpMax) {
-    qwk::norm_item<qwk::kElementThreads>(p, blockIdx.y, blockIdx.x, ds::Par{}, sh.ln[0], sh.row);
+    qwk::norm_item<qwk::kElementThreads, Fused>(p, blockIdx.y, blockIdx.x, ds::Par{}, sh.ln[0],
+                                                sh.row, sh.gm);
     return;
   }
   const uint32_t w = threadIdx.x / qwk::kWarp;
   const uint64_t item = static_cast<uint64_t>(blockIdx.x) * qwk::kNormItems + w;
   // Uniform across the warp: the unit is the warp's.
   if (item >= static_cast<uint64_t>(p.rows) * p.units) return;
-  qwk::norm_item<qwk::kWarp>(p, static_cast<uint32_t>(item / p.units),
-                             static_cast<uint32_t>(item % p.units), qwk::WarpPar{}, sh.ln[w],
-                             sh.row + w * qwk::kNormWarpMax);
+  qwk::norm_item<qwk::kWarp, Fused>(p, static_cast<uint32_t>(item / p.units),
+                                    static_cast<uint32_t>(item % p.units), qwk::WarpPar{},
+                                    sh.ln[w], sh.row + w * qwk::kNormWarpMax,
+                                    sh.gm + w * (qwk::kNormWarpMax / 4));
+}
+
+extern "C" __global__ void __launch_bounds__(qwk::kElementThreads)
+    eidola_qwen_norm(const __grid_constant__ QwNormParams p) {
+  norm_entry<false>(p);
 }
 EIDOLA_KERNEL_META(eidola_qwen_norm, qwk::kElementThreads, 1, 1, 0, 1, 1, 1, sizeof(QwNormParams));
+
+// The norm's fused forms (`qwen_ops.cuh`): the residual add from a split
+// GEMM's partials, the normed rows quantised. The same grid.
+extern "C" __global__ void __launch_bounds__(qwk::kElementThreads)
+    eidola_qwen_norm_fused(const __grid_constant__ QwNormParams p) {
+  norm_entry<true>(p);
+}
+EIDOLA_KERNEL_META(eidola_qwen_norm_fused, qwk::kElementThreads, 1, 1, 0, 1, 1, 1,
+                   sizeof(QwNormParams));
 
 // The warp form (`qwen_ops.cuh`): a warp per block and up to `kQuantRows` rows
 // (the rows over the grid's y: one a CTA at decode sizes, four at prefill

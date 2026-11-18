@@ -1305,6 +1305,7 @@ pub fn all<D: QwenDevice>(dev: &D) -> Vec<(&'static str, Result<(), String>)> {
     vec![
         ("copies", copies(dev, 10)),
         ("norm", norm(dev, 1)),
+        ("norm fused", norm_fused(dev, 11)),
         ("quant", quant(dev, 7)),
         ("conversions", conversions(dev, 8)),
         ("lin8", lin8(dev, 2)),
@@ -1314,6 +1315,124 @@ pub fn all<D: QwenDevice>(dev: &D) -> Vec<(&'static str, Result<(), String>)> {
         ("deltanet", deltanet(dev, 6)),
         ("dn recurrence", dn_recurrence(dev, 9)),
     ]
+}
+
+/// A norm's residual, normed rows, codes and scales.
+type NormOutputs = (Vec<u16>, Vec<u16>, Vec<u8>, Vec<f32>);
+
+/// The residual norm's fused forms against the launches they stand for, bit for bit: with
+/// `add_parts` (a split GEMM's partial sums) against those sums added in split order from
+/// the first, rounded once to BF16 (here, as `eidola_qwen_fast_split_sum` stores them),
+/// then the norm with that BF16 `add`; with `codes`, the normed rows' codes and scales
+/// against the quantiser's over the norm's output; and both at once. The residual updated
+/// in place, the normed rows, the codes and the scales all compared, at a CTA's unit
+/// (5,120) and a warp's (512, 384), one row and several, over rows with zeros, ties and
+/// spikes; partials of 2 and 3 splits.
+pub fn norm_fused<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
+    let mut g = Lcg(seed);
+    for &(n, rows, splits) in &[
+        (5120usize, 1usize, 3usize),
+        (5120, 9, 2),
+        (512, 1, 2),
+        (512, 6, 3),
+        (384, 13, 2),
+    ] {
+        let m_pad = rows.next_multiple_of(4);
+        let mut x: Vec<f32> = (0..rows * n).map(|_| g.bf16(2.0)).collect();
+        x[..128].fill(0.0);
+        let w: Vec<f32> = (0..n).map(|_| 1.0 + g.bf16(0.5)).collect();
+        // Partials whose sums land on BF16 ties and past the largest normal BF16 now and
+        // then, and a block of zeros.
+        let mut parts: Vec<f32> = (0..splits * m_pad * n)
+            .map(|_| g.f32() * 3.0 - 1.5)
+            .collect();
+        for (i, v) in parts.iter_mut().enumerate() {
+            if i % 97 == 5 {
+                *v = f32::from_bits(0x3f80_8000);
+            }
+            if i % (m_pad * n) < 128 {
+                *v = 0.0;
+            }
+        }
+        if rows > 1 {
+            parts[n + 7] = 1.0e38;
+            parts[m_pad * n + n + 7] = 3.0e38;
+        }
+        // The sums as the split GEMM's sum stores them.
+        let sums: Vec<u16> = (0..rows * n)
+            .map(|i| {
+                let mut acc = parts[i];
+                for sp in 1..splits {
+                    acc += parts[sp * m_pad * n + i];
+                }
+                eidola_engine_cuda::bf16::from_f32(acc)
+            })
+            .collect();
+        let xb = bits(&x);
+        for (with_parts, quantise) in [(false, true), (true, false), (true, true)] {
+            let run = |fused: bool| -> Result<NormOutputs, String> {
+                let (xd, wd) = (buf(dev, &xb), buf(dev, &w));
+                let (ad, pd) = (buf(dev, &sums), buf(dev, &parts));
+                let out = zeros(dev, rows * n * 2);
+                let codes = zeros(dev, m_pad * n);
+                let scales = zeros(dev, (n / 128) * m_pad * 4);
+                let mut p = NormParams {
+                    x: xd.addr,
+                    weight: wd.addr,
+                    out: out.addr,
+                    rows: u(rows),
+                    units: 1,
+                    n: u(n),
+                    x_stride: u(n),
+                    add_stride: u(n),
+                    out_stride: u(n),
+                    eps: 1e-6,
+                    ..NormParams::default()
+                };
+                if with_parts && fused {
+                    p.add_parts = pd.addr;
+                    p.add_splits = u(splits);
+                    p.add_part_rows = u(m_pad);
+                } else if with_parts {
+                    p.add = ad.addr;
+                }
+                if quantise && fused {
+                    p.codes = codes.addr;
+                    p.scales = scales.addr;
+                    p.m_pad = u(m_pad);
+                }
+                // SAFETY: every buffer holds what the struct names.
+                unsafe { dev.norm(&p) }.map_err(|e| e.to_string())?;
+                if quantise && !fused {
+                    let q = QuantParams {
+                        x: out.addr,
+                        codes: codes.addr,
+                        scales: scales.addr,
+                        rows: u(rows),
+                        k: u(n),
+                        x_stride: u(n),
+                        m_pad: u(m_pad),
+                    };
+                    // SAFETY: as above.
+                    unsafe { dev.quant(&q) }.map_err(|e| e.to_string())?;
+                }
+                Ok((
+                    read::<D, u16>(dev, &xd, rows * n),
+                    read::<D, u16>(dev, &out, rows * n),
+                    read::<D, u8>(dev, &codes, rows * n),
+                    read::<D, f32>(dev, &scales, (n / 128) * m_pad),
+                ))
+            };
+            let (a, b) = (run(false)?, run(true)?);
+            let what = format!("{n} wide, {rows} rows, parts {with_parts}, codes {quantise}");
+            same(&format!("{what}: residual"), &b.0, &a.0)?;
+            same(&format!("{what}: normed"), &b.1, &a.1)?;
+            same(&format!("{what}: codes"), &b.2, &a.2)?;
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            same(&format!("{what}: scales"), &bits(&b.3), &bits(&a.3))?;
+        }
+    }
+    Ok(())
 }
 
 /// The fast profile's BF16 GEMM (the DeltaNet's stacked `a` and `b` projections, and a
@@ -1753,6 +1872,7 @@ pub fn norm_forms<D: QwenDevice>(
             out_unit_stride: u(ou),
             rotary: u(rotary),
             eps: 1e-6,
+            ..NormParams::default()
         };
         // SAFETY: every buffer holds what the struct names.
         unsafe { dev.norm(&p) }.map_err(|e| e.to_string())?;

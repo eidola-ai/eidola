@@ -126,6 +126,10 @@ fn qwen_kernels_on_the_device() {
         ("fast_fp8_split_forms", fast_fp8_split_forms(&fast, 25)),
         ("fast_fp8_split_order", fast_fp8_split_order(&fast, 26)),
         ("fast_fp8_stacks", fast_fp8_stacks(&fast, 27)),
+        (
+            "fast_norm_split_residual",
+            fast_norm_split_residual(&fast, 28),
+        ),
     ] {
         match outcome {
             Ok(report) => {
@@ -590,6 +594,103 @@ fn fast_fp8_split_order(fast: &CudaDevice, seed: u64) -> Result<String, String> 
     }
     Ok(format!(
         "{checked} launches: each range its own GEMM, the sum in range order, bit for bit"
+    ))
+}
+
+/// A norm's residual, normed rows, codes and scales' bits.
+type NormOutputs = (Vec<u16>, Vec<u16>, Vec<u8>, Vec<u32>);
+
+/// The program's residual path at the split shapes, end to end on the device: the split
+/// GEMM's partials left for the norm (`lin8_parts`, the norm's `add_parts`) and its rows
+/// quantised by the norm (`codes`) against the GEMM with its sum (`lin8`), the norm over
+/// that BF16 output, and the quantiser over the norm's: the residual, the normed rows,
+/// the codes and the scales bit for bit, at 1 to 300 rows of `o_proj`'s and `down_proj`'s
+/// shapes.
+fn fast_norm_split_residual(fast: &CudaDevice, seed: u64) -> Result<String, String> {
+    use eidola_engine_cuda::qwen::abi::{NormParams, QuantParams};
+    use eidola_engine_cuda::qwen::kernels::{MAX_SPLITS, QwenKernels, fp8_splits};
+    use qwen_common::{Lcg, bits, buf, read, zeros};
+
+    let u = |x: usize| u32::try_from(x).expect("small");
+    let mut g = Lcg(seed);
+    let mut checked = 0usize;
+    for &(n, k) in &[(5120usize, 6144usize), (5120, 17408)] {
+        let splits = fp8_splits(u(n), u(k)) as usize;
+        let c = Fp8Case::new(fast, &mut g, n, k, 300);
+        let h: Vec<f32> = (0..300 * n).map(|_| g.bf16(4.0)).collect();
+        let w: Vec<f32> = (0..n).map(|_| 1.0 + g.bf16(0.5)).collect();
+        let wb = buf(fast, &w);
+        for rows in [1usize, 4, 16, 33, 64, 65, 300] {
+            let m_pad = rows.next_multiple_of(4);
+            let run = |fused: bool| -> Result<NormOutputs, String> {
+                let add = zeros(fast, m_pad * n * 2);
+                let parts = zeros(fast, MAX_SPLITS as usize * m_pad * n * 4);
+                let hb = buf(fast, &bits(&h[..rows * n]));
+                let out = zeros(fast, rows * n * 2);
+                let codes = zeros(fast, m_pad * n);
+                let scales = zeros(fast, (n / 128) * m_pad * 4);
+                let l = c.quant(fast, rows, 0, add.addr)?;
+                let mut p = NormParams {
+                    x: hb.addr,
+                    weight: wb.addr,
+                    out: out.addr,
+                    rows: u(rows),
+                    units: 1,
+                    n: u(n),
+                    x_stride: u(n),
+                    add_stride: u(n),
+                    out_stride: u(n),
+                    eps: 1e-6,
+                    ..NormParams::default()
+                };
+                // SAFETY: every buffer covers `m_pad` rows of these shapes.
+                unsafe {
+                    if fused {
+                        fast.lin8_parts(&l, parts.addr).map_err(|e| e.to_string())?;
+                        p.add_parts = parts.addr;
+                        p.add_splits = u(splits);
+                        p.add_part_rows = u(m_pad);
+                        p.codes = codes.addr;
+                        p.scales = scales.addr;
+                        p.m_pad = u(m_pad);
+                        fast.norm(&p).map_err(|e| e.to_string())?;
+                    } else {
+                        fast.lin8(&l, Some(parts.addr)).map_err(|e| e.to_string())?;
+                        p.add = add.addr;
+                        fast.norm(&p).map_err(|e| e.to_string())?;
+                        let q = QuantParams {
+                            x: out.addr,
+                            codes: codes.addr,
+                            scales: scales.addr,
+                            rows: u(rows),
+                            k: u(n),
+                            x_stride: u(n),
+                            m_pad: u(m_pad),
+                        };
+                        fast.quant(&q).map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok((
+                    read::<CudaDevice, u16>(fast, &hb, rows * n),
+                    read::<CudaDevice, u16>(fast, &out, rows * n),
+                    read::<CudaDevice, u8>(fast, &codes, rows * n),
+                    read::<CudaDevice, f32>(fast, &scales, (n / 128) * m_pad)
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect(),
+                ))
+            };
+            let (a, b) = (run(false)?, run(true)?);
+            let what = format!("{n}x{k}, {rows} rows");
+            cases::same(&format!("{what}: residual"), &b.0, &a.0)?;
+            cases::same(&format!("{what}: normed"), &b.1, &a.1)?;
+            cases::same(&format!("{what}: codes"), &b.2, &a.2)?;
+            cases::same(&format!("{what}: scales"), &b.3, &a.3)?;
+            checked += 1;
+        }
+    }
+    Ok(format!(
+        "{checked} launches: the fused residual norm equal to the GEMM's sum, norm and quantiser"
     ))
 }
 
