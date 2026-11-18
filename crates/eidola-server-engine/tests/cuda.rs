@@ -16,6 +16,12 @@
 //! before the devices, and the node's executor configuration run over host devices
 //! answering token for token as the CPU executor does.
 //!
+//! Qwen3.8 (its dev model), without a device: graphs refused, one KV budget, the state
+//! pool and one sequence in it, the host tier and the weights hash before the device; and
+//! the node's executor configuration run over the kernels' bodies compiled for the host
+//! answering token for token as the CPU executor does, its pools and step scratch within
+//! the shared rules' counts.
+//!
 //! With a device (`EIDOLA_TEST_CUDA_WEIGHTS` and `EIDOLA_ENGINE_KERNELS_DIR`): the node
 //! booted on real MiMo-V2.6-Flash weights answers a chat request end to end, and its
 //! output equals, token for token, the engine core driven directly over a CUDA executor
@@ -624,6 +630,451 @@ fn the_nodes_deepseek_configuration_computes_what_the_cpu_executor_does() {
             max_tokens,
         );
         assert_eq!(got, expected, "draft width {k}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Qwen3.8 without a device.
+// ---------------------------------------------------------------------------------------
+
+/// The CUDA executor's settings over the Qwen3.8 dev model: a 64 MiB KV budget.
+fn qwen_cuda_env() -> HashMap<&'static str, String> {
+    let mut map = cuda_env(qwen_model_dir(), qwen_weights_hash());
+    map.insert(env::MODEL_ID, QWEN_MODEL_ID.into());
+    map.insert(env::KV_DEVICE_BYTES, (64u64 << 20).to_string());
+    map
+}
+
+/// A Qwen3.8 configuration the node accepts on the host goes on to the device and,
+/// without one, fails closed there, drafting or not. Never a CPU fallback.
+#[test]
+fn qwen_reaches_the_device_and_fails_closed_without_it() {
+    for k in ["0", "3"] {
+        let mut map = qwen_cuda_env();
+        map.insert(env::DRAFT_TOKENS, k.into());
+        let err = boot_err(&map);
+        assert!(!err.contains(env::KV_DEVICE_BYTES), "{k}: {err}");
+        if !Gpu::available() {
+            assert!(err.contains(NO_DEVICE), "{k}: {err}");
+        }
+    }
+}
+
+/// Before the device: decode graphs (the executor captures none), a budget that names
+/// two devices or cannot hold the state pool and one sequence, a host tier under two of
+/// each, and a wrong weights hash before anything of the executor's.
+#[test]
+fn qwen_refusals_come_before_the_device() {
+    let refused = |overrides: &[(&'static str, &str)], needles: &[&str]| {
+        let mut map = qwen_cuda_env();
+        for (k, v) in overrides {
+            map.insert(k, v.to_string());
+        }
+        let err = boot_err(&map);
+        for needle in needles {
+            assert!(err.contains(needle), "{overrides:?}: {err}");
+        }
+        assert!(!err.contains(NO_DEVICE), "{overrides:?}: {err}");
+    };
+    refused(
+        &[(env::CUDA_GRAPHS, "on")],
+        &[env::CUDA_GRAPHS, "no decode graphs"],
+    );
+    let two = format!("{0},{0}", 64u64 << 20);
+    refused(&[(env::KV_DEVICE_BYTES, &two)], &["device budgets"]);
+    refused(
+        &[(env::KV_DEVICE_BYTES, "4096")],
+        &[env::KV_DEVICE_BYTES, "state pool"],
+    );
+    let states = eidola_common::engine_deployment::recurrent_state_buffers(
+        &config_from(&qwen_cuda_env()).unwrap().sizing,
+        &config_from(&qwen_cuda_env()).unwrap().cache,
+    );
+    let image = eidola_server_engine::cuda::qwen_dims(qwen_loaded().qwen_config().unwrap())
+        .state_image_bytes();
+    let only_states = (states * image + 1000).to_string();
+    refused(&[(env::KV_DEVICE_BYTES, &only_states)], &["fewer than the"]);
+    refused(&[(env::KV_HOST_BYTES, "4096")], &[env::KV_HOST_BYTES]);
+    for graphs in ["off", "on"] {
+        refused(
+            &[
+                (env::WEIGHTS_SHA256, &"ab".repeat(32)),
+                (env::CUDA_GRAPHS, graphs),
+            ],
+            &["weights hash"],
+        );
+    }
+}
+
+/// An allocation the counting device made, kept with its size and the device's tally.
+struct Counted {
+    _inner: Box<dyn std::any::Any>,
+    bytes: u64,
+    tally: Arc<std::sync::Mutex<Tally>>,
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.tally.lock().unwrap().live -= self.bytes;
+    }
+}
+
+/// The device allocations live, their peak, and every size allocated in order.
+#[derive(Default)]
+struct Tally {
+    live: u64,
+    peak: u64,
+    sizes: Vec<u64>,
+}
+
+/// A Qwen3.8 device that counts its allocations and otherwise is the device it wraps.
+struct Counting<D> {
+    inner: D,
+    tally: Arc<std::sync::Mutex<Tally>>,
+}
+
+mod counting {
+    use super::*;
+    use eidola_engine::kv_cipher::KvNonce;
+    use eidola_engine::secret::KvKey;
+    use eidola_engine_cuda::Result;
+    use eidola_engine_cuda::qwen::abi::*;
+    use eidola_engine_cuda::qwen::device::{QwenDevice, QwenProfile};
+    use eidola_engine_cuda::qwen::kernels::QwenKernels;
+
+    impl<D: QwenKernels> QwenKernels for Counting<D> {
+        unsafe fn embed(&self, p: &EmbedParams) -> Result<()> {
+            unsafe { self.inner.embed(p) }
+        }
+        unsafe fn norm(&self, p: &NormParams) -> Result<()> {
+            unsafe { self.inner.norm(p) }
+        }
+        unsafe fn quant(&self, p: &QuantParams) -> Result<()> {
+            unsafe { self.inner.quant(p) }
+        }
+        unsafe fn lin8(&self, p: &Lin8Params) -> Result<()> {
+            unsafe { self.inner.lin8(p) }
+        }
+        unsafe fn linear(&self, p: &LinearParams, large: bool) -> Result<()> {
+            unsafe { self.inner.linear(p, large) }
+        }
+        unsafe fn gate(&self, p: &GateParams) -> Result<()> {
+            unsafe { self.inner.gate(p) }
+        }
+        unsafe fn kv_write(&self, p: &KvWriteParams) -> Result<()> {
+            unsafe { self.inner.kv_write(p) }
+        }
+        unsafe fn attention(&self, p: &AttnParams) -> Result<()> {
+            unsafe { self.inner.attention(p) }
+        }
+        unsafe fn dn_prep(&self, p: &DnPrepParams) -> Result<()> {
+            unsafe { self.inner.dn_prep(p) }
+        }
+        unsafe fn dn_rec(&self, p: &DnRecParams) -> Result<()> {
+            unsafe { self.inner.dn_rec(p) }
+        }
+        unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()> {
+            unsafe { self.inner.dn_norm(p) }
+        }
+        unsafe fn widen(&self, p: &WidenParams) -> Result<()> {
+            unsafe { self.inner.widen(p) }
+        }
+        unsafe fn round(&self, p: &RoundParams) -> Result<()> {
+            unsafe { self.inner.round(p) }
+        }
+    }
+
+    impl<D: QwenDevice> QwenDevice for Counting<D> {
+        fn profile(&self) -> QwenProfile {
+            self.inner.profile()
+        }
+        fn alloc(&self, bytes: usize) -> Result<(u64, Box<dyn std::any::Any>)> {
+            let (addr, keep) = self.inner.alloc(bytes)?;
+            let bytes = bytes as u64;
+            let mut t = self.tally.lock().unwrap();
+            t.live += bytes;
+            t.peak = t.peak.max(t.live);
+            t.sizes.push(bytes);
+            drop(t);
+            Ok((
+                addr,
+                Box::new(Counted {
+                    _inner: keep,
+                    bytes,
+                    tally: self.tally.clone(),
+                }),
+            ))
+        }
+        unsafe fn zero(&self, addr: u64, bytes: usize) -> Result<()> {
+            unsafe { self.inner.zero(addr, bytes) }
+        }
+        unsafe fn upload(&self, addr: u64, src: &[u8]) -> Result<()> {
+            unsafe { self.inner.upload(addr, src) }
+        }
+        unsafe fn download(&self, addr: u64, dst: &mut [u8]) -> Result<()> {
+            unsafe { self.inner.download(addr, dst) }
+        }
+        unsafe fn copy(&self, dst: u64, src: u64, bytes: usize) -> Result<()> {
+            unsafe { self.inner.copy(dst, src, bytes) }
+        }
+        unsafe fn cipher(
+            &self,
+            addr: u64,
+            words: u32,
+            counter: u32,
+            key: &KvKey,
+            nonce: &KvNonce,
+        ) -> Result<()> {
+            unsafe { self.inner.cipher(addr, words, counter, key, nonce) }
+        }
+        fn alloc_host(&self, bytes: usize) -> Result<(*mut u8, Box<dyn std::any::Any>)> {
+            self.inner.alloc_host(bytes)
+        }
+        unsafe fn copy_to_host(&self, dst: *mut u8, src: u64, bytes: usize) -> Result<()> {
+            unsafe { self.inner.copy_to_host(dst, src, bytes) }
+        }
+        unsafe fn copy_from_host(&self, dst: u64, src: *const u8, bytes: usize) -> Result<()> {
+            unsafe { self.inner.copy_from_host(dst, src, bytes) }
+        }
+        fn synchronize(&self) -> Result<()> {
+            self.inner.synchronize()
+        }
+    }
+}
+
+/// The kernels' own bodies compiled for the host (the CUDA crate's
+/// `oracle/qwen_launch_host.cc`), or `None` without a C++ compiler.
+fn qwen_host_device() -> Option<eidola_engine_cuda::qwen::host::HostDevice> {
+    use std::process::Command;
+    let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
+    if Command::new(&cxx).arg("--version").output().is_err() {
+        eprintln!("SKIPPED: no C++ compiler ({cxx}) for the Qwen3.8 kernel bodies");
+        return None;
+    }
+    let cuda = Path::new(env!("CARGO_MANIFEST_DIR")).join("../eidola-engine-cuda");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "libqwen_launch_host-node-{}-{nanos}.{}",
+        std::process::id(),
+        std::env::consts::DLL_EXTENSION
+    ));
+    let status = Command::new(&cxx)
+        .args(["-std=c++17", "-O2", "-ffp-contract=off", "-shared", "-fPIC"])
+        .arg("-I")
+        .arg(cuda.join("../eidola-engine-kernels/csrc"))
+        .arg(cuda.join("oracle/qwen_launch_host.cc"))
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .expect("run the C++ compiler");
+    assert!(
+        status.success(),
+        "{cxx} failed on oracle/qwen_launch_host.cc"
+    );
+    // SAFETY: a library this test just built from the CUDA crate's own source; it has no
+    // initialisers.
+    let lib = Arc::new(unsafe { libloading::Library::new(&out) }.expect("load the bodies"));
+    type HostFn = unsafe extern "C" fn(*const std::ffi::c_void, u32, u32);
+    Some(eidola_engine_cuda::qwen::host::HostDevice::new(Box::new(
+        move |family, params, gx, gy| {
+            let name = format!("qwen_host_{family}\0");
+            // SAFETY: every `qwen_host_*` symbol takes its family's parameter struct.
+            unsafe {
+                let f: libloading::Symbol<HostFn> =
+                    lib.get(name.as_bytes()).expect("a host body per family");
+                f(params, gx, gy);
+            }
+        },
+    )))
+}
+
+/// Greedy generation of `prompt` through the engine core over `exec` at the node's
+/// scheduler limits for `sizing`.
+fn qwen_greedy<E: eidola_engine::executor::Executor>(
+    exec: E,
+    sizing: &eidola_server_engine::config::Sizing,
+    prompt: Vec<u32>,
+    max_tokens: u32,
+) -> Vec<u32> {
+    use eidola_engine::engine::{CacheScope, Engine, Request, SchedulerConfig};
+    use eidola_engine::kv::CachePolicy;
+    use eidola_engine::sampling::SamplingParams;
+    let model = qwen_loaded();
+    let mut engine = Engine::new(
+        exec,
+        SchedulerConfig {
+            max_batched_tokens: sizing.max_batched_tokens,
+            max_seqs: sizing.max_seqs,
+            max_prefill_chunk: sizing.max_prefill_chunk,
+            eos_token_ids: model.tokenizer().eos_token_ids().to_vec(),
+            speculative: sizing.draft_tokens > 0,
+            cache: CachePolicy::default(),
+            sweep_interval_ms: 1000,
+        },
+    )
+    .unwrap();
+    engine
+        .submit(Request {
+            id: 1,
+            prompt,
+            sampling: SamplingParams::greedy(),
+            max_tokens,
+            required_cached_tokens: 0,
+            stop_token_ids: Vec::new(),
+            cache: CacheScope::Private,
+        })
+        .unwrap();
+    let mut out = Vec::new();
+    for now in 0.. {
+        for ev in engine.step(now).unwrap() {
+            out.extend(ev.tokens);
+            if ev.finish.is_some() {
+                return out;
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// The executor configuration the node derives for Qwen3.8 (`cuda::qwen_config`, over
+/// the dev model's verified configuration and sampleable vocabulary), run over the
+/// kernels' bodies compiled for the host in the exact profile, generates exactly the CPU
+/// executor's greedy tokens, without drafts and drafting two; its pools are the sizes
+/// the shared rules count (`engine_deployment::recurrent_kv_block_bytes`, the state
+/// image, `recurrent_seat_bytes`), and its step scratch stays within
+/// `recurrent_step_scratch_bytes` over a prompt that fills the window in whole steps.
+#[test]
+fn the_nodes_qwen_configuration_computes_what_the_cpu_executor_does() {
+    use eidola_common::engine_deployment::{
+        recurrent_kv_block_bytes, recurrent_seat_bytes, recurrent_step_scratch_bytes,
+    };
+    use eidola_engine_cpu::qwen::QwenCpuExecutor;
+    use eidola_engine_cuda::qwen::QwenCudaExecutor;
+    use eidola_server_engine::model::Served;
+
+    let model = qwen_loaded();
+    let Served::Qwen {
+        model: reference,
+        template,
+    } = model.served()
+    else {
+        panic!("the Qwen dev model");
+    };
+    let text = "Name three primary colours, and say why each is one. ".repeat(60);
+    let input = eidola_engine_chat::ChatInput::from_json(
+        &json!([{"role": "user", "content": text}]).to_string(),
+        None,
+    )
+    .unwrap();
+    let prompt = template
+        .render_prompt(&input, &eidola_server_engine::pipeline::qwen_options())
+        .unwrap();
+    let prompt = model.tokenizer().encode_prompt(&prompt).unwrap();
+    assert!(
+        prompt.len() > 700 && prompt.len() < 1000,
+        "{}",
+        prompt.len()
+    );
+    let max_tokens = 8;
+
+    let base = config_from(&qwen_env_map()).unwrap();
+    let sizing = eidola_server_engine::config::Sizing {
+        draft_tokens: 0,
+        ..base.sizing
+    };
+    let cpu_config = eidola_server_engine::qwen_cpu_config(
+        reference.config(),
+        &sizing,
+        &base.cache,
+        256,
+        0,
+        model.sampleable_vocab_size(),
+    )
+    .unwrap();
+    let expected = qwen_greedy(
+        QwenCpuExecutor::new(reference.clone(), cpu_config),
+        &sizing,
+        prompt.clone(),
+        max_tokens,
+    );
+    assert!(!expected.is_empty());
+
+    let dims = eidola_server_engine::cuda::qwen_dims(reference.config());
+    for k in ["0", "2"] {
+        let Some(host) = qwen_host_device() else {
+            return;
+        };
+        let mut map = qwen_cuda_env();
+        map.insert(env::DRAFT_TOKENS, k.into());
+        let config = config_from(&map).unwrap();
+        let ExecutorConfig::Cuda {
+            kv_device_bytes,
+            graphs,
+            ..
+        } = &config.executor
+        else {
+            unreachable!()
+        };
+        let exec_config = eidola_server_engine::cuda::qwen_config(
+            reference.config(),
+            &config.sizing,
+            &config.cache,
+            *kv_device_bytes,
+            config.kv_host_bytes,
+            *graphs,
+            model.sampleable_vocab_size(),
+        )
+        .unwrap();
+        let tally = Arc::new(std::sync::Mutex::new(Tally::default()));
+        let dev = Counting {
+            inner: host,
+            tally: tally.clone(),
+        };
+        let exec = QwenCudaExecutor::new(dev, reference, exec_config.clone()).unwrap();
+
+        // The pools, in the executor's order after its weights: the target's KV, with
+        // drafting the drafter's KV and its taps, the states, then each seat's live
+        // image, tail and kept states, and the status word.
+        let (persistent, pools) = {
+            let t = tally.lock().unwrap();
+            let drafting = config.sizing.draft_tokens > 0;
+            let n = if drafting { 8 } else { 6 };
+            (t.live, t.sizes[t.sizes.len() - n..].to_vec())
+        };
+        let s = &config.sizing;
+        let blocks = u64::from(exec_config.num_blocks);
+        let b = u64::from(s.kv_block_size);
+        let mut want = vec![blocks * b * dims.kv_bytes_per_position()];
+        if s.draft_tokens > 0 {
+            want.push(blocks * b * dims.drafter_kv_bytes_per_position());
+            want.push(blocks * dims.tap_bytes());
+        }
+        want.push(u64::from(exec_config.state_buffers) * dims.state_image_bytes());
+        assert_eq!(pools[..want.len()], want[..], "k = {k}");
+        assert_eq!(
+            want[..want.len() - 1].iter().sum::<u64>() / blocks,
+            recurrent_kv_block_bytes(&dims, s),
+            "k = {k}"
+        );
+        assert_eq!(
+            pools[want.len()..want.len() + 3].iter().sum::<u64>(),
+            u64::from(s.max_seqs) * recurrent_seat_bytes(&dims, s),
+            "k = {k}"
+        );
+
+        let got = qwen_greedy(exec, s, prompt.clone(), max_tokens);
+        assert_eq!(got, expected, "draft width {k}");
+        let t = tally.lock().unwrap();
+        let scratch = t.peak - persistent;
+        let bound = recurrent_step_scratch_bytes(&dims, s);
+        eprintln!("k = {k}: step scratch peak {scratch} of the {bound} counted");
+        assert!(scratch <= bound, "k = {k}: {scratch} > {bound}");
+        assert!(
+            scratch * 2 > bound,
+            "k = {k}: {scratch} is far below {bound}"
+        );
     }
 }
 

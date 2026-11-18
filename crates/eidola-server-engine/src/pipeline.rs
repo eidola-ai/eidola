@@ -1,8 +1,8 @@
 //! From a validated request to engine tokens, and from engine tokens to OpenAI output.
 //!
-//! In: the chat crate renders the prompt in the served model's format (MiMo-V2.6: the
-//! model's own template; DeepSeek-V4.1: the compiled-in encoder; byte-exact to the
-//! reference either way), tokenizes it (request data never as a control token), and the
+//! In: the chat crate renders the prompt in the served model's format (MiMo-V2.6 and
+//! Qwen3.8: the model's own template; DeepSeek-V4.1: the compiled-in encoder; byte-exact to
+//! the reference every way), tokenizes it (request data never as a control token), and the
 //! request becomes an engine [`Request`] with checked
 //! [`SamplingParams`] and a [`CacheScope`]: the client's key turned into its lineage (the
 //! engine salt and the idle-KV key, by the per-boot HMAC) and dropped, or
@@ -23,6 +23,7 @@ use eidola_engine::secret::SaltDeriver;
 use eidola_engine_chat::deepseek::{self, EncodeOptions};
 use eidola_engine_chat::json::Json;
 use eidola_engine_chat::mimo::RenderOptions;
+use eidola_engine_chat::qwen;
 use eidola_engine_chat::{
     ChatDelta, ChatInput, Detokenizer, FinishReason, OutputConfig, OutputParser, PrefixedCallIds,
     Prompt, StopCause, ToolSchemas,
@@ -89,6 +90,9 @@ pub fn prepare(
             render_mimo(template, messages, tools, parse_tools, continuation)?
         }
         Served::DeepSeek { .. } => render_deepseek(messages, tools, parse_tools, continuation)?,
+        Served::Qwen { template, .. } => {
+            render_qwen(template, messages, tools, parse_tools, continuation)?
+        }
     };
     // Only the template's own text becomes control tokens: one spelled by the
     // request's data is encoded as the text it is.
@@ -215,6 +219,55 @@ fn render_deepseek(
     Ok((
         prompt,
         OutputConfig::deepseek_v4_1(options.thinking, schemas),
+    ))
+}
+
+/// Qwen3.8's template options for a request. The node's subset carries no thinking
+/// switch, `reasoning_effort` or `preserve_thinking`, so each is left undefined, as for
+/// MiMo-V2.6, and the template's defaults hold: thinking on, at its default effort
+/// (`xhigh`), and every past turn's reasoning kept. Keeping it is what makes a new turn's
+/// prompt this turn's prompt and output followed by more, the token prefix a client
+/// declares cached (`eidola-engine-chat/AGENTS.md` → Qwen3.8 → Prefix across turns);
+/// with `preserve_thinking` false the reasoning before the last user message is dropped,
+/// and no later turn would extend an earlier one.
+pub fn qwen_options() -> qwen::RenderOptions {
+    qwen::RenderOptions {
+        add_generation_prompt: true,
+        enable_thinking: None,
+        preserve_thinking: None,
+        reasoning_effort: None,
+    }
+}
+
+/// Qwen3.8: the model's template over the request (string tool-call arguments decoded by
+/// the template's own rule), opening a new assistant turn. The template trims the field a
+/// continuation would continue, so none of its answers is continuable and a continuation
+/// is refused, as for DeepSeek-V4.1.
+fn render_qwen(
+    template: &qwen::ChatTemplate,
+    messages: Json,
+    tools: Option<Json>,
+    parse_tools: bool,
+    continuation: Option<ContinueField>,
+) -> Result<(Prompt, OutputConfig), ApiError> {
+    if continuation.is_some() {
+        return Err(ApiError::invalid(
+            "this model's format cannot continue a message: its answers are never continuable",
+        ));
+    }
+    let schemas = if parse_tools {
+        tools.as_ref().map(ToolSchemas::from_tools)
+    } else {
+        None
+    };
+    let options = qwen_options();
+    let input = ChatInput { messages, tools };
+    let prompt = template
+        .render_prompt(&input, &options)
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
+    Ok((
+        prompt,
+        OutputConfig::qwen3_8(options.enable_thinking, schemas),
     ))
 }
 
