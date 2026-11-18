@@ -196,6 +196,8 @@ pub struct Pair<D: QwenDevice> {
     pub steps: u64,
     pub compared_logits: u64,
     pub compared_images: u64,
+    /// Drafting rows by the tokens they produced (index 1 to `k + 1`).
+    pub accepted: [u64; 8],
 }
 
 impl<D: QwenDevice> Executor for Pair<D> {
@@ -215,6 +217,11 @@ impl<D: QwenDevice> Executor for Pair<D> {
         let n = self.steps;
         assert_eq!(a.num_tokens, b.num_tokens, "step {n}: token counts");
         assert_eq!(a.tokens, b.tokens, "step {n}: tokens");
+        for (e, &m) in step.seqs.iter().zip(&a.num_tokens) {
+            if e.sample && e.num_drafts > 0 {
+                self.accepted[m as usize] += 1;
+            }
+        }
         let (la, lb) = (
             a.logits.as_ref().expect("logits"),
             b.logits.as_ref().expect("logits"),
@@ -267,6 +274,8 @@ pub struct Harness<D: QwenDevice> {
     pub now: u64,
     pub outputs: HashMap<u64, Vec<u32>>,
     pub finished: HashMap<u64, FinishReason>,
+    /// Prompt positions each finished request was served from the cache.
+    pub cached: HashMap<u64, u32>,
 }
 
 impl<D: QwenDevice> Harness<D> {
@@ -296,12 +305,14 @@ impl<D: QwenDevice> Harness<D> {
             steps: 0,
             compared_logits: 0,
             compared_images: 0,
+            accepted: [0; 8],
         };
         Harness {
             eng: Engine::new(pair, sched).expect("a valid configuration"),
             now: 0,
             outputs: HashMap::new(),
             finished: HashMap::new(),
+            cached: HashMap::new(),
         }
     }
 
@@ -364,6 +375,7 @@ impl<D: QwenDevice> Harness<D> {
             self.outputs.entry(e.id).or_default().extend(&e.tokens);
             if let Some(f) = e.finish {
                 assert!(self.finished.insert(e.id, f).is_none(), "finished twice");
+                self.cached.insert(e.id, e.cached_prompt_tokens);
             }
         }
         self.check();

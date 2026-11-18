@@ -2,7 +2,7 @@
 
 `Qwen/Qwen3.8-27B-FP8`, text only, on one Blackwell GPU. The architecture is `eidola_common::architecture::Architecture::Qwen38Dense27B`.
 
-**Status: in progress.** The reference forward and the chat format are implemented and verified; the serving core carries the recurrent state (below); the CPU executor reproduces the forward bit for bit through the real scheduler, drafting included; and the CUDA executor and its kernels are built (decode graphs per rung, FA2 at head dimension 256 in the fast profile, sampling and chain acceptance on the device), equal to the CPU executor on host-compiled kernel bodies eagerly and on the padded rung path, not yet run on a GPU. Nothing else is implemented. The variant is a stub: its shape is `unimplemented!`, and no catalog row or deployment may name it.
+**Status: in progress.** The reference forward and the chat format are implemented and verified; the serving core carries the recurrent state (below); the CPU executor reproduces the forward bit for bit through the real scheduler, drafting included; and the CUDA executor and its kernels are built (decode graphs per rung, FA2 at head dimension 256 in the fast profile, sampling and chain acceptance on the device, one target forward a drafting step), equal to the CPU executor on host-compiled kernel bodies eagerly and on the padded rung path, not yet run on a GPU. Nothing else is implemented. The variant is a stub: its shape is `unimplemented!`, and no catalog row or deployment may name it.
 
 ## The model
 

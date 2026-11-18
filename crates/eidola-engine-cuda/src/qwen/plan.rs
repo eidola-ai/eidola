@@ -1,17 +1,19 @@
 //! A step as data: what every launch of the step program ([`super::program`]) reads,
 //! laid out in one table of 32-bit words that one host-to-device copy fills.
 //!
-//! The executor describes a step as a [`StepPlan`]: per forward its rows, the DeltaNet
+//! The executor describes a step as a [`StepPlan`]: the drafter's passes that draw the
+//! drafts, the one target forward over every row's host tokens and drafts (its DeltaNet
 //! sequences, the row copies that stage and keep the recurrent state's inputs, the
-//! attention rows (and, in the fast profile, FA2 requests), the head's rows, the sample
-//! rows and chain acceptance, and the copies that keep the drafter's states. Every count
-//! the launches take is a [`Shape`]; [`Layout::new`] places every array at an offset that
-//! is a function of the shape alone, and [`pack`] writes a plan into it. An eager step's
-//! shape is its plan's own ([`Shape::of`]); a graph rung's is fixed, and a plan is packed
-//! into it only if each of its variable lists fits, the rest padded with inert entries
-//! (a copy of a pad row onto itself, a fully padded attention request). So a captured
-//! launch sequence, which fixed the shape and the table's addresses, serves every step
-//! of its rung with new table contents.
+//! attention rows and, in the fast profile, FA2 requests), the head's rows, the drafter
+//! over the host positions of rows that do not draft, the sample rows and chain
+//! acceptance, the canonical rewrite, and the copies that keep the drafter's states. Every
+//! count the launches take is a [`Shape`]; [`Layout::new`] places every array at an
+//! offset that is a function of the shape alone, and [`pack`] writes a plan into it. An
+//! eager step's shape is its plan's own ([`Shape::of`]); a graph rung's is fixed, and a
+//! plan is packed into it only if each of its variable lists fits, the rest padded with
+//! inert entries (a copy of a pad row onto itself, a fully padded attention request). So
+//! a captured launch sequence, which fixed the shape and the table's addresses, serves
+//! every step of its rung with new table contents.
 //!
 //! Nothing here touches a device: the layouts, the padding and the refusals are tested
 //! on the host.
@@ -48,17 +50,17 @@ pub mod buf {
     pub const O_ROWS: u32 = 1;
     pub const O_PAD: u32 = 2;
     /// Rows of `hidden` BF16 (`hidden / 2` words): the slots' kept normed states, the
-    /// drafter's taps, pass A's and pass B's normed rows, the drafter's normed rows, the
-    /// launch's destination (the drafter's input, or the head's), the pad rows.
+    /// drafter's taps, the target's normed rows, the drafter's normed rows, the launch's
+    /// destination (the drafter's input, or the head's), the pad rows.
     pub const H_KEPT: u32 = 0;
     pub const H_TAPS: u32 = 1;
-    pub const H_A: u32 = 2;
-    pub const H_B: u32 = 3;
-    pub const H_DRAFT: u32 = 4;
-    pub const H_DST: u32 = 5;
-    pub const H_PAD: u32 = 6;
-    /// One-word rows (token ids): pass A's tokens (in the table), the draft lanes, the
-    /// launch's destination token array, the pad rows.
+    pub const H_NORMED: u32 = 2;
+    pub const H_DRAFT: u32 = 3;
+    pub const H_DST: u32 = 4;
+    pub const H_PAD: u32 = 5;
+    /// One-word rows (token ids): the target's tokens (in the table: host ids, and the
+    /// drafts once their copies have run), the draft lanes, the launch's destination token
+    /// array, the pad rows.
     pub const T_HOST: u32 = 0;
     pub const T_LANES: u32 = 1;
     pub const T_DST: u32 = 2;
@@ -104,9 +106,9 @@ pub struct AttnRows {
 /// One forward through the target's layers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TargetPass {
-    /// Host token ids (pass A); empty when `token_copies` gather them on the device.
+    /// Token ids by row: each run's host ids, then a placeholder per draft.
     pub tokens: Vec<u32>,
-    /// One-word copies filling the token array (pass B: the drafts from their lanes).
+    /// One-word copies of the drafts from their lanes over the placeholders.
     pub token_copies: Vec<Item>,
     /// The DeltaNet sequences, one a run.
     pub seqs: Vec<DnSeq>,
@@ -154,15 +156,18 @@ pub struct DrafterPass {
 /// A step's whole plan.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StepPlan {
-    pub a: TargetPass,
-    /// Pass A's normed rows into the head's input, the head's logits at the front of
-    /// the target logits.
-    pub head_a: Vec<Item>,
-    /// The drafter's pass over the host positions, then one a chain depth.
-    pub drafter: Vec<DrafterPass>,
-    pub b: Option<TargetPass>,
-    /// Every row of pass B through the head, after pass A's.
-    pub head_b: Vec<Item>,
+    /// The drafter at each drafting row's host position, then one pass a chain depth,
+    /// each drawing a depth's drafts into the lanes: before the target, whose input the
+    /// drafts are.
+    pub lead: Vec<DrafterPass>,
+    /// The target over every row's host tokens and, after them, its drafts.
+    pub target: TargetPass,
+    /// The target's normed rows into the head's input: every sampled row's last host
+    /// row, then every draft's row.
+    pub head: Vec<Item>,
+    /// The drafter over the host positions of rows that do not draft, which may read
+    /// the target's normed rows of this step.
+    pub trail: Option<DrafterPass>,
     /// Rows without drafts, drawn from the target logits (tokens into the read-back).
     pub plain: Vec<SampleRow>,
     /// Drafting rows' target distributions (rows `p ..= p + k` of each, consecutive).
@@ -226,11 +231,10 @@ pub struct DrafterShape {
 /// Every count of a step's launches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shape {
-    pub a: TargetShape,
-    pub head_a: usize,
-    pub drafter: Vec<DrafterShape>,
-    pub b: Option<TargetShape>,
-    pub head_b: usize,
+    pub lead: Vec<DrafterShape>,
+    pub target: TargetShape,
+    pub head: usize,
+    pub trail: Option<DrafterShape>,
     pub plain: usize,
     pub targets: usize,
     pub accept: usize,
@@ -322,11 +326,10 @@ impl Shape {
             })
         };
         Ok(Shape {
-            a: target(&p.a)?,
-            head_a: p.head_a.len(),
-            drafter: p.drafter.iter().map(drafter).collect::<Result<_>>()?,
-            b: p.b.as_ref().map(target).transpose()?,
-            head_b: p.head_b.len(),
+            lead: p.lead.iter().map(drafter).collect::<Result<_>>()?,
+            target: target(&p.target)?,
+            head: p.head.len(),
+            trail: p.trail.as_ref().map(drafter).transpose()?,
             plain: p.plain.len(),
             targets: p.targets.len(),
             accept: p.accept.len(),
@@ -337,9 +340,9 @@ impl Shape {
         })
     }
 
-    /// Target logit rows: pass A's head rows, then pass B's.
+    /// Target logit rows: the head's.
     pub fn target_logits(&self) -> usize {
-        self.head_a + self.head_b
+        self.head
     }
 }
 
@@ -433,11 +436,10 @@ pub const SEQ_WORDS: usize = std::mem::size_of::<DnSeq>() / 4;
 /// Every array of a step's table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
-    pub a: TargetAt,
-    pub head_a: ItemsAt,
-    pub drafter: Vec<DrafterAt>,
-    pub b: Option<TargetAt>,
-    pub head_b: ItemsAt,
+    pub lead: Vec<DrafterAt>,
+    pub target: TargetAt,
+    pub head: ItemsAt,
+    pub trail: Option<DrafterAt>,
     pub plain: Arr,
     pub targets: Arr,
     /// Acceptance: sample rows, target rows, draft rows (`d`), draft counts.
@@ -498,11 +500,11 @@ impl Arena {
         }
     }
 
-    fn target(&mut self, s: &TargetShape, host_tokens: bool) -> TargetAt {
+    fn target(&mut self, s: &TargetShape) -> TargetAt {
         let t = s.attn.rows;
         TargetAt {
             tokens: self.arr(t),
-            token_copies: self.items(if host_tokens { 0 } else { s.token_copies }),
+            token_copies: self.items(s.token_copies),
             seqs: self.arr(s.runs * SEQ_WORDS),
             runs: s.runs,
             window: self.arr(s.staged),
@@ -533,11 +535,10 @@ impl Layout {
     /// Every array at an offset that is a function of `s` alone.
     pub fn new(s: &Shape) -> Layout {
         let mut m = Arena(0);
-        let a = m.target(&s.a, true);
-        let head_a = m.items(s.head_a);
-        let drafter = s.drafter.iter().map(|d| m.drafter(d, d.draws)).collect();
-        let b = s.b.as_ref().map(|b| m.target(b, false));
-        let head_b = m.items(s.head_b);
+        let lead = s.lead.iter().map(|d| m.drafter(d, d.draws)).collect();
+        let target = m.target(&s.target);
+        let head = m.items(s.head);
+        let trail = s.trail.as_ref().map(|d| m.drafter(d, d.draws));
         let plain = m.arr(s.plain * SAMPLE_WORDS);
         let targets = m.arr(s.targets * SAMPLE_WORDS);
         let accept_rows = m.arr(s.accept * SAMPLE_WORDS);
@@ -547,11 +548,10 @@ impl Layout {
         let rewrite = s.rewrite.as_ref().map(|r| m.drafter(r, 0));
         let keep = m.items(s.keep);
         Layout {
-            a,
-            head_a,
-            drafter,
-            b,
-            head_b,
+            lead,
+            target,
+            head,
+            trail,
             plain,
             targets,
             accept_rows,
@@ -655,9 +655,8 @@ fn attn(words: &mut [u32], at: &AttnAt, a: &AttnRows, g: &Fa2Geometry, what: &st
 }
 
 fn target(words: &mut [u32], at: &TargetAt, t: &TargetPass, geo: &Geo, what: &str) -> Result<()> {
-    if at.token_copies.items == 0 {
-        exact(words, at.tokens, &t.tokens, what)?;
-    } else if t.token_copies.len() != at.token_copies.items {
+    exact(words, at.tokens, &t.tokens, what)?;
+    if t.token_copies.len() != at.token_copies.items {
         return Err(refuse(format!("{what}: token copies")));
     }
     items(words, &at.token_copies, &t.token_copies, buf::T_PAD, what)?;
@@ -706,26 +705,25 @@ fn drafter(
 pub fn pack(p: &StepPlan, layout: &Layout, geo: &Geo) -> Result<Vec<u32>> {
     let mut w = vec![0u32; layout.words];
     let words = &mut w;
-    if p.drafter.len() != layout.drafter.len()
-        || p.b.is_some() != layout.b.is_some()
+    if p.lead.len() != layout.lead.len()
+        || p.trail.is_some() != layout.trail.is_some()
         || p.rewrite.is_some() != layout.rewrite.is_some()
         || p.drafting != layout.drafting
         || p.width != layout.width
     {
         return Err(refuse("the plan's passes are not the shape's".into()));
     }
-    target(words, &layout.a, &p.a, geo, "pass A")?;
-    if p.head_a.len() != layout.head_a.items || p.head_b.len() != layout.head_b.items {
-        return Err(refuse("head rows".into()));
-    }
-    items(words, &layout.head_a, &p.head_a, buf::H_PAD, "head A")?;
-    for (d, at) in p.drafter.iter().zip(&layout.drafter) {
+    for (d, at) in p.lead.iter().zip(&layout.lead) {
         drafter(words, at, d, geo, "drafter")?;
     }
-    if let (Some(b), Some(at)) = (&p.b, &layout.b) {
-        target(words, at, b, geo, "pass B")?;
+    target(words, &layout.target, &p.target, geo, "target")?;
+    if p.head.len() != layout.head.items {
+        return Err(refuse("head rows".into()));
     }
-    items(words, &layout.head_b, &p.head_b, buf::H_PAD, "head B")?;
+    items(words, &layout.head, &p.head, buf::H_PAD, "head")?;
+    if let (Some(d), Some(at)) = (&p.trail, &layout.trail) {
+        drafter(words, at, d, geo, "trailing drafter")?;
+    }
     exact(words, layout.plain, &words_of(&p.plain), "plain rows")?;
     exact(words, layout.targets, &words_of(&p.targets), "target rows")?;
     let rows: Vec<SampleRow> = p.accept.iter().map(|a| a.0).collect();
@@ -836,26 +834,32 @@ mod tests {
         for fast in [false, true] {
             let g = geo(fast);
             let mut p = StepPlan {
-                a: row_pass(3, 5, fast),
+                target: row_pass(3, 5, fast),
                 ..StepPlan::default()
             };
             let s = Shape::of(&p, &g).expect("shape");
             let l = Layout::new(&s);
             let one = pack(&p, &l, &g).expect("pack");
-            p.a.tokens = vec![1, 2, 3];
-            p.a.stage_conv.truncate(2);
-            p.a.window.truncate(4);
+            p.target.tokens = vec![1, 2, 3];
+            p.target.stage_conv.truncate(2);
+            p.target.window.truncate(4);
             let two = pack(&p, &l, &g).expect("pack");
             assert_eq!(Layout::new(&s), l);
             assert_eq!(one.len(), two.len());
             // The truncated lists are padded: inert self-copies, window rows at 0.
-            let at = l.a.stage_conv;
+            let at = l.target.stage_conv;
             assert_eq!(two[at.src_buf.at + 3], buf::C_PAD);
             assert_eq!(two[at.src_row.at + 3], 3);
             assert_eq!(two[at.dst_row.at + 3], 3);
-            assert_eq!(two[l.a.window.at + 4], 0);
+            assert_eq!(two[l.target.window.at + 4], 0);
             // Every array of an even word, inside the table.
-            for a in [l.a.seqs, l.a.window, l.a.tokens, l.a.attn.rope, l.plain] {
+            for a in [
+                l.target.seqs,
+                l.target.window,
+                l.target.tokens,
+                l.target.attn.rope,
+                l.plain,
+            ] {
                 assert!(a.at.is_multiple_of(2) && a.at + a.len <= l.words);
             }
         }
@@ -865,22 +869,62 @@ mod tests {
     fn a_plan_past_its_shape_is_refused() {
         let g = geo(false);
         let p = StepPlan {
-            a: row_pass(3, 5, false),
+            target: row_pass(3, 5, false),
             ..StepPlan::default()
         };
         let l = Layout::new(&Shape::of(&p, &g).expect("shape"));
         let mut more = p.clone();
-        more.a.stage_conv.push(Item::default());
+        more.target.stage_conv.push(Item::default());
         assert!(pack(&more, &l, &g).is_err());
         let mut longer = p.clone();
-        longer.a.window.push(0);
+        longer.target.window.push(0);
         assert!(pack(&longer, &l, &g).is_err());
         let mut fewer = p.clone();
-        fewer.a.tokens.pop();
+        fewer.target.tokens.pop();
         assert!(pack(&fewer, &l, &g).is_err());
         let mut drafting = p;
-        drafting.drafter.push(DrafterPass::default());
+        drafting.lead.push(DrafterPass::default());
         assert!(pack(&drafting, &l, &g).is_err());
+    }
+
+    #[test]
+    fn drafts_join_the_host_tokens_in_one_target_pass() {
+        // Two drafting rows of three drafts each: one run each of four positions, the
+        // host id first, the drafts copied from their lanes over the placeholders.
+        let g = geo(false);
+        let mut p = StepPlan {
+            target: row_pass(8, 8, false),
+            width: 3,
+            drafting: 2,
+            ..StepPlan::default()
+        };
+        p.target.tokens = vec![7, 0, 0, 0, 9, 0, 0, 0];
+        for (d, first) in [(0u32, 0u32), (1, 4)] {
+            for j in 0..3 {
+                p.target.token_copies.push(Item::new(
+                    buf::T_LANES,
+                    j * 2 + d,
+                    buf::T_DST,
+                    first + 1 + j,
+                ));
+            }
+        }
+        let l = Layout::new(&Shape::of(&p, &g).expect("shape"));
+        let w = pack(&p, &l, &g).expect("pack");
+        let at = l.target.tokens;
+        assert_eq!(&w[at.at..at.at + 8], &[7, 0, 0, 0, 9, 0, 0, 0]);
+        let c = l.target.token_copies;
+        assert_eq!(c.items, 6);
+        assert_eq!(
+            w[c.src_row.at + 4],
+            3,
+            "the second row's second draft's lane"
+        );
+        assert_eq!(w[c.dst_row.at + 4], 6);
+        // A draft without its copy is refused.
+        let mut short = p;
+        short.target.token_copies.pop();
+        assert!(pack(&short, &l, &g).is_err());
     }
 
     #[test]
@@ -899,23 +943,23 @@ mod tests {
         )
         .expect("caps");
         let mut p = StepPlan {
-            a: row_pass(4, 4, true),
+            target: row_pass(4, 4, true),
             ..StepPlan::default()
         };
-        p.a.attn.requests = (0..4)
+        p.target.attn.requests = (0..4)
             .map(|r| request(r, 1, 100 + 600 * r, 4, &mut |j| j + 1))
             .collect();
         let mut s = Shape::of(&p, &g).expect("shape");
-        s.a.attn.fa2 = Some(caps);
+        s.target.attn.fa2 = Some(caps);
         let l = Layout::new(&s);
         let w = pack(&p, &l, &g).expect("pack");
-        let f = l.a.attn.fa2.expect("fa2");
+        let f = l.target.attn.fa2.expect("fa2");
         // Work items: one per row and chunk (1 + 1 + 2 + 2), walked by the fixed grid.
         assert_eq!(w[f.counts.at], 6);
         assert_eq!(w[f.counts.at + 1], SPLIT_KEYS);
         assert_eq!(caps.shape.grid, caps.work_items.min(148));
         // Rows past the reservation's pages (600 a row) are refused.
-        p.a.attn.requests = (0..4)
+        p.target.attn.requests = (0..4)
             .map(|r| request(r, 1, 2403, 4, &mut |j| j + 1))
             .collect();
         assert!(pack(&p, &l, &g).is_err());
