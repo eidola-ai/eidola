@@ -229,6 +229,10 @@ pub fn dn_prep_grid(p: &DnPrepParams) -> Result<[u32; 3]> {
     rows_grid(p.k_heads, p.positions)
 }
 
+/// Value columns a block of the recurrence computes (`kDnCols`): block `x` runs sequence
+/// `x / slices` over columns `DN_COLS · (x % slices) ..` of value head `y`.
+const DN_COLS: u32 = 32;
+
 pub fn dn_rec_grid(p: &DnRecParams) -> Result<[u32; 3]> {
     ensure(
         [p.seqs, p.q, p.k, p.v, p.beta, p.alpha, p.out]
@@ -247,7 +251,13 @@ pub fn dn_rec_grid(p: &DnRecParams) -> Result<[u32; 3]> {
     )?;
     ensure(p.reserved == 0, "dn rec: reserved")?;
     ensure(p.v_heads <= MAX_GRID_Y, "dn rec: heads")?;
-    Ok([p.seq_count.max(1), p.v_heads, 1])
+    let slices = p.v_dim.div_ceil(DN_COLS);
+    let x = p
+        .seq_count
+        .max(1)
+        .checked_mul(slices)
+        .ok_or_else(|| refuse("dn rec: sequences"))?;
+    Ok([x, p.v_heads, 1])
 }
 
 pub fn dn_norm_grid(p: &DnNormParams) -> Result<[u32; 3]> {
@@ -410,7 +420,23 @@ mod tests {
             v_dim: 128,
             ..DnRecParams::default()
         };
-        assert_eq!(dn_rec_grid(&rec).unwrap(), [5, 48, 1]);
+        assert_eq!(dn_rec_grid(&rec).unwrap(), [20, 48, 1]);
+        assert_eq!(
+            dn_rec_grid(&DnRecParams { v_dim: 64, ..rec }).unwrap(),
+            [10, 48, 1]
+        );
+        assert_eq!(
+            dn_rec_grid(&DnRecParams { v_dim: 33, ..rec }).unwrap(),
+            [10, 48, 1]
+        );
+        assert_eq!(
+            dn_rec_grid(&DnRecParams {
+                seq_count: 0,
+                ..rec
+            })
+            .unwrap(),
+            [4, 48, 1]
+        );
         assert!(dn_rec_grid(&DnRecParams { k_dim: 64, ..rec }).is_err());
         assert!(dn_rec_grid(&DnRecParams { v_dim: 256, ..rec }).is_err());
         assert!(dn_rec_grid(&DnRecParams { v_heads: 47, ..rec }).is_err());

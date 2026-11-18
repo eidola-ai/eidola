@@ -7,7 +7,8 @@
 //!   rows and exact at 1 and 4: µs, TB/s of weights, TFLOP/s;
 //! - `head`: the BF16 head (248,320 × 5,120), fast;
 //! - `dn_rec`: one DeltaNet layer's recurrence at the released width, 1 to 64 rows, with
-//!   a fold of 0 and 9 positions before 4 outputs, and one row over 2,048 positions;
+//!   a fold of 0 and 9 positions before 4 outputs; one row prefilling 2,048 and 10,240
+//!   positions; 64 rows each prefilling 1,760 positions of their own;
 //! - `cipher`: the idle cipher over one 157 MB state image;
 //! - `host`: a 157 MB image to and from page-locked host memory.
 //!
@@ -182,7 +183,7 @@ fn main() {
     // One DeltaNet layer at the released width: 16 key heads, 48 value heads of 128.
     let (kh, vh, kd, vd) = (16u32, 48u32, 128u32, 128u32);
     let state = (vh * kd * vd) as usize * 4;
-    let max_pos = 2048usize;
+    let max_pos = 64 * 1760usize;
     let q = alloc(&fast, max_pos * (kh * kd) as usize * 4, &mut keep);
     let kk = alloc(&fast, max_pos * (kh * kd) as usize * 4, &mut keep);
     let v = alloc(&fast, max_pos * (vh * vd) as usize * 4, &mut keep);
@@ -195,30 +196,27 @@ fn main() {
     // SAFETY: the decay array.
     unsafe { fast.upload(alpha, &al) }.unwrap_or_else(|e| fail(e));
     let states = alloc(&fast, 64 * state, &mut keep);
-    for (rows, fold, outs) in [
-        (1u32, 0u32, 4u32),
-        (1, 9, 4),
-        (8, 0, 4),
-        (8, 9, 4),
-        (64, 2, 4),
-        (64, 9, 4),
-        (1, 0, 2048),
+    // (rows, fold, outputs, whether each row reads positions of its own).
+    for (rows, fold, outs, own) in [
+        (1u32, 0u32, 4u32, false),
+        (1, 9, 4, false),
+        (8, 0, 4, false),
+        (8, 9, 4, false),
+        (64, 2, 4, false),
+        (64, 9, 4, false),
+        (1, 0, 2048, false),
+        (1, 0, 10240, false),
+        (64, 0, 1760, true),
     ] {
         let seqs: Vec<DnSeq> = (0..rows)
             .map(|r| DnSeq {
                 src: states + u64::from(r) * state as u64,
                 live: states + u64::from(r) * state as u64,
-                first: r * (fold + outs).min(32),
+                first: if own { r * (fold + outs) } else { 0 },
                 count: fold + outs,
                 out_from: fold,
                 live_after: fold + 1,
                 ..DnSeq::default()
-            })
-            .map(|mut s| {
-                if rows > 1 {
-                    s.first = 0;
-                }
-                s
             })
             .collect();
         let sb = alloc(&fast, seqs.len() * std::mem::size_of::<DnSeq>(), &mut keep);
@@ -258,9 +256,10 @@ fn main() {
             unsafe { fast.dn_rec(&p) }.unwrap_or_else(|e| fail(e))
         });
         println!(
-            "{{\"bench\":\"dn_rec\",\"rows\":{rows},\"fold\":{fold},\"outputs\":{outs},\"us_per_layer\":{:.1},\"us_per_token_step\":{:.3}}}",
+            "{{\"bench\":\"dn_rec\",\"rows\":{rows},\"fold\":{fold},\"outputs\":{outs},\"us_per_layer\":{:.1},\"us_per_token_step\":{:.3},\"us_per_token\":{:.4}}}",
             s * 1e6,
-            s * 1e6 / f64::from(fold + outs)
+            s * 1e6 / f64::from(fold + outs),
+            s * 1e6 / f64::from((fold + outs) * rows)
         );
     }
 

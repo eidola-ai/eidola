@@ -92,28 +92,79 @@ void qwen_host_dn_prep(const QwDnPrepParams* p, uint32_t gx, uint32_t gy) {
     }
 }
 
-// `eidola_qwen_dn_rec`'s entry: every thread's column array kept across the
-// tokens, the block's staged keys and queries between barriers.
+// `eidola_qwen_dn_rec`'s entry: every thread's share of its column kept across
+// the tokens, the block's staged chunks between barriers, and a column's four
+// threads exchanging their partial sums as the device's shuffles do.
 void qwen_host_dn_rec(const QwDnRecParams* p, uint32_t gx, uint32_t gy) {
-  std::vector<float> st(static_cast<size_t>(qwk::kBlockThreads) * qwk::kKeyDim);
-  float k[qwk::kKeyDim];
-  float q[qwk::kKeyDim];
+  constexpr uint32_t kT = qwk::kDnThreads;
+  constexpr uint32_t kG = qwk::kDnGroup;
+  qwk::DnRecShared sh;
+  std::vector<float> st(static_cast<size_t>(kT) * qwk::kDnPer);
+  std::vector<qwk::DnFetch> f(kT);
+  float part[kT];
+  float x[qwk::kDnPer];
+  // Steps 2 and 1 of every column's tree, then the +0 tail.
+  auto group_sum = [&]() {
+    for (uint32_t w = 2; w > 0; w >>= 1) {
+      float next[kT];
+      for (uint32_t t = kT; t-- > 0;)
+        next[t] = qwk::dn_tree_step(part[t], part[t ^ w], t % kG, w);
+      std::memcpy(part, next, sizeof part);
+    }
+    for (uint32_t t = kT; t-- > 0;) part[t] = part[t] + 0.0f;
+  };
+  const uint32_t slices = qwk::dn_rec_slices(p->v_dim);
   for (uint32_t h = gy; h-- > 0;)
-    for (uint32_t b = gx; b-- > 0;) {
-      const QwDnSeq s = p->seqs[b];
-      for (uint32_t j = qwk::kBlockThreads; j-- > 0;) {
-        if (j >= p->v_dim) continue;
-        qwk::dn_rec_load(*p, s, h, j, &st[j * qwk::kKeyDim]);
-        qwk::dn_rec_stores(*p, s, 0, h, j, &st[j * qwk::kKeyDim]);
+    for (uint32_t bx = gx; bx-- > 0;) {
+      garbage(&sh);
+      const uint32_t slice = bx % slices;
+      const QwDnSeq s = p->seqs[bx / slices];
+      auto col = [&](uint32_t t) { return slice * qwk::kDnCols + t / kG; };
+      for (uint32_t t = kT; t-- > 0;) {
+        qwk::dn_rec_fetch(*p, s, h, slice, 0, t, f[t]);
+        qwk::dn_rec_load(*p, s, h, col(t), t % kG, &st[t * qwk::kDnPer]);
+        qwk::dn_rec_stores(*p, s, 0, h, col(t), t % kG, &st[t * qwk::kDnPer]);
       }
-      for (uint32_t i = 0; i < s.count; ++i) {
-        std::memset(k, kGarbage, sizeof k);
-        std::memset(q, kGarbage, sizeof q);
-        for (uint32_t t = qwk::kBlockThreads; t-- > 0;)
-          qwk::dn_rec_stage(*p, s.first + i, h, t, qwk::kBlockThreads, k, q);
-        for (uint32_t j = qwk::kBlockThreads; j-- > 0;) {
-          if (j >= p->v_dim) continue;
-          qwk::dn_rec_token(*p, s, h, j, i, k, q, &st[j * qwk::kKeyDim]);
+      for (uint32_t t = kT; t-- > 0;) qwk::dn_rec_put(f[t], t, sh, 0);
+      uint32_t b = 0;
+      for (uint32_t base = 0; base < s.count; base += qwk::kDnChunk, b ^= 1) {
+        const bool more = base + qwk::kDnChunk < s.count;
+        if (more)
+          for (uint32_t t = kT; t-- > 0;)
+            qwk::dn_rec_fetch(*p, s, h, slice, base + qwk::kDnChunk, t, f[t]);
+        const uint32_t n = s.count - base < qwk::kDnChunk ? s.count - base : qwk::kDnChunk;
+        for (uint32_t u = 0; u < n; ++u) {
+          const uint32_t i = base + u;
+          for (uint32_t t = kT; t-- > 0;) {
+            qwk::dn_row(sh.k[b][u][t % kG], x);
+            part[t] = qwk::dn_rec_decay(&st[t * qwk::kDnPer], x, sh.alpha[b][u]);
+          }
+          group_sum();
+          for (uint32_t t = kT; t-- > 0;) {
+            qwk::dn_row(sh.k[b][u][t % kG], x);
+            qwk::dn_rec_update(&st[t * qwk::kDnPer], x, sh.v[b][u][t / kG], sh.beta[b][u],
+                               part[t]);
+          }
+          if (i >= s.out_from) {
+            for (uint32_t t = kT; t-- > 0;) {
+              qwk::dn_row(sh.q[b][u][t % kG], x);
+              part[t] = qwk::dn_partial(&st[t * qwk::kDnPer], x);
+            }
+            group_sum();
+            for (uint32_t t = kT; t-- > 0;)
+              if (t % kG == 0 && col(t) < p->v_dim)
+                qwk::dn_rec_out(*p, s.first + i, h, col(t), part[t]);
+          }
+          for (uint32_t t = kT; t-- > 0;)
+            qwk::dn_rec_stores(*p, s, i + 1, h, col(t), t % kG, &st[t * qwk::kDnPer]);
+        }
+        if (more) {
+          garbage(&sh.k[b ^ 1]);
+          garbage(&sh.q[b ^ 1]);
+          garbage(&sh.v[b ^ 1]);
+          garbage(&sh.alpha[b ^ 1]);
+          garbage(&sh.beta[b ^ 1]);
+          for (uint32_t t = kT; t-- > 0;) qwk::dn_rec_put(f[t], t, sh, b ^ 1);
         }
       }
     }
