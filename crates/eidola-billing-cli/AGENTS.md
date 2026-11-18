@@ -1,6 +1,6 @@
 # Private billing tool
 
-This binary links `eidola-billing`, connects directly to PostgreSQL and Stripe, and runs with the caller's credentials. It is never an administrative gateway endpoint. Keep the CLI a presentation layer over the shared billing service; do not add another balance mutation path here. The `serve-webhooks` and `work` commands are separately deployable roles in the same binary/image; neither starts the other.
+This binary links `eidola-billing`, connects directly to PostgreSQL and Stripe, and runs with the caller's credentials. It is never an administrative gateway endpoint. Keep the CLI a presentation layer over the shared billing service; do not add another balance mutation path here. The `serve-webhooks` and `work` commands are separately deployable roles in the same binary/image; neither starts the other. The image (`oci/eidola-billing/Containerfile`) is built and published by CI like the gateway's and recorded in `artifact-manifest.json` from schema 5 (`.github/AGENTS.md` → `oci-billing`); no deployment config for it lives in this repository.
 
 - Keep database and Stripe credentials in the environment, never command-line arguments, persisted support records, or output.
 - Refunds name an explicit durable operation UUID. Reusing it means retrying the same request, not authorizing a second refund. Keep normal refunds and cash-only goodwill refunds visibly distinct.

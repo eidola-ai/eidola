@@ -15,7 +15,7 @@ variable "TAGS" {
 # Empty (the default, and what local builds use) disables the cache entirely;
 # CI sets it for non-release builds and leaves it empty for v* release tags so
 # the attested artifacts compile clean. The dev and ci-* variant of each image
-# share one ref per image (eidola-buildcache:{server,cli,cli-arm64,postgres,engine-kernels,server-engine}), so the
+# share one ref per image (eidola-buildcache:{server,cli,cli-arm64,billing,postgres,engine-kernels,server-engine}), so the
 # promotion PR (which builds the dev targets) warms the post-merge push to main
 # (which builds the ci-* targets). See .github/workflows/artifacts.yml.
 variable "CACHE_REGISTRY" {
@@ -62,6 +62,11 @@ target "_cache_cli" {
 target "_cache_cli_arm64" {
   cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:cli-arm64"] : []
   cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:cli-arm64,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+}
+
+target "_cache_billing" {
+  cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:billing"] : []
+  cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:billing,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
 }
 
 target "_cache_postgres" {
@@ -130,10 +135,15 @@ target "cli-arm64" {
   tags       = ["eidola-cli-arm64:dev"]
 }
 
-# Operational image, runnable as receiver, worker or private support CLI.
-# Kept outside the client artifact manifest and release publication pipeline.
+# The billing image (`eidola-billing`): one static binary, run as the Stripe
+# webhook receiver, a billing worker, or the private support CLI. Built and
+# pushed like the gateway's image and recorded under the manifest key
+# `eidola-billing` from the manifest schema that records it
+# (scripts/artifact-manifest.sh, BILLING_IMAGE_SCHEMA). It runs outside the
+# attested boundary and nothing here deploys it: its deployment configuration
+# lives with the operator.
 target "billing" {
-  inherits   = ["_common"]
+  inherits   = ["_common", "_cache_billing"]
   context    = "."
   dockerfile = "oci/eidola-billing/Containerfile"
   tags       = ["eidola-billing:dev"]
@@ -215,6 +225,13 @@ target "ci-cli" {
   context    = "."
   dockerfile = "oci/eidola-cli/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-cli:${t}"]
+}
+
+target "ci-billing" {
+  inherits   = ["_ci", "_cache_billing"]
+  context    = "."
+  dockerfile = "oci/eidola-billing/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-billing:${t}"]
 }
 
 target "ci-postgres" {
