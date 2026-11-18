@@ -148,6 +148,7 @@ fn sass_uses_the_intended_tensor_core_path() {
         for gemm in [
             "cutlass_fp8_blockwise_gemm",
             "cutlass_fp8_blockwise_swap",
+            "cutlass_fp8_blockwise_split",
             "deepgemm_fp8_fp4_grouped",
         ] {
             assert!(mma(manifest, gemm, arch, "UTCQMMA") > 0, "{gemm} {arch}");
@@ -578,8 +579,10 @@ fn qwen_fast_deltanet_is_unfused_on_mma_sync() {
 }
 
 /// The fast profile's own kernels: the `own` profile (contraction allowed: their bodies
-/// spell out the fused multiply-adds they mean), no tensor cores, exactly their three
-/// entries (the gates and the small-N GEMM's two forms); the swapped FP8 GEMM's image exactly its three tile instances; and Qwen's
+/// spell out the fused multiply-adds they mean), no tensor cores, exactly their four
+/// entries (the gates, the small-N GEMM's two forms and the split FP8 GEMM's sum); the
+/// swapped FP8 GEMM's image exactly its three tile instances, and the split one its four
+/// (the three swapped tiles and the unswapped); and Qwen's
 /// sampler, in both profiles, the `own` profile (every f64 operation it means rounded is
 /// an explicit round-to-nearest intrinsic, as the shared sampler's), its four sample and
 /// three acceptance kernels.
@@ -595,6 +598,17 @@ fn qwen_fast_images_hold_their_entries() {
                     "eidola_qwen_fast_gate",
                     "eidola_qwen_fast_gemm_bf16",
                     "eidola_qwen_fast_gemm_bf16_tiled",
+                    "eidola_qwen_fast_split_sum",
+                ][..],
+            ),
+            (
+                "cutlass_fp8_blockwise_split",
+                "cutlass",
+                &[
+                    "eidola_cutlass_fp8_blockwise_split128_f32",
+                    "eidola_cutlass_fp8_blockwise_split16_f32",
+                    "eidola_cutlass_fp8_blockwise_split32_f32",
+                    "eidola_cutlass_fp8_blockwise_split64_f32",
                 ][..],
             ),
             (

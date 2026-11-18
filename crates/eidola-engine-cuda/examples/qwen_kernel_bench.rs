@@ -3,10 +3,14 @@
 //!     qwen_kernel_bench <kernel dir> [--quick]
 //!
 //! - `copy`: device-to-device bandwidth (the streaming roofline every estimate assumes);
-//! - `lin8`: the FP8 linear at the released fused shapes, fast (CUTLASS, the GEMM
-//!   `fp8_kind` dispatches to) at 1 to 2,048 rows and exact at 1 and 4: µs, TB/s of
-//!   weights, TFLOP/s; and `lin8_kind`, every fast GEMM forced (the swapped kernel at
-//!   each activation tile, and the unswapped one) at 1, 8, 64 and 2,048 rows;
+//! - `lin8`: the FP8 linear at the executor's stacked shapes, fast (CUTLASS, the GEMM
+//!   `fp8_kind` dispatches to, split over K for the shapes `fp8_splits` splits) at 1 to
+//!   2,048 rows and exact at 1 and 4: µs, TB/s of weights, TFLOP/s; and `lin8_kind`,
+//!   every fast GEMM forced (the swapped kernel at each activation tile, and the unswapped
+//!   one; for a shape that splits, every split instance at its split too, the partials'
+//!   sum included) at 1, 8, 16, 32, 64, 256 and 2,048 rows: a split shape's unsplit kinds
+//!   beside its split ones give the split's gain at decode sizes and its cost at prefill
+//!   sizes;
 //! - `small_gemm`: the DeltaNet's stacked `a` and `b` projections (96 × 5,120) on the
 //!   small-N kernel as dispatched (`small_n`), in each of its forms forced
 //!   (`small_n_rows`, `small_n_tiled`), and on CUTLASS's BF16 GEMM, at 1, 8, 64, 256 and
@@ -45,11 +49,14 @@ use std::time::Instant;
 use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::secret::KvKey;
 use eidola_engine_cuda::KernelDir;
+use eidola_engine_cuda::mimo::gemm::{GemmKind, SplitTile};
 use eidola_engine_cuda::qwen::QwenDevice;
 use eidola_engine_cuda::qwen::QwenProfile;
 use eidola_engine_cuda::qwen::abi::*;
 use eidola_engine_cuda::qwen::cuda::{CudaDevice, FP8_KINDS};
-use eidola_engine_cuda::qwen::kernels::{AcceptLaunch, QwenKernels, SampleArgs};
+use eidola_engine_cuda::qwen::kernels::{
+    AcceptLaunch, MAX_SPLITS, QwenKernels, SampleArgs, fp8_splits,
+};
 use eidola_engine_cuda::qwen::sampler::{accept_work_bytes, sample_work_bytes};
 use eidola_engine_cuda::sampler::SampleRow;
 
@@ -150,6 +157,12 @@ fn main() {
     let scales = alloc(&fast, (kmax / 128) * max_rows as usize * 4, &mut keep);
     fill(&fast, codes, max_rows as usize * kmax, 1);
     let out = alloc(&fast, max_rows as usize * 34816 * 2, &mut keep);
+    // The split shapes' partial sums: at most `MAX_SPLITS` arrays of the widest split N.
+    let parts = alloc(
+        &fast,
+        MAX_SPLITS as usize * max_rows as usize * 5120 * 4,
+        &mut keep,
+    );
     for (n, k) in shapes {
         let w = alloc(&fast, n as usize * k as usize, &mut keep);
         fill(&fast, w, n as usize * k as usize, u64::from(n + k));
@@ -189,7 +202,7 @@ fn main() {
                 }
                 // SAFETY: every buffer covers `m_pad` rows of this shape.
                 let s = time(dev, if name == "exact" { 1 } else { it }, || {
-                    unsafe { dev.lin8(&p) }.unwrap_or_else(|e| fail(e))
+                    unsafe { dev.lin8(&p, Some(parts)) }.unwrap_or_else(|e| fail(e))
                 });
                 let bytes = f64::from(n) * f64::from(k);
                 println!(
@@ -199,11 +212,16 @@ fn main() {
                     2.0 * bytes * f64::from(rows) / s / 1e12
                 );
             }
-            if [1, 8, 64, 2048].contains(&rows) {
-                for kind in FP8_KINDS {
-                    // SAFETY: as above.
+            if [1, 8, 16, 32, 64, 256, 2048].contains(&rows) {
+                let splits = fp8_splits(n, k);
+                let split_kinds = SplitTile::ALL
+                    .into_iter()
+                    .filter(|_| splits > 1)
+                    .map(|t| GemmKind::Fp8Split(t, splits));
+                for kind in FP8_KINDS.into_iter().chain(split_kinds) {
+                    // SAFETY: as above; the partials' scratch holds every split.
                     let s = time(&fast, it, || {
-                        unsafe { fast.lin8_on(&p, kind) }.unwrap_or_else(|e| fail(e))
+                        unsafe { fast.lin8_on(&p, kind, Some(parts)) }.unwrap_or_else(|e| fail(e))
                     });
                     let bytes = f64::from(n) * f64::from(k);
                     println!(

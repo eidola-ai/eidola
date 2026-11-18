@@ -53,8 +53,10 @@ pub trait QwenKernels {
     unsafe fn norm(&self, p: &NormParams) -> Result<()>;
     unsafe fn quant(&self, p: &QuantParams) -> Result<()>;
     /// The FP8 linear: exact (`lin8_rows`) in the exact profile, the tensor-core form in
-    /// the fast one.
-    unsafe fn lin8(&self, p: &Lin8Params) -> Result<()>;
+    /// the fast one. A shape the fast profile splits ([`fp8_splits`] above 1) needs `parts`,
+    /// an f32 scratch of `splits · m_pad · n` values for its partial sums, there (and on a
+    /// host device planning as the fast profile does); the exact profile ignores it.
+    unsafe fn lin8(&self, p: &Lin8Params, parts: Option<u64>) -> Result<()>;
     /// The BF16 linear: exact (`linear_bf16_rows`) in the exact profile, the tensor-core
     /// form in the fast one for the large linears (the head and the drafter's input
     /// projection), which name an f32 scratch of `rows · n` values in `fast`; `None` for
@@ -529,9 +531,117 @@ pub fn round_grid(p: &RoundParams) -> Result<[u32; 3]> {
     rows_grid(p.width.div_ceil(ELEMENT), p.rows)
 }
 
+/// CTAs a split FP8 GEMM may fill at one tile row: the SM count of a B200 and a B300.
+/// A constant, not the device's count, so a shape's split is the same on every device.
+pub const SPLIT_CTAS: u32 = 148;
+/// The most ranges a GEMM's K is split into, which bounds the partial sums' traffic at
+/// prefill sizes (every row count runs the same split).
+pub const MAX_SPLITS: u32 = 4;
+/// The fewest 128-wide K blocks a range holds.
+pub const MIN_SPLIT_BLOCKS: u32 = 8;
+
+/// The ranges of K the fast profile's FP8 GEMM of `n` outputs over `k` runs in, a
+/// function of the shape alone: the most, up to [`MAX_SPLITS`], that divide K's 128-wide
+/// blocks into ranges of at least [`MIN_SPLIT_BLOCKS`] and keep the 128-output tiles of
+/// all ranges within [`SPLIT_CTAS`]; 1 (no split) when none does. On the released model:
+/// 3 for `o_proj` and the DeltaNet's `out_proj` (`5,120 × 6,144`, 120 CTAs), 2 for
+/// `down_proj` (`5,120 × 17,408`, 80 CTAs: 136 blocks have no third), and 1 for every
+/// wider GEMM, whose tiles already fill the device. Every row of such a shape, at any row
+/// count, is summed range by range and the ranges added in order
+/// (`eidola_qwen_fast_split_sum`), so a row's bits do not depend on its batch.
+pub fn fp8_splits(n: u32, k: u32) -> u32 {
+    let tiles = n.div_ceil(BLOCK);
+    let blocks = k / BLOCK;
+    (2..=MAX_SPLITS)
+        .rev()
+        .find(|&s| {
+            blocks.is_multiple_of(s)
+                && blocks / s >= MIN_SPLIT_BLOCKS
+                && tiles.saturating_mul(s) <= SPLIT_CTAS
+        })
+        .unwrap_or(1)
+}
+
+/// f32 values a split FP8 GEMM's partial sums take a row: `splits · n`, or 0 for a shape
+/// that does not split. At most `SPLIT_CTAS · 128` by [`fp8_splits`]'s rule.
+pub fn split_width(n: u32, k: u32) -> usize {
+    match fp8_splits(n, k) {
+        1 => 0,
+        s => s as usize * n as usize,
+    }
+}
+
+/// Outputs a thread of `eidola_qwen_fast_split_sum` adds (`kSumChunk`), and its CTA.
+const SUM_CHUNK: u32 = 4;
+const SUM_THREADS: u32 = 256;
+
+pub fn split_sum_grid(p: &SplitSumParams) -> Result<[u32; 3]> {
+    ensure(p.parts != 0 && p.out != 0, "split sum: null")?;
+    ensure(
+        p.n > 0 && p.splits > 1 && p.part_rows >= p.rows && p.out_stride >= p.n,
+        "split sum: shape",
+    )?;
+    ensure(p.reserved == 0, "split sum: reserved")?;
+    rows_grid(p.n.div_ceil(SUM_CHUNK * SUM_THREADS), p.rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_are_fixed_by_the_shape() {
+        // The released model: o_proj and out_proj, down_proj, and the wide GEMMs.
+        assert_eq!(fp8_splits(5120, 6144), 3);
+        assert_eq!(fp8_splits(5120, 17408), 2);
+        for (n, k) in [(16384, 5120), (14336, 5120), (34816, 5120), (12288, 5120)] {
+            assert_eq!(fp8_splits(n, k), 1, "{n} x {k}");
+            assert_eq!(split_width(n, k), 0);
+        }
+        assert_eq!(split_width(5120, 6144), 15360);
+        // The drafter's stacked keys and values alone: 16 tiles, 40 blocks.
+        assert_eq!(fp8_splits(2048, 5120), 4);
+        // Too few blocks for two ranges of eight.
+        assert_eq!(fp8_splits(256, 1024 + 896), 1);
+        assert_eq!(fp8_splits(256, 2048), 2);
+        // Every split fits the CTAs and holds whole ranges.
+        for n in (128..20_000).step_by(128) {
+            for k in (128..20_000).step_by(128) {
+                let s = fp8_splits(n, k);
+                assert!(s <= MAX_SPLITS && (k / 128).is_multiple_of(s));
+                if s > 1 {
+                    assert!(n.div_ceil(128) * s <= SPLIT_CTAS && k / 128 / s >= MIN_SPLIT_BLOCKS);
+                    assert!(split_width(n, k) <= (SPLIT_CTAS * 128) as usize);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_sum_grid_covers_rows_and_refuses_one_split() {
+        let p = SplitSumParams {
+            parts: 16,
+            out: 16,
+            rows: 3,
+            n: 5120,
+            splits: 3,
+            part_rows: 4,
+            out_stride: 5120,
+            reserved: 0,
+        };
+        assert_eq!(split_sum_grid(&p).unwrap(), [5, 3, 1]);
+        for bad in [
+            SplitSumParams { splits: 1, ..p },
+            SplitSumParams { part_rows: 2, ..p },
+            SplitSumParams {
+                out_stride: 100,
+                ..p
+            },
+            SplitSumParams { parts: 0, ..p },
+        ] {
+            assert!(split_sum_grid(&bad).is_err(), "{bad:?}");
+        }
+    }
 
     fn lin8() -> Lin8Params {
         Lin8Params {

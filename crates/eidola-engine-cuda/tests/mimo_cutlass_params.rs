@@ -12,7 +12,7 @@
 //! descriptors, so for them the encode calls are compared and the descriptor
 //! bytes are not.
 
-use eidola_engine_cuda::mimo::gemm::{GemmArgs, GemmKind, PARAMS_BYTES, SwapTile};
+use eidola_engine_cuda::mimo::gemm::{GemmArgs, GemmKind, PARAMS_BYTES, SplitTile, SwapTile};
 use eidola_engine_cuda::mimo::tma::{TmaSpec, TmaSwizzle, TmaType};
 use serde_json::Value;
 
@@ -40,12 +40,20 @@ fn cases() -> Vec<Case> {
         .lines()
         .map(|l| {
             let v: Value = serde_json::from_str(l).unwrap();
+            // Records before the split kernels carry no split: one batch.
+            let splits = v["splits"]
+                .as_u64()
+                .map_or(1, |s| u32::try_from(s).unwrap());
             let kind = match v["kernel"].as_str().unwrap() {
                 "fp8_blockwise" => GemmKind::Fp8Blockwise,
                 "bf16" => GemmKind::Bf16,
                 "fp8_swap16" => GemmKind::Fp8Swap(SwapTile::T16),
                 "fp8_swap32" => GemmKind::Fp8Swap(SwapTile::T32),
                 "fp8_swap64" => GemmKind::Fp8Swap(SwapTile::T64),
+                "fp8_split16" => GemmKind::Fp8Split(SplitTile::Swap(SwapTile::T16), splits),
+                "fp8_split32" => GemmKind::Fp8Split(SplitTile::Swap(SwapTile::T32), splits),
+                "fp8_split64" => GemmKind::Fp8Split(SplitTile::Swap(SwapTile::T64), splits),
+                "fp8_split128" => GemmKind::Fp8Split(SplitTile::Wide, splits),
                 k => panic!("{k}"),
             };
             let u = |k: &str| u32::try_from(v[k].as_u64().unwrap()).unwrap();
@@ -94,6 +102,7 @@ fn spec_matches(spec: &TmaSpec, rec: &Value) {
         TmaSwizzle::B32 => 1,
         TmaSwizzle::B64 => 2,
         TmaSwizzle::B128 => 3,
+        TmaSwizzle::B128Atom32 => 4,
     };
     let list = |k: &str| -> Vec<u64> {
         rec[k]
@@ -174,12 +183,21 @@ fn params_match_cutlass_with_recorded_descriptors() {
         checked += 1;
     }
     assert!(checked >= 20);
-    // Every swapped tile is recorded.
+    // Every swapped tile is recorded, and every split instance at a split of K.
     for t in SwapTile::ALL {
         assert!(
             cases()
                 .iter()
                 .any(|c| c.kind == GemmKind::Fp8Swap(t) && c.can_implement),
+            "{t:?}"
+        );
+    }
+    for t in SplitTile::ALL {
+        assert!(
+            cases().iter().any(
+                |c| matches!(c.kind, GemmKind::Fp8Split(u, s) if u == t && s > 1)
+                    && c.can_implement
+            ),
             "{t:?}"
         );
     }

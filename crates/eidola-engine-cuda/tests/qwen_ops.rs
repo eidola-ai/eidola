@@ -123,6 +123,22 @@ fn qwen_kernels_on_the_device() {
             failed.push("fast_fp8_configs_agree");
         }
     }
+    for (name, outcome) in [
+        ("fast_fp8_split_forms", fast_fp8_split_forms(&fast, 25)),
+        ("fast_fp8_split_order", fast_fp8_split_order(&fast, 26)),
+        ("fast_fp8_stacks", fast_fp8_stacks(&fast, 27)),
+    ] {
+        match outcome {
+            Ok(report) => {
+                eprintln!("ok      {name}: {report}");
+                qwen_common::record(&format!("qwen_ops_{name}"), &report);
+            }
+            Err(e) => {
+                eprintln!("FAILED  {name}: {e}");
+                failed.push(name);
+            }
+        }
+    }
     match fast_gates(&fast, 16) {
         Ok(report) => {
             eprintln!("ok      fast_gates: {report}");
@@ -251,7 +267,9 @@ fn small_gemm_form_on(fast: &CudaDevice, tiled: bool) -> impl cases::SmallGemmRu
 /// the same bits: each kind over a 300-row batch, and over rows alone and in batches at
 /// several offsets, against the unswapped kernel's 300-row batch; then the dispatch
 /// itself at row counts either side of each boundary. This is what lets the executor
-/// choose by row count.
+/// choose by row count. Its shapes are ones `fp8_splits` leaves whole (asserted), the
+/// unsplit kinds' domain; the split shapes' instances are `fast_fp8_split_forms`' and
+/// `fast_fp8_split_order`'s.
 fn fast_fp8_configs_agree(fast: &CudaDevice, seed: u64) -> Result<String, String> {
     use eidola_engine_cuda::mimo::gemm::GemmKind;
     use eidola_engine_cuda::qwen::abi::{Lin8Params, QuantParams};
@@ -262,7 +280,11 @@ fn fast_fp8_configs_agree(fast: &CudaDevice, seed: u64) -> Result<String, String
     let u = |x: usize| u32::try_from(x).expect("small");
     let mut g = Lcg(seed);
     let mut checked = 0usize;
-    for &(n, k) in &[(1024usize, 640usize), (384, 5120), (256, 128)] {
+    // K of 5,120 at 10,240 outputs: 80 tiles, too many to split.
+    for &(n, k) in &[(1024usize, 640usize), (10240, 5120), (256, 128)] {
+        if eidola_engine_cuda::qwen::kernels::fp8_splits(u(n), u(k)) != 1 {
+            return Err(format!("{n}x{k} splits: not an unsplit kind's shape"));
+        }
         let (codes, scales) = cases::fp8_weight(&mut g, n, k);
         let ts = cases::transpose_scales(&scales, n, k);
         let rows_max = 300usize;
@@ -301,8 +323,8 @@ fn fast_fp8_configs_agree(fast: &CudaDevice, seed: u64) -> Result<String, String
             unsafe {
                 fast.quant(&q).map_err(|e| e.to_string())?;
                 match kind {
-                    Some(kind) => fast.lin8_on(&l, kind),
-                    None => fast.lin8(&l),
+                    Some(kind) => fast.lin8_on(&l, kind, None),
+                    None => fast.lin8(&l, None),
                 }
                 .map_err(|e| e.to_string())?;
             }
@@ -346,6 +368,416 @@ fn fast_fp8_configs_agree(fast: &CudaDevice, seed: u64) -> Result<String, String
     Ok(format!(
         "{checked} batches over {} kinds and the dispatch, every row's bits equal",
         FP8_KINDS.len()
+    ))
+}
+
+/// One FP8 weight and activation rows on the device, quantised by the device's own
+/// quantiser into codes and scales for any run of the rows.
+struct Fp8Case {
+    n: usize,
+    k: usize,
+    x: qwen_common::Buf,
+    w: qwen_common::Buf,
+    ws: qwen_common::Buf,
+    codes: qwen_common::Buf,
+    scales: qwen_common::Buf,
+}
+
+impl Fp8Case {
+    fn new(
+        fast: &CudaDevice,
+        g: &mut qwen_common::Lcg,
+        n: usize,
+        k: usize,
+        rows_max: usize,
+    ) -> Self {
+        use qwen_common::{bits, buf, zeros};
+        let (codes, scales) = cases::fp8_weight(g, n, k);
+        let ts = cases::transpose_scales(&scales, n, k);
+        let x: Vec<f32> = (0..rows_max * k).map(|_| g.bf16(3.0)).collect();
+        Fp8Case {
+            n,
+            k,
+            x: buf(fast, &bits(&x)),
+            w: buf(fast, &codes),
+            ws: buf(fast, &ts),
+            codes: zeros(fast, rows_max.next_multiple_of(4) * k),
+            scales: zeros(fast, (k / 128) * rows_max.next_multiple_of(4) * 4),
+        }
+    }
+
+    /// Rows `first .. first + rows` quantised, and the linear's parameters over them into
+    /// `out`.
+    fn quant(
+        &self,
+        fast: &CudaDevice,
+        rows: usize,
+        first: usize,
+        out: u64,
+    ) -> Result<eidola_engine_cuda::qwen::abi::Lin8Params, String> {
+        use eidola_engine_cuda::qwen::abi::{Lin8Params, QuantParams};
+        use eidola_engine_cuda::qwen::kernels::QwenKernels;
+        let u = |x: usize| u32::try_from(x).expect("small");
+        let m_pad = rows.next_multiple_of(4);
+        let q = QuantParams {
+            x: self.x.addr + (first * self.k * 2) as u64,
+            codes: self.codes.addr,
+            scales: self.scales.addr,
+            rows: u(rows),
+            k: u(self.k),
+            x_stride: u(self.k),
+            m_pad: u(m_pad),
+        };
+        // SAFETY: the buffers hold `rows_max` rows of this shape.
+        unsafe { fast.quant(&q) }.map_err(|e| e.to_string())?;
+        Ok(Lin8Params {
+            a: self.codes.addr,
+            a_scales: self.scales.addr,
+            w: self.w.addr,
+            w_scales: self.ws.addr,
+            out,
+            rows: u(rows),
+            n: u(self.n),
+            k: u(self.k),
+            m_pad: u(m_pad),
+            out_stride: u(self.n),
+            reserved: 0,
+        })
+    }
+}
+
+/// The split FP8 GEMM (`cutlass_fp8_blockwise_split`, its partials added by
+/// `eidola_qwen_fast_split_sum`) gives every row the same bits in every instance a row
+/// can be routed to: each instance over a 300-row batch, and over rows alone and in
+/// batches at several offsets, against the unswapped instance's batch; then the dispatch
+/// (`fp8_kind`) at row counts either side of each boundary, which takes the split form
+/// at every row count for these shapes. The released model's `o_proj` / `out_proj` and
+/// `down_proj` shapes are among them.
+fn fast_fp8_split_forms(fast: &CudaDevice, seed: u64) -> Result<String, String> {
+    use eidola_engine_cuda::mimo::gemm::{GemmKind, SplitTile};
+    use eidola_engine_cuda::qwen::kernels::{QwenKernels, fp8_splits};
+    use qwen_common::{Lcg, read, zeros};
+
+    let mut g = Lcg(seed);
+    let mut checked = 0usize;
+    for &(n, k) in &[
+        (5120usize, 6144usize),
+        (5120, 17408),
+        (1024, 3072),
+        (640, 2048),
+    ] {
+        let u = |x: usize| u32::try_from(x).expect("small");
+        let splits = fp8_splits(u(n), u(k));
+        if splits < 2 {
+            return Err(format!("{n}x{k} does not split"));
+        }
+        let c = Fp8Case::new(fast, &mut g, n, k, 300);
+        let parts = zeros(fast, splits as usize * 300usize.next_multiple_of(4) * n * 4);
+        let run = |rows: usize, first: usize, kind: Option<GemmKind>| -> Result<Vec<u16>, String> {
+            let out = zeros(fast, rows.next_multiple_of(4) * n * 2);
+            let l = c.quant(fast, rows, first, out.addr)?;
+            // SAFETY: every buffer covers `m_pad` rows of this shape.
+            unsafe {
+                match kind {
+                    Some(kind) => fast.lin8_on(&l, kind, Some(parts.addr)),
+                    None => fast.lin8(&l, Some(parts.addr)),
+                }
+            }
+            .map_err(|e| e.to_string())?;
+            Ok(read::<CudaDevice, u16>(fast, &out, rows * n))
+        };
+        let want = run(300, 0, Some(GemmKind::Fp8Split(SplitTile::Wide, splits)))?;
+        for tile in SplitTile::ALL {
+            let kind = GemmKind::Fp8Split(tile, splits);
+            let got = run(300, 0, Some(kind))?;
+            cases::same(&format!("{kind:?} {n}x{k}: 300 rows"), &got, &want)?;
+            for &(rows, first) in &[
+                (1usize, 0usize),
+                (1, 77),
+                (1, 299),
+                (3, 5),
+                (16, 100),
+                (17, 31),
+                (40, 200),
+                (64, 1),
+                (65, 150),
+            ] {
+                let got = run(rows, first, Some(kind))?;
+                cases::same(
+                    &format!("{kind:?} {n}x{k}: rows {first}..{}", first + rows),
+                    &got,
+                    &want[first * n..(first + rows) * n],
+                )?;
+                checked += 1;
+            }
+        }
+        for rows in [1usize, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128, 257] {
+            let first = (rows * 7) % (300 - rows + 1);
+            let got = run(rows, first, None)?;
+            cases::same(
+                &format!("dispatch {n}x{k}: rows {first}..{}", first + rows),
+                &got,
+                &want[first * n..(first + rows) * n],
+            )?;
+            checked += 1;
+        }
+    }
+    Ok(format!(
+        "{checked} batches over {} split instances and the dispatch, every row's bits equal",
+        SplitTile::ALL.len()
+    ))
+}
+
+/// The split's arithmetic as documented: range `s` of a split launch is that range's own
+/// GEMM from zero (the same instance over the range's columns and scale blocks copied
+/// into a dense problem, unsplit), bit for bit; and the sum is the ranges' values added
+/// in order from the first, rounded once to BF16 (computed here from the partials the
+/// device left), bit for bit. A sum in any other order, or a range's sums carried into
+/// the next, fails it.
+fn fast_fp8_split_order(fast: &CudaDevice, seed: u64) -> Result<String, String> {
+    use eidola_engine_cuda::mimo::gemm::{GemmKind, SplitTile};
+    use eidola_engine_cuda::qwen::abi::{Lin8Params, SplitSumParams};
+    use eidola_engine_cuda::qwen::kernels::split_sum_grid;
+    use qwen_common::{Lcg, buf, read, zeros};
+
+    let u = |x: usize| u32::try_from(x).expect("small");
+    let mut g = Lcg(seed);
+    let mut checked = 0usize;
+    for &(n, k, splits, rows) in &[
+        (1024usize, 3072usize, 3usize, 37usize),
+        (5120, 6144, 3, 1),
+        (5120, 17408, 2, 64),
+        (256, 2048, 4, 130),
+    ] {
+        let c = Fp8Case::new(fast, &mut g, n, k, rows);
+        let m_pad = rows.next_multiple_of(4);
+        let out = zeros(fast, m_pad * n * 2);
+        let parts = zeros(fast, splits * m_pad * n * 4);
+        let l = c.quant(fast, rows, 0, out.addr)?;
+        let codes = read::<CudaDevice, u8>(fast, &c.codes, m_pad * k);
+        let scales = read::<CudaDevice, f32>(fast, &c.scales, (k / 128) * m_pad);
+        let w = read::<CudaDevice, u8>(fast, &c.w, n * k);
+        let ws = read::<CudaDevice, f32>(fast, &c.ws, (k / 128) * (n / 128));
+        let (ks, kbs, nb) = (k / splits, k / 128 / splits, n / 128);
+        for tile in SplitTile::ALL {
+            if tile == SplitTile::Wide && rows < 65 {
+                continue;
+            }
+            // SAFETY: the buffers hold `m_pad` rows of this shape and `splits` arrays.
+            unsafe { fast.fp8_split_parts(&l, tile, u(splits), parts.addr) }
+                .map_err(|e| e.to_string())?;
+            let p = read::<CudaDevice, f32>(fast, &parts, splits * m_pad * n);
+            for s in 0..splits {
+                // Range `s` as a dense problem of its own.
+                let a: Vec<u8> = (0..m_pad)
+                    .flat_map(|r| codes[r * k + s * ks..r * k + (s + 1) * ks].to_vec())
+                    .collect();
+                let sa = scales[s * kbs * m_pad..(s + 1) * kbs * m_pad].to_vec();
+                let b: Vec<u8> = (0..n)
+                    .flat_map(|o| w[o * k + s * ks..o * k + (s + 1) * ks].to_vec())
+                    .collect();
+                let sb = ws[s * kbs * nb..(s + 1) * kbs * nb].to_vec();
+                let (ab, sab, bb, sbb) =
+                    (buf(fast, &a), buf(fast, &sa), buf(fast, &b), buf(fast, &sb));
+                let one = zeros(fast, m_pad * n * 4);
+                // The partials alone: `out` is checked, not written.
+                let lr = Lin8Params {
+                    a: ab.addr,
+                    a_scales: sab.addr,
+                    w: bb.addr,
+                    w_scales: sbb.addr,
+                    out: one.addr,
+                    rows: u(rows),
+                    n: u(n),
+                    k: u(ks),
+                    m_pad: u(m_pad),
+                    out_stride: u(n),
+                    reserved: 0,
+                };
+                // SAFETY: dense buffers of the range's problem.
+                unsafe { fast.fp8_split_parts(&lr, tile, 1, one.addr) }
+                    .map_err(|e| e.to_string())?;
+                let alone = read::<CudaDevice, f32>(fast, &one, rows * n);
+                let got: Vec<u32> = p[s * m_pad * n..s * m_pad * n + rows * n]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                let want: Vec<u32> = alone.iter().map(|v| v.to_bits()).collect();
+                cases::same(
+                    &format!("{tile:?} {n}x{k}/{splits}: range {s} against its own GEMM"),
+                    &got,
+                    &want,
+                )?;
+            }
+            let sp = SplitSumParams {
+                parts: parts.addr,
+                out: out.addr,
+                rows: u(rows),
+                n: u(n),
+                splits: u(splits),
+                part_rows: u(m_pad),
+                out_stride: u(n),
+                reserved: 0,
+            };
+            let grid = split_sum_grid(&sp).map_err(|e| e.to_string())?;
+            // SAFETY: the partials and the output just sized.
+            unsafe { fast.split_sum(&sp, grid) }.map_err(|e| e.to_string())?;
+            let got = read::<CudaDevice, u16>(fast, &out, rows * n);
+            let want: Vec<u16> = (0..rows * n)
+                .map(|i| {
+                    let mut acc = p[i];
+                    for s in 1..splits {
+                        acc += p[s * m_pad * n + i];
+                    }
+                    bf16_nearest(acc)
+                })
+                .collect();
+            cases::same(&format!("{tile:?} {n}x{k}/{splits}: the sum"), &got, &want)?;
+            // The dispatch's form is the same bits.
+            let o2 = zeros(fast, m_pad * n * 2);
+            let l2 = Lin8Params { out: o2.addr, ..l };
+            // SAFETY: as above.
+            unsafe { fast.lin8_on(&l2, GemmKind::Fp8Split(tile, u(splits)), Some(parts.addr)) }
+                .map_err(|e| e.to_string())?;
+            cases::same(
+                &format!("{tile:?} {n}x{k}/{splits}: linear against parts and sum"),
+                &read::<CudaDevice, u16>(fast, &o2, rows * n),
+                &want,
+            )?;
+            checked += 1;
+        }
+    }
+    Ok(format!(
+        "{checked} launches: each range its own GEMM, the sum in range order, bit for bit"
+    ))
+}
+
+/// The nearest BF16 of `x`, ties to even, a NaN as the one quiet NaN.
+fn bf16_nearest(x: f32) -> u16 {
+    if x.is_nan() {
+        return 0x7fc0;
+    }
+    let b = x.to_bits();
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
+}
+
+/// A stack of FP8 weights sharing an input (the executor's `qkvz`, `qkv`, `gate_up`) gives
+/// each part's outputs the bits the part gives alone on the stack's own instance, at decode
+/// and prefill row counts (the swapped kernel at every tile, the unswapped one): an
+/// output's bits depend on its weight row, not on where the stack puts it. (A part's shape
+/// alone may split, as `1024 × 5120` does; the executor runs only the stack.)
+fn fast_fp8_stacks(fast: &CudaDevice, seed: u64) -> Result<String, String> {
+    use eidola_engine_cuda::qwen::abi::Lin8Params;
+    use eidola_engine_cuda::qwen::kernels::{MAX_SPLITS, QwenKernels, fp8_splits};
+    use qwen_common::{Lcg, bits, buf, read, zeros};
+
+    let u = |x: usize| u32::try_from(x).expect("small");
+    let mut g = Lcg(seed);
+    let mut checked = 0usize;
+    let k = 5120usize;
+    // The executor's stacks are all wider than a split allows; this one too (80 tiles),
+    // while its 1,024-row parts alone would split (asserted).
+    let parts_n = [8192usize, 1024, 1024];
+    let n: usize = parts_n.iter().sum();
+    if fp8_splits(u(n), u(k)) != 1 || fp8_splits(1024, u(k)) == 1 {
+        return Err(format!(
+            "{n}x{k} must stay whole and its 1024-row parts split"
+        ));
+    }
+    let weights: Vec<(Vec<u8>, Vec<f32>)> = parts_n
+        .iter()
+        .map(|&p| cases::fp8_weight(&mut g, p, k))
+        .collect();
+    let mut codes = Vec::new();
+    for (c, _) in &weights {
+        codes.extend_from_slice(c);
+    }
+    // The stack's scales `[k / 128][n / 128]`, each part's blocks in turn.
+    let (nb, kb) = (n / 128, k / 128);
+    let mut ts = vec![0.0f32; nb * kb];
+    let mut first_block = 0;
+    for (&pn, (_, sc)) in parts_n.iter().zip(&weights) {
+        for i in 0..pn / 128 {
+            for j in 0..kb {
+                ts[j * nb + first_block + i] = sc[i * kb + j];
+            }
+        }
+        first_block += pn / 128;
+    }
+    let rows_max = 300usize;
+    let x: Vec<f32> = (0..rows_max * k).map(|_| g.bf16(3.0)).collect();
+    let xb = buf(fast, &bits(&x));
+    let cb = zeros(fast, rows_max.next_multiple_of(4) * k);
+    let sb = zeros(fast, kb * rows_max.next_multiple_of(4) * 4);
+    let pb = zeros(
+        fast,
+        MAX_SPLITS as usize * rows_max.next_multiple_of(4) * n * 4,
+    );
+    let (wb, wsb) = (buf(fast, &codes), buf(fast, &ts));
+    let part_bufs: Vec<_> = parts_n
+        .iter()
+        .zip(&weights)
+        .map(|(&pn, (c, sc))| (buf(fast, c), buf(fast, &cases::transpose_scales(sc, pn, k))))
+        .collect();
+    for rows in [1usize, 16, 33, 64, 65, 300] {
+        let m_pad = rows.next_multiple_of(4);
+        let q = eidola_engine_cuda::qwen::abi::QuantParams {
+            x: xb.addr,
+            codes: cb.addr,
+            scales: sb.addr,
+            rows: u(rows),
+            k: u(k),
+            x_stride: u(k),
+            m_pad: u(m_pad),
+        };
+        let lin = |w: u64, ws: u64, n: usize, out: u64| Lin8Params {
+            a: cb.addr,
+            a_scales: sb.addr,
+            w,
+            w_scales: ws,
+            out,
+            rows: u(rows),
+            n: u(n),
+            k: u(k),
+            m_pad: u(m_pad),
+            out_stride: u(n),
+            reserved: 0,
+        };
+        let out = zeros(fast, m_pad * n * 2);
+        // SAFETY: every buffer covers `m_pad` rows of these shapes.
+        unsafe {
+            fast.quant(&q).map_err(|e| e.to_string())?;
+            fast.lin8(&lin(wb.addr, wsb.addr, n, out.addr), Some(pb.addr))
+                .map_err(|e| e.to_string())?;
+        }
+        let stacked = read::<CudaDevice, u16>(fast, &out, rows * n);
+        let mut col = 0;
+        for (&pn, (w, ws)) in parts_n.iter().zip(&part_bufs) {
+            let o = zeros(fast, m_pad * pn * 2);
+            // SAFETY: as above.
+            unsafe {
+                fast.lin8_on(
+                    &lin(w.addr, ws.addr, pn, o.addr),
+                    eidola_engine_cuda::qwen::cuda::fp8_kind(u(m_pad), u(n), u(k)),
+                    Some(pb.addr),
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            let alone = read::<CudaDevice, u16>(fast, &o, rows * pn);
+            let want: Vec<u16> = (0..rows)
+                .flat_map(|r| stacked[r * n + col..r * n + col + pn].to_vec())
+                .collect();
+            cases::same(
+                &format!("stack {n}x{k}: part of {pn} at {col}, {rows} rows"),
+                &alone,
+                &want,
+            )?;
+            col += pn;
+            checked += 1;
+        }
+    }
+    Ok(format!(
+        "{checked} parts against their stack, every output's bits equal"
     ))
 }
 

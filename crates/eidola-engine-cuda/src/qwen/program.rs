@@ -18,7 +18,7 @@ use eidola_engine::sampling::Stream;
 use super::super::abi::*;
 use super::super::attention::{Fa2Args, HEAD_DIM, PARTIAL_BYTES_PER_HEAD};
 use super::super::device::QwenDevice;
-use super::super::kernels::{AcceptLaunch, DN_SHORT_RUN, SampleArgs};
+use super::super::kernels::{AcceptLaunch, DN_SHORT_RUN, SampleArgs, split_width};
 use super::super::plan::{AttnAt, DrafterAt, Fa2At, ItemsAt, Layout, SAMPLE_WORDS, TargetAt};
 use super::super::sampler::{accept_work_bytes, sample_work_bytes};
 use super::super::weights::{AttentionW, DeltaNetW, LayerW, MixerW, ab_rows};
@@ -77,11 +77,14 @@ pub(super) struct Scratch {
     pub normed: Alloc,
     pub codes: Alloc,
     pub scales: Alloc,
-    pub gate: Alloc,
-    pub up: Alloc,
+    /// The split FP8 GEMMs' partial sums (fast profile only).
+    pub parts: Alloc,
+    /// The MLP's stacked gate and up outputs: `[rows, 2 · inter]`, gate's then up's.
+    pub gate_up: Alloc,
     pub hmid: Alloc,
-    pub mixed: Alloc,
-    pub z: Alloc,
+    /// The DeltaNet's stacked input projections: `[rows, conv_dim + value_dim]`, the
+    /// convolution's inputs then `z`.
+    pub qkvz: Alloc,
     pub aa: Alloc,
     pub bb: Alloc,
     pub nrm: Alloc,
@@ -97,9 +100,9 @@ pub(super) struct Scratch {
     pub o: Alloc,
     pub o_rows: Alloc,
     pub zero_rows: Alloc,
-    pub qg: Alloc,
-    pub kk: Alloc,
-    pub vv: Alloc,
+    /// The attention's stacked projections: `[rows, 2 · q_width + 2 · kv_width]`, the
+    /// queries and gates, then keys, then values.
+    pub qkv: Alloc,
     pub q: Alloc,
     pub kr: Alloc,
     pub attn: Alloc,
@@ -172,6 +175,25 @@ fn head_tmp(c: &Caps, d: &super::Dims) -> usize {
         .max(pad4(c.drafter) * d.hidden as usize)
         .max(pad4(c.rows.max(c.drafter)) * ab_rows(d.v_heads) as usize)
         * 4
+}
+
+/// f32 values a row of the split FP8 GEMMs' partial sums takes: the most of any FP8
+/// linear of the model ([`split_width`]; 0 when none splits).
+pub(super) fn parts_width(d: &super::Dims) -> usize {
+    let (h, cd, vd) = (d.hidden, d.conv_dim(), d.value_dim());
+    let (qw, kvw) = (d.q_heads * d.head_dim, d.kv_width());
+    [
+        (cd + vd, h),
+        (h, vd),
+        (2 * qw + 2 * kvw, h),
+        (h, qw),
+        (2 * d.inter, h),
+        (h, d.inter),
+    ]
+    .into_iter()
+    .map(|(n, k)| split_width(n, k))
+    .max()
+    .unwrap_or(0)
 }
 
 /// One group of a row-copy launch: its items, its width in words, and its buffers
@@ -265,11 +287,14 @@ fn build_scratch(
         normed: a(pad4(c.rows) * hid * 2)?,
         codes: a(rows * k_max)?,
         scales: a(k_max / 128 * rows * 4)?,
-        gate: a(rows * d.inter as usize * 2)?,
-        up: a(rows * d.inter as usize * 2)?,
+        parts: a(if fast {
+            (rows * parts_width(d) * 4).max(8)
+        } else {
+            8
+        })?,
+        gate_up: a(rows * 2 * d.inter as usize * 2)?,
         hmid: a(rows * d.inter as usize * 2)?,
-        mixed: a(rows * cd * 2)?,
-        z: a(rows * vd * 2)?,
+        qkvz: a(rows * (cd + vd) * 2)?,
         aa: a(rows * vh * 2)?,
         bb: a(rows * vh * 2)?,
         nrm: a(rows * vd * 2)?,
@@ -285,9 +310,7 @@ fn build_scratch(
         o: a(c.staged.max(1) * vd * 4)?,
         o_rows: a(rows * vd * 4)?,
         zero_rows,
-        qg: a(rows * 2 * qw * 2)?,
-        kk: a(rows * kvw * 2)?,
-        vv: a(rows * kvw * 2)?,
+        qkv: a(rows * (2 * qw + 2 * kvw) * 2)?,
         q: a(rows * qw * 2)?,
         kr: a(rows * kvw * 2)?,
         attn: a(rows * qw * 2)?,
@@ -656,17 +679,32 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         unsafe { self.dev.norm(&p) }
     }
 
+    /// The FP8 linear of `rows` rows of `x` by `w` into `out`: the quantiser, then
+    /// [`Self::gemm8`].
     fn lin8(&self, x: u64, rows: usize, w: &super::super::weights::Fp8W, out: u64) -> Result<()> {
-        let m_pad = n32(pad4(rows));
+        self.quant(x, rows, w.k)?;
+        self.gemm8(rows, w, out)
+    }
+
+    /// `rows` rows of `x`, `k` wide, quantised into the codes and scales scratch.
+    fn quant(&self, x: u64, rows: usize, k: u32) -> Result<()> {
         let q = QuantParams {
             x,
             codes: self.scratch.codes.addr,
             scales: self.scratch.scales.addr,
             rows: n32(rows),
-            k: w.k,
-            x_stride: w.k,
-            m_pad,
+            k,
+            x_stride: k,
+            m_pad: n32(pad4(rows)),
         };
+        // SAFETY: the quantiser's scratch holds the widest K at the capacity's rows.
+        unsafe { self.dev.quant(&q) }
+    }
+
+    /// The FP8 GEMM of the `rows` rows [`Self::quant`] left by `w` into `out`, the split
+    /// shapes' partial sums through the parts scratch.
+    fn gemm8(&self, rows: usize, w: &super::super::weights::Fp8W, out: u64) -> Result<()> {
+        let m_pad = n32(pad4(rows));
         let l = Lin8Params {
             a: self.scratch.codes.addr,
             a_scales: self.scratch.scales.addr,
@@ -680,12 +718,11 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             out_stride: w.n,
             reserved: 0,
         };
-        // SAFETY: the quantiser's scratch holds the widest K at the capacity's rows; `out`
-        // holds `m_pad` rows (the fast form writes the padding rows).
-        unsafe {
-            self.dev.quant(&q)?;
-            self.dev.lin8(&l)
-        }
+        let parts =
+            (self.dev.profile() == super::QwenProfile::Fast).then_some(self.scratch.parts.addr);
+        // SAFETY: the codes and scales of `m_pad` rows; `out` holds `m_pad` rows (the fast
+        // forms write the padding rows); the parts scratch holds `parts_width` f32 a row.
+        unsafe { self.dev.lin8(&l, parts) }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -782,16 +819,15 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
     fn mlp(&self, l: &LayerW, x: u64, rows: usize, m: u64) -> Result<()> {
         let s = &self.scratch;
         let inter = self.dims.inter;
-        self.lin8(x, rows, &l.gate, s.gate.addr)?;
-        self.lin8(x, rows, &l.up, s.up.addr)?;
+        self.lin8(x, rows, &l.gate_up, s.gate_up.addr)?;
         let p = GateParams {
-            a: s.up.addr,
-            g: s.gate.addr,
+            a: s.gate_up.addr + u64::from(inter) * 2,
+            g: s.gate_up.addr,
             out: s.hmid.addr,
             rows: n32(rows),
             width: inter,
-            a_stride: inter,
-            g_stride: inter,
+            a_stride: 2 * inter,
+            g_stride: 2 * inter,
             out_stride: inter,
             unit: inter,
             g_unit_stride: 0,
@@ -821,8 +857,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         if new && t > 0 {
             let two = n32(2 * vh);
             self.widen(
-                s.mixed.addr,
-                d.conv_dim(),
+                s.qkvz.addr,
+                d.conv_dim() + d.value_dim(),
                 s.new_f32.addr,
                 d.conv_dim(),
                 t,
@@ -973,19 +1009,18 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             self.norm(s.h.addr, prev_m, lw.input_norm, s.x.addr, t, d.hidden)?;
             match &lw.mixer {
                 MixerW::DeltaNet(w) => {
-                    self.lin8(s.x.addr, t, &w.qkv, s.mixed.addr)?;
-                    self.lin8(s.x.addr, t, &w.z, s.z.addr)?;
+                    self.lin8(s.x.addr, t, &w.qkvz, s.qkvz.addr)?;
                     self.ab_projections(s.x.addr, t, w)?;
                     self.deltanet(at, dn, w, true)?;
                     let p = DnNormParams {
                         o: s.o_rows.addr,
-                        z: s.z.addr,
+                        z: s.qkvz.addr + u64::from(d.conv_dim()) * 2,
                         weight: w.norm,
                         out: s.nrm.addr,
                         rows: n32(t),
                         v_heads: d.v_heads,
                         v_dim: d.v_dim,
-                        z_stride: d.value_dim(),
+                        z_stride: d.conv_dim() + d.value_dim(),
                         eps: d.eps,
                         reserved: 0,
                     };
@@ -1050,11 +1085,14 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let (hq, hd, kvw) = (d.q_heads, d.head_dim, d.kv_width());
         let qw = hq * hd;
         let r = n32(rows);
-        if !kv_only {
-            self.lin8(x, rows, &w.q, s.qg.addr)?;
-        }
-        self.lin8(x, rows, &w.k, s.kk.addr)?;
-        self.lin8(x, rows, &w.v, s.vv.addr)?;
+        // One GEMM over the stacked projections, the passes that write KV alone too, so
+        // every pass computes a position's keys and values by the same GEMM.
+        self.lin8(x, rows, &w.qkv, s.qkv.addr)?;
+        let stride = 2 * qw + 2 * kvw;
+        let (kk, vv) = (
+            s.qkv.addr + u64::from(2 * qw) * 2,
+            s.qkv.addr + u64::from(2 * qw + kvw) * 2,
+        );
         let rope = self.tw(at.rope);
         let rot =
             |src: u64, units: u32, stride: u32, unit_stride: u32, out: u64, wt: u64| NormParams {
@@ -1078,13 +1116,13 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let pool = &self.pools[group];
         let kvp = KvWriteParams {
             k: s.kr.addr,
-            v: s.vv.addr,
+            v: vv,
             pool: pool.data.addr,
             targets: self.tw(at.targets),
             rows: r,
             width: kvw,
             k_stride: kvw,
-            v_stride: kvw,
+            v_stride: stride,
             layer,
             layers: pool.layers,
             block_size: self.cfg.block_size,
@@ -1095,10 +1133,10 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         unsafe {
             if !kv_only {
                 self.dev
-                    .norm(&rot(s.qg.addr, hq, 2 * qw, 2 * hd, s.q.addr, w.q_norm))?;
+                    .norm(&rot(s.qkv.addr, hq, stride, 2 * hd, s.q.addr, w.q_norm))?;
             }
             self.dev
-                .norm(&rot(s.kk.addr, d.kv_heads, kvw, hd, s.kr.addr, w.k_norm))?;
+                .norm(&rot(kk, d.kv_heads, stride, hd, s.kr.addr, w.k_norm))?;
             self.dev.kv_write(&kvp)?;
         }
         if kv_only {
@@ -1136,12 +1174,12 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         }
         let gp = GateParams {
             a: s.attn.addr,
-            g: s.qg.addr + u64::from(hd) * 2,
+            g: s.qkv.addr + u64::from(hd) * 2,
             out: s.y.addr,
             rows: r,
             width: qw,
             a_stride: qw,
-            g_stride: 2 * qw,
+            g_stride: stride,
             out_stride: qw,
             unit: hd,
             g_unit_stride: 2 * hd,

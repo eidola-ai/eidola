@@ -45,6 +45,17 @@ impl QwenProfile {
     }
 }
 
+/// One range of [`QwenDevice::cipher_ranges`]: `words` 32-bit words at `addr` and the
+/// keystream of (`key`, `nonce`) from block `counter` on.
+#[derive(Clone, Copy)]
+pub struct CipherRange<'k> {
+    pub addr: u64,
+    pub words: u32,
+    pub counter: u32,
+    pub key: &'k KvKey,
+    pub nonce: KvNonce,
+}
+
 /// Memory, copies and kernels.
 pub trait QwenDevice: QwenKernels {
     /// The profile this device computes in.
@@ -89,6 +100,19 @@ pub trait QwenDevice: QwenKernels {
         key: &KvKey,
         nonce: &KvNonce,
     ) -> Result<()>;
+    /// [`QwenDevice::cipher`] over every range of `ranges`, which do not overlap: on a
+    /// GPU in one launch of the cipher kernel (one item list, zeroed behind the launch).
+    ///
+    /// # Safety
+    ///
+    /// As [`QwenDevice::cipher`], for each range.
+    unsafe fn cipher_ranges(&self, ranges: &[CipherRange<'_>]) -> Result<()> {
+        for r in ranges {
+            // SAFETY: the caller's.
+            unsafe { self.cipher(r.addr, r.words, r.counter, r.key, &r.nonce)? };
+        }
+        Ok(())
+    }
     /// `bytes` zeroed bytes of host memory for the host tier (page-locked on a CUDA
     /// device), and what keeps them allocated.
     fn alloc_host(&self, bytes: usize) -> Result<(*mut u8, Box<dyn Any>)>;

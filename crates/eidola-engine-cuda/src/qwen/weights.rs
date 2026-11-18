@@ -1,8 +1,13 @@
 //! The model on a device, in the kernels' layouts.
 //!
-//! Copied as stored, with three changes of form, each exact: FP8 block scales are BF16 in
+//! Copied as stored, with four changes of form, each exact: FP8 block scales are BF16 in
 //! the checkpoint and become f32 transposed to `[k / 128][n / 128]` (the CUTLASS SFB
-//! layout both GEMM forms read); norm weights are the model crate's f32 (`1 + w` where
+//! layout both GEMM forms read); the FP8 projections of one input are stacked into one
+//! weight, their rows one after another (each part a whole number of 128-row blocks, so
+//! its outputs are a run of the stack's columns: the DeltaNet's `qkv` and `z`, the
+//! attention's `q`, `k` and `v`, the MLP's `gate` and `up`), so a layer quantises each
+//! input once and runs one GEMM over it, each output a function of its own weight row as
+//! before; norm weights are the model crate's f32 (`1 + w` where
 //! zero-centred); the DeltaNet's `a` and `b` projections, held by the model crate in f32,
 //! go back to their BF16 bits, stacked in one matrix (`a`'s rows, `b`'s, then zero rows to
 //! a multiple of 8: [`ab_rows`]) that the exact profile reads as two and the fast profile
@@ -33,8 +38,8 @@ pub struct Fp8W {
 
 #[derive(Clone, Copy, Debug)]
 pub struct DeltaNetW {
-    pub qkv: Fp8W,
-    pub z: Fp8W,
+    /// `in_proj_qkv`'s `conv_dim` rows, then `in_proj_z`'s `value_dim`.
+    pub qkvz: Fp8W,
     /// BF16 `[ab_n, hidden]`: `a`'s `v_heads` rows, then `b`'s, then zero rows.
     pub ab: u64,
     /// [`ab_rows`] of the layer's value heads.
@@ -54,10 +59,9 @@ pub struct DeltaNetW {
 
 #[derive(Clone, Copy, Debug)]
 pub struct AttentionW {
-    /// `[2 · q_heads · head_dim, hidden]`: per head its query then its gate.
-    pub q: Fp8W,
-    pub k: Fp8W,
-    pub v: Fp8W,
+    /// `q_proj`'s `2 · q_heads · head_dim` rows (per head its query then its gate), then
+    /// `k_proj`'s and `v_proj`'s `kv_heads · head_dim` each.
+    pub qkv: Fp8W,
     pub o: Fp8W,
     pub q_norm: u64,
     pub k_norm: u64,
@@ -74,8 +78,8 @@ pub struct LayerW {
     pub input_norm: u64,
     pub post_norm: u64,
     pub mixer: MixerW,
-    pub gate: Fp8W,
-    pub up: Fp8W,
+    /// `gate_proj`'s `intermediate` rows, then `up_proj`'s.
+    pub gate_up: Fp8W,
     pub down: Fp8W,
 }
 
@@ -165,24 +169,43 @@ impl<D: QwenDevice> Loader<'_, D> {
     }
 
     fn fp8(&mut self, w: &Fp8Linear) -> Result<Fp8W> {
-        let codes = w.codes.bytes();
-        if let Some(i) = codes.iter().position(|&c| c & 0x7f == 0x7f) {
-            return Err(CudaError::new(format!(
-                "an FP8 weight holds a NaN code at element {i}"
-            )));
+        self.stack(&[w])
+    }
+
+    /// `parts` stacked by rows into one weight: the codes one after another, and the
+    /// scales transposed to `[k / 128][n / 128]` over the stack's blocks.
+    fn stack(&mut self, parts: &[&Fp8Linear]) -> Result<Fp8W> {
+        let k = parts[0].cols;
+        if parts.iter().any(|w| w.cols != k) {
+            return Err(CudaError::new("stacked FP8 weights differ in K"));
         }
-        let (nb, kb) = (w.rows / 128, w.cols / 128);
-        let mut t = vec![0.0f32; w.scales.len()];
-        for i in 0..nb {
-            for j in 0..kb {
-                t[j * nb + i] = w.scales[i * kb + j];
+        let rows: usize = parts.iter().map(|w| w.rows).sum();
+        let mut codes = Vec::with_capacity(rows * k);
+        for w in parts {
+            let c = w.codes.bytes();
+            if let Some(i) = c.iter().position(|&c| c & 0x7f == 0x7f) {
+                return Err(CudaError::new(format!(
+                    "an FP8 weight holds a NaN code at element {i}"
+                )));
             }
+            codes.extend_from_slice(c);
+        }
+        let (nb, kb) = (rows / 128, k / 128);
+        let mut t = vec![0.0f32; nb * kb];
+        let mut first = 0;
+        for w in parts {
+            for i in 0..w.rows / 128 {
+                for j in 0..kb {
+                    t[j * nb + first + i] = w.scales[i * kb + j];
+                }
+            }
+            first += w.rows / 128;
         }
         Ok(Fp8W {
-            codes: self.put(codes)?,
+            codes: self.put(&codes)?,
             scales: self.f32s(&t)?,
-            n: narrow(w.rows, "FP8 rows")?,
-            k: narrow(w.cols, "FP8 columns")?,
+            n: narrow(rows, "FP8 rows")?,
+            k: narrow(k, "FP8 columns")?,
         })
     }
 
@@ -192,8 +215,7 @@ impl<D: QwenDevice> Loader<'_, D> {
                 let exp_a: Vec<f32> = d.a_log.iter().map(|&x| exp32(x)).collect();
                 let (ab, ab_n) = self.ab(&d.in_proj_a, &d.in_proj_b)?;
                 MixerW::DeltaNet(DeltaNetW {
-                    qkv: self.fp8(&d.in_proj_qkv)?,
-                    z: self.fp8(&d.in_proj_z)?,
+                    qkvz: self.stack(&[&d.in_proj_qkv, &d.in_proj_z])?,
                     ab,
                     ab_n,
                     a: ab,
@@ -206,9 +228,7 @@ impl<D: QwenDevice> Loader<'_, D> {
                 })
             }
             MixerWeights::Attention(a) => MixerW::Attention(AttentionW {
-                q: self.fp8(&a.q_proj)?,
-                k: self.fp8(&a.k_proj)?,
-                v: self.fp8(&a.v_proj)?,
+                qkv: self.stack(&[&a.q_proj, &a.k_proj, &a.v_proj])?,
                 o: self.fp8(&a.o_proj)?,
                 q_norm: self.norm(&a.q_norm)?,
                 k_norm: self.norm(&a.k_norm)?,
@@ -218,8 +238,7 @@ impl<D: QwenDevice> Loader<'_, D> {
             input_norm: self.norm(&l.input_norm)?,
             post_norm: self.norm(&l.post_norm)?,
             mixer,
-            gate: self.fp8(&l.mlp.gate)?,
-            up: self.fp8(&l.mlp.up)?,
+            gate_up: self.stack(&[&l.mlp.gate, &l.mlp.up])?,
             down: self.fp8(&l.mlp.down)?,
         })
     }
