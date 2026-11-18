@@ -179,7 +179,7 @@ fn engine(
         SchedulerConfig {
             max_batched_tokens: 2048,
             max_seqs: MAX_SEQS,
-            max_prefill_chunk: 2048,
+            max_prefill_chunk: eidola_engine_cuda::qwen::SERVING_PREFILL_CHUNK,
             eos_token_ids: Vec::new(),
             speculative,
             cache: CachePolicy::default(),

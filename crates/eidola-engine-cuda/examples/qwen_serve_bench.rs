@@ -3,7 +3,7 @@
 //!
 //!     qwen_serve_bench <kernel dir> <checkpoint dir> <out.jsonl> <B|C>
 //!         [--concurrency 1,8,32,64] [--draft K] [--profile fast|exact]
-//!         [--graphs on|off] [--prompts prompts.json]
+//!         [--graphs on|off] [--prompts prompts.json] [--prefill-chunk N]
 //!
 //! The workloads are `scripts/qwen_workloads.json`, the one definition `qwen_whole`'s
 //! bench and `scripts/qwen_vllm.py` read too:
@@ -18,7 +18,9 @@
 //!
 //! Beside `qwen_whole bench`, this serves one workload at one draft width, profile and
 //! graph setting per run, from the reference runs' prompts when given, and reports the
-//! steps each path ran.
+//! steps each path ran. The scheduler takes a step of 2,048 tokens and prefill chunks of
+//! `--prefill-chunk` positions, by default the one Qwen3.8 is served at
+//! (`qwen::SERVING_PREFILL_CHUNK`, 256).
 //!
 //! Prompts come from `--prompts` (`{"b": [[ids]], "conversations": [{"first": [ids],
 //! "later": [[ids]]}]}`, text tokenised as the reference's runs were: acceptance of drafts
@@ -165,7 +167,7 @@ fn main() {
     if args.len() < 5 {
         fail(
             "usage: qwen_serve_bench <kernels> <checkpoint> <out.jsonl> <B|C> [--concurrency L] \
-             [--draft K] [--profile fast|exact] [--graphs on|off] [--prompts F]",
+             [--draft K] [--profile fast|exact] [--graphs on|off] [--prompts F] [--prefill-chunk N]",
         );
     }
     let (kdir, ckpt, out, workload) = (
@@ -207,6 +209,12 @@ fn main() {
         .unwrap_or_else(|| fail("profile: fast or exact"));
     let graphs = CudaGraphs::parse(opt.get("graphs").map_or("on", String::as_str))
         .unwrap_or_else(|e| fail(e));
+    let prefill_chunk: u32 = opt
+        .get("prefill-chunk")
+        .map_or(Ok(eidola_engine_cuda::qwen::SERVING_PREFILL_CHUNK), |s| {
+            s.parse()
+        })
+        .unwrap_or_else(|_| fail("prefill-chunk"));
     let prompts: Option<serde_json::Value> = opt.get("prompts").map(|p| {
         serde_json::from_slice(&std::fs::read(p).unwrap_or_else(|e| fail(e)))
             .unwrap_or_else(|e| fail(e))
@@ -259,7 +267,7 @@ fn main() {
         SchedulerConfig {
             max_batched_tokens: 2048,
             max_seqs: seats,
-            max_prefill_chunk: 2048,
+            max_prefill_chunk: prefill_chunk,
             eos_token_ids: Vec::new(),
             speculative: k > 0,
             cache: CachePolicy::default(),
@@ -408,7 +416,7 @@ fn main() {
             })
             .collect();
         let line = json!({
-            "workload": workload, "profile": profile.name(), "graphs": graphs.as_str(),
+            "workload": workload, "profile": profile.name(), "graphs": graphs.as_str(), "prefill_chunk": prefill_chunk,
             "draft": k, "concurrency": c, "requests": done.len(),
             "wall_seconds": wall, "output_tokens": output, "input_tokens": input,
             "output_tokens_per_second": output as f64 / wall,
