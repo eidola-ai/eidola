@@ -30,13 +30,17 @@
 #   device against the CPU reference executor, eagerly and replaying graphs
 #   (graphs keep it exact);
 # - `perf_fast`: both profiles' reproducibility between calls, asserted,
-#   eagerly and replaying graphs, and the same workloads on every path (eager,
+#   eagerly and replaying graphs (a 1,800-position prompt among them, past
+#   several FA2 chunks and prefilled in two attention passes), and the same
+#   workloads on every path (eager,
 #   a rung run directly, its graph replayed) equal in tokens and logits bits;
 #   the fast profile's deviation recorded in $OUT/qwen_fast_deviation.txt;
 # - `perf_kernels`: the kernel bench (`examples/qwen_kernel_bench.rs`) as JSON
 #   lines in $OUT/qwen_kernel_bench.jsonl: every FP8 GEMM form at 1 to 2,048
 #   rows at the stacked shapes (a split shape's split and unsplit forms side
-#   by side), the small-N and CUTLASS `a`/`b` projection,
+#   by side), a target layer's FA2 decode launch at 1 to 64 rows and 1,024 to
+#   12,288 keys split at 256, 512 and 1,024, the small-N and CUTLASS `a`/`b`
+#   projection,
 #   the norm, quantiser, gates, DeltaNet preparation and gated norm at 1, 8, 64
 #   and 2,048 rows, the recurrence, the cipher and the host copies;
 # - `serve_b`, `serve_b_mtp`: workload B (1,024 in, 256 out, greedy) at
