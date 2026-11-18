@@ -127,22 +127,25 @@ pub(super) struct Scratch {
     pub pad_o: Alloc,
     pub pad_h: Alloc,
     pub pad_t: Alloc,
-    /// The blocked DeltaNet's scratch (`W`, `U`, `P`, the factors), when the DeltaNet
-    /// runs in blocks.
+    /// The blocked DeltaNet's scratch (`W`, `U`, `P`, the factors, the rounded queries
+    /// and keys), when the DeltaNet runs in blocks.
     pub dn_w: Alloc,
     pub dn_u: Alloc,
     pub dn_pm: Alloc,
     pub dn_fac: Alloc,
+    pub dn_qr: Alloc,
+    pub dn_kr: Alloc,
 }
 
-/// Bytes of the blocked DeltaNet's four scratch arrays (8 each without blocks).
-fn chunk_bytes(c: &Caps, d: &super::Dims, blocked: bool) -> [usize; 4] {
+/// Bytes of the blocked DeltaNet's six scratch arrays (8 each without blocks).
+fn chunk_bytes(c: &Caps, d: &super::Dims, blocked: bool) -> [usize; 6] {
     if !blocked {
-        return [8; 4];
+        return [8; 6];
     }
     let (w, u, pm, fac) = chunk_scratch_floats(d.v_dim);
     let n = c.tiles.max(1) * d.v_heads as usize * 4;
-    [n * w, n * u, n * pm, n * fac]
+    let nk = c.tiles.max(1) * d.k_heads as usize * 4 * CHUNK_QK_FLOATS;
+    [n * w, n * u, n * pm, n * fac, nk, nk]
 }
 
 /// Bytes of the fast BF16 linears' f32 scratch: the head's rows of the vocabulary, the
@@ -264,6 +267,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             dn_u: a(cb[1])?,
             dn_pm: a(cb[2])?,
             dn_fac: a(cb[3])?,
+            dn_qr: a(cb[4])?,
+            dn_kr: a(cb[5])?,
             caps: c,
         })
     }
@@ -367,6 +372,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             (s.dn_u.addr, cb[1]),
             (s.dn_pm.addr, cb[2]),
             (s.dn_fac.addr, cb[3]),
+            (s.dn_qr.addr, cb[4]),
+            (s.dn_kr.addr, cb[5]),
         ]
     }
 
@@ -862,6 +869,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 u: s.dn_u.addr,
                 pm: s.dn_pm.addr,
                 fac: s.dn_fac.addr,
+                qr: s.dn_qr.addr,
+                kr: s.dn_kr.addr,
                 state_offset: (dn * self.layer_bytes() + 3 * cd * 4) as u64,
                 seq_count: n32(at.runs),
                 tiles: n32(tiles),

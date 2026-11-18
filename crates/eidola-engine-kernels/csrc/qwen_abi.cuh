@@ -310,7 +310,7 @@ QW_ABI_FIELD(QwDnRecParams, seq_count, 64);
 // `g` is the per-position log decay (`QwDnPrepParams::log_decay`). Two
 // kernels: `eidola_qwen_fast_dn_intra` (grid `(tiles, k_heads)`) fills the
 // scratch with every block's state-free parts, and `eidola_qwen_fast_dn_state`
-// (grid `(seq_count · v_dim / 32, v_heads)`) runs each run's blocks in order
+// (grid `(seq_count · ⌈v_dim / 64⌉, v_heads)`) runs each run's blocks in order
 // from its source, writing the outputs and the states.
 struct QwDnChunkParams {
   const QwDnSeq* seqs;
@@ -324,6 +324,8 @@ struct QwDnChunkParams {
   float* u;                 // [tiles, v_heads, 16, v_dim]
   float* pm;                // [tiles, v_heads, 16, 16]
   float* fac;               // [tiles, v_heads, 48]
+  float* qr;                // [tiles, k_heads, 16, k_dim]: queries rounded to TF32
+  float* kr;                // [tiles, k_heads, 16, k_dim]: keys rounded to TF32
   uint64_t state_offset;    // bytes added to every state address
   uint32_t seq_count;
   uint32_t tiles;
@@ -334,10 +336,10 @@ struct QwDnChunkParams {
   uint32_t chunk;           // positions a block, 1 to 16
   uint32_t reserved;
 };
-QW_ABI_STRUCT(QwDnChunkParams, 128);
-QW_ABI_FIELD(QwDnChunkParams, state_offset, 88);
-QW_ABI_FIELD(QwDnChunkParams, seq_count, 96);
-QW_ABI_FIELD(QwDnChunkParams, chunk, 120);
+QW_ABI_STRUCT(QwDnChunkParams, 144);
+QW_ABI_FIELD(QwDnChunkParams, state_offset, 104);
+QW_ABI_FIELD(QwDnChunkParams, seq_count, 112);
+QW_ABI_FIELD(QwDnChunkParams, chunk, 136);
 
 // The DeltaNet's gated RMS norm per value head (`deltanet::gated_norm`):
 // `bf16(bf16(w · bf16(o · r)) · silu(z))`, `r = rsqrt(Σo² / v_dim + eps)`.

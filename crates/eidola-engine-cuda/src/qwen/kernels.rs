@@ -349,7 +349,7 @@ pub fn dn_rec_grid(p: &DnRecParams) -> Result<[u32; 3]> {
 fn dn_chunk_check(p: &DnChunkParams) -> Result<()> {
     ensure(
         [
-            p.seqs, p.q, p.k, p.v, p.beta, p.g, p.out, p.w, p.u, p.pm, p.fac,
+            p.seqs, p.q, p.k, p.v, p.beta, p.g, p.out, p.w, p.u, p.pm, p.fac, p.qr, p.kr,
         ]
         .iter()
         .all(|&a| a != 0),
@@ -357,8 +357,8 @@ fn dn_chunk_check(p: &DnChunkParams) -> Result<()> {
     )?;
     ensure(p.k_dim == KEY_DIM, "dn chunk: key dim 128")?;
     ensure(
-        p.v_dim > 0 && p.v_dim <= KEY_DIM && p.v_dim.is_multiple_of(DN_COLS),
-        "dn chunk: value dim a multiple of 32, at most 128",
+        p.v_dim > 0 && p.v_dim <= KEY_DIM && p.v_dim.is_multiple_of(16),
+        "dn chunk: value dim a multiple of 16, at most 128",
     )?;
     ensure(
         p.k_heads > 0 && p.v_heads.is_multiple_of(p.k_heads),
@@ -376,19 +376,22 @@ fn dn_chunk_check(p: &DnChunkParams) -> Result<()> {
     Ok(())
 }
 
+/// Value columns a state CTA owns.
+const DN_SLICE: u32 = 64;
+
 /// The intra kernel's grid: a CTA per (block of the scratch, key head).
 pub fn dn_intra_grid(p: &DnChunkParams) -> Result<[u32; 3]> {
     dn_chunk_check(p)?;
     Ok([p.tiles.max(1), p.k_heads, 1])
 }
 
-/// The state kernel's grid: a CTA per (run, 32 value columns, value head).
+/// The state kernel's grid: a CTA per (run, 64 value columns, value head).
 pub fn dn_state_grid(p: &DnChunkParams) -> Result<[u32; 3]> {
     dn_chunk_check(p)?;
     let x = p
         .seq_count
         .max(1)
-        .checked_mul(p.v_dim / DN_COLS)
+        .checked_mul(p.v_dim.div_ceil(DN_SLICE))
         .ok_or_else(|| refuse("dn chunk: sequences"))?;
     Ok([x, p.v_heads, 1])
 }

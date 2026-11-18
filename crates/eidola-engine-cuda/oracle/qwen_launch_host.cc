@@ -233,12 +233,8 @@ void qwen_host_dn_intra(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
 }
 
 void qwen_host_dn_state(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
-  qwd::StateShared sh;
   for (uint32_t y = gy; y-- > 0;)
-    for (uint32_t x = gx; x-- > 0;) {
-      garbage(&sh);
-      qwd::dn_state_host(*p, x, y, sh);
-    }
+    for (uint32_t x = gx; x-- > 0;) qwd::dn_state_host(*p, x, y);
 }
 
 void qwen_host_dn_norm(const QwDnNormParams* p, uint32_t gx, uint32_t gy) {

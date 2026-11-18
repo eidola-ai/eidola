@@ -258,6 +258,9 @@ pub struct DnChunkParams {
     pub u: u64,
     pub pm: u64,
     pub fac: u64,
+    /// The queries and keys of each block and key head, rounded to TF32.
+    pub qr: u64,
+    pub kr: u64,
     pub state_offset: u64,
     pub seq_count: u32,
     /// Blocks the scratch holds: the intra kernel's grid.
@@ -270,7 +273,7 @@ pub struct DnChunkParams {
     pub chunk: u32,
     pub reserved: u32,
 }
-layout!(DnChunkParams, 128, { state_offset: 88, seq_count: 96, chunk: 120 });
+layout!(DnChunkParams, 144, { state_offset: 104, seq_count: 112, chunk: 136 });
 
 /// The rows of a block's tile: the longest block of the blocked DeltaNet.
 pub const CHUNK_TILE: u32 = 16;
@@ -280,6 +283,10 @@ pub fn chunk_scratch_floats(v_dim: u32) -> (usize, usize, usize, usize) {
     let t = CHUNK_TILE as usize;
     (t * KEY_DIM as usize, t * v_dim as usize, t * t, 48)
 }
+
+/// Floats of the blocked DeltaNet's rounded queries (and as many of its keys) per
+/// (block, key head): 16 × 128.
+pub const CHUNK_QK_FLOATS: usize = (CHUNK_TILE * KEY_DIM) as usize;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

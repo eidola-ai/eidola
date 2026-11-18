@@ -312,6 +312,8 @@ fn main() {
         alloc(&fast, per * fp, &mut keep),
         alloc(&fast, per * ff, &mut keep),
     );
+    let perk = max_tiles * kh as usize * 4 * CHUNK_QK_FLOATS;
+    let (sq, sk) = (alloc(&fast, perk, &mut keep), alloc(&fast, perk, &mut keep));
     // (rows, fold, outputs).
     for (rows, fold, outs) in [
         (1u32, 0u32, 2048u32),
@@ -368,6 +370,8 @@ fn main() {
             u: su,
             pm: sp,
             fac: sf,
+            qr: sq,
+            kr: sk,
             state_offset: 0,
             seq_count: rows,
             tiles: tile,

@@ -45,6 +45,20 @@ fn kstep(a: impl Fn(usize) -> f32, b: impl Fn(usize) -> f32, k0: usize) -> f32 {
     s
 }
 
+/// `Σ_j P_rj · Δ_j` over a tile's 16 rows in the state kernel's order: four partial sums
+/// (rows `2t, 2t + 1, 2t + 8, 2t + 9` from +0), then `(p0 + p1) + (p2 + p3)`.
+pub fn ztree(pr: &[f32; TILE], dj: &[f32]) -> f32 {
+    let mut p = [0.0f32; 4];
+    for (t, pt) in p.iter_mut().enumerate() {
+        let mut a = 0.0f32;
+        for j in [2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9] {
+            a += pr[j] * dj[j];
+        }
+        *pt = a;
+    }
+    (p[0] + p[1]) + (p[2] + p[3])
+}
+
 /// One run of one value head: its key head's queries and keys (`[n][128]`), its values
 /// (`[n][vd]`), write strengths and log decays.
 pub struct HeadRun<'a> {
@@ -90,7 +104,7 @@ pub fn model(r: &HeadRun<'_>, s0: &[f32], chunk: usize) -> (Vec<f32>, Vec<Vec<f3
         }
         let mut a = [[0.0f32; TILE]; TILE];
         let mut pm = [[0.0f32; TILE]; TILE];
-        for row in 0..TILE {
+        for row in 0..n {
             for j in 0..=row {
                 let d = exp32(gc[row] - gc[j]);
                 pm[row][j] = dot(&qs[row], &ks[j]) * d;
@@ -106,28 +120,29 @@ pub fn model(r: &HeadRun<'_>, s0: &[f32], chunk: usize) -> (Vec<f32>, Vec<Vec<f3
         let mut t = [[0.0f32; TILE]; TILE];
         for j in 0..TILE {
             for row in 0..TILE {
-                t[row][j] = if row < j {
-                    0.0
-                } else if row == j {
+                t[row][j] = if row == j {
                     1.0
-                } else {
+                } else if row > j && row < n {
                     let mut acc = a[row][j];
                     for m in j + 1..row {
                         acc += a[row][m] * t[m][j];
                     }
                     -acc
+                } else {
+                    0.0
                 };
             }
         }
+        // W (rounded to TF32) and U on the present rows, zero past them.
         let mut w = vec![[0.0f32; KD]; TILE];
         let mut uu = vec![vec![0.0f32; vd]; TILE];
-        for row in 0..TILE {
+        for row in 0..n {
             for i in 0..KD {
                 let mut acc = 0.0f32;
                 for j in 0..=row {
                     acc += (t[row][j] * c[j]) * ks[j][i];
                 }
-                w[row][i] = acc;
+                w[row][i] = tf32(acc);
             }
             for col in 0..vd {
                 let mut acc = 0.0f32;
@@ -141,34 +156,29 @@ pub fn model(r: &HeadRun<'_>, s0: &[f32], chunk: usize) -> (Vec<f32>, Vec<Vec<f3
         let mut y = vec![vec![0.0f32; vd]; TILE];
         for row in 0..TILE {
             for col in 0..vd {
-                let (mut x0, mut x1, mut y0, mut y1) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                let (mut x, mut yy) = (0.0f32, 0.0f32);
                 for ks_ in 0..KD / 8 {
-                    let sx = kstep(|k| w[row][k], |k| s[k * vd + col], 8 * ks_);
-                    let sy = kstep(|k| qs[row][k], |k| s[k * vd + col], 8 * ks_);
-                    if ks_ % 2 == 0 {
-                        x0 += sx;
-                        y0 += sy;
-                    } else {
-                        x1 += sx;
-                        y1 += sy;
-                    }
+                    x += kstep(|k| w[row][k], |k| s[k * vd + col], 8 * ks_);
+                    yy += kstep(|k| qs[row][k], |k| s[k * vd + col], 8 * ks_);
                 }
-                delta[row][col] = uu[row][col] - (x0 + x1);
-                y[row][col] = y0 + y1;
+                delta[row][col] = uu[row][col] - x;
+                y[row][col] = yy;
             }
         }
-        let mut dl = vec![vec![0.0f32; vd]; TILE];
         for row in 0..n {
             for col in 0..vd {
-                let mut acc = 0.0f32;
-                for j in 0..=row {
-                    acc += pm[row][j] * delta[j][col];
-                }
-                out[(from + row) * vd + col] = bf16_round(eg[row] * y[row][col] + acc);
-                dl[row][col] = egl[row] * delta[row][col];
+                let dj: Vec<f32> = (0..TILE).map(|j| delta[j][col]).collect();
+                let z = ztree(&pm[row], &dj);
+                out[(from + row) * vd + col] = bf16_round(eg[row] * y[row][col] + z);
             }
         }
         if n == chunk {
+            let mut dl = vec![vec![0.0f32; vd]; TILE];
+            for j in 0..n {
+                for col in 0..vd {
+                    dl[j][col] = egl[j] * delta[j][col];
+                }
+            }
             for m in 0..KD {
                 for col in 0..vd {
                     let mut dd = 0.0f32;
@@ -387,6 +397,8 @@ pub fn launch<D: QwenDevice>(
         zeros(dev, n * fp * 4),
         zeros(dev, n * ff * 4),
     );
+    let nk = tile.max(1) * inp.k_heads * CHUNK_QK_FLOATS * 4;
+    let (qr, kr) = (zeros(dev, nk), zeros(dev, nk));
     let p = DnChunkParams {
         seqs: sb.addr,
         q: qb.addr,
@@ -399,6 +411,8 @@ pub fn launch<D: QwenDevice>(
         u: uu.addr,
         pm: pm.addr,
         fac: fac.addr,
+        qr: qr.addr,
+        kr: kr.addr,
         state_offset: 0,
         seq_count: u(runs.len()),
         tiles: u(tile),
@@ -478,9 +492,14 @@ const GEOMETRIES: [((usize, usize, usize), usize); 4] = [
 
 /// Several runs in one launch (from zero and from a state, folding a prefix, outputs from
 /// varied positions, states stored at block boundaries) against [`model`]: bit for bit
-/// when `exact` (the host form); else every stored state within `bound` of the model's
-/// (relative to `1 + |x|`) and every output (rounded to BF16) within one BF16 unit of it.
-/// Returns the largest state deviation and the outputs' units apart (0, 1, more).
+/// when `exact` (the host form). Else (a GPU, whose tensor cores sum a K-step their own
+/// way, so its f32 values differ from the host form's by a few f32 units of the products'
+/// magnitude) every stored state within `bound` of the model's relative to `1 + |x|`, and
+/// every output within one BF16 unit of its own plus `bound` of the largest output of its
+/// run: a difference at the products' scale crosses at most one BF16 rounding boundary of
+/// an output of that scale, but an output that cancels to a small value (`exp(G) · Y + Z`)
+/// is many of its own units from it. Returns the largest state deviation and the outputs'
+/// units apart (0, 1, 2 and more).
 pub fn against_model<D: QwenDevice>(
     dev: &D,
     seed: u64,
@@ -490,6 +509,7 @@ pub fn against_model<D: QwenDevice>(
     let mut g = Lcg(seed);
     let mut worst_seen = 0.0f64;
     let mut ulps = [0usize; 3];
+    let mut excess = 0.0f64;
     for (dims, chunk) in GEOMETRIES {
         let lens = [1usize, chunk, chunk + 1, 3 * chunk + 5, 70, 2];
         let total: usize = lens.iter().sum();
@@ -528,11 +548,15 @@ pub fn against_model<D: QwenDevice>(
             if exact {
                 same(&format!("{what}: run {i} outputs"), gout, wout)?;
             } else {
+                let scale = wout.iter().fold(0.0f64, |m, &b| m.max(f64::from(b).abs()));
                 for (&a, &b) in gout.iter().zip(wout) {
                     let d = (super::cases::ord16(eidola_engine_cuda::bf16::from_f32(a))
                         - super::cases::ord16(eidola_engine_cuda::bf16::from_f32(b)))
                     .unsigned_abs();
                     ulps[(d as usize).min(2)] += 1;
+                    let unit = f64::from(b).abs() * f64::from(f32::EPSILON) * 65536.0;
+                    let off = (f64::from(a) - f64::from(b)).abs() - unit.max(f64::MIN_POSITIVE);
+                    excess = excess.max(off / scale.max(f64::MIN_POSITIVE));
                 }
             }
             same(
@@ -558,14 +582,16 @@ pub fn against_model<D: QwenDevice>(
             }
         }
     }
-    if worst_seen > bound || ulps[2] > 0 {
+    if worst_seen > bound || excess > bound {
         return Err(format!(
-            "states {worst_seen:e} from the model (bound {bound:e}); outputs 0/1/2+ BF16 units \
-             apart: {ulps:?}"
+            "states {worst_seen:e} from the model, outputs {excess:e} of their run's scale past \
+             one BF16 unit (bound {bound:e}); outputs 0/1/2+ BF16 units apart: {ulps:?}"
         ));
     }
     Ok(format!(
-        "states within {worst_seen:e} of the model; outputs 0/1/2+ BF16 units apart: {ulps:?}"
+        "states within {worst_seen:e} of the model, outputs within one BF16 unit and \
+         {:e} of their run's scale; 0/1/2+ BF16 units apart: {ulps:?}",
+        excess.max(0.0)
     ))
 }
 
@@ -862,8 +888,9 @@ fn append(dst: &mut Inputs, src: &Inputs, from: usize, n: usize) {
         .extend_from_slice(&src.g[from * src.v_heads..(from + n) * src.v_heads]);
 }
 
-/// The intra kernel's scratch after one launch over `runs` (`W`, `U`, `P` and the
-/// factors, in that order), for holding a device's bits to the host body's.
+/// The intra kernel's scratch after one launch over `runs` (`W`, `U`, `P`, the factors,
+/// the rounded queries and keys, in that order), for holding a device's bits to the host
+/// body's.
 pub fn intra_scratch<D: QwenDevice>(
     dev: &D,
     intra: &dyn Fn(&DnChunkParams) -> Result<(), String>,
@@ -894,12 +921,16 @@ pub fn intra_scratch<D: QwenDevice>(
         let sb = buf(dev, &seqs);
         let (fw, fu, fp, ff) = chunk_scratch_floats(u(inp.vd));
         let n = tile * inp.v_heads;
-        let bufs = [
-            zeros(dev, n * fw * 4),
-            zeros(dev, n * fu * 4),
-            zeros(dev, n * fp * 4),
-            zeros(dev, n * ff * 4),
+        let nk = tile * inp.k_heads;
+        let lens6 = [
+            n * fw,
+            n * fu,
+            n * fp,
+            n * ff,
+            nk * CHUNK_QK_FLOATS,
+            nk * CHUNK_QK_FLOATS,
         ];
+        let bufs: Vec<Buf> = lens6.iter().map(|&l| zeros(dev, l * 4)).collect();
         let p = DnChunkParams {
             seqs: sb.addr,
             q: qb.addr,
@@ -912,6 +943,8 @@ pub fn intra_scratch<D: QwenDevice>(
             u: bufs[1].addr,
             pm: bufs[2].addr,
             fac: bufs[3].addr,
+            qr: bufs[4].addr,
+            kr: bufs[5].addr,
             state_offset: 0,
             seq_count: u(lens.len()),
             tiles: u(tile),
@@ -924,8 +957,8 @@ pub fn intra_scratch<D: QwenDevice>(
         };
         intra(&p)?;
         dev.synchronize().map_err(|e| e.to_string())?;
-        for (b, len) in bufs.iter().zip([fw, fu, fp, ff]) {
-            all.push(read::<D, u32>(dev, b, n * len));
+        for (b, &len) in bufs.iter().zip(&lens6) {
+            all.push(read::<D, u32>(dev, b, len));
         }
     }
     Ok(all)
