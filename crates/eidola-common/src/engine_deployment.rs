@@ -18,7 +18,7 @@
 //! already depend on `argon2` themselves (see the crate docs' dependency
 //! rule).
 
-pub use crate::architecture::{Architecture, Shape};
+pub use crate::architecture::{Architecture, HybridDims, Shape};
 
 /// The node's environment variables. Every one is required (an empty value
 /// counts as missing) except where noted.
@@ -294,6 +294,9 @@ pub const DRAFT_TABLE_SEAT_BYTES_PER_CHUNK: u64 = 2 * 2 * 3 * 4;
 /// [`StepScratch`](crate::architecture::StepScratch) names in place of the
 /// drafter's.
 pub fn cuda_device_reserve_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
+    if let Some(dims) = &shape.recurrent {
+        return recurrent_device_reserve_bytes(dims, sizing);
+    }
     let blocks_per_seq =
         u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size.max(1)));
     if shape.step_scratch.is_some() {
@@ -342,6 +345,173 @@ pub fn cuda_device_reserve_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
         .saturating_add(
             u64::from(sizing.max_model_len).saturating_mul(shape.rope_device_bytes_per_position),
         )
+}
+
+/// State buffers of a recurrent model's pool (Qwen3.8's): the reserved zero
+/// state and, per seat (`MAX_SEQS`), its base, the one fresh buffer a step
+/// may store for it, and with the prefix cache [`RETENTION_POINTS`]
+/// snapshots (its branch, regeneration and continuation points):
+/// 1 + `MAX_SEQS` × (2 + `P`). The serving core's minimum progress needs
+/// 1 + 2 × `MAX_SEQS` (`eidola-engine/AGENTS.md` → State pool); the rest
+/// holds snapshots, as the sliding pools hold retained windows
+/// ([`cuda_kv_min_bytes`]). Saturates.
+pub fn recurrent_state_buffers(sizing: &Sizing, cache: &CacheConfig) -> u64 {
+    let points = if cache.enabled { RETENTION_POINTS } else { 0 };
+    u64::from(sizing.max_seqs)
+        .saturating_mul(2 + points)
+        .saturating_add(1)
+}
+
+/// Bytes of one KV block of a recurrent model on the device, every group
+/// together: the target's attention layers and, drafting, the drafter's
+/// layer and its block's boundary tap. Every group holds one count of
+/// blocks. Saturates.
+pub fn recurrent_kv_block_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
+    let b = u64::from(sizing.kv_block_size.max(1));
+    let target = b.saturating_mul(dims.kv_bytes_per_position());
+    if sizing.draft_tokens > 0 {
+        target
+            .saturating_add(b.saturating_mul(dims.drafter_kv_bytes_per_position()))
+            .saturating_add(dims.tap_bytes())
+    } else {
+        target
+    }
+}
+
+/// Device bytes a recurrent model's executor keeps per seat: its live
+/// state image, its tail of `KV_BLOCK_SIZE − 1 + DRAFT_TOKENS` positions,
+/// and `DRAFT_TOKENS + 1` kept normed states. Saturates.
+pub fn recurrent_seat_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
+    let k = u64::from(sizing.draft_tokens);
+    let tail = u64::from(sizing.kv_block_size.max(1)) - 1 + k;
+    dims.state_image_bytes()
+        .saturating_add(tail.saturating_mul(dims.tail_bytes_per_position()))
+        .saturating_add((k + 1).saturating_mul(dims.kept_row_bytes()))
+}
+
+/// Bounds the program's allocations of no row (the sink, the status and
+/// zero rows, each allocation's eight-byte floor).
+const RECURRENT_SCRATCH_FIXED_BYTES: u64 = 64 << 10;
+
+/// Step-table words a row of a forward takes besides its attention's pages:
+/// its token, positions, KV target, DeltaNet sequence and copy items, its
+/// FA2 request and work items, sampling and acceptance words. Bounded from
+/// above by the node's `cuda::tests`, which hold the executor's tables to it.
+pub const RECURRENT_TABLE_ROW_WORDS: u64 = 1024;
+
+/// Words of one step table at its largest, for a recurrent model's executor
+/// (`eidola-engine-cuda`'s `qwen::plan`): per target row (the `N` host
+/// tokens and drafts of passes A and B) the pages of a `MAX_MODEL_LEN + k +
+/// 1`-position sequence, a word a block, and per drafter row (with drafting,
+/// `N + 2Sk`: the host positions, the chain and the accepted drafts'
+/// rewrite) a word a position (the drafter's pages are positions), each with
+/// [`RECURRENT_TABLE_ROW_WORDS`]. Saturates.
+pub fn recurrent_table_words(sizing: &Sizing) -> u64 {
+    let n = u64::from(sizing.max_batched_tokens);
+    let s = u64::from(sizing.max_seqs);
+    let k = u64::from(sizing.draft_tokens);
+    let positions = u64::from(sizing.max_model_len) + k + 1;
+    let blocks = positions.div_ceil(u64::from(sizing.kv_block_size.max(1)));
+    let target = n.saturating_mul(blocks.saturating_add(RECURRENT_TABLE_ROW_WORDS));
+    let drafter = if k > 0 {
+        n.saturating_add(s.saturating_mul(2 * k))
+            .saturating_mul(positions.saturating_add(RECURRENT_TABLE_ROW_WORDS))
+    } else {
+        0
+    };
+    target.saturating_add(drafter)
+}
+
+/// Keys per chunk of FA2's split attention (`eidola-engine-cuda`'s
+/// `qwen::plan::SPLIT_KEYS`): a row's keys are reduced in chunks of this
+/// many positions, each a partial row.
+pub const RECURRENT_SPLIT_KEYS: u64 = 1024;
+
+/// A recurrent model's step scratch in the fast profile (the executor's
+/// `capacities` and `program::alloc_scratch`, sized once at construction,
+/// plus its step tables), bounded from above. With `N` =
+/// `MAX_BATCHED_TOKENS`, `S` = `MAX_SEQS`, `k` = `DRAFT_TOKENS`, `B` =
+/// `KV_BLOCK_SIZE`, the tail `T` = `B − 1 + k`, the forward's rows `R` =
+/// max(`N`, `Sk`), padded to 4, and the head's rows `H` = max(`S`, `Sk`, 64):
+///
+/// - per row of `R`, [`HybridDims::program_row_bytes`]; pass A's and pass
+///   B's normed rows;
+/// - the DeltaNet's staging: max(`N + ST`, `Sk`) staged positions
+///   ([`HybridDims::staged_position_bytes`]) and three more convolution rows a
+///   seat;
+/// - FA2's partial rows: `R` rows times the chunks of [`RECURRENT_SPLIT_KEYS`]
+///   of `MAX_MODEL_LEN + k + 1` positions ([`HybridDims::partial_row_bytes`]):
+///   about 12 bytes per row and position of the context at Qwen3.8's shape,
+///   where the exact profile's scores, which this profile does not allocate,
+///   take 96 a layer;
+/// - the head's input, its f32 output (or the drafter's and the stacked
+///   `a`/`b` projections', the largest), the target's logit rows, max(`S`,
+///   64) and `Sk` more, and the drafter's (`H`), f32 over the head's rows, and the
+///   sampler's f64 distributions: `S` plain, `S(k + 1)` target, `Sk` draft and
+///   `S` acceptance rows;
+/// - the padding rows of the row copies, the draft lanes and the read-back;
+/// - the step tables: the rungs' fixed table and the eager table, which grows
+///   to a power of two, together at most three times
+///   [`recurrent_table_words`] words;
+/// - `RECURRENT_SCRATCH_FIXED_BYTES` (64 KiB).
+///
+/// Saturates.
+pub fn recurrent_step_scratch_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
+    let pad4 = |x: u64| x.next_multiple_of(4).max(4);
+    let n = u64::from(sizing.max_batched_tokens);
+    let s = u64::from(sizing.max_seqs);
+    let k = u64::from(sizing.draft_tokens);
+    let b = u64::from(sizing.kv_block_size.max(1));
+    let tail = b - 1 + k;
+    let positions = u64::from(sizing.max_model_len).saturating_add(k + 1);
+    let (h, v) = (dims.hidden, dims.vocab);
+    let rows = n.max(s * k);
+    let r = pad4(rows);
+    let head = s.max(s * k).max(64);
+    let staged = n.saturating_add(s.saturating_mul(tail)).max(s * k);
+    let conv_rows = 3 * s + staged;
+    let partial_rows = rows.saturating_mul(positions.div_ceil(RECURRENT_SPLIT_KEYS).max(1));
+    let head_tmp = (pad4(head) * v).max(r * h).max(r * dims.ab_rows()) * 4;
+    let logit_rows = s.max(64) + s * k + head;
+    let distributions = s + s * (k + 1) + (s * k).max(1) + s;
+    let pad_conv = 3 * s + s * (1 + tail) + 3 * 4 * s + 4 * s;
+    let pad_ab = s * (1 + tail) + s;
+    let pad_h = s * (k + 1) + s * ((k + 1) / b + 1) + s * k + s;
+    let readback = 1 + s + s * (k + 1) + s;
+    r.saturating_mul(dims.program_row_bytes())
+        .saturating_add((pad4(n) + pad4((s * k).max(1))) * h * 2)
+        .saturating_add(staged.saturating_mul(dims.staged_position_bytes()))
+        .saturating_add(conv_rows.saturating_mul(dims.conv_row_bytes()))
+        .saturating_add(partial_rows.saturating_mul(dims.partial_row_bytes()))
+        .saturating_add(pad4(head) * h * 2 + head_tmp)
+        .saturating_add(logit_rows.saturating_mul(v * 4))
+        .saturating_add(distributions.saturating_mul(v * 8))
+        .saturating_add(
+            pad_conv * dims.conv_row_bytes()
+                + pad_ab * dims.ab_row_bytes()
+                + s.max(s * k) * dims.value_row_bytes()
+                + pad_h * h * 2
+                + (s * k + s) * 4
+                + (s * k).max(1) * 4
+                + n.max(s * k) * 4
+                + readback * 4,
+        )
+        .saturating_add(recurrent_table_words(sizing).saturating_mul(3 * 4))
+        .saturating_add(RECURRENT_SCRATCH_FIXED_BYTES)
+}
+
+/// [`cuda_device_reserve_bytes`] for a recurrent model: [`DEVICE_FIXED_RESERVE_BYTES`],
+/// [`recurrent_seat_bytes`] for every seat and the padding rows' seat, the RoPE
+/// tables over `MAX_MODEL_LEN + DRAFT_TOKENS + 1` positions, and
+/// [`recurrent_step_scratch_bytes`]. Saturates.
+fn recurrent_device_reserve_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
+    let rope_positions = u64::from(sizing.max_model_len) + u64::from(sizing.draft_tokens) + 1;
+    DEVICE_FIXED_RESERVE_BYTES
+        .saturating_add(
+            (u64::from(sizing.max_seqs) + 1).saturating_mul(recurrent_seat_bytes(dims, sizing)),
+        )
+        .saturating_add(rope_positions.saturating_mul(dims.rope_bytes_per_position()))
+        .saturating_add(recurrent_step_scratch_bytes(dims, sizing))
 }
 
 /// The rows a step's scratch is sized for on a device with a
@@ -534,8 +704,24 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
 /// needs ⌈`MAX_MODEL_LEN` / `B`⌉ + 1 blocks of [`uniform_kv_bank_block_bytes`]
 /// beside [`uniform_kv_window_blocks`] of [`uniform_kv_window_block_bytes`].
 /// No pool holds a pad block.
+///
+/// A shape with a [`Shape::recurrent`] state (Qwen3.8's) follows its node's
+/// rule (`cuda::derive_qwen_pools` in `eidola-server-engine`): the state pool
+/// holds [`recurrent_state_buffers`] images of
+/// [`HybridDims::state_image_bytes`], and every KV group one count of blocks,
+/// which must hold one `MAX_MODEL_LEN` sequence and the null block, so the
+/// device needs ⌈`MAX_MODEL_LEN` / `B`⌉ + 1 blocks of
+/// [`recurrent_kv_block_bytes`] and each pool's pad block (where a decode
+/// rung's padding rows write) beside the state pool.
 pub fn cuda_kv_min_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig) -> u64 {
     let b = u64::from(sizing.kv_block_size.max(1));
+    if let Some(dims) = &shape.recurrent {
+        return (u64::from(sizing.max_model_len).div_ceil(b) + 2)
+            .saturating_mul(recurrent_kv_block_bytes(dims, sizing))
+            .saturating_add(
+                recurrent_state_buffers(sizing, cache).saturating_mul(dims.state_image_bytes()),
+            );
+    }
     if !shape.uniform_kv_groups.is_empty() {
         return (u64::from(sizing.max_model_len).div_ceil(b) + 1)
             .saturating_mul(uniform_kv_bank_block_bytes(shape, sizing))
@@ -666,6 +852,12 @@ fn cuda_windowed_pools_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig
 /// for every group of every device, at least two, so this device's share of
 /// the least tier is two blocks of [`uniform_kv_block_bytes`], whatever
 /// `kv_device_bytes`; [`check_device_resources`] sums the devices' shares.
+///
+/// A shape with a [`Shape::recurrent`] state scales the same way over its two
+/// pools (`cuda::derive_qwen_host_pools`): the KV blocks `kv_device_bytes`
+/// leaves beside the state pool, less the pad block (at most `i32::MAX`), of
+/// [`recurrent_kv_block_bytes`], and the [`recurrent_state_buffers`] state
+/// images, each needing two on the host.
 pub fn cuda_kv_host_min_bytes(
     shape: &Shape,
     sizing: &Sizing,
@@ -674,6 +866,17 @@ pub fn cuda_kv_host_min_bytes(
 ) -> u64 {
     if !shape.uniform_kv_groups.is_empty() {
         return uniform_kv_block_bytes(shape, sizing).saturating_mul(2);
+    }
+    if let Some(dims) = &shape.recurrent {
+        let block = recurrent_kv_block_bytes(dims, sizing).max(1);
+        let states = recurrent_state_buffers(sizing, cache);
+        let state_bytes = states.saturating_mul(dims.state_image_bytes());
+        let blocks = (kv_device_bytes.saturating_sub(state_bytes) / block)
+            .saturating_sub(1)
+            .min(i32::MAX as u64);
+        let device = u128::from(blocks) * u128::from(block) + u128::from(state_bytes);
+        let smallest = u128::from(blocks.min(states).max(1));
+        return u64::try_from((2 * device).div_ceil(smallest)).unwrap_or(u64::MAX);
     }
     let windowed = sliding_pool_blocks(shape, sizing, cache);
     let global_bytes = global_block_bytes(shape, sizing).max(1);
@@ -716,7 +919,10 @@ pub fn check_resources(
     let host_kv = match executor {
         ExecutorSettings::Cpu { kv_blocks } => u64::from(*kv_blocks)
             .saturating_mul(u64::from(sizing.kv_block_size))
-            .saturating_mul(shape.kv_bytes_per_position()),
+            .saturating_mul(shape.kv_bytes_per_position())
+            .saturating_add(shape.recurrent.as_ref().map_or(0, |dims| {
+                recurrent_state_buffers(sizing, cache).saturating_mul(dims.state_image_bytes())
+            })),
         ExecutorSettings::Cuda { .. } => 0,
     };
     let host = host_memory_bytes(sizing)
