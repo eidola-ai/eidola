@@ -368,6 +368,13 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
     let ones: Vec<u8> = (0..inter).flat_map(|_| 1.0f32.to_le_bytes()).collect();
     // SAFETY: the weight vector just made.
     unsafe { fast.upload(w, &ones) }.unwrap_or_else(|e| fail(e));
+    // The DeltaNet's convolution weights: four taps of each of its 10,240 channels
+    // (16 key heads twice and 48 value heads, all of 128).
+    let conv_taps = 10_240 * 4;
+    let conv_w = alloc(fast, conv_taps * 4, keep);
+    let taps: Vec<u8> = (0..conv_taps).flat_map(|_| 0.25f32.to_le_bytes()).collect();
+    // SAFETY: the convolution weights just made.
+    unsafe { fast.upload(conv_w, &taps) }.unwrap_or_else(|e| fail(e));
     let codes = alloc(fast, rows_max * inter as usize, keep);
     let scales = alloc(fast, (inter as usize / 128) * rows_max * 4, keep);
     let ab_w = alloc(fast, 96 * hidden as usize * 2, keep);
@@ -463,7 +470,7 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
             conv_in: out,
             window: wb,
             ab: out,
-            conv_w: w,
+            conv_w,
             exp_a_log: w,
             dt_bias: w,
             q: y,
@@ -479,7 +486,8 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
             reserved: 0,
         };
         // SAFETY: the prep reads at most 2,048 + 3 rows of 10,240 f32 values from `out`
-        // (2,048 × 17,408 f32) and writes 2,048 rows of 6,144 f32 values into `y`.
+        // (2,048 × 17,408 f32) and 10,240 × 4 from `conv_w`, and writes 2,048 rows of
+        // 6,144 f32 values into `y`.
         let s = time(fast, it, || {
             unsafe { fast.dn_prep(&prep) }.unwrap_or_else(|e| fail(e))
         });

@@ -2,7 +2,7 @@
 
 `Qwen/Qwen3.8-27B-FP8`, text only, on one Blackwell GPU. The architecture is `eidola_common::architecture::Architecture::Qwen38Dense27B`.
 
-**Status: in progress.** The reference forward and the chat format are implemented and verified; the serving core carries the recurrent state (below); the CPU executor reproduces the forward bit for bit through the real scheduler, drafting included; and the CUDA executor and its kernels are built (decode graphs per rung, FA2 at head dimension 256 in the fast profile, the FP8 GEMM swapped at decode sizes, sampling and chain acceptance on the device by a sampler of its own, one target forward a drafting step), equal to the CPU executor on host-compiled kernel bodies eagerly and on the padded rung path, and run on a B200 (its device suites, and the serving bench under a profiler). Nothing else is implemented. The variant is a stub: its shape is `unimplemented!`, and no catalog row or deployment may name it.
+**Status: in progress.** The reference forward and the chat format are implemented and verified; the serving core carries the recurrent state (below); the CPU executor reproduces the forward bit for bit through the real scheduler, drafting included; the CUDA executor and its kernels are built (decode graphs per rung, FA2 at head dimension 256 in the fast profile, the FP8 GEMM swapped at decode sizes, sampling and chain acceptance on the device by a sampler of its own, one target forward a drafting step), equal to the CPU executor on host-compiled kernel bodies eagerly and on the padded rung path, and run on a B200 (its device suites, and the serving bench under a profiler); and the inference node serves the architecture (below). The variant is implemented: its `Shape` is known, so a catalog row and a deployment may name it. None is committed.
 
 ## The model
 
@@ -45,5 +45,6 @@ The DeltaNet layers' state is a pool of state buffers beside the KV groups (`eid
 
 - the reference forward against the reference as released on a GPU, and its drafter against vLLM's (prepared: `golden/qwen/full_session.sh`);
 - tuning the CUDA executor from the profiles. Built and held without a GPU, to measure on one (`qwen_perf_session.sh`'s `perf_tiny` and `perf_kernels`): the decode step's answers to a B200 profile (`eidola-engine-cuda/AGENTS.md` → Qwen3.8): a sampler of Qwen's own, selecting top-k and top-p from candidates rather than searching the vocabulary (the shared one cost 14.5 ms a sampled row), the quantiser a CTA a row at decode sizes, the recurrence's short form at twice the blocks an SM, and the row copies grouped into two launches a DeltaNet layer with their padding skipped. Then a split-K form of the narrow FP8 GEMMs fixed by their shape, FA2 decode with shorter key chunks, device-side page lists, a fused staging kernel and piecewise capture of prefill steps;
-- the architecture's `Shape`, the node, the catalog row and the deployment;
+- the catalog row and the deployment;
+- the CPU reference executor refuses to embed a sampled vision placeholder, which ends its engine, where the CUDA executor embeds its row;
 - speed measured against a reference serving stack on the same GPU.

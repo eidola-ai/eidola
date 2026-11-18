@@ -28,8 +28,10 @@
 //! `continuable`, `usage`); `error` is the node's error body (a refusal, or an `event: error`
 //! ending a stream) or this client's own failure; `status` is the HTTP status, null when
 //! nothing was sent. A rerun onto the same output file skips every id it already holds a
-//! response for and appends the rest, so an interrupted batch resumes; a reader takes the last
-//! line for an id. The totals go to standard error at the end.
+//! response for and appends the rest, so an interrupted batch resumes: a last line the
+//! interruption left without its newline is completed if it is whole JSON and cut off if it
+//! is not, so every appended line starts a line of its own. A reader takes the last line for
+//! an id. The totals go to standard error at the end.
 
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
@@ -270,6 +272,31 @@ async fn run(
     }
 }
 
+/// Repairs the tail an interrupted run may have left on `out`: a last line without its
+/// newline is completed when it parses as JSON and cut off when it does not.
+fn repair_tail(out: &std::path::Path) {
+    let bytes = match std::fs::read(out) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => fail(format!("{}: {e}", out.display())),
+    };
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return;
+    }
+    let start = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let whole = serde_json::from_slice::<Value>(&bytes[start..]).is_ok();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(out)
+        .unwrap_or_else(|e| fail(format!("{}: {e}", out.display())));
+    if whole {
+        file.write_all(b"\n")
+    } else {
+        file.set_len(start as u64)
+    }
+    .unwrap_or_else(|e| fail(format!("{}: {e}", out.display())));
+}
+
 /// The ids an earlier run onto `out` already holds a response for.
 fn answered(out: &std::path::Path) -> HashSet<String> {
     let Ok(file) = std::fs::File::open(out) else {
@@ -333,6 +360,7 @@ async fn main() {
     }
 
     let text = std::fs::read_to_string(input).unwrap_or_else(|e| fail(format!("{input}: {e}")));
+    repair_tail(std::path::Path::new(out));
     let done = answered(std::path::Path::new(out));
     let mut ids = HashSet::new();
     let mut jobs = Vec::new();
