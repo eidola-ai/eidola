@@ -5,12 +5,13 @@
 //! every per-step value is table data read through fixed addresses, so the captured
 //! launches serve every step of the rung.
 //!
-//! Order: the status word cleared; pass A (the target over every row's host tokens) and
-//! its head; the drafter over the host positions and each chain depth, each depth's
-//! drafts drawn on the device into the draft lanes; pass B (the target over the drafts)
-//! and its head; plain rows drawn, drafting rows' target distributions and chain
-//! acceptance into the read-back; the drafter's canonical KV at the drafts' positions;
-//! the normed rows into the slots' kept states and the drafter's taps.
+//! Order: the status word cleared; the drafter at each drafting row's host position and
+//! each chain depth, each depth's drafts drawn on the device into the draft lanes; the
+//! target, once, over every row's host tokens followed by its drafts, and its head; the
+//! drafter over the host positions of rows that do not draft; plain rows drawn, drafting
+//! rows' target distributions and chain acceptance into the read-back; the drafter's
+//! canonical KV at the drafts' positions; the normed rows into the slots' kept states and
+//! the drafter's taps.
 
 use eidola_engine::sampling::Stream;
 
@@ -27,21 +28,19 @@ use crate::{CudaError, Result};
 /// The capacities the scratch is sized for.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Caps {
-    /// Rows of a target forward (pass A's tokens, or pass B's drafts).
+    /// Rows of the target's forward: host tokens and drafts.
     pub rows: usize,
-    /// Rows of pass A's forward: its normed rows.
-    pub rows_a: usize,
-    /// Rows of pass B's forward.
-    pub rows_b: usize,
     /// Staged DeltaNet positions of one forward.
     pub staged: usize,
     /// Staged conv rows.
     pub conv_rows: usize,
     /// Rows of a drafter forward.
     pub drafter: usize,
-    /// Head rows of one launch, and target logit rows (pass A's then pass B's).
+    /// Head rows of one launch, target logit rows, and the drafter's logit rows (one
+    /// depth's drafting rows).
     pub head: usize,
     pub logits_t: usize,
+    pub logits_d: usize,
     /// Drafting rows and draft depth: lanes and draft distributions are `K · D`.
     pub drafting: usize,
     pub depth: usize,
@@ -72,8 +71,7 @@ pub(super) struct Scratch {
     pub x: Alloc,
     pub mix: Alloc,
     pub m: Alloc,
-    pub normed_a: Alloc,
-    pub normed_b: Alloc,
+    pub normed: Alloc,
     pub codes: Alloc,
     pub scales: Alloc,
     pub gate: Alloc,
@@ -181,8 +179,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             x: a(rows * hid * 2)?,
             mix: a(rows * hid * 2)?,
             m: a(rows * hid * 2)?,
-            normed_a: a(pad4(c.rows_a) * hid * 2)?,
-            normed_b: a(pad4(c.rows_b) * hid * 2)?,
+            normed: a(pad4(c.rows) * hid * 2)?,
             codes: a(rows * k_max)?,
             scales: a(k_max / 128 * rows * 4)?,
             gate: a(rows * d.inter as usize * 2)?,
@@ -233,7 +230,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             head_in: a(pad4(c.head) * hid * 2)?,
             head_tmp: a(if fast { head_tmp(&c, d) } else { 8 })?,
             logits_t: a(c.logits_t.max(1) * vocab * 4)?,
-            logits_d: a(c.head.max(1) * vocab * 4)?,
+            logits_d: a(c.logits_d.max(1) * vocab * 4)?,
             p_plain: a(c.plain.max(1) * n * 8)?,
             p_target: a(c.targets.max(1) * n * 8)?,
             q_draft: a((c.drafting * c.depth).max(1) * n * 8)?,
@@ -273,8 +270,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             (s.x.addr, rows * hid * 2),
             (s.mix.addr, rows * hid * 2),
             (s.m.addr, rows * hid * 2),
-            (s.normed_a.addr, pad4(c.rows_a) * hid * 2),
-            (s.normed_b.addr, pad4(c.rows_b) * hid * 2),
+            (s.normed.addr, pad4(c.rows) * hid * 2),
             (s.codes.addr, rows * kmax),
             (s.scales.addr, kmax / 128 * rows * 4),
             (s.gate.addr, rows * d.inter as usize * 2),
@@ -332,7 +328,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             (s.head_in.addr, pad4(c.head) * hid * 2),
             (s.head_tmp.addr, if fast { head_tmp(c, d) } else { 8 }),
             (s.logits_t.addr, c.logits_t.max(1) * vocab * 4),
-            (s.logits_d.addr, c.head.max(1) * vocab * 4),
+            (s.logits_d.addr, c.logits_d.max(1) * vocab * 4),
             (s.p_plain.addr, c.plain.max(1) * vocab * 8),
             (s.p_target.addr, c.targets.max(1) * vocab * 8),
             (s.q_draft.addr, (c.drafting * c.depth).max(1) * vocab * 8),
@@ -432,7 +428,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         ]
     }
 
-    fn hid_bufs(&self, dst: u64, dst_rows: usize) -> [(u64, u64); 7] {
+    fn hid_bufs(&self, dst: u64, dst_rows: usize) -> [(u64, u64); 6] {
         let s = &self.scratch;
         let c = &s.caps;
         let (taps, tap_rows) = match self.pools.get(DRAFTER).and_then(|p| p.taps.as_ref()) {
@@ -443,8 +439,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         [
             (self.hiddens.addr, (self.slot_count() * k1) as u64),
             (taps, tap_rows),
-            (s.normed_a.addr, pad4(c.rows_a) as u64),
-            (s.normed_b.addr, pad4(c.rows_b) as u64),
+            (s.normed.addr, pad4(c.rows) as u64),
             (s.d_normed.addr, pad4(c.rows.max(c.drafter)) as u64),
             (dst, dst_rows as u64),
             (s.pad_h.addr, c.pad_h as u64),
@@ -454,7 +449,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
     fn tok_bufs(&self, l: &Layout, dst: u64, dst_rows: usize) -> [(u64, u64); 4] {
         let s = &self.scratch;
         [
-            (self.tw(l.a.tokens), l.a.tokens.len as u64),
+            (self.tw(l.target.tokens), l.target.tokens.len as u64),
             (s.lanes.addr, (s.caps.drafting * s.caps.depth) as u64),
             (dst, dst_rows as u64),
             (s.pad_t.addr, s.caps.pad_t as u64),
@@ -466,15 +461,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let s = &self.scratch;
         // SAFETY: the read-back's status word.
         unsafe { self.dev.zero(self.status_addr(), 4)? };
-        self.target_forward(l, &l.a, s.normed_a.addr)?;
         let hsz = self.dims.hidden as usize;
-        self.copies(
-            &l.head_a,
-            hsz / 2,
-            &self.hid_bufs(s.head_in.addr, pad4(s.caps.head)),
-        )?;
-        self.head(l.head_a.items, s.logits_t.addr)?;
-        for (j, d) in l.drafter.iter().enumerate() {
+        for (j, d) in l.lead.iter().enumerate() {
             self.drafter_forward(l, d)?;
             if d.head.items > 0 {
                 self.copies(
@@ -500,15 +488,15 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 })?;
             }
         }
-        if let Some(b) = &l.b {
-            self.target_forward(l, b, s.normed_b.addr)?;
-            self.copies(
-                &l.head_b,
-                hsz / 2,
-                &self.hid_bufs(s.head_in.addr, pad4(s.caps.head)),
-            )?;
-            let at = s.logits_t.addr + (l.head_a.items * self.dims.vocab as usize * 4) as u64;
-            self.head(l.head_b.items, at)?;
+        self.target_forward(l, &l.target, s.normed.addr)?;
+        self.copies(
+            &l.head,
+            hsz / 2,
+            &self.hid_bufs(s.head_in.addr, pad4(s.caps.head)),
+        )?;
+        self.head(l.head.items, s.logits_t.addr)?;
+        if let Some(d) = &l.trail {
+            self.drafter_forward(l, d)?;
         }
         let plain = l.plain.len / SAMPLE_WORDS;
         self.sample(SampleArgs {

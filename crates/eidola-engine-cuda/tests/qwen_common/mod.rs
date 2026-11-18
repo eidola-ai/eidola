@@ -92,6 +92,19 @@ fn host_launch(lib: Arc<libloading::Library>) -> Box<eidola_engine_cuda::qwen::h
     })
 }
 
+/// A [`HostDevice`] whose launches run the compiled bodies, counting the launches of each
+/// family into `counts`.
+pub fn counting_device(
+    lib: Arc<libloading::Library>,
+    counts: Arc<std::sync::Mutex<std::collections::HashMap<&'static str, u64>>>,
+) -> HostDevice {
+    let run = host_launch(lib);
+    HostDevice::new(Box::new(move |family, params, gx, gy| {
+        *counts.lock().expect("counts").entry(family).or_default() += 1;
+        run(family, params, gx, gy);
+    }))
+}
+
 /// The quantiser's reference form (`quant_thread`) compiled for the host, over host
 /// buffers: `(params, grid x, grid y)`, the grid a thread per 128-wide block.
 pub fn quant_thread_reference(
