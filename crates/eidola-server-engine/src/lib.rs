@@ -39,6 +39,7 @@ use eidola_engine::secret::SaltDeriver;
 use eidola_engine::spec::Bucket;
 use eidola_engine_cpu::deepseek::{DsCpuExecutor, DsCpuExecutorConfig};
 use eidola_engine_cpu::mimo::{CpuExecutor, CpuExecutorConfig, MtpHidden};
+use eidola_engine_cpu::qwen::{QwenCpuExecutor, QwenCpuExecutorConfig};
 use tokio::sync::oneshot;
 
 use crate::config::{Config, ExecutorConfig};
@@ -357,6 +358,58 @@ pub fn deepseek_cpu_config(
     })
 }
 
+/// The Qwen3.8 CPU executor's configuration: one captured shape, as for the others; both
+/// KV groups `kv_blocks` blocks; a state pool of
+/// `eidola_common::engine_deployment::recurrent_state_buffers` buffers (the CUDA
+/// executor's rule: per seat its base, a fresh buffer and, with the prefix cache, its
+/// retention points). Refuses what the executor would panic on: drafting without the
+/// model's MTP layer. A host tier is not offered for this executor.
+pub fn qwen_cpu_config(
+    qwen: &eidola_engine_model::qwen::QwenConfig,
+    sizing: &config::Sizing,
+    cache: &config::CacheConfig,
+    kv_blocks: u32,
+    kv_host_bytes: u64,
+    sampleable_vocab_size: u32,
+) -> Result<QwenCpuExecutorConfig, BootError> {
+    if sizing.draft_tokens > 0 && qwen.mtp_layers == 0 {
+        return Err(BootError(format!(
+            "{} ({}) needs the model's MTP layer, and it has none",
+            config::env::DRAFT_TOKENS,
+            sizing.draft_tokens
+        )));
+    }
+    if kv_host_bytes > 0 {
+        return Err(BootError(format!(
+            "{} must be 0: the Qwen3.8 cpu executor takes no host tier",
+            config::env::KV_HOST_BYTES
+        )));
+    }
+    let state_buffers = eidola_common::engine_deployment::recurrent_state_buffers(sizing, cache);
+    let state_buffers = u32::try_from(state_buffers).map_err(|_| {
+        BootError(format!(
+            "{} overflows the state pool",
+            config::env::MAX_SEQS
+        ))
+    })?;
+    Ok(QwenCpuExecutorConfig {
+        block_size: sizing.kv_block_size,
+        num_blocks: kv_blocks,
+        host_blocks: 0,
+        state_buffers,
+        host_state_buffers: 0,
+        num_state_slots: sizing.max_seqs,
+        max_model_len: sizing.max_model_len,
+        buckets: vec![Bucket {
+            max_seqs: sizing.max_seqs,
+            max_tokens: sizing.max_batched_tokens,
+        }],
+        draft_tokens: sizing.draft_tokens,
+        sampleable_vocab_size,
+        record: false,
+    })
+}
+
 /// Starts the node over an already verified model. Refuses unless the model's verified
 /// weights hash is the one `config` expects.
 pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError> {
@@ -451,6 +504,80 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 host_kv_blocks = c.host_blocks,
                 draft_tokens = c.draft_width,
                 "loading the model onto the devices"
+            );
+            let engine = worker::spawn(
+                move || prepared.build(),
+                scheduler,
+                SWEEP_INTERVAL,
+                stopped_tx,
+            );
+            (engine, Some(report))
+        }
+        (
+            ExecutorConfig::Cpu { kv_blocks },
+            Served::Qwen {
+                model: reference, ..
+            },
+        ) => {
+            let exec_config = qwen_cpu_config(
+                reference.config(),
+                &sizing,
+                &config.cache,
+                *kv_blocks,
+                config.kv_host_bytes,
+                sampleable_vocab_size,
+            )?;
+            let reference = reference.clone();
+            let engine = worker::spawn(
+                move || {
+                    // The executor panics on a configuration it does not run; the checks
+                    // above refuse every one the node can be given that would.
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        QwenCpuExecutor::new(reference, exec_config)
+                    }))
+                    .map_err(|_| "the Qwen3.8 executor refused this model".to_string())
+                },
+                scheduler,
+                SWEEP_INTERVAL,
+                stopped_tx,
+            );
+            (engine, None)
+        }
+        // Qwen3.8 on one GPU. Never a fallback: a refusal here ends the boot.
+        #[cfg(feature = "cuda")]
+        (
+            ExecutorConfig::Cuda {
+                kernels_dir,
+                kv_device_bytes,
+                further_kv_device_bytes,
+                graphs,
+                gpu_cc,
+            },
+            Served::Qwen { .. },
+        ) => {
+            check_device_budgets(model.architecture(), 1 + further_kv_device_bytes.len())?;
+            let prepared = cuda::prepare_qwen(
+                &model,
+                &sizing,
+                &config.cache,
+                kernels_dir,
+                *kv_device_bytes,
+                config.kv_host_bytes,
+                *graphs,
+                *gpu_cc,
+            )?;
+            let report = prepared.report();
+            let c = prepared.config();
+            tracing::info!(
+                device = %report.name,
+                compute_capability = %report.compute_capability,
+                kv_blocks = c.num_blocks,
+                state_buffers = c.state_buffers,
+                host_kv_blocks = c.host_blocks,
+                host_state_buffers = c.host_state_buffers,
+                draft_tokens = c.draft_tokens,
+                profile = prepared.profile().name(),
+                "loading the model onto the device"
             );
             let engine = worker::spawn(
                 move || prepared.build(),
@@ -584,8 +711,10 @@ mod tests {
     fn a_node_names_one_budget_per_device() {
         assert!(check_device_budgets(Architecture::MimoV26Flash, 1).is_ok());
         assert!(check_device_budgets(Architecture::DeepSeekV41Flash, 2).is_ok());
+        assert!(check_device_budgets(Architecture::Qwen38Dense27B, 1).is_ok());
         for (arch, n) in [
             (Architecture::MimoV26Flash, 2),
+            (Architecture::Qwen38Dense27B, 2),
             (Architecture::DeepSeekV41Flash, 1),
             (Architecture::DeepSeekV41Flash, 3),
         ] {

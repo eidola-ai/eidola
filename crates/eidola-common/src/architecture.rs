@@ -44,9 +44,7 @@ pub enum Architecture {
     /// the drafter on device 1.
     DeepSeekV41Flash,
     /// Qwen3.8-27B, text only: a dense model of 48 Gated DeltaNet and 16
-    /// gated full-attention layers, with one MTP layer. **Not implemented**:
-    /// a stub while its engine work is in progress, and nothing may name it
-    /// in a catalog row or a deployment.
+    /// gated full-attention layers, with one MTP layer, on one GPU.
     Qwen38Dense27B,
 }
 
@@ -81,7 +79,7 @@ impl Architecture {
             Architecture::MimoV26Flash => true,
             Architecture::MimoV26Pro => false,
             Architecture::DeepSeekV41Flash => true,
-            Architecture::Qwen38Dense27B => false,
+            Architecture::Qwen38Dense27B => true,
         }
     }
 
@@ -102,10 +100,7 @@ impl Architecture {
                  implemented; nothing may name this architecture yet"
             ),
             Architecture::DeepSeekV41Flash => &DEEPSEEK_V41_FLASH,
-            Architecture::Qwen38Dense27B => unimplemented!(
-                "Qwen3.8-27B: its KV and recurrent-state layout, drafter, executor scratch and \
-                 kernels are not implemented; nothing may name this architecture yet"
-            ),
+            Architecture::Qwen38Dense27B => core::slice::from_ref(&QWEN38_DENSE_27B),
         }
     }
 
@@ -152,8 +147,10 @@ pub struct Shape {
     pub sliding_kv_bytes_per_position: u64,
     /// Positions a sliding layer sees.
     pub sliding_window: u64,
-    /// The MTP layers the checkpoint ships, each serving one draft depth:
-    /// the widest draft the CUDA executor can run.
+    /// The widest draft the CUDA executor can run: the MTP layers the
+    /// checkpoint ships where each serves one draft depth (MiMo-V2.6's), or
+    /// the grammar's cuda cap for a drafter that runs any depth
+    /// (DeepSeek-V4.1's slots, Qwen3.8's one layer run on its own output).
     pub mtp_layers: u32,
     /// Drafter KV bytes per position for each draft depth (one MTP layer).
     pub drafter_kv_bytes_per_position_per_depth: u64,
@@ -196,6 +193,193 @@ pub struct Shape {
     /// allocation (DeepSeek-V4.1's), that count; `None` for one whose reserve
     /// reads the per-token fields above (MiMo-V2.6's).
     pub step_scratch: Option<StepScratch>,
+    /// For a hybrid model whose linear-attention layers keep a recurrent state
+    /// (Qwen3.8's), its dimensions, from which this crate counts the state
+    /// pool, each seat's state and the executor's step scratch
+    /// ([`HybridDims`]); `None` for a model with no recurrent state.
+    pub recurrent: Option<HybridDims>,
+}
+
+/// The dimensions of a dense hybrid of Gated DeltaNet and gated
+/// full-attention layers with one MTP layer (Qwen3.8's), as the CUDA
+/// executor (`eidola-engine-cuda`'s `QwenCudaExecutor`) lays its memory out
+/// from them. Every byte count below is that executor's own, which
+/// `eidola-server-engine`'s `cuda::tests` hold to its allocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HybridDims {
+    pub hidden: u64,
+    pub intermediate: u64,
+    /// Rows of the embedding and the head.
+    pub vocab: u64,
+    pub attention_layers: u64,
+    pub deltanet_layers: u64,
+    pub q_heads: u64,
+    pub kv_heads: u64,
+    pub head_dim: u64,
+    /// Dimensions of each head that carry the rotary position.
+    pub rotary: u64,
+    pub k_heads: u64,
+    pub v_heads: u64,
+    pub k_dim: u64,
+    pub v_dim: u64,
+}
+
+impl HybridDims {
+    const fn key_dim(&self) -> u64 {
+        self.k_heads * self.k_dim
+    }
+
+    const fn value_dim(&self) -> u64 {
+        self.v_heads * self.v_dim
+    }
+
+    /// The DeltaNet's convolved width: queries, keys and values.
+    const fn conv_dim(&self) -> u64 {
+        2 * self.key_dim() + self.value_dim()
+    }
+
+    const fn q_width(&self) -> u64 {
+        self.q_heads * self.head_dim
+    }
+
+    const fn kv_width(&self) -> u64 {
+        self.kv_heads * self.head_dim
+    }
+
+    /// Target KV bytes per position: BF16 K and V of every attention layer.
+    pub const fn kv_bytes_per_position(&self) -> u64 {
+        self.attention_layers * 2 * self.kv_width() * 2
+    }
+
+    /// The drafter's KV bytes per position: its one attention layer.
+    pub const fn drafter_kv_bytes_per_position(&self) -> u64 {
+        2 * self.kv_width() * 2
+    }
+
+    /// A drafter block's boundary tap: one BF16 row of the hidden size.
+    pub const fn tap_bytes(&self) -> u64 {
+        self.hidden * 2
+    }
+
+    /// Device bytes of one state buffer: every DeltaNet layer's convolution
+    /// history (three inputs of the convolved width) and state matrix, f32,
+    /// then a 4-byte tag, padded to a whole number of convolution rows
+    /// (`4 × conv_dim` bytes) at a multiple of 256, as the executor strides
+    /// its images. A seat's live image is one more of the same.
+    pub const fn state_image_bytes(&self) -> u64 {
+        let data =
+            self.deltanet_layers * (3 * self.conv_dim() + self.v_heads * self.k_dim * self.v_dim);
+        let row = self.conv_dim() * 4;
+        let stride = lcm(256, row);
+        (data * 4 + 4).div_ceil(stride) * stride
+    }
+
+    /// Device bytes one position of a seat's tail takes: every DeltaNet
+    /// layer's convolved inputs, decay and write strength, f32.
+    pub const fn tail_bytes_per_position(&self) -> u64 {
+        self.deltanet_layers * (self.conv_dim() + 2 * self.v_heads) * 4
+    }
+
+    /// One kept normed state of a seat: a BF16 row of the hidden size.
+    pub const fn kept_row_bytes(&self) -> u64 {
+        self.hidden * 2
+    }
+
+    /// RoPE table bytes per position: f32 cosines and sines of the rotary
+    /// dimensions.
+    pub const fn rope_bytes_per_position(&self) -> u64 {
+        2 * self.rotary * 4
+    }
+
+    /// The widest input of an FP8 linear: the quantiser's scratch width.
+    pub const fn widest_input(&self) -> u64 {
+        let mut k = self.hidden;
+        if self.intermediate > k {
+            k = self.intermediate;
+        }
+        if self.q_width() > k {
+            k = self.q_width();
+        }
+        if self.value_dim() > k {
+            k = self.value_dim();
+        }
+        k
+    }
+
+    /// The step program's scratch per row of its widest forward (the
+    /// executor's `program::alloc_scratch`): the residual stream and its
+    /// three working rows; the quantised input and its scales; the MLP's
+    /// gate, up and gated rows; the DeltaNet's projections, gated norm,
+    /// widened inputs, decay and write rows and output rows; the attention's
+    /// gated query, K, V, normed query and key, output and gated output; and
+    /// the drafter's embedding, hidden, concatenation, residual and normed
+    /// rows.
+    pub const fn program_row_bytes(&self) -> u64 {
+        let (h, cd, vd, vh) = (self.hidden, self.conv_dim(), self.value_dim(), self.v_heads);
+        let (qw, kvw) = (self.q_width(), self.kv_width());
+        let k = self.widest_input();
+        4 * h * 2
+            + k
+            + k / 128 * 4
+            + 3 * self.intermediate * 2
+            + cd * 2
+            + vd * 2
+            + 2 * vh * 2
+            + vd * 2
+            + cd * 4
+            + 2 * vh * 4
+            + vd * 4
+            + 2 * qw * 2
+            + 3 * kvw * 2
+            + 3 * qw * 2
+            + 4 * h * 2
+            + 2 * h * 2
+    }
+
+    /// The DeltaNet's staging per staged position (a row's new positions and
+    /// the kept ones it folds first): decay and write inputs, queries, keys,
+    /// values, both gates and the output, f32.
+    pub const fn staged_position_bytes(&self) -> u64 {
+        let v = self.value_dim();
+        2 * self.v_heads * 4 + 2 * self.key_dim() * 4 + v * 4 + 2 * self.v_heads * 4 + v * 4
+    }
+
+    /// One convolution input row of the staging, f32.
+    pub const fn conv_row_bytes(&self) -> u64 {
+        self.conv_dim() * 4
+    }
+
+    /// One FA2 partial row: every query head's BF16 output and f32
+    /// log-sum-exp.
+    pub const fn partial_row_bytes(&self) -> u64 {
+        self.q_heads * (self.head_dim * 2 + 4)
+    }
+
+    /// The rows of the stacked DeltaNet `a` and `b` weight: `2 × v_heads`,
+    /// to a multiple of 8.
+    pub const fn ab_rows(&self) -> u64 {
+        (2 * self.v_heads).next_multiple_of(8)
+    }
+
+    /// The decay and write rows' bytes, f32.
+    pub const fn ab_row_bytes(&self) -> u64 {
+        2 * self.v_heads * 4
+    }
+
+    pub const fn value_row_bytes(&self) -> u64 {
+        self.value_dim() * 4
+    }
+}
+
+/// The least common multiple of two positive numbers.
+const fn lcm(a: u64, b: u64) -> u64 {
+    let (mut x, mut y) = (a, b);
+    while y != 0 {
+        let t = x % y;
+        x = y;
+        y = t;
+    }
+    a / x * b
 }
 
 /// A device's step scratch, as an executor sizes it beside its weights and KV
@@ -302,6 +486,55 @@ pub const MIMO_V26_FLASH: Shape = Shape {
     uniform_kv_groups: &[],
     drafter_weights_bytes: 0,
     step_scratch: None,
+    recurrent: None,
+};
+
+/// Qwen3.8-27B's dimensions (the released `config.json`'s `text_config`):
+/// 64 layers, every fourth gated full attention.
+pub const QWEN38_DIMS: HybridDims = HybridDims {
+    hidden: 5120,
+    intermediate: 17_408,
+    vocab: 248_320,
+    attention_layers: 16,
+    deltanet_layers: 48,
+    q_heads: 24,
+    kv_heads: 4,
+    head_dim: 256,
+    // `partial_rotary_factor` 0.25 of the 256.
+    rotary: 64,
+    k_heads: 16,
+    v_heads: 48,
+    k_dim: 128,
+    v_dim: 128,
+};
+
+/// Qwen3.8-27B's numbers on its one GPU. Its KV is full attention only: the
+/// target's 16 layers (64 KiB a position) and, drafting, the drafter's one
+/// layer and a boundary tap per block. Its pools, seats and step scratch are
+/// counted from [`QWEN38_DIMS`] (`engine_deployment`'s recurrent rules), not
+/// from the per-token fields, which are 0.
+pub const QWEN38_DENSE_27B: Shape = Shape {
+    global_kv_bytes_per_position: QWEN38_DIMS.kv_bytes_per_position(),
+    sliding_kv_bytes_per_position: 0,
+    sliding_window: 0,
+    // One MTP layer, run again on its own output for each further depth: the
+    // executor drafts at any width, and the grammar holds a CUDA draft to
+    // `caps::CUDA_DRAFT_TOKENS`.
+    mtp_layers: 3,
+    drafter_kv_bytes_per_position_per_depth: 0,
+    drafter_tap_bytes_per_depth: 0,
+    drafter_kv_bytes_per_position: QWEN38_DIMS.drafter_kv_bytes_per_position(),
+    hidden_row_bytes: 0,
+    step_token_device_bytes: 0,
+    expert_floor_device_bytes: 0,
+    sampler_row_device_bytes: 0,
+    split_partial_row_bytes: 0,
+    rope_device_bytes_per_position: QWEN38_DIMS.rope_bytes_per_position(),
+    weights_bytes: None,
+    uniform_kv_groups: &[],
+    drafter_weights_bytes: 0,
+    step_scratch: None,
+    recurrent: Some(QWEN38_DIMS),
 };
 
 /// One window-KV cell of DeepSeek-V4.1: 512 FP8 codes and an E8M0 scale per
@@ -368,6 +601,7 @@ pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
             draft_slots: 5,
             fixed_bytes: DS_SCRATCH_FIXED_BYTES,
         }),
+        recurrent: None,
         // The executor's encoder groups: the three pooled sources' bank, and
         // layers 0-19's window.
         uniform_kv_groups: &[
@@ -432,6 +666,7 @@ pub const DEEPSEEK_V41_FLASH: [Shape; 2] = [
             draft_slots: 5,
             fixed_bytes: DS_SCRATCH_FIXED_BYTES,
         }),
+        recurrent: None,
         // The executor's decoder groups: layer 20's bank, layers 20-39's
         // window, and when drafting the drafter's three blocks' window.
         uniform_kv_groups: &[
@@ -558,10 +793,27 @@ mod tests {
         let _ = Architecture::MimoV26Pro.shape();
     }
 
+    /// Qwen3.8-27B on one device, at the released configuration's sizes: 64
+    /// KiB of target KV a position over its 16 attention layers, 4 KiB of
+    /// the drafter's, a 10 KiB boundary tap, a state image of the 48 DeltaNet
+    /// layers (about 157 MB, the executor's padded stride) and about 2 MB of
+    /// tail a position.
     #[test]
-    #[should_panic(expected = "Qwen3.8-27B")]
-    fn the_qwen_stub_has_no_shape() {
-        assert!(!Architecture::Qwen38Dense27B.is_implemented());
-        let _ = Architecture::Qwen38Dense27B.shape();
+    fn qwen_is_one_device_with_a_recurrent_state() {
+        let qwen = Architecture::Qwen38Dense27B;
+        assert!(qwen.is_implemented());
+        let shape = qwen.shape();
+        assert_eq!(qwen.devices().len(), 1);
+        let dims = shape.recurrent.expect("a recurrent state");
+        assert_eq!(shape.kv_bytes_per_position(), 65_536);
+        assert_eq!(shape.drafter_kv_bytes_per_position, 4096);
+        assert_eq!(dims.tap_bytes(), 10_240);
+        // 48 × (3 × 10,240 + 48 × 128 × 128) f32 and a tag, to whole conv rows of
+        // 40,960 bytes.
+        assert_eq!(dims.state_image_bytes(), 156_917_760);
+        assert_eq!(dims.tail_bytes_per_position(), 48 * 10_336 * 4);
+        assert_eq!(dims.rope_bytes_per_position(), 512);
+        assert_eq!(shape.weights_bytes, None);
+        assert_eq!(qwen.mtp_layers(), 3);
     }
 }

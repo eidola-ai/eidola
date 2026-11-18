@@ -16,6 +16,15 @@
 //! `tokenizer.json`. Like the released checkpoint, its shards carry no Engram map. Every
 //! other tensor is the fixture's, byte for byte.
 //!
+//! The Qwen3.8 dev model is derived the same way from the model crate's synthetic Qwen
+//! fixture (`tests/fixtures/qwen_tiny`): its embedding and head widened from 512 rows to
+//! the released head's 248,320, `config.json` with that vocabulary and the released
+//! special and vision token ids, and the chat crate's pinned Qwen3.8 `tokenizer.json`,
+//! `chat_template.jinja` and `generation_config.json`. The head's rows of the vision
+//! placeholders are zero, so they never rank among the dev model's random logits: the CPU
+//! reference executor refuses to embed one (vision is not served), and a sampled one
+//! would end the engine. Every other tensor is the fixture's, byte for byte.
+//!
 //! The output is gibberish (random weights); tests assert structure and token-level
 //! equality, never semantics.
 
@@ -55,6 +64,32 @@ const DEEPSEEK_WIDENED: [&str; 4] = [
     "mtp.2.markov_head.embed.weight",
     "mtp.2.markov_head.head.weight",
 ];
+
+/// Rows of the Qwen3.8 dev model's widened embedding and head: the released head's.
+pub const QWEN_VOCAB: usize = 248_320;
+
+/// The released Qwen3.8 tokenizer's ids: `<|endoftext|>` (BOS and EOS in `config.json`),
+/// the vision start and end markers, and the image and video placeholders.
+pub const QWEN_ENDOFTEXT: u32 = 248_044;
+pub const QWEN_VISION_START: u32 = 248_053;
+pub const QWEN_VISION_END: u32 = 248_054;
+pub const QWEN_IMAGE_TOKEN: u32 = 248_056;
+pub const QWEN_VIDEO_TOKEN: u32 = 248_057;
+
+const QWEN_WIDENED: [&str; 2] = ["model.language_model.embed_tokens.weight", "lm_head.weight"];
+
+/// Every input file of the Qwen3.8 derivation.
+fn qwen_input_files() -> Vec<PathBuf> {
+    let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/qwen_tiny");
+    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures/qwen");
+    vec![
+        tiny.join("config.json"),
+        tiny.join("model.safetensors"),
+        chat.join("tokenizer.json.gz"),
+        chat.join("chat_template.jinja"),
+        chat.join("generation_config.json"),
+    ]
+}
 
 /// Recorded inside a built directory: the fingerprint of the inputs it was built from.
 /// (Not a file the node reads, so it is outside the weights hash.)
@@ -125,6 +160,15 @@ pub fn ensure_deepseek_dev_model(out: &Path) -> std::io::Result<()> {
     ensure_built(out, &fingerprint, write_deepseek_dev_model)
 }
 
+/// [`ensure_dev_model`] for the Qwen3.8 dev model.
+pub fn ensure_qwen_dev_model(out: &Path) -> std::io::Result<()> {
+    let fingerprint = fingerprint_of(
+        "eidola-server-engine qwen dev model v1",
+        &qwen_input_files(),
+    )?;
+    ensure_built(out, &fingerprint, write_qwen_dev_model)
+}
+
 fn ensure_built(
     out: &Path,
     fingerprint: &str,
@@ -173,7 +217,7 @@ pub fn write_dev_model(out: &Path) -> std::io::Result<()> {
     std::fs::write(out.join("config.json"), canonical_json(&config, true))?;
 
     // model.safetensors: every tensor copied, the two vocabulary matrices widened.
-    let file = widened_safetensors(&tiny.join("model.safetensors"), &WIDENED, WIDE_VOCAB)?;
+    let file = widened_safetensors(&tiny.join("model.safetensors"), &WIDENED, WIDE_VOCAB, &[])?;
     std::fs::write(out.join("model.safetensors"), file)?;
 
     // The pinned chat artifacts.
@@ -204,6 +248,7 @@ pub fn write_deepseek_dev_model(out: &Path) -> std::io::Result<()> {
         &tiny.join("model.safetensors"),
         &DEEPSEEK_WIDENED,
         DEEPSEEK_VOCAB,
+        &[],
     )?;
     std::fs::write(out.join("model.safetensors"), file)?;
 
@@ -214,10 +259,58 @@ pub fn write_deepseek_dev_model(out: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Writes the Qwen3.8 dev model into `out` (module docs).
+pub fn write_qwen_dev_model(out: &Path) -> std::io::Result<()> {
+    let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/qwen_tiny");
+    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures/qwen");
+    std::fs::create_dir_all(out)?;
+
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(tiny.join("config.json"))?)?;
+    config["text_config"]["vocab_size"] = QWEN_VOCAB.into();
+    config["text_config"]["bos_token_id"] = QWEN_ENDOFTEXT.into();
+    config["text_config"]["eos_token_id"] = QWEN_ENDOFTEXT.into();
+    config["image_token_id"] = QWEN_IMAGE_TOKEN.into();
+    config["video_token_id"] = QWEN_VIDEO_TOKEN.into();
+    config["vision_start_token_id"] = QWEN_VISION_START.into();
+    config["vision_end_token_id"] = QWEN_VISION_END.into();
+    std::fs::write(out.join("config.json"), canonical_json(&config, true))?;
+
+    let vision = [
+        QWEN_VISION_START,
+        QWEN_VISION_END,
+        QWEN_IMAGE_TOKEN,
+        QWEN_VIDEO_TOKEN,
+    ]
+    .map(|t| t as usize);
+    let file = widened_safetensors(
+        &tiny.join("model.safetensors"),
+        &QWEN_WIDENED,
+        QWEN_VOCAB,
+        &[("lm_head.weight", &vision)],
+    )?;
+    std::fs::write(out.join("model.safetensors"), file)?;
+
+    let mut tokenizer = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(chat.join("tokenizer.json.gz"))?)
+        .read_to_end(&mut tokenizer)?;
+    std::fs::write(out.join("tokenizer.json"), tokenizer)?;
+    for name in ["chat_template.jinja", "generation_config.json"] {
+        std::fs::copy(chat.join(name), out.join(name))?;
+    }
+    Ok(())
+}
+
 /// The safetensors file at `path` with the BF16 matrices named in `widened` grown to
 /// `rows` rows (the original rows first, then deterministic random rows at the scale of
-/// the original), every other tensor copied.
-fn widened_safetensors(path: &Path, widened: &[&str], rows_to: usize) -> std::io::Result<Vec<u8>> {
+/// the original), the rows `zeroed` names of a matrix set to zero, every other tensor
+/// copied.
+fn widened_safetensors(
+    path: &Path,
+    widened: &[&str],
+    rows_to: usize,
+    zeroed: &[(&str, &[usize])],
+) -> std::io::Result<Vec<u8>> {
     let bytes = std::fs::read(path)?;
     let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
     let header: serde_json::Map<String, serde_json::Value> =
@@ -260,6 +353,11 @@ fn widened_safetensors(path: &Path, widened: &[&str], rows_to: usize) -> std::io
                 tensor.extend_from_slice(&((x.to_bits() >> 16) as u16).to_le_bytes());
             }
             shape[0] = rows_to as u64;
+            for (_, rows) in zeroed.iter().filter(|(n, _)| n == name) {
+                for &r in *rows {
+                    tensor[r * cols * 2..(r + 1) * cols * 2].fill(0);
+                }
+            }
         }
         let begin = new_data.len();
         new_data.extend_from_slice(&tensor);
