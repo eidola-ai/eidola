@@ -208,7 +208,9 @@ fn small_gemm_form_on(fast: &CudaDevice, tiled: bool) -> impl cases::SmallGemmRu
 /// the same bits: each kind over a 300-row batch, and over rows alone and in batches at
 /// several offsets, against the unswapped kernel's 300-row batch; then the dispatch
 /// itself at row counts either side of each boundary. This is what lets the executor
-/// choose by row count.
+/// choose by row count. Its shapes are ones `fp8_splits` leaves whole (asserted), the
+/// unsplit kinds' domain; the split shapes' instances are `fast_fp8_split_forms`' and
+/// `fast_fp8_split_order`'s.
 fn fast_fp8_configs_agree(fast: &CudaDevice, seed: u64) -> Result<String, String> {
     use eidola_engine_cuda::mimo::gemm::GemmKind;
     use eidola_engine_cuda::qwen::abi::{Lin8Params, QuantParams};
@@ -219,7 +221,11 @@ fn fast_fp8_configs_agree(fast: &CudaDevice, seed: u64) -> Result<String, String
     let u = |x: usize| u32::try_from(x).expect("small");
     let mut g = Lcg(seed);
     let mut checked = 0usize;
-    for &(n, k) in &[(1024usize, 640usize), (384, 5120), (256, 128)] {
+    // K of 5,120 at 10,240 outputs: 80 tiles, too many to split.
+    for &(n, k) in &[(1024usize, 640usize), (10240, 5120), (256, 128)] {
+        if eidola_engine_cuda::qwen::kernels::fp8_splits(u(n), u(k)) != 1 {
+            return Err(format!("{n}x{k} splits: not an unsplit kind's shape"));
+        }
         let (codes, scales) = cases::fp8_weight(&mut g, n, k);
         let ts = cases::transpose_scales(&scales, n, k);
         let rows_max = 300usize;
@@ -603,15 +609,22 @@ fn bf16_nearest(x: f32) -> u16 {
 /// alone may split, as `1024 × 5120` does; the executor runs only the stack.)
 fn fast_fp8_stacks(fast: &CudaDevice, seed: u64) -> Result<String, String> {
     use eidola_engine_cuda::qwen::abi::Lin8Params;
-    use eidola_engine_cuda::qwen::kernels::{MAX_SPLITS, QwenKernels};
+    use eidola_engine_cuda::qwen::kernels::{MAX_SPLITS, QwenKernels, fp8_splits};
     use qwen_common::{Lcg, bits, buf, read, zeros};
 
     let u = |x: usize| u32::try_from(x).expect("small");
     let mut g = Lcg(seed);
     let mut checked = 0usize;
     let k = 5120usize;
-    let parts_n = [2048usize, 1024, 1024];
+    // The executor's stacks are all wider than a split allows; this one too (80 tiles),
+    // while its 1,024-row parts alone would split (asserted).
+    let parts_n = [8192usize, 1024, 1024];
     let n: usize = parts_n.iter().sum();
+    if fp8_splits(u(n), u(k)) != 1 || fp8_splits(1024, u(k)) == 1 {
+        return Err(format!(
+            "{n}x{k} must stay whole and its 1024-row parts split"
+        ));
+    }
     let weights: Vec<(Vec<u8>, Vec<f32>)> = parts_n
         .iter()
         .map(|&p| cases::fp8_weight(&mut g, p, k))
@@ -687,7 +700,7 @@ fn fast_fp8_stacks(fast: &CudaDevice, seed: u64) -> Result<String, String> {
                 fast.lin8_on(
                     &lin(w.addr, ws.addr, pn, o.addr),
                     eidola_engine_cuda::qwen::cuda::fp8_kind(u(m_pad), u(n), u(k)),
-                    None,
+                    Some(pb.addr),
                 )
             }
             .map_err(|e| e.to_string())?;
