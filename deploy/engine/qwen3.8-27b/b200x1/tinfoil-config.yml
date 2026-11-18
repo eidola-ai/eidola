@@ -14,9 +14,9 @@
 # hash of the token the gateway's ENGINE_TOKEN secret carries
 # (`cargo run -p hash-secret`) and re-measure.
 #
-# The weights pack's `mpk` is not filled in: it is the reference of the
-# modelwrap schema 1 pack of the repo below, which has not been built. Until
-# it is, this deployment is not pinned and the gateway's build refuses it.
+# The weights pack is the modelwrap schema 1 pack of the repo below; its
+# reference is reproducible from the repo at that revision (`modelwrap
+# --schema 1 <repo>@<revision>`, the packer image of modelwrap v0.3.0).
 #
 # The sizing is the whole 262,144-position context at 64 seats, steps of
 # 2,048 tokens of prefill chunks of 256 (the serving chunk), decode graphs on:
@@ -31,7 +31,7 @@ gpus: 1
 models:
   - name: "weights"
     repo: "Qwen/Qwen3.8-27B-FP8@c3a462cc3d38cf351f3b26cbd763469eeb74ef81"
-    mpk: "unbuilt"
+    mpk: "eb71be46ee520ce64401fb88b7d2b34ccb383bdaa8e56a85f9c7c1d31e9b8e14_30890057728_b9f97056-df6a-592f-a2a0-6e8998548668"
     schema: 1
 
 containers:

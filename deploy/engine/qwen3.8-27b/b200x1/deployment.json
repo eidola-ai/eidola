@@ -10,7 +10,7 @@
     "platform_endorsements": {
       "release": "platform-v0.1.11",
       "sha256": "ba0ccfbe8fb8a92d77a072ffeab362dc4b67faa0c88e7114eee7939ad9dd9548",
-      "policy": "tdx-b200-prod"
+      "policy": "tdx-b200-1-5-20-prod"
     },
     "dynamic_platform": "true",
     "cached_keys": "true",

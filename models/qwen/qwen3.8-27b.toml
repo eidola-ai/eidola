@@ -372,9 +372,6 @@ output_modalities = ["text"]
 max_output_tokens = 65536
 output_budget_class = "reasoning"
 
-# PROVISIONAL, not a decision: OpenRouter's median list price for Qwen3.8-27B
-# across its endpoints, with cached input at a quarter of input as MiMo-V2.6-Flash's
-# row has it. The price is to be set before this row is served.
 [price]
 input_per_m = 0.15
 output_per_m = 2.20

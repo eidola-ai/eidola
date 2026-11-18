@@ -2338,9 +2338,9 @@ mod tests {
         assert_eq!(reserve / 100_000_000, 348, "{reserve}");
         let scratch = recurrent_step_scratch_bytes(&dims, &sizing);
         assert_eq!(scratch / 100_000_000, 178, "{scratch}");
-        // Every covered file of the checkpoint is 30.88 GB; the pack holds its
-        // other files too.
-        let pack = 31_000_000_000;
+        // The pack's data size: the schema 1 modelwrap pack of the checkpoint,
+        // every file of the repository at its revision.
+        let pack = 30_890_057_728;
         let budget = 115u64 << 30;
         assert_eq!(recurrent_state_buffers(&sizing, &DS_CACHE), 321);
         let blocks = (budget - 321 * dims.state_image_bytes())
