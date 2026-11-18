@@ -1920,7 +1920,7 @@ pub(crate) mod tests {
             crate::backend::Catalog::new(None).unwrap(),
             None,
             crate::db::create_pool(
-                "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+                "postgres://nobody@127.0.0.1:1/none?sslmode=verify-full",
                 None,
                 None,
             )

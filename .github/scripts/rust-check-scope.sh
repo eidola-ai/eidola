@@ -29,6 +29,9 @@ while IFS= read -r path; do
     # `eval` stage reads is the kernel crate, which is Rust scope.
     scripts/check-oci-stub-workspace.sh|oci/*/Containerfile|.dockerignore)
       oci=true ;;
+    # The database tests' server serves the TLS this script makes.
+    scripts/dev-postgres-tls.sh)
+      rust=true ;;
     *.md|.rumdl.toml) : ;;
     .github/*|docs/*|www/*|scripts/*|*.sh|justfile) : ;;
     compose*.yaml|compose*.yml|Containerfile*|*.hcl|.dockerignore) : ;;

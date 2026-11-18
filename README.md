@@ -34,7 +34,7 @@ All Rust workspace packages live under `crates/`, including the code generation 
 
 ### Server
 
-The server requires environment variables to work correctly. See .env.example. For local development, `DATABASE_URL=postgres://eidola@localhost/eidola` uses the plain Postgres container from `compose.yaml`. For production, you can point `DATABASE_URL` at an external Postgres, set `DATABASE_PASSWORD` as a secret, and optionally provide `DATABASE_SSL_CERT` with the PEM-encoded root CA certificate if the database does not chain to the default WebPKI roots.
+The server requires environment variables to work correctly. See .env.example. Every database connection is verified TLS; `sslmode=disable` is refused. For local development, `DATABASE_URL=postgres://eidola@localhost/eidola?sslmode=verify-full` reaches the Postgres container from `compose.yaml`, which serves only TLS with a certificate from a private root that `scripts/dev-postgres-tls.sh` makes; `DATABASE_SSL_CERT` is that root (`.dev-certs/postgres/ca.pem`), which `just services` writes into `.env.local`. For production, point `DATABASE_URL` at an external Postgres with `sslmode=verify-full`, and provide `DATABASE_SSL_CERT` only if the database's certificate does not chain to the default WebPKI roots.
 
 There are two supported development workflows:
 

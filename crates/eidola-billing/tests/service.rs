@@ -16,7 +16,6 @@ use eidola_billing::service::BillingService;
 use eidola_billing::store::{RefundRequest, Store};
 use eidola_billing::stripe::StripeClient;
 use serde_json::{Value, json};
-use tokio_postgres::NoTls;
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -139,7 +138,15 @@ impl Fixture {
     async fn new() -> Self {
         let url = std::env::var("BILLING_TEST_DATABASE_URL")
             .expect("set isolated BILLING_TEST_DATABASE_URL");
-        let (admin, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        let tls = eidola_billing::connection::tls_connector(
+            std::env::var("DATABASE_SSL_CERT").ok().as_deref(),
+        )
+        .unwrap();
+        let (admin, connection) = eidola_billing::connection::parse_database_url(&url)
+            .unwrap()
+            .connect(tls.clone())
+            .await
+            .unwrap();
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -148,10 +155,10 @@ impl Fixture {
             .batch_execute(&format!("CREATE SCHEMA {schema}"))
             .await
             .unwrap();
-        let mut config: tokio_postgres::Config = url.parse().unwrap();
+        let mut config = eidola_billing::connection::parse_database_url(&url).unwrap();
         config.options(format!("-c search_path={schema},public"));
         config.application_name(&schema);
-        let pool = Pool::builder(Manager::new(config, NoTls))
+        let pool = Pool::builder(Manager::new(config, tls))
             .max_size(8)
             .build()
             .unwrap();

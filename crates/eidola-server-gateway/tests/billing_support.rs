@@ -18,7 +18,6 @@ use eidola_server_gateway::{
     AppState, backend::Catalog, credentials::KeyCache, stripe::StripeClient,
 };
 use serde_json::{Value, json};
-use tokio_postgres::NoTls;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -34,7 +33,15 @@ impl TestDb {
     async fn new() -> Self {
         let url = std::env::var("BILLING_TEST_DATABASE_URL")
             .expect("set BILLING_TEST_DATABASE_URL to a dedicated test database");
-        let (admin, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        let tls = eidola_billing::connection::tls_connector(
+            std::env::var("DATABASE_SSL_CERT").ok().as_deref(),
+        )
+        .unwrap();
+        let (admin, connection) = eidola_billing::connection::parse_database_url(&url)
+            .unwrap()
+            .connect(tls.clone())
+            .await
+            .unwrap();
         tokio::spawn(async move { connection.await.unwrap() });
         // Extensions are shared by schemas. Install once outside the isolated
         // schema so cleaning one test cannot remove another test's extension.
@@ -46,9 +53,9 @@ impl TestDb {
             .batch_execute(&format!("CREATE SCHEMA {schema}"))
             .await
             .unwrap();
-        let mut config: tokio_postgres::Config = url.parse().unwrap();
+        let mut config = eidola_billing::connection::parse_database_url(&url).unwrap();
         config.options(format!("-c search_path={schema},public"));
-        let pool = Pool::builder(Manager::new(config, NoTls))
+        let pool = Pool::builder(Manager::new(config, tls))
             .max_size(8)
             .build()
             .unwrap();

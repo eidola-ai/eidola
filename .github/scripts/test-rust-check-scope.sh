@@ -27,6 +27,12 @@ markdown=false
 oci=false' "$apple_path"
 done
 
+# The database tests run against a server serving this script's TLS.
+assert_scope 'rust=true
+apple=false
+markdown=false
+oci=true' scripts/dev-postgres-tls.sh
+
 # The teeth of the glob: a script that does not exist yet must already be in
 # scope, because an enumeration is what silently drops one.
 for future_path in \
