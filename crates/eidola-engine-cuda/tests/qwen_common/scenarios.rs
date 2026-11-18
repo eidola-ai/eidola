@@ -79,6 +79,7 @@ pub fn hits_and_pressure<D: QwenDevice>(make: &dyn Fn() -> D) {
                 host_buffers: if tiered { 8 } else { 0 },
                 k: 3,
                 strategy,
+                graphs: super::graphs_now(),
             };
             let mut h = Harness::new(make(), &g, sched(5, true));
             let mut rng = TestRng(7);

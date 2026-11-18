@@ -269,6 +269,7 @@ pub fn linear<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
         let wb = buf(dev, &wbits);
         for out_f32 in [0u32, 1] {
             let ob = zeros(dev, rows * n * 4);
+            let tmp = zeros(dev, rows * n * 4);
             let p = LinearParams {
                 x: xb.addr,
                 w: wb.addr,
@@ -281,7 +282,7 @@ pub fn linear<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
                 out_f32,
             };
             // SAFETY: the buffers hold what the struct names.
-            unsafe { dev.linear(&p, true) }.map_err(|e| e.to_string())?;
+            unsafe { dev.linear(&p, Some(tmp.addr)) }.map_err(|e| e.to_string())?;
             if out_f32 == 1 {
                 same(
                     "linear f32",
@@ -951,6 +952,144 @@ pub fn quant<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// BF16 bit patterns for the quantiser's edges: blocks of +0, of -0, holding a NaN, only
+/// NaNs, infinities, subnormals, magnitudes about 448 and the largest finite, a negative
+/// largest magnitude, ties and spikes, then random blocks of every scale.
+pub fn quant_edge_rows(g: &mut Lcg, rows: usize, x_stride: usize, k: usize) -> Vec<u16> {
+    const NAN: u16 = 0x7fc0;
+    let mut x = vec![0u16; rows * x_stride];
+    for r in 0..rows {
+        for b in 0..k / 128 {
+            let blk = &mut x[r * x_stride + b * 128..r * x_stride + (b + 1) * 128];
+            let rnd = |g: &mut Lcg, scale: f32| eidola_engine_cuda::bf16::from_f32(g.f32() * scale);
+            match (r * (k / 128) + b) % 16 {
+                0 => blk.fill(0x0000),
+                1 => blk.fill(0x8000),
+                2 => {
+                    for v in blk.iter_mut() {
+                        *v = rnd(g, 3.0);
+                    }
+                    blk[usize::try_from(g.below(128)).expect("small")] = NAN;
+                    blk[usize::try_from(g.below(128)).expect("small")] = 0xffc1;
+                }
+                3 => blk.fill(NAN),
+                4 => {
+                    for v in blk.iter_mut() {
+                        *v = rnd(g, 1.0);
+                    }
+                    blk[7] = 0x7f80;
+                    blk[90] = 0xff80;
+                }
+                5 => {
+                    // Subnormals of both signs, and the smallest normal.
+                    for (i, v) in blk.iter_mut().enumerate() {
+                        let m = u16::try_from(g.below(0x7f) + 1).expect("small");
+                        *v = if i % 2 == 0 { m } else { 0x8000 | m };
+                    }
+                    blk[3] = 0x0080;
+                }
+                6 => {
+                    for v in blk.iter_mut() {
+                        *v = rnd(g, 448.0);
+                    }
+                    blk[11] = eidola_engine_cuda::bf16::from_f32(448.0);
+                    blk[12] = eidola_engine_cuda::bf16::from_f32(-464.0);
+                }
+                7 => {
+                    for v in blk.iter_mut() {
+                        *v = rnd(g, 1e38);
+                    }
+                    blk[0] = 0x7f7f;
+                    blk[127] = 0xff7f;
+                }
+                8 => {
+                    for v in blk.iter_mut() {
+                        *v = rnd(g, 2.0);
+                    }
+                    blk[64] = eidola_engine_cuda::bf16::from_f32(-9.0);
+                }
+                9 => {
+                    // Ties: few distinct values, the largest magnitude repeated.
+                    for v in blk.iter_mut() {
+                        *v = eidola_engine_cuda::bf16::from_f32(
+                            [0.5f32, -0.5, 1.0, -1.0, 0.25]
+                                [usize::try_from(g.below(5)).expect("small")],
+                        );
+                    }
+                }
+                10 => {
+                    blk.fill(0x0000);
+                    blk[usize::try_from(g.below(128)).expect("small")] = rnd(g, 1e-3);
+                }
+                c => {
+                    let scale = f32::from_bits(
+                        0x3f80_0000 + ((u32::try_from(c * 9 + r).expect("small") % 40) << 23) / 4,
+                    ) * 1e-4;
+                    for v in blk.iter_mut() {
+                        *v = rnd(g, scale);
+                    }
+                }
+            }
+        }
+    }
+    x
+}
+
+/// The quantiser's kernel form (a warp per block) against its reference form
+/// (`quant_thread`, compiled for the host, `reference`): every code's and every scale's
+/// bits, over random and edge blocks ([`quant_edge_rows`]), padded rows and strided input.
+pub fn quant_forms<D: QwenDevice>(
+    dev: &D,
+    reference: &dyn Fn(&QuantParams, u32, u32),
+    seed: u64,
+) -> Result<(), String> {
+    let mut g = Lcg(seed);
+    for &(rows, k, x_stride) in &[
+        (1usize, 5120usize, 5120usize),
+        (37, 640, 768),
+        (300, 128, 128),
+    ] {
+        let m_pad = rows.next_multiple_of(4) + 4;
+        let x = quant_edge_rows(&mut g, rows, x_stride, k);
+        let xb = buf(dev, &x);
+        let cb = zeros(dev, rows * k);
+        let sb = zeros(dev, (k / 128) * m_pad * 4);
+        let q = QuantParams {
+            x: xb.addr,
+            codes: cb.addr,
+            scales: sb.addr,
+            rows: u(rows),
+            k: u(k),
+            x_stride: u(x_stride),
+            m_pad: u(m_pad),
+        };
+        // SAFETY: the buffers hold what the struct names.
+        unsafe { dev.quant(&q) }.map_err(|e| e.to_string())?;
+        let codes = read::<D, u8>(dev, &cb, rows * k);
+        let scales = read::<D, f32>(dev, &sb, (k / 128) * m_pad);
+        let mut want_codes = vec![0u8; rows * k];
+        let mut want_scales = vec![0.0f32; (k / 128) * m_pad];
+        let h = QuantParams {
+            x: x.as_ptr() as u64,
+            codes: want_codes.as_mut_ptr() as u64,
+            scales: want_scales.as_mut_ptr() as u64,
+            ..q
+        };
+        reference(&h, u((k / 128).div_ceil(128)), u(rows));
+        same(
+            &format!("quant forms {rows}×{k} codes"),
+            &codes,
+            &want_codes,
+        )?;
+        same(
+            &format!("quant forms {rows}×{k} scales"),
+            &f32_bits(&scales),
+            &f32_bits(&want_scales),
+        )?;
+    }
+    Ok(())
+}
+
 /// The f32 → BF16 rounding (both outputs) and the BF16 → f32 widening against
 /// `bf16_round`.
 pub fn conversions<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
@@ -1016,6 +1155,126 @@ pub fn all<D: QwenDevice>(dev: &D) -> Vec<(&'static str, Result<(), String>)> {
         ("deltanet", deltanet(dev, 6)),
         ("dn recurrence", dn_recurrence(dev, 9)),
     ]
+}
+
+/// The fast profile's BF16 GEMM (the DeltaNet's stacked `a` and `b` projections, and a
+/// fixture's padded stack) rounded to BF16 by `eidola_qwen_round` as the program does,
+/// against the exact linear: every output within one BF16 unit in the last place of the
+/// exact one plus the f32 rounding of the sum's magnitude (asserted), the units-apart
+/// histogram (recorded), and each row's bits alone and inside larger batches (asserted).
+pub fn fast_bf16_gemm<E: QwenDevice, F: QwenDevice>(
+    exact: &E,
+    fast: &F,
+    seed: u64,
+) -> Result<String, String> {
+    let mut g = Lcg(seed);
+    let mut report = Vec::new();
+    for &(n, width, k) in &[
+        (96usize, 96usize, 5120usize),
+        (16, 12, 128),
+        (256, 200, 640),
+    ] {
+        let rows_max = 64usize;
+        let x: Vec<f32> = (0..rows_max * k).map(|_| g.bf16(4.0)).collect();
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| if i / k < width { g.bf16(0.05) } else { 0.0 })
+            .collect();
+        let (xb, wb) = (bits(&x), bits(&w));
+        let (xe, we) = (buf(exact, &xb), buf(exact, &wb));
+        let (xf, wf) = (buf(fast, &xb), buf(fast, &wb));
+        let oe = zeros(exact, rows_max * n * 2);
+        let tmp = zeros(fast, rows_max * n * 4);
+        let lin =
+            |x: u64, w: u64, out: u64, rows: usize, out_f32: u32, out_stride: usize| LinearParams {
+                x,
+                w,
+                out,
+                rows: u(rows),
+                n: u(n),
+                k: u(k),
+                x_stride: u(k),
+                out_stride: u(out_stride),
+                out_f32,
+            };
+        // SAFETY: the buffers hold what the struct names.
+        unsafe { exact.linear(&lin(xe.addr, we.addr, oe.addr, rows_max, 0, n), None) }
+            .map_err(|e| e.to_string())?;
+        let want = read::<E, u16>(exact, &oe, rows_max * n);
+        let run = |rows: usize, first: usize| -> Result<Vec<f32>, String> {
+            let out = zeros(fast, rows * width * 4);
+            let r = RoundParams {
+                x: tmp.addr,
+                out: out.addr,
+                rows: u(rows),
+                width: u(width),
+                x_stride: u(n),
+                out_stride: u(width),
+                out_f32: 1,
+                reserved: 0,
+            };
+            // SAFETY: `rows` rows from `first`, the weight, the f32 scratch and the output.
+            unsafe {
+                fast.gemm_bf16(&lin(
+                    xf.addr + (first * k * 2) as u64,
+                    wf.addr,
+                    tmp.addr,
+                    rows,
+                    1,
+                    n,
+                ))
+                .map_err(|e| e.to_string())?;
+                fast.round(&r).map_err(|e| e.to_string())?;
+            }
+            Ok(read::<F, f32>(fast, &out, rows * width))
+        };
+        let batch = run(rows_max, 0)?;
+        let mut hist = [0usize; 5];
+        for r in 0..rows_max {
+            for c in 0..width {
+                let e = eidola_engine_cuda::bf16::to_f32(want[r * n + c]);
+                let f = batch[r * width + c];
+                if f.to_bits() & 0xffff != 0 {
+                    return Err(format!(
+                        "fast gemm {n}x{k}: row {r} col {c}: {f} is not BF16"
+                    ));
+                }
+                let mag: f32 = (0..k).map(|i| (x[r * k + i] * w[c * k + i]).abs()).sum();
+                let sum = mag * (k as f32) * f32::EPSILON;
+                let bound = (e.abs() + sum) / 64.0 + sum;
+                if (f - e).abs() > bound {
+                    return Err(format!(
+                        "fast gemm {n}x{k}: row {r} col {c}: {f}, exact {e}, past {bound}"
+                    ));
+                }
+                let d = usize::try_from(
+                    (ord16(eidola_engine_cuda::bf16::from_f32(f)) - ord16(want[r * n + c]))
+                        .unsigned_abs(),
+                )
+                .expect("small");
+                hist[d.min(4)] += 1;
+            }
+        }
+        report.push(format!("{width}/{n}x{k}: ulp 0/1/2/3/4+ = {hist:?}"));
+        for &(rows, first) in &[
+            (1usize, 0usize),
+            (1, 13),
+            (1, 63),
+            (5, 3),
+            (17, 40),
+            (32, 32),
+        ] {
+            let got = run(rows, first)?;
+            same(
+                &format!(
+                    "fast gemm {n}x{k}: rows {first}..{} alone against the batch",
+                    first + rows
+                ),
+                &f32_bits(&got),
+                &f32_bits(&batch[first * width..(first + rows) * width]),
+            )?;
+        }
+    }
+    Ok(report.join("; "))
 }
 
 /// What the fast profile's linears do against the exact ones: per shape and row count,

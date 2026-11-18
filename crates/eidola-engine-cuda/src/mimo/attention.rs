@@ -316,13 +316,19 @@ pub struct AttnRequest {
 /// run (query rows × GQA group size) is `packed`: FlashInfer's rule. Only
 /// speed depends on it.
 pub fn tile_for(packed: u64) -> u32 {
-    if packed <= 16 {
+    tile_for_max(packed, 128)
+}
+
+/// [`tile_for`] for an image whose largest query tile is `max_tile` (64 or 128).
+pub fn tile_for_max(packed: u64, max_tile: u32) -> u32 {
+    let tile = if packed <= 16 {
         16
     } else if packed <= 64 {
         64
     } else {
         128
-    }
+    };
+    tile.min(max_tile)
 }
 
 /// One launch's work list as the host derives it, before upload: FlashInfer's
@@ -457,6 +463,25 @@ impl HostPlan {
         reduction: Reduction,
         partial_rows: u32,
     ) -> Result<HostPlan> {
+        HostPlan::with_max_tile(
+            requests,
+            group_size,
+            page_size,
+            reduction,
+            partial_rows,
+            128,
+        )
+    }
+
+    /// [`HostPlan::new`] for an image whose largest query tile is `max_tile`.
+    pub fn with_max_tile(
+        requests: &[AttnRequest],
+        group_size: u32,
+        page_size: u32,
+        reduction: Reduction,
+        partial_rows: u32,
+        max_tile: u32,
+    ) -> Result<HostPlan> {
         let bad =
             |r: &AttnRequest, why: &str| CudaError::new(format!("attention request {r:?}: {why}"));
         let int = |x: u64| i32::try_from(x).ok();
@@ -515,7 +540,7 @@ impl HostPlan {
             .map(|r| r.qo_len as u64 * group_size as u64)
             .max()
             .unwrap_or(1);
-        let tile = tile_for(packed);
+        let tile = tile_for_max(packed, max_tile);
         let mut plan = HostPlan {
             group_size,
             page_size,
@@ -729,9 +754,33 @@ impl PassCaps {
         max_pages: u32,
         max_model_len: u32,
     ) -> Result<PassCaps> {
+        PassCaps::with_max_tile(
+            reduction,
+            rows,
+            queries,
+            group_size,
+            page_size,
+            max_pages,
+            max_model_len,
+            128,
+        )
+    }
+
+    /// [`PassCaps::new`] for an image whose largest query tile is `max_tile`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_max_tile(
+        reduction: Reduction,
+        rows: u32,
+        queries: u32,
+        group_size: u32,
+        page_size: u32,
+        max_pages: u32,
+        max_model_len: u32,
+        max_tile: u32,
+    ) -> Result<PassCaps> {
         let overflow =
             || CudaError::new(format!("attention reservation for {rows} rows overflows"));
-        let tile = tile_for(u64::from(queries) * u64::from(group_size));
+        let tile = tile_for_max(u64::from(queries) * u64::from(group_size), max_tile);
         let tiles = (u64::from(queries) * u64::from(group_size)).div_ceil(u64::from(tile));
         let rows64 = u64::from(rows);
         let fit = |x: u64| u32::try_from(x).ok().filter(|&v| i32::try_from(v).is_ok());

@@ -4,7 +4,9 @@
 //! the checkpoint and become f32 transposed to `[k / 128][n / 128]` (the CUTLASS SFB
 //! layout both GEMM forms read); norm weights are the model crate's f32 (`1 + w` where
 //! zero-centred); the DeltaNet's `a` and `b` projections, held by the model crate in f32,
-//! go back to their BF16 bits. `exp(A_log)` is computed once per head with the model
+//! go back to their BF16 bits, stacked in one matrix (`a`'s rows, `b`'s, then zero rows to
+//! a multiple of 8: [`ab_rows`]) that the exact profile reads as two and the fast profile
+//! multiplies at once. `exp(A_log)` is computed once per head with the model
 //! crate's `exp32`, and the RoPE tables are the model crate's `rope_cos_sin` at every
 //! position the executor can rotate.
 
@@ -33,7 +35,11 @@ pub struct Fp8W {
 pub struct DeltaNetW {
     pub qkv: Fp8W,
     pub z: Fp8W,
-    /// BF16 `[v_heads, hidden]`.
+    /// BF16 `[ab_n, hidden]`: `a`'s `v_heads` rows, then `b`'s, then zero rows.
+    pub ab: u64,
+    /// [`ab_rows`] of the layer's value heads.
+    pub ab_n: u32,
+    /// `a` and `b` alone, BF16 `[v_heads, hidden]`: rows of `ab`.
     pub a: u64,
     pub b: u64,
     /// f32 `[conv_dim, 4]`.
@@ -83,6 +89,12 @@ pub struct MtpW {
     pub norm: u64,
 }
 
+/// Rows of the stacked `a` and `b` projections: `2 · v_heads` rounded up to a multiple of
+/// 8, the BF16 GEMM's alignment (96 on the released model, which needs no zero rows).
+pub fn ab_rows(v_heads: u32) -> u32 {
+    (2 * v_heads).next_multiple_of(8)
+}
+
 /// Every weight of the forward on one device.
 pub struct DevWeights {
     /// BF16 `[vocab, hidden]`.
@@ -125,17 +137,27 @@ impl<D: QwenDevice> Loader<'_, D> {
         self.put(m.data.bytes())
     }
 
-    /// An f32 matrix of BF16 values, as BF16 bits.
-    fn bf16_of_f32(&mut self, m: &Matrix) -> Result<u64> {
-        let mut bytes = Vec::with_capacity(m.data.len() * 2);
-        for &v in &m.data {
-            let b = v.to_bits();
-            if b & 0xffff != 0 {
-                return Err(CudaError::new("a BF16 weight that is not a BF16 value"));
-            }
-            bytes.extend(((b >> 16) as u16).to_le_bytes());
+    /// `a` and `b` (f32 matrices of BF16 values, `[v_heads, k]` each) stacked as BF16
+    /// bits, zero rows to [`ab_rows`]; the stack's address and rows.
+    fn ab(&mut self, a: &Matrix, b: &Matrix) -> Result<(u64, u32)> {
+        if a.rows != b.rows || a.cols != b.cols {
+            return Err(CudaError::new(
+                "the DeltaNet's a and b projections differ in shape",
+            ));
         }
-        self.put(&bytes)
+        let n = ab_rows(narrow(a.rows, "DeltaNet value heads")?);
+        let mut bytes = Vec::with_capacity(n as usize * a.cols * 2);
+        for m in [a, b] {
+            for &v in &m.data {
+                let x = v.to_bits();
+                if x & 0xffff != 0 {
+                    return Err(CudaError::new("a BF16 weight that is not a BF16 value"));
+                }
+                bytes.extend(((x >> 16) as u16).to_le_bytes());
+            }
+        }
+        bytes.resize(n as usize * a.cols * 2, 0);
+        Ok((self.put(&bytes)?, n))
     }
 
     fn norm(&mut self, n: &ZcNorm) -> Result<u64> {
@@ -168,11 +190,14 @@ impl<D: QwenDevice> Loader<'_, D> {
         let mixer = match &l.mixer {
             MixerWeights::DeltaNet(d) => {
                 let exp_a: Vec<f32> = d.a_log.iter().map(|&x| exp32(x)).collect();
+                let (ab, ab_n) = self.ab(&d.in_proj_a, &d.in_proj_b)?;
                 MixerW::DeltaNet(DeltaNetW {
                     qkv: self.fp8(&d.in_proj_qkv)?,
                     z: self.fp8(&d.in_proj_z)?,
-                    a: self.bf16_of_f32(&d.in_proj_a)?,
-                    b: self.bf16_of_f32(&d.in_proj_b)?,
+                    ab,
+                    ab_n,
+                    a: ab,
+                    b: ab + (d.in_proj_a.rows * d.in_proj_a.cols * 2) as u64,
                     conv: self.f32s(&d.conv)?,
                     exp_a_log: self.f32s(&exp_a)?,
                     dt_bias: self.f32s(&d.dt_bias)?,
