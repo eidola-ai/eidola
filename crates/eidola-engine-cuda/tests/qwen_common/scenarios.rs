@@ -180,3 +180,90 @@ pub fn alone_and_crowded<D: QwenDevice>(make: &dyn Fn() -> D) {
     crowd.flush();
     assert_eq!(crowd.outputs[&1], a);
 }
+
+/// A harness over a model whose distributions have few outcomes (the sampleable
+/// vocabulary narrowed to `sampleable`), so drafts are accepted in every pattern.
+fn narrow<D: QwenDevice>(dev: D, sampleable: u32, k: u32, buffers: u32) -> Harness<D> {
+    let g = Geometry {
+        buffers,
+        ..Geometry::plain(k)
+    };
+    let (mut cpu, mut cuda) = (cpu_config(&g), cuda_config(&g));
+    cpu.sampleable_vocab_size = sampleable;
+    cuda.sampleable_vocab_size = sampleable;
+    Harness::with_configs(dev, cpu, cuda, sched(5, k > 0))
+}
+
+/// Drafts accepted and rejected in every pattern, from none of three to all three, for
+/// greedy and sampled rows: every step equal to the reference executor's.
+pub fn draft_patterns<D: QwenDevice>(make: &dyn Fn() -> D) {
+    let mut seen = [0u64; 8];
+    for sampleable in [2u32, 3] {
+        let mut h = narrow(make(), sampleable, 3, 128);
+        let mut rng = TestRng(u64::from(sampleable));
+        for id in 0..10u64 {
+            let n = 2 + small(rng.below(11));
+            let prompt = rng.tokens(n, sampleable);
+            h.submit(request(
+                id,
+                prompt,
+                params(id),
+                24,
+                keyed(u8::try_from(id).expect("small")),
+            ));
+        }
+        h.run();
+        h.flush();
+        for (s, a) in seen.iter_mut().zip(h.pair().accepted) {
+            *s += a;
+        }
+    }
+    assert!(
+        seen[1..=4].iter().all(|&n| n > 0),
+        "drafting rows by tokens produced: {seen:?}"
+    );
+}
+
+/// A stop token or a length limit inside the drafts a step accepted: the turn ends where
+/// the engine says, its continuation point holds its own state (saved from the slot when
+/// accepted drafts carried it past a boundary), and the next turn resumes there exactly.
+pub fn endings_inside_drafts<D: QwenDevice>(make: &dyn Fn() -> D) {
+    let g = SamplingParams::greedy();
+    let mut saved = 0;
+    for sampleable in [2u32, 3] {
+        for seed in 0..6u64 {
+            for stop in [false, true] {
+                let mut rng = TestRng(seed * 31 + u64::from(sampleable));
+                let n = 5 + small(rng.below(5));
+                let prompt = rng.tokens(n, sampleable);
+                let cut = 4 + small(seed % 8);
+                let max = u32::try_from(cut).expect("small");
+                let mut first = request(1, prompt.clone(), g, max, keyed(1));
+                if stop {
+                    // Stop on the token the free run ends with, if it is new there.
+                    let mut free = narrow(make(), sampleable, 0, 64);
+                    let out = free.run_one(request(1, prompt.clone(), g, max, keyed(1)));
+                    if out[..cut - 1].contains(&out[cut - 1]) {
+                        continue;
+                    }
+                    first.stop_token_ids = vec![out[cut - 1]];
+                    first.max_tokens = 40;
+                }
+                let mut h = narrow(make(), sampleable, 3, 64);
+                h.run_one(first);
+                assert_eq!(h.outputs[&1].len(), cut, "seed {seed} stop {stop}");
+                saved += h.eng.kv().saved_states();
+                let mut next = prompt.clone();
+                next.extend(&h.outputs[&1]);
+                next.extend(rng.tokens(2, sampleable));
+                h.run_one(request(2, next, g, 6, keyed(1)));
+                let computed = u32::try_from(prompt.len() + cut - 1).expect("small");
+                assert_eq!(h.cached[&2], computed / 4 * 4, "seed {seed} stop {stop}");
+            }
+        }
+    }
+    assert!(
+        saved > 0,
+        "no ending fell inside accepted drafts past a boundary"
+    );
+}

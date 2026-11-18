@@ -1,9 +1,10 @@
 //! The fast profile's reproducibility between calls on a GPU, asserted (the serving
 //! contract): greedy tokens and every logit's bits the same alone and beside traffic,
 //! under every chunking, decoded and prefilled, from a cache hit and computed fresh, at
-//! every draft width (`qwen_common::invariance`), eagerly and with decode steps replaying
-//! their captured graphs; and the same workloads giving the same tokens and logits bits on
-//! every path (eager, a rung's launches run directly, its graph replayed). The fast
+//! every draft width, and with drafting on, greedy and seeded sampled rows alone, beside
+//! traffic and after a hit (`qwen_common::invariance`), eagerly and with decode steps
+//! replaying their captured graphs; and the same workloads giving the same tokens and
+//! logits bits on every path (eager, a rung's launches run directly, its graph replayed). The fast
 //! profile's attention is FA2 at head dimension 256. The exact profile is run the same way
 //! beside it. Then the fast profile's deviation from the exact one on the same requests,
 //! recorded. All on the fixture with 256-wide attention heads (`qwen_tiny256`), the
