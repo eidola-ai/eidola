@@ -62,9 +62,21 @@ fn f32_bits(x: &[f32]) -> Vec<u32> {
 /// rotated units (the query and key norms with RoPE).
 pub fn norm<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
     let mut g = Lcg(seed);
-    for &(rows, n) in &[(5usize, 200usize), (3, 5120), (1, 16), (4, 17)] {
+    // (rows, width, whether a residual is added): the widths a thread holds one, several
+    // and the most (8,192) elements of, a tail past the 16-wide chunks, and no residual.
+    for &(rows, n, with_add) in &[
+        (5usize, 200usize, true),
+        (3, 5120, true),
+        (1, 16, true),
+        (4, 17, true),
+        (2, 8192, true),
+        (3, 5120, false),
+        (2, 8191, false),
+    ] {
         let x: Vec<f32> = (0..rows * n).map(|_| g.bf16(4.0)).collect();
-        let add: Vec<f32> = (0..rows * n).map(|_| g.bf16(2.0)).collect();
+        let add: Vec<f32> = (0..rows * n)
+            .map(|_| if with_add { g.bf16(2.0) } else { 0.0 })
+            .collect();
         let w: Vec<f32> = (0..n).map(|_| 1.0 + g.bf16(0.5)).collect();
         let xb = buf(dev, &bits(&x));
         let ab = buf(dev, &bits(&add));
@@ -72,7 +84,7 @@ pub fn norm<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
         let ob = zeros(dev, rows * n * 2);
         let p = NormParams {
             x: xb.addr,
-            add: ab.addr,
+            add: if with_add { ab.addr } else { 0 },
             weight: wb.addr,
             out: ob.addr,
             rows: u(rows),
@@ -90,7 +102,13 @@ pub fn norm<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
         let mut want = Vec::new();
         for r in 0..rows {
             let hr: Vec<f32> = (0..n)
-                .map(|i| bf16_round(x[r * n + i] + add[r * n + i]))
+                .map(|i| {
+                    if with_add {
+                        bf16_round(x[r * n + i] + add[r * n + i])
+                    } else {
+                        x[r * n + i]
+                    }
+                })
                 .collect();
             let mut o = vec![0.0; n];
             rms_norm_zc(&hr, &w, 1e-6, &mut o);
@@ -1382,4 +1400,101 @@ pub fn fast_linears<E: QwenDevice, F: QwenDevice>(
         }
     }
     Ok(report.join("; "))
+}
+
+/// The fast profile's small-N BF16 GEMM (`qwen_fast.cuh`) as its body orders it: lane `l`
+/// of 32 sums its 8-element chunks `l, l + 32, …` by fused multiply-adds from +0, then the
+/// xor butterfly (16 down to 1); every lane ends with lane 0's sum.
+pub fn small_gemm_model(x: &[f32], w: &[f32], rows: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * n];
+    for r in 0..rows {
+        for o in 0..n {
+            let mut lanes = [0.0f32; 32];
+            for (l, lane) in lanes.iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for c in (l..k / 8).step_by(32) {
+                    for e in 0..8 {
+                        let i = c * 8 + e;
+                        acc = x[r * k + i].mul_add(w[o * k + i], acc);
+                    }
+                }
+                *lane = acc;
+            }
+            let mut off = 16;
+            while off > 0 {
+                let prev = lanes;
+                for (l, lane) in lanes.iter_mut().enumerate() {
+                    *lane = prev[l] + prev[l ^ off];
+                }
+                off /= 2;
+            }
+            out[r * n + o] = lanes[0];
+        }
+    }
+    out
+}
+
+/// A runner of the small-N GEMM: `(x, w, rows, first row, n, k)` to the f32 outputs of
+/// rows `first .. first + rows`.
+pub trait SmallGemmRun:
+    Fn(&[u16], &[u16], usize, usize, usize, usize) -> Result<Vec<f32>, String>
+{
+}
+impl<F: Fn(&[u16], &[u16], usize, usize, usize, usize) -> Result<Vec<f32>, String>> SmallGemmRun
+    for F
+{
+}
+pub type SmallGemm<'a> = &'a dyn SmallGemmRun;
+
+/// The small-N GEMM against [`small_gemm_model`] bit for bit, over a whole batch and over
+/// rows alone and in short batches at several offsets (so every row sits in several
+/// positions of a CTA's four).
+pub fn small_gemm(run: SmallGemm<'_>, seed: u64) -> Result<String, String> {
+    let mut g = Lcg(seed);
+    let mut report = Vec::new();
+    for &(n, k) in &[(96usize, 5120usize), (16, 128), (37, 640), (5, 264)] {
+        let rows_max = 70usize;
+        let x: Vec<f32> = (0..rows_max * k).map(|_| g.bf16(4.0)).collect();
+        let w: Vec<f32> = (0..n * k).map(|_| g.bf16(0.05)).collect();
+        let (xb, wb) = (bits(&x), bits(&w));
+        let want = small_gemm_model(&x, &w, rows_max, n, k);
+        let got = run(&xb, &wb, rows_max, 0, n, k)?;
+        same(
+            &format!("small gemm {n}x{k}"),
+            &f32_bits(&got),
+            &f32_bits(&want),
+        )?;
+        for &(rows, first) in &[(1usize, 0usize), (1, 13), (3, 5), (5, 64), (17, 2)] {
+            let got = run(&xb, &wb, rows, first, n, k)?;
+            same(
+                &format!("small gemm {n}x{k}: rows {first}..{}", first + rows),
+                &f32_bits(&got),
+                &f32_bits(&want[first * n..(first + rows) * n]),
+            )?;
+        }
+        report.push(format!("{n}x{k}"));
+    }
+    Ok(report.join(", "))
+}
+
+/// [`small_gemm`]'s runner on a device's `gemm_bf16`.
+pub fn small_gemm_on<D: QwenDevice>(dev: &D) -> impl SmallGemmRun + '_ {
+    move |x, w, rows, first, n, k| {
+        let (xb, wb) = (buf(dev, x), buf(dev, w));
+        let out = zeros(dev, rows * n * 4);
+        let p = LinearParams {
+            x: xb.addr + (first * k * 2) as u64,
+            w: wb.addr,
+            out: out.addr,
+            rows: u(rows),
+            n: u(n),
+            k: u(k),
+            x_stride: u(k),
+            out_stride: u(n),
+            out_f32: 1,
+        };
+        // SAFETY: the buffers hold what the struct names.
+        unsafe { dev.gemm_bf16(&p) }.map_err(|e| e.to_string())?;
+        Ok(read::<D, f32>(dev, &out, rows * n))
+    }
 }

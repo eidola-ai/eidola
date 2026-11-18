@@ -29,6 +29,13 @@
 #include "ds_body.cuh"
 #include "qwen_abi.cuh"
 
+// A loop over a thread's own values unrolled, so they stay in registers.
+#if defined(__CUDA_ARCH__)
+#define QW_UNROLL _Pragma("unroll")
+#else
+#define QW_UNROLL
+#endif
+
 namespace qwk {
 
 constexpr uint32_t kElementThreads = 256;
@@ -94,7 +101,13 @@ constexpr uint32_t kNormMax = 8192;  // widest unit a norm stages
 
 // A unit's BF16 inputs (after the residual add) are staged in shared memory by
 // every thread at once, so the sum's 16 serial lanes, in the reference's order,
-// read them at shared-memory latency.
+// read them at shared-memory latency. Each phase that touches global memory
+// issues all of a thread's loads before any of its stores (its elements `t`,
+// `t + 256`, … held in registers): written as load-compute-store per element,
+// the compiler cannot move a load above the store before it (the arrays may
+// alias), and a 5,120-wide unit cost twenty dependent memory round trips a
+// phase. Only where the loads sit moves; every value is computed by the
+// expressions and in the order it was.
 struct NormShared {
   float lanes[16];
   float tail;
@@ -102,6 +115,9 @@ struct NormShared {
   uint16_t row[kNormMax];
   float staged[kRopeMax];
 };
+
+// The elements one thread of a norm holds.
+constexpr uint32_t kNormPer = kNormMax / kElementThreads;
 
 template <class P>
 DS_FN void norm_block(const QwNormParams& p, uint32_t row, uint32_t unit, const P& par,
@@ -111,30 +127,54 @@ DS_FN void norm_block(const QwNormParams& p, uint32_t row, uint32_t unit, const 
   uint16_t* out = p.out + static_cast<uint64_t>(row) * p.out_stride +
                   static_cast<uint64_t>(unit) * p.out_unit_stride;
   const uint32_t threads = kElementThreads;
+  const uint32_t n = p.n;
   const uint16_t* add =
       p.add != nullptr ? p.add + static_cast<uint64_t>(row) * p.add_stride : nullptr;
   par.run([&](uint32_t t) {
-    for (uint32_t i = t; i < p.n; i += threads) {
-      uint16_t v = x[i];
-      if (add != nullptr) {
-        v = ds::bf16_store(ds::bf16_round(ds::bf16_value(v) + ds::bf16_value(add[i])));
-        x[i] = v;
+    uint16_t v[kNormPer];
+    uint16_t a[kNormPer];
+    QW_UNROLL
+    for (uint32_t c = 0; c < kNormPer; ++c) {
+      const uint32_t i = t + c * threads;
+      v[c] = i < n ? x[i] : uint16_t{0};
+    }
+    if (add != nullptr) {
+      QW_UNROLL
+      for (uint32_t c = 0; c < kNormPer; ++c) {
+        const uint32_t i = t + c * threads;
+        a[c] = i < n ? add[i] : uint16_t{0};
       }
-      sh.row[i] = v;
+      QW_UNROLL
+      for (uint32_t c = 0; c < kNormPer; ++c) {
+        const uint32_t i = t + c * threads;
+        if (i < n) {
+          v[c] = ds::bf16_store(ds::bf16_round(ds::bf16_value(v[c]) + ds::bf16_value(a[c])));
+          x[i] = v[c];
+        }
+      }
+    }
+    QW_UNROLL
+    for (uint32_t c = 0; c < kNormPer; ++c) {
+      const uint32_t i = t + c * threads;
+      if (i < n) sh.row[i] = v[c];
     }
   });
-  const uint32_t full = p.n & ~15u;
+  const uint32_t full = n & ~15u;
   par.run([&](uint32_t t) {
     if (t < 16) {
       float acc = 0.0f;
+      const uint16_t* r = sh.row;
+#if defined(__CUDA_ARCH__)
+#pragma unroll 8
+#endif
       for (uint32_t i = t; i < full; i += 16) {
-        const float v = ds::bf16_value(sh.row[i]);
+        const float v = ds::bf16_value(r[i]);
         acc = acc + v * v;
       }
       sh.lanes[t] = acc;
     } else if (t == 16) {
       float tail = 0.0f;
-      for (uint32_t i = full; i < p.n; ++i) {
+      for (uint32_t i = full; i < n; ++i) {
         const float v = ds::bf16_value(sh.row[i]);
         tail = tail + v * v;
       }
@@ -145,26 +185,35 @@ DS_FN void norm_block(const QwNormParams& p, uint32_t row, uint32_t unit, const 
     if (t == 0) {
       float acc[16];
       for (int j = 0; j < 16; ++j) acc[j] = sh.lanes[j];
-      sh.r = ds::rms_factor(ds::pinned_reduce(acc, sh.tail), p.n, p.eps);
+      sh.r = ds::rms_factor(ds::pinned_reduce(acc, sh.tail), n, p.eps);
     }
   });
   if (p.rotary == 0) {
     par.run([&](uint32_t t) {
-      for (uint32_t i = t; i < p.n; i += threads) {
-        out[i] = ds::bf16_store(ds::rms_element(ds::bf16_value(sh.row[i]), sh.r, p.weight[i]));
+      float w[kNormPer];
+      QW_UNROLL
+      for (uint32_t c = 0; c < kNormPer; ++c) {
+        const uint32_t i = t + c * threads;
+        w[c] = i < n ? p.weight[i] : 0.0f;
+      }
+      const float r = sh.r;
+      QW_UNROLL
+      for (uint32_t c = 0; c < kNormPer; ++c) {
+        const uint32_t i = t + c * threads;
+        if (i < n) out[i] = ds::bf16_store(ds::rms_element(ds::bf16_value(sh.row[i]), r, w[c]));
       }
     });
     return;
   }
   par.run([&](uint32_t t) {
-    for (uint32_t i = t; i < p.n; i += threads) {
+    for (uint32_t i = t; i < n; i += threads) {
       sh.staged[i] = ds::rms_element(ds::bf16_value(sh.row[i]), sh.r, p.weight[i]);
     }
   });
   const uint64_t at = static_cast<uint64_t>(p.positions[row]) * p.rotary;
   const uint32_t half = p.rotary / 2;
   par.run([&](uint32_t t) {
-    for (uint32_t j = t; j < p.n; j += threads) {
+    for (uint32_t j = t; j < n; j += threads) {
       float v = sh.staged[j];
       if (j < p.rotary) {
         const float rot = j < half ? -sh.staged[j + half] : sh.staged[j - half];
@@ -194,8 +243,10 @@ DS_FN void quant_thread(const QwQuantParams& p, uint32_t bx, uint32_t row, uint3
 }
 
 // The warp form (`eidola_qwen_quant`): a warp per 128-wide block, lane `l`
-// holding the block's elements `4l .. 4l + 4`, `kQuantWarps` blocks of a row
-// per CTA. Lane amaxes start from +0 like the reference's, and the warp
+// holding the block's elements `4l .. 4l + 4`, `kQuantWarps` blocks per CTA,
+// each for `kQuantRows` consecutive rows (every row's loads issued before any
+// row's arithmetic, so a large launch keeps several loads in flight a lane and
+// a quarter of the CTAs). Lane amaxes start from +0 like the reference's, and the warp
 // combines them by `max32` across a butterfly. That is the reference's amax
 // bit for bit in any order: every operand is a magnitude (no sign bit, so +0
 // and -0 never meet) and `max32` drops a NaN operand, so the result is the
@@ -204,13 +255,14 @@ DS_FN void quant_thread(const QwQuantParams& p, uint32_t bx, uint32_t row, uint3
 constexpr uint32_t kWarp = 32;
 constexpr uint32_t kQuantLane = QW_BLOCK / kWarp;
 constexpr uint32_t kQuantWarps = kBlockThreads / kWarp;
+constexpr uint32_t kQuantRows = 4;
 static_assert(kQuantLane == 4, "four elements a lane: one 8-byte load, one 4-byte store");
 
-// The block warp `w` of CTA (`bx`, `row`) quantises, or false past the row's.
-DS_FN bool quant_block_of(const QwQuantParams& p, uint32_t bx, uint32_t row, uint32_t w,
-                          uint32_t* b) {
+// The block warp `w` of CTA column `bx` quantises (in each of the CTA's rows),
+// or false past the row's blocks.
+DS_FN bool quant_block_of(const QwQuantParams& p, uint32_t bx, uint32_t w, uint32_t* b) {
   *b = bx * kQuantWarps + w;
-  return row < p.rows && *b < p.k / QW_BLOCK;
+  return *b < p.k / QW_BLOCK;
 }
 
 // Lane `l`'s elements of block `b` into `v`, and the amax of their magnitudes
@@ -434,6 +486,9 @@ DS_FN float dn_conv(const QwDnPrepParams& p, uint32_t pos, uint32_t ch) {
   return ds::bf16_round(ds::silu32(ds::bf16_round(acc)));
 }
 
+// Value channels a dn_prep thread convolves before storing any.
+constexpr uint32_t kDnPrepBatch = 4;
+
 // Block (position, key head): the key head's queries and keys, its value
 // heads' values, `β` and `α`.
 template <class P>
@@ -443,14 +498,29 @@ DS_FN void dn_prep_block(const QwDnPrepParams& p, uint32_t pos, uint32_t kh, con
   const uint32_t key_dim = p.k_heads * kd;
   const uint32_t group = p.v_heads / p.k_heads;
   const uint32_t threads = kBlockThreads;
+  // A thread's convolutions are computed a batch at a time before their
+  // stores, so their loads overlap (a store between them would order every
+  // later load behind it).
   par.run([&](uint32_t t) {
     for (uint32_t i = t; i < kd; i += threads) {
-      sh.q[i] = dn_conv(p, pos, kh * kd + i);
-      sh.k[i] = dn_conv(p, pos, key_dim + kh * kd + i);
+      const float q = dn_conv(p, pos, kh * kd + i);
+      const float k = dn_conv(p, pos, key_dim + kh * kd + i);
+      sh.q[i] = q;
+      sh.k[i] = k;
     }
-    for (uint32_t i = t; i < group * p.v_dim; i += threads) {
-      const uint32_t c = kh * group * p.v_dim + i;
-      p.v[static_cast<uint64_t>(pos) * p.v_heads * p.v_dim + c] = dn_conv(p, pos, 2 * key_dim + c);
+    const uint32_t values = group * p.v_dim;
+    for (uint32_t base = 0; base < values; base += kDnPrepBatch * threads) {
+      float y[kDnPrepBatch];
+      QW_UNROLL
+      for (uint32_t b = 0; b < kDnPrepBatch; ++b) {
+        const uint32_t i = base + b * threads + t;
+        y[b] = i < values ? dn_conv(p, pos, 2 * key_dim + kh * values + i) : 0.0f;
+      }
+      QW_UNROLL
+      for (uint32_t b = 0; b < kDnPrepBatch; ++b) {
+        const uint32_t i = base + b * threads + t;
+        if (i < values) p.v[static_cast<uint64_t>(pos) * p.v_heads * p.v_dim + kh * values + i] = y[b];
+      }
     }
   });
   par.run([&](uint32_t t) {
@@ -514,12 +584,6 @@ static_assert(kDnChunk <= kDnThreads, "a gate per thread");
 #define QW_ALIGN16 __align__(16)
 #else
 #define QW_ALIGN16 alignas(16)
-#endif
-// A loop over a thread's state values unrolled, so they stay in registers.
-#if defined(__CUDA_ARCH__)
-#define QW_UNROLL _Pragma("unroll")
-#else
-#define QW_UNROLL
 #endif
 
 struct QW_ALIGN16 DnRecShared {
@@ -711,9 +775,15 @@ DS_FN void dn_rec_out(const QwDnRecParams& p, uint32_t pos, uint32_t h, uint32_t
 
 // ---- DeltaNet: the gated norm (`deltanet::gated_norm`) ----
 
+// A head's outputs are staged in shared memory by every thread at once (one
+// load each), so the 16 serial lanes read them at shared-memory latency, and
+// the last phase issues its three loads before its store.
+constexpr uint32_t kDnNormMax = kBlockThreads;  // widest head the gated norm stages
+
 struct DnNormShared {
   float lanes[16];
   float r;
+  float o[kDnNormMax];
 };
 
 template <class P>
@@ -723,28 +793,32 @@ DS_FN void dn_norm_block(const QwDnNormParams& p, uint32_t row, uint32_t h, cons
   const float* o = p.o + (static_cast<uint64_t>(row) * p.v_heads + h) * vd;
   const uint32_t full = vd & ~15u;
   par.run([&](uint32_t t) {
+    if (t < vd) sh.o[t] = o[t];
+  });
+  par.run([&](uint32_t t) {
     if (t < 16) {
       float acc = 0.0f;
-      for (uint32_t i = t; i < full; i += 16) acc = acc + o[i] * o[i];
+      for (uint32_t i = t; i < full; i += 16) acc = acc + sh.o[i] * sh.o[i];
       sh.lanes[t] = acc;
     }
   });
   par.run([&](uint32_t t) {
     if (t == 0) {
       float tail = 0.0f;
-      for (uint32_t i = full; i < vd; ++i) tail = tail + o[i] * o[i];
+      for (uint32_t i = full; i < vd; ++i) tail = tail + sh.o[i] * sh.o[i];
       float acc[16];
       for (int j = 0; j < 16; ++j) acc[j] = sh.lanes[j];
       sh.r = ds::rms_factor(ds::pinned_reduce(acc, tail), vd, p.eps);
     }
   });
   par.run([&](uint32_t t) {
-    for (uint32_t j = t; j < vd; j += kBlockThreads) {
-      const float n = ds::bf16_round(p.weight[j] * ds::bf16_round(o[j] * sh.r));
-      const float z = ds::bf16_value(p.z[static_cast<uint64_t>(row) * p.z_stride + h * vd + j]);
-      p.out[(static_cast<uint64_t>(row) * p.v_heads + h) * vd + j] =
-          ds::bf16_store(ds::bf16_round(n * ds::silu32(z)));
-    }
+    if (t >= vd) return;
+    const float w = p.weight[t];
+    const uint16_t zb = p.z[static_cast<uint64_t>(row) * p.z_stride + h * vd + t];
+    const float n = ds::bf16_round(w * ds::bf16_round(sh.o[t] * sh.r));
+    const float z = ds::bf16_value(zb);
+    p.out[(static_cast<uint64_t>(row) * p.v_heads + h) * vd + t] =
+        ds::bf16_store(ds::bf16_round(n * ds::silu32(z)));
   });
 }
 

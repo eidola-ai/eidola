@@ -7,9 +7,12 @@
 //!
 //! Without a GPU, the descriptors come from the recording and everything else
 //! is checked; with one, the descriptors are encoded by the driver too and the
-//! whole defined image must match.
+//! whole defined image must match. Records the oracle made without a driver
+//! (`"driver":false`: the swapped FP8 kernels') hold zeros for their
+//! descriptors, so for them the encode calls are compared and the descriptor
+//! bytes are not.
 
-use eidola_engine_cuda::mimo::gemm::{GemmArgs, GemmKind, PARAMS_BYTES};
+use eidola_engine_cuda::mimo::gemm::{GemmArgs, GemmKind, PARAMS_BYTES, SwapTile};
 use eidola_engine_cuda::mimo::tma::{TmaSpec, TmaSwizzle, TmaType};
 use serde_json::Value;
 
@@ -27,6 +30,9 @@ struct Case {
     params: Vec<u8>,
     defined: Vec<bool>,
     encodes: Vec<Value>,
+    /// Whether the oracle encoded its descriptors through a driver (a GPU
+    /// host), or ran without one and recorded zeros for them.
+    driver: bool,
 }
 
 fn cases() -> Vec<Case> {
@@ -37,6 +43,9 @@ fn cases() -> Vec<Case> {
             let kind = match v["kernel"].as_str().unwrap() {
                 "fp8_blockwise" => GemmKind::Fp8Blockwise,
                 "bf16" => GemmKind::Bf16,
+                "fp8_swap16" => GemmKind::Fp8Swap(SwapTile::T16),
+                "fp8_swap32" => GemmKind::Fp8Swap(SwapTile::T32),
+                "fp8_swap64" => GemmKind::Fp8Swap(SwapTile::T64),
                 k => panic!("{k}"),
             };
             let u = |k: &str| u32::try_from(v[k].as_u64().unwrap()).unwrap();
@@ -66,6 +75,7 @@ fn cases() -> Vec<Case> {
                     .map(|b| b == b'1')
                     .collect(),
                 encodes: v["encodes"].as_array().unwrap().clone(),
+                driver: v["driver"].as_bool().unwrap_or(true),
             }
         })
         .collect()
@@ -114,9 +124,17 @@ fn spec_matches(spec: &TmaSpec, rec: &Value) {
     assert_eq!(rec["oob"].as_u64().unwrap(), 0);
 }
 
+/// The descriptors' bytes in Params: A, B, their fallbacks, D.
+const DESCRIPTORS: [usize; 5] = [128, 384, 640, 896, 1664];
+
+fn in_descriptor(i: usize) -> bool {
+    DESCRIPTORS.iter().any(|&d| (d..d + 128).contains(&i))
+}
+
 fn compare(case: &Case, ours: &[u8; PARAMS_BYTES]) {
     for (i, (&o, &theirs)) in ours.iter().zip(&case.params).enumerate() {
-        if case.defined[i] {
+        // A record made without a driver holds zeros for its descriptors.
+        if case.defined[i] && (case.driver || !in_descriptor(i)) {
             assert_eq!(
                 o, theirs,
                 "{:?} {:?}: byte {i} differs",
@@ -155,7 +173,16 @@ fn params_match_cutlass_with_recorded_descriptors() {
         compare(&case, &ours);
         checked += 1;
     }
-    assert!(checked >= 10);
+    assert!(checked >= 20);
+    // Every swapped tile is recorded.
+    for t in SwapTile::ALL {
+        assert!(
+            cases()
+                .iter()
+                .any(|c| c.kind == GemmKind::Fp8Swap(t) && c.can_implement),
+            "{t:?}"
+        );
+    }
 }
 
 /// The full defined image, descriptors encoded by this machine's driver.

@@ -6,9 +6,11 @@
 //! profile the FP8 linears run CUTLASS's blockwise tcgen05 GEMM
 //! (`cutlass_fp8_blockwise_gemm`, the same image MiMo's executor runs: f32 scales per
 //! 1×128 of the activations and 128×128 of the weights, exactly the kernels' layouts),
-//! and the BF16 linears (the head, the drafter's input projection, the DeltaNet's stacked
-//! `a` and `b` projections) CUTLASS's BF16 GEMM into an f32 scratch the caller names,
-//! rounded to BF16 by `eidola_qwen_round`; and
+//! with its operands swapped up to 64 rows (`cutlass_fp8_blockwise_swap`, [`fp8_kind`]); the BF16 linears
+//! (the head, the drafter's input projection) CUTLASS's BF16 GEMM into an f32 scratch the
+//! caller names, rounded to BF16 by `eidola_qwen_round`, and the DeltaNet's stacked `a`
+//! and `b` projections (`gemm_bf16`) our small-N kernel (`qwen_fast.cu`); the gates are
+//! computed in f32 there too (`eidola_qwen_fast_gate`); and
 //! attention runs FA2 at head dimension 256 ([`super::attention`]). Both profiles load the
 //! shared sampler (`sampling`) and the row copy (`engine_ops`'s `eidola_copy_rows`). Graphs
 //! are captured on the device's one stream ([`QwenDevice::capture`]).
@@ -28,13 +30,16 @@ use super::kernels::*;
 use crate::kv_cipher::{CipherItem, CipherItems, KvCipher};
 use crate::launch::dptr;
 use crate::mimo::engine_ops::EngineOps;
-use crate::mimo::gemm::{Gemm, GemmArgs, GemmKind};
+use crate::mimo::gemm::{Gemm, GemmArgs, GemmKind, SwapTile};
 use crate::module::{Kernel, KernelDir, KernelModule};
 use crate::sampler::{SampleLaunch, Sampler};
 use crate::{CudaError, Gpu, Result};
 
 /// The Qwen3.8 kernel images.
 pub const IMAGES: [&str; 3] = ["qwen_ops", "qwen_ops_div", "qwen_deltanet"];
+
+/// The fast profile's own kernels (`qwen_fast.cu`).
+pub const FAST_IMAGE: &str = "qwen_fast";
 
 struct Kernels {
     embed: Kernel,
@@ -52,10 +57,36 @@ struct Kernels {
     round: Kernel,
 }
 
+/// The fast profile's FP8 GEMM for `m` activation rows (the padded count the
+/// scales are laid out for): CUTLASS's blockwise kernel swapped, with the
+/// smallest activation tile that holds them, up to 64 rows; the unswapped
+/// kernel above. A row's bits are the same in every one of them
+/// (`tests/qwen_ops.rs`, `fast_fp8_configs_agree`), so the choice by row count
+/// keeps every row's result its own.
+pub fn fp8_kind(m: u32) -> GemmKind {
+    match m {
+        0..=16 => GemmKind::Fp8Swap(SwapTile::T16),
+        17..=32 => GemmKind::Fp8Swap(SwapTile::T32),
+        33..=64 => GemmKind::Fp8Swap(SwapTile::T64),
+        _ => GemmKind::Fp8Blockwise,
+    }
+}
+
+/// Every FP8 GEMM [`fp8_kind`] can choose.
+pub const FP8_KINDS: [GemmKind; 4] = [
+    GemmKind::Fp8Swap(SwapTile::T16),
+    GemmKind::Fp8Swap(SwapTile::T32),
+    GemmKind::Fp8Swap(SwapTile::T64),
+    GemmKind::Fp8Blockwise,
+];
+
 /// The fast profile's GEMMs and attention.
 struct Fast {
     fp8: Gemm,
+    fp8_swap: [Gemm; 3],
     bf16: Gemm,
+    small: Kernel,
+    gate: Kernel,
     attention: QwenAttention,
     _modules: Vec<KernelModule>,
 }
@@ -111,13 +142,24 @@ impl CudaDevice {
             QwenProfile::Exact => None,
             QwenProfile::Fast => {
                 let f = KernelModule::load(&gpu, dir, GemmKind::Fp8Blockwise.kernel().0)?;
+                let sw =
+                    KernelModule::load(&gpu, dir, GemmKind::Fp8Swap(SwapTile::T16).kernel().0)?;
                 let b = KernelModule::load(&gpu, dir, GemmKind::Bf16.kernel().0)?;
+                let q = KernelModule::load(&gpu, dir, FAST_IMAGE)?;
                 let a = KernelModule::load(&gpu, dir, super::attention::IMAGE)?;
+                let swap = |t| Gemm::from_module(GemmKind::Fp8Swap(t), &sw);
                 Some(Fast {
                     fp8: Gemm::from_module(GemmKind::Fp8Blockwise, &f)?,
+                    fp8_swap: [
+                        swap(SwapTile::T16)?,
+                        swap(SwapTile::T32)?,
+                        swap(SwapTile::T64)?,
+                    ],
                     bf16: Gemm::from_module(GemmKind::Bf16, &b)?,
+                    small: bound::<LinearParams>(&q, FAST_IMAGE, "eidola_qwen_fast_gemm_bf16")?,
+                    gate: bound::<GateParams>(&q, FAST_IMAGE, "eidola_qwen_fast_gate")?,
                     attention: QwenAttention::from_module(a)?,
-                    _modules: vec![f, b],
+                    _modules: vec![f, sw, b, q],
                 })
             }
         };
@@ -170,6 +212,87 @@ impl CudaDevice {
     ///
     /// `p` is the kernel's parameter struct and every address in it is valid for what the
     /// kernel does with it.
+    /// The fast FP8 linear of `p` on the GEMM of `kind` (one of [`FP8_KINDS`]), whatever
+    /// [`fp8_kind`] would choose: for the tests that hold every kind to the others, and
+    /// the bench.
+    ///
+    /// # Safety
+    ///
+    /// As [`QwenKernels::lin8`].
+    pub unsafe fn lin8_on(&self, p: &Lin8Params, kind: GemmKind) -> Result<()> {
+        if p.rows == 0 {
+            return Ok(());
+        }
+        lin8_grid(p)?;
+        let f = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the FP8 GEMMs run in the fast profile"))?;
+        if p.out_stride != p.n {
+            return Err(CudaError::new("the fast FP8 linear writes dense rows"));
+        }
+        let gemm = match kind {
+            GemmKind::Fp8Blockwise => &f.fp8,
+            GemmKind::Fp8Swap(SwapTile::T16) => &f.fp8_swap[0],
+            GemmKind::Fp8Swap(SwapTile::T32) => &f.fp8_swap[1],
+            GemmKind::Fp8Swap(SwapTile::T64) => &f.fp8_swap[2],
+            GemmKind::Bf16 => return Err(CudaError::new("not an FP8 GEMM")),
+        };
+        let a = GemmArgs {
+            m: p.m_pad,
+            n: p.n,
+            k: p.k,
+            a: p.a,
+            b: p.w,
+            d: p.out,
+            sfa: p.a_scales,
+            sfb: p.w_scales,
+            alpha: 1.0,
+        };
+        kind.check(&a)?;
+        // SAFETY: `m_pad` rows of codes and scales, the weight and `m_pad · n` outputs
+        // (the padding rows' outputs are written and never read).
+        unsafe { gemm.launch(&self.gpu, &a) }
+    }
+
+    /// The exact gates of `p` (`eidola_qwen_gate`) whatever the profile: the test that
+    /// measures the fast gates' distance from them, and the bench.
+    ///
+    /// # Safety
+    ///
+    /// As [`QwenKernels::gate`].
+    pub unsafe fn gate_exact(&self, p: &GateParams) -> Result<()> {
+        if p.rows == 0 {
+            return Ok(());
+        }
+        let g = gate_grid(p)?;
+        // SAFETY: the caller's.
+        unsafe { self.go(&self.k.gate, p, g) }
+    }
+
+    /// The fast BF16 GEMM of `p` on CUTLASS's tensor-core kernel rather than the small-N
+    /// kernel [`QwenKernels::gemm_bf16`] runs: the bench's comparison.
+    ///
+    /// # Safety
+    ///
+    /// As [`QwenKernels::gemm_bf16`].
+    pub unsafe fn gemm_bf16_cutlass(&self, p: &LinearParams) -> Result<()> {
+        if p.rows == 0 {
+            return Ok(());
+        }
+        linear_grid(p)?;
+        let f = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the BF16 GEMM runs in the fast profile"))?;
+        if p.out_stride != p.n || p.out_f32 != 1 {
+            return Err(CudaError::new("the fast BF16 GEMM writes dense f32 rows"));
+        }
+        let a = Self::bf16_args(p, p.out)?;
+        // SAFETY: the caller's.
+        unsafe { f.bf16.launch(&self.gpu, &a) }
+    }
+
     unsafe fn go<P: Copy>(&self, kernel: &Kernel, p: &P, grid: [u32; 3]) -> Result<()> {
         let mut v = *p;
         let mut args = [(&mut v as *mut P).cast::<c_void>()];
@@ -207,26 +330,8 @@ impl QwenKernels for CudaDevice {
         let g = lin8_grid(p)?;
         match &self.fast {
             None => unsafe { self.go(&self.k.lin8, p, g) },
-            Some(f) => {
-                if p.out_stride != p.n {
-                    return Err(CudaError::new("the fast FP8 linear writes dense rows"));
-                }
-                let a = GemmArgs {
-                    m: p.m_pad,
-                    n: p.n,
-                    k: p.k,
-                    a: p.a,
-                    b: p.w,
-                    d: p.out,
-                    sfa: p.a_scales,
-                    sfb: p.w_scales,
-                    alpha: 1.0,
-                };
-                GemmKind::Fp8Blockwise.check(&a)?;
-                // SAFETY: `m_pad` rows of codes and scales, the weight and `m_pad · n`
-                // outputs (the padding rows' outputs are written and never read).
-                unsafe { f.fp8.launch(&self.gpu, &a) }
-            }
+            // SAFETY: the caller's.
+            Some(_) => unsafe { self.lin8_on(p, fp8_kind(p.m_pad)) },
         }
     }
     unsafe fn linear(&self, p: &LinearParams, fast: Option<u64>) -> Result<()> {
@@ -270,16 +375,23 @@ impl QwenKernels for CudaDevice {
         if p.out_stride != p.n || p.out_f32 != 1 {
             return Err(CudaError::new("the fast BF16 GEMM writes dense f32 rows"));
         }
-        let a = Self::bf16_args(p, p.out)?;
+        let g = small_gemm_grid(p)?;
         // SAFETY: `rows` input rows, the weight, `rows · n` f32 outputs: the caller's.
-        unsafe { f.bf16.launch(&self.gpu, &a) }
+        unsafe { self.go(&f.small, p, g) }
     }
     unsafe fn gate(&self, p: &GateParams) -> Result<()> {
         if p.rows == 0 {
             return Ok(());
         }
         let g = gate_grid(p)?;
-        unsafe { self.go(&self.k.gate, p, g) }
+        match &self.fast {
+            None => unsafe { self.go(&self.k.gate, p, g) },
+            Some(f) => {
+                let g = fast_gate_grid(p)?;
+                // SAFETY: the caller's rows, checked by the grid functions.
+                unsafe { self.go(&f.gate, p, g) }
+            }
+        }
     }
     unsafe fn kv_write(&self, p: &KvWriteParams) -> Result<()> {
         if p.rows == 0 {

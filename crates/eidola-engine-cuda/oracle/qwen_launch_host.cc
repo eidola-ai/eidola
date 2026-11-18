@@ -1,6 +1,7 @@
-// The Qwen3.8 kernels' bodies (`eidola-engine-kernels`' `csrc/qwen_ops.cuh`,
-// the C++ a GPU compiles) as a host library: one function per launch, each
-// repeating its kernel's entry over the grid the Rust wrapper computed. Blocks
+// The Qwen3.8 kernels' bodies (`eidola-engine-kernels`' `csrc/qwen_ops.cuh`
+// and the fast profile's `csrc/qwen_fast.cuh`, the C++ a GPU compiles) as a
+// host library: one function per launch, each repeating its kernel's entry
+// over the grid the Rust wrapper computed. Blocks
 // and threads run in descending order and shared memory starts as garbage, so
 // a body that reads what another thread writes inside a phase, or reads
 // shared memory it never wrote, shows up. Dev-only: built by the crate's tests
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <vector>
 
+#include "qwen_fast.cuh"
 #include "qwen_ops.cuh"
 
 namespace {
@@ -44,17 +46,18 @@ void qwen_host_norm(const QwNormParams* p, uint32_t gx, uint32_t gy) {
     }
 }
 
-// `eidola_qwen_quant`'s entry: a warp per block, its lanes' amaxes combined by
-// the butterfly the device's shuffles run, in the same operand order.
+// `eidola_qwen_quant`'s entry: a warp per block and `kQuantRows` rows, its
+// lanes' amaxes combined by the butterfly the device's shuffles run, in the
+// same operand order.
 void qwen_host_quant(const QwQuantParams* p, uint32_t gx, uint32_t gy) {
   constexpr uint32_t kW = qwk::kWarp;
   float v[kW][qwk::kQuantLane];
   float m[kW];
-  for (uint32_t y = gy; y-- > 0;)
+  for (uint32_t y = gy * qwk::kQuantRows; y-- > 0;)
     for (uint32_t x = gx; x-- > 0;)
       for (uint32_t w = qwk::kQuantWarps; w-- > 0;) {
         uint32_t b;
-        if (!qwk::quant_block_of(*p, x, y, w, &b)) continue;
+        if (y >= p->rows || !qwk::quant_block_of(*p, x, w, &b)) continue;
         for (uint32_t l = kW; l-- > 0;) m[l] = qwk::quant_lane_load(*p, y, b, l, v[l]);
         for (uint32_t off = kW / 2; off > 0; off >>= 1) {
           float next[kW];
@@ -62,6 +65,28 @@ void qwen_host_quant(const QwQuantParams* p, uint32_t gx, uint32_t gy) {
           std::memcpy(m, next, sizeof m);
         }
         for (uint32_t l = kW; l-- > 0;) qwk::quant_lane_store(*p, y, b, l, v[l], m[l]);
+      }
+}
+
+// `eidola_qwen_fast_gemm_bf16`'s entry (the fast profile's small-N GEMM): a
+// warp per output, its lanes' sums combined by the butterfly the device's
+// shuffles run.
+void qwen_host_fast_gemm(const QwLinearParams* p, uint32_t gx, uint32_t gy) {
+  constexpr uint32_t kW = qwf::kWarp;
+  float acc[kW][qwf::kSmallRows];
+  for (uint32_t y = gy; y-- > 0;)
+    for (uint32_t x = gx; x-- > 0;)
+      for (uint32_t w = qwf::kSmallWarps; w-- > 0;) {
+        uint32_t n, r0, rows;
+        if (!qwf::small_gemm_unit(*p, x, y, w, &n, &r0, &rows)) continue;
+        for (uint32_t l = kW; l-- > 0;) qwf::small_gemm_lane(*p, n, r0, rows, l, acc[l]);
+        for (uint32_t off = kW / 2; off > 0; off >>= 1) {
+          float next[kW][qwf::kSmallRows];
+          for (uint32_t l = kW; l-- > 0;)
+            for (uint32_t r = 0; r < qwf::kSmallRows; ++r) next[l][r] = acc[l][r] + acc[l ^ off][r];
+          std::memcpy(acc, next, sizeof acc);
+        }
+        qwf::small_gemm_store(*p, n, r0, rows, acc[0]);
       }
 }
 

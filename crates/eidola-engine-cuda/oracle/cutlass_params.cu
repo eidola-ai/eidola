@@ -27,6 +27,14 @@
 //     -Icutlass/include -Icutlass/tools/util/include -Icrates/eidola-engine-kernels/csrc \
 //     crates/eidola-engine-cuda/oracle/cutlass_params.cu -lcuda -ldl -o cutlass-params
 //   ./cutlass-params > crates/eidola-engine-cuda/tests/data/cutlass_params.jsonl
+//
+// Built with `-DEIDOLA_ORACLE_NO_DRIVER` (and without `-lcuda`) it runs on a
+// host with no GPU and no driver, inside the kernel build's own toolchain
+// (`nix-shell crates/eidola-engine-kernels/nix`): every encode call is still
+// logged with its arguments, but the descriptor it returns is zeros, and each
+// record says `"driver":false`. The Params bytes CUTLASS defines outside the
+// descriptors are what a GPU host prints; the Rust test compares those, and
+// on a GPU it encodes the logged descriptors itself.
 
 #include <cuda.h>
 #include <dlfcn.h>
@@ -50,6 +58,7 @@ CUresult oracle_encode(CUtensorMap* map, CUtensorMapDataType dtype, cuuint32_t r
 
 #include "cutlass_bf16_gemm.cu"
 #include "cutlass_fp8_blockwise_gemm.cu"
+#include "cutlass_fp8_blockwise_swap.cu"
 
 #undef cuTensorMapEncodeTiled
 
@@ -77,8 +86,13 @@ CUresult oracle_encode(CUtensorMap* map, CUtensorMapDataType dtype, cuuint32_t r
   snprintf(buf + n, sizeof buf - n, "],\"interleave\":%d,\"swizzle\":%d,\"l2\":%d,\"oob\":%d}",
            (int)interleave, (int)swizzle, (int)l2, (int)oob);
   g_encodes.push_back(buf);
+#if defined(EIDOLA_ORACLE_NO_DRIVER)
+  memset(map, 0, sizeof *map);
+  return CUDA_SUCCESS;
+#else
   return cuTensorMapEncodeTiled(map, dtype, rank, addr, dims, strides, box, elem_strides, interleave,
                                 swizzle, l2, oob);
+#endif
 }
 
 template <class T>
@@ -99,6 +113,12 @@ static std::string encodes() {
   g_encodes.clear();
   return s + "]";
 }
+
+#if defined(EIDOLA_ORACLE_NO_DRIVER)
+constexpr bool kDriver = false;
+#else
+constexpr bool kDriver = true;
+#endif
 
 constexpr uint64_t kA = 0x7f0000000000ull, kB = 0x7f1000000000ull, kD = 0x7f2000000000ull,
                    kSFA = 0x7f3000000000ull, kSFB = 0x7f4000000000ull;
@@ -155,7 +175,7 @@ static void emit(const char* name, int m, int n, int k, double alpha,
          "\"workspace\":%zu,\"grid\":[%u,%u,%u],\"params_bytes\":%zu,"
          "\"offsets\":{\"problem_shape\":%td,\"mainloop\":%td,\"epilogue\":%td,\"scheduler\":%td,"
          "\"hw_info\":%td,\"sizeof_mainloop\":%zu,\"sizeof_epilogue\":%zu,\"sizeof_scheduler\":%zu},"
-         "\"params\":\"%s\",\"defined\":\"%s\",\"encodes\":%s}\n",
+         "\"params\":\"%s\",\"defined\":\"%s\",\"driver\":%s,\"encodes\":%s}\n",
          name, m, n, k, alpha, ok ? "true" : "false", ws, grid.x, grid.y, grid.z, sizeof(params),
          reinterpret_cast<const char*>(&params.problem_shape) - base,
          reinterpret_cast<const char*>(&params.mainloop) - base,
@@ -163,7 +183,7 @@ static void emit(const char* name, int m, int n, int k, double alpha,
          reinterpret_cast<const char*>(&params.scheduler) - base,
          reinterpret_cast<const char*>(&params.hw_info) - base, sizeof(params.mainloop),
          sizeof(params.epilogue), sizeof(params.scheduler), hex(params).c_str(), mask.c_str(),
-         enc.c_str());
+         kDriver ? "true" : "false", enc.c_str());
 }
 
 static cutlass::KernelHardwareInfo hw() {
@@ -196,6 +216,35 @@ static void fp8(int m, int n, int k) {
   emit<K>("fp8_blockwise", m, n, k, 1.0, args);
 }
 
+// The swapped FP8 GEMM, recorded in the executor's terms: `m` activation rows
+// at kA with scales at kSFA, the weight `[n, k]` at kB with scales at kSFB.
+// CUTLASS sees the transposed problem (n, m, k): its A is the weight, its B
+// the activations, its D column-major.
+template <class K, class ScaleConfig>
+static void fp8_swap(const char* name, int m, int n, int k) {
+  using StrideA = typename K::StrideA;
+  using StrideB = typename K::StrideB;
+  using StrideD = typename K::StrideD;
+  using StrideC = typename K::StrideC;
+  using EA = typename K::ElementA;
+  using EB = typename K::ElementB;
+  using ED = typename K::ElementD;
+  auto sa = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(n, k, 1));
+  auto sb = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(m, k, 1));
+  auto sd = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(n, m, 1));
+  auto sc = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(n, m, 1));
+  auto lsfa = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(n, m, k, 1));
+  auto lsfb = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(n, m, k, 1));
+  typename K::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {n, m, k, 1},
+      {reinterpret_cast<EA*>(kB), sa, reinterpret_cast<EB*>(kA), sb,
+       reinterpret_cast<float*>(kSFB), lsfa, reinterpret_cast<float*>(kSFA), lsfb},
+      {{}, nullptr, sc, reinterpret_cast<ED*>(kD), sd},
+      hw()};
+  emit<K>(name, m, n, k, 1.0, args);
+}
+
 static void bf16(int m, int n, int k, float alpha) {
   using K = EidolaBf16Gemm;
   using namespace eidola_bf16_gemm;
@@ -217,6 +266,7 @@ static void bf16(int m, int n, int k, float alpha) {
 }
 
 int main() {
+#if !defined(EIDOLA_ORACLE_NO_DRIVER)
   if (cuInit(0) != CUDA_SUCCESS) {
     fprintf(stderr, "cuInit failed\n");
     return 1;
@@ -229,6 +279,7 @@ int main() {
     fprintf(stderr, "no device context\n");
     return 1;
   }
+#endif
   for (auto [m, n, k] : std::vector<std::tuple<int, int, int>>{
            {1, 13824, 4096}, {37, 14848, 4096}, {300, 32768, 4096}, {5, 4096, 16384},
            {128, 128, 128}, {1000, 4096, 2048}, {4, 256, 512}, {2048, 13824, 4096}})
@@ -238,5 +289,17 @@ int main() {
            {4, 4096, 8192, 0.5f}, {1, 256, 4096, 1.0f}, {2048, 4096, 8192, 0.707f},
            {64, 128, 64, 1.0f}})
     bf16(m, n, k, a);
+  {
+    using SC = eidola_fp8_blockwise_swap::ScaleConfig;
+    for (auto [m, n, k] : std::vector<std::tuple<int, int, int>>{
+             {4, 5120, 6144}, {16, 17408, 5120}, {1, 1024, 5120}, {12, 5120, 17408}, {3, 256, 512}})
+      fp8_swap<EidolaFp8Swap16, SC>("fp8_swap16", m, n, k);
+    for (auto [m, n, k] : std::vector<std::tuple<int, int, int>>{
+             {32, 10240, 5120}, {20, 5120, 6144}, {4, 1024, 5120}})
+      fp8_swap<EidolaFp8Swap32, SC>("fp8_swap32", m, n, k);
+    for (auto [m, n, k] : std::vector<std::tuple<int, int, int>>{
+             {64, 17408, 5120}, {36, 5120, 17408}, {64, 256, 128}, {48, 12288, 5120}})
+      fp8_swap<EidolaFp8Swap64, SC>("fp8_swap64", m, n, k);
+  }
   return 0;
 }

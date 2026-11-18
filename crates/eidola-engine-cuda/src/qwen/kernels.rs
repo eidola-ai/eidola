@@ -107,6 +107,8 @@ const BLOCK_THREADS: u32 = 128;
 const LIN_ROWS: u32 = 8;
 /// 128-wide blocks a CTA of the quantiser takes, a warp each (`kQuantWarps`).
 const QUANT_WARPS: u32 = BLOCK_THREADS / 32;
+/// Rows a quantiser CTA covers (`kQuantRows`).
+const QUANT_ROWS: u32 = 4;
 
 pub fn embed_grid(p: &EmbedParams) -> Result<[u32; 3]> {
     ensure(
@@ -161,7 +163,10 @@ pub fn quant_grid(p: &QuantParams) -> Result<[u32; 3]> {
         p.x.is_multiple_of(8) && p.x_stride.is_multiple_of(4) && p.codes.is_multiple_of(4),
         "quant: a lane's 8-byte load and 4-byte store aligned",
     )?;
-    rows_grid((p.k / BLOCK).div_ceil(QUANT_WARPS), p.rows)
+    rows_grid(
+        (p.k / BLOCK).div_ceil(QUANT_WARPS),
+        p.rows.div_ceil(QUANT_ROWS),
+    )
 }
 
 pub fn lin8_grid(p: &Lin8Params) -> Result<[u32; 3]> {
@@ -190,6 +195,32 @@ pub fn linear_grid(p: &LinearParams) -> Result<[u32; 3]> {
     Ok([p.n.div_ceil(BLOCK_THREADS), y.max(1), 1])
 }
 
+/// Outputs (a warp each) and rows of a small-N GEMM CTA (`qwen_fast.cuh`).
+const SMALL_WARPS: u32 = 4;
+const SMALL_ROWS: u32 = 4;
+
+/// The fast profile's small-N BF16 GEMM (`eidola_qwen_fast_gemm_bf16`): f32 outputs,
+/// dense rows of 16-byte chunks; CTAs of four outputs by four rows.
+pub fn small_gemm_grid(p: &LinearParams) -> Result<[u32; 3]> {
+    ensure(p.x != 0 && p.w != 0 && p.out != 0, "small gemm: null")?;
+    ensure(p.n > 0 && p.k > 0, "small gemm: empty")?;
+    ensure(
+        p.out_f32 == 1 && p.out_stride >= p.n,
+        "small gemm: f32 rows",
+    )?;
+    ensure(
+        p.k.is_multiple_of(8)
+            && p.x_stride.is_multiple_of(8)
+            && p.x_stride >= p.k
+            && p.x.is_multiple_of(16)
+            && p.w.is_multiple_of(16),
+        "small gemm: rows of whole 16-byte chunks, aligned",
+    )?;
+    let y = p.rows.div_ceil(SMALL_ROWS);
+    ensure(y <= MAX_GRID_Y, "small gemm: rows")?;
+    Ok([p.n.div_ceil(SMALL_WARPS), y.max(1), 1])
+}
+
 pub fn gate_grid(p: &GateParams) -> Result<[u32; 3]> {
     ensure(p.a != 0 && p.g != 0 && p.out != 0, "gate: null")?;
     ensure(
@@ -204,6 +235,12 @@ pub fn gate_grid(p: &GateParams) -> Result<[u32; 3]> {
         "gate: strides",
     )?;
     rows_grid(p.width.div_ceil(ELEMENT), p.rows)
+}
+
+/// The fast profile's gates (`eidola_qwen_fast_gate`): 256 threads of 8 elements.
+pub fn fast_gate_grid(p: &GateParams) -> Result<[u32; 3]> {
+    gate_grid(p)?;
+    rows_grid(p.width.div_ceil(ELEMENT * 8), p.rows)
 }
 
 pub fn kv_write_grid(p: &KvWriteParams) -> Result<[u32; 3]> {
@@ -317,6 +354,10 @@ pub fn dn_norm_grid(p: &DnNormParams) -> Result<[u32; 3]> {
         "dn norm: widths",
     )?;
     ensure(
+        p.v_dim <= BLOCK_THREADS,
+        "dn norm: value dim at most 128 (a thread per staged value)",
+    )?;
+    ensure(
         p.eps.is_finite() && p.eps > 0.0 && p.reserved == 0,
         "dn norm: epsilon",
     )?;
@@ -397,8 +438,17 @@ mod tests {
             x_stride: 5120,
             m_pad: 4,
         };
-        assert_eq!(quant_grid(&q).unwrap(), [10, 3, 1]);
-        assert_eq!(quant_grid(&QuantParams { k: 640, ..q }).unwrap(), [2, 3, 1]);
+        assert_eq!(quant_grid(&q).unwrap(), [10, 1, 1]);
+        assert_eq!(quant_grid(&QuantParams { k: 640, ..q }).unwrap(), [2, 1, 1]);
+        assert_eq!(
+            quant_grid(&QuantParams {
+                rows: 9,
+                m_pad: 12,
+                ..q
+            })
+            .unwrap(),
+            [10, 3, 1]
+        );
         for bad in [
             QuantParams { k: 100, ..q },
             QuantParams { x: 260, ..q },
