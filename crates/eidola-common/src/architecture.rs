@@ -344,6 +344,16 @@ impl HybridDims {
         2 * self.v_heads * 4 + 2 * self.key_dim() * 4 + v * 4 + 2 * self.v_heads * 4 + v * 4
     }
 
+    /// One block's scratch of the fast profile's blocked DeltaNet (16
+    /// positions at most), f32: per value head `W` (16 × key dim), `U` (16 ×
+    /// value dim), `P` (16 × 16) and 48 factors; per key head the block's
+    /// queries and keys rounded (16 × key dim each).
+    pub const fn chunk_tile_bytes(&self) -> u64 {
+        let t = 16;
+        self.v_heads * (t * self.k_dim + t * self.v_dim + t * t + 48) * 4
+            + self.k_heads * 2 * t * self.k_dim * 4
+    }
+
     /// One convolution input row of the staging, f32.
     pub const fn conv_row_bytes(&self) -> u64 {
         self.conv_dim() * 4

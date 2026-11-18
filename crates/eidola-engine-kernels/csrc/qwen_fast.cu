@@ -26,6 +26,29 @@ extern "C" __global__ void __launch_bounds__(qwf::kSmallWarps * qwf::kWarp)
 EIDOLA_KERNEL_META(eidola_qwen_fast_gemm_bf16, qwf::kSmallWarps * qwf::kWarp, 1, 1, 0, 1, 1, 1,
                    sizeof(QwLinearParams));
 
+// The tiled form (`qwen_fast.cuh`): a warp per `kTileRows` rows by `kTileOuts`
+// outputs, the same sums in the same order, the same butterfly.
+extern "C" __global__ void __launch_bounds__(qwf::kTileWarps * qwf::kWarp)
+    eidola_qwen_fast_gemm_bf16_tiled(const __grid_constant__ QwLinearParams p) {
+  const uint32_t l = threadIdx.x % qwf::kWarp;
+  uint32_t n0, outs, r0, rows;
+  // Uniform across the warp: the tile is the warp's.
+  if (!qwf::tile_gemm_unit(p, blockIdx.x, blockIdx.y, threadIdx.x / qwf::kWarp, &n0, &outs, &r0,
+                           &rows))
+    return;
+  float acc[qwf::kTileRows * qwf::kTileOuts];
+  qwf::tile_gemm_lane(p, n0, outs, r0, rows, l, acc);
+#pragma unroll
+  for (uint32_t i = 0; i < qwf::kTileRows * qwf::kTileOuts; ++i) {
+    for (uint32_t off = qwf::kWarp / 2; off > 0; off >>= 1) {
+      acc[i] = acc[i] + __shfl_xor_sync(0xffffffffu, acc[i], off);
+    }
+  }
+  if (l == 0) qwf::tile_gemm_store(p, n0, outs, r0, rows, acc);
+}
+EIDOLA_KERNEL_META(eidola_qwen_fast_gemm_bf16_tiled, qwf::kTileWarps * qwf::kWarp, 1, 1, 0, 1, 1,
+                   1, sizeof(QwLinearParams));
+
 // ---- the gates in f32 (`eidola_qwen_fast_gate`) ----
 //
 // The exact gates (`eidola_qwen_gate`) take the reference's sigmoid and SiLU

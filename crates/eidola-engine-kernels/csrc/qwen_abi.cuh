@@ -386,3 +386,38 @@ struct QwRoundParams {
 };
 QW_ABI_STRUCT(QwRoundParams, 40);
 QW_ABI_FIELD(QwRoundParams, out_f32, 32);
+
+// Row copies of 32-bit words (`eidola_qwen_copy_rows`): up to
+// `QW_COPY_GROUPS` groups in one launch, each a table of up to
+// `QW_COPY_BUFFERS` buffers of `width`-word rows and `items` copies (source
+// buffer and row, destination buffer and row: device data). An item whose
+// buffer or row is out of range copies nothing and raises
+// `QW_STATUS_BAD_INDEX`; an item copying a row onto itself (the padding of a
+// rung's lists) copies nothing.
+constexpr uint32_t QW_COPY_GROUPS = 3;
+constexpr uint32_t QW_COPY_BUFFERS = 8;
+constexpr uint32_t QW_STATUS_BAD_INDEX = 4u;
+
+struct QwCopyGroup {
+  uint32_t* buf[QW_COPY_BUFFERS];
+  uint64_t rows[QW_COPY_BUFFERS];  // rows each buffer holds
+  const uint32_t* src_buf;         // [items]
+  const uint32_t* src_row;
+  const uint32_t* dst_buf;
+  const uint32_t* dst_row;
+  uint32_t width;  // words a row
+  uint32_t items;
+};
+QW_ABI_STRUCT(QwCopyGroup, 168);
+QW_ABI_FIELD(QwCopyGroup, src_buf, 128);
+QW_ABI_FIELD(QwCopyGroup, width, 160);
+
+struct QwCopyParams {
+  QwCopyGroup group[QW_COPY_GROUPS];
+  uint32_t* status;
+  uint32_t groups;
+  uint32_t reserved;
+};
+QW_ABI_STRUCT(QwCopyParams, 520);
+QW_ABI_FIELD(QwCopyParams, status, 504);
+QW_ABI_FIELD(QwCopyParams, groups, 512);

@@ -745,9 +745,11 @@ fn dn_rec_launch<D: QwenDevice>(
     g: &mut Lcg,
     (k_heads, v_heads, v_dim): (usize, usize, usize),
     lens: &[usize],
+    short: bool,
 ) -> Result<(), String> {
     let kd = 128usize;
-    let what = format!("dn rec {k_heads}/{v_heads}x{v_dim} over {lens:?}");
+    let form = if short { "short" } else { "general" };
+    let what = format!("dn rec ({form}) {k_heads}/{v_heads}x{v_dim} over {lens:?}");
     let group = v_heads / k_heads;
     let state_len = v_heads * kd * v_dim;
     let total: usize = lens.iter().sum();
@@ -822,7 +824,11 @@ fn dn_rec_launch<D: QwenDevice>(
         reserved: 0,
     };
     // SAFETY: the buffers hold what the struct names.
-    unsafe { dev.dn_rec(&p) }.map_err(|e| e.to_string())?;
+    if short {
+        unsafe { dev.dn_rec_short(&p) }.map_err(|e| e.to_string())?;
+    } else {
+        unsafe { dev.dn_rec(&p) }.map_err(|e| e.to_string())?;
+    }
     let got_out = read::<D, f32>(dev, &ob, total * v_heads * v_dim);
     for (r, (first, len, src, out_from, live_after, writes)) in plans.into_iter().enumerate() {
         let mut st = src.unwrap_or_else(|| vec![0.0; state_len]);
@@ -897,17 +903,22 @@ fn dn_rec_launch<D: QwenDevice>(
 /// The recurrence alone at every remainder of its column blocks and staged chunks: 1, 3
 /// and 64 sequences, prefills of 1, 63, 64, 65 and 2,048 positions, a value width that
 /// leaves a partial column block, at the released head grouping (three value heads a key
-/// head) and at a narrow one.
+/// head) and at a narrow one; in both forms (the short one also over decode-size runs:
+/// 32 sequences of 1 to 9 positions, one of none).
 pub fn dn_recurrence<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
     let mut g = Lcg(seed);
-    dn_rec_launch(dev, &mut g, (2, 6, 128), &[1])?;
-    dn_rec_launch(dev, &mut g, (1, 3, 128), &[63, 1, 65])?;
-    dn_rec_launch(dev, &mut g, (2, 4, 80), &[64, 9, 17])?;
-    let lens: Vec<usize> = (0..64)
-        .map(|r| [1, 63, 64, 65, 2, 8, 9, 16][r % 8])
-        .collect();
-    dn_rec_launch(dev, &mut g, (1, 2, 128), &lens)?;
-    dn_rec_launch(dev, &mut g, (1, 2, 128), &[2048])?;
+    for short in [false, true] {
+        dn_rec_launch(dev, &mut g, (2, 6, 128), &[1], short)?;
+        dn_rec_launch(dev, &mut g, (1, 3, 128), &[63, 1, 65], short)?;
+        dn_rec_launch(dev, &mut g, (2, 4, 80), &[64, 9, 17], short)?;
+        let lens: Vec<usize> = (0..64)
+            .map(|r| [1, 63, 64, 65, 2, 8, 9, 16][r % 8])
+            .collect();
+        dn_rec_launch(dev, &mut g, (1, 2, 128), &lens, short)?;
+        dn_rec_launch(dev, &mut g, (1, 2, 128), &[2048], short)?;
+    }
+    let lens: Vec<usize> = (0..32).map(|r| [1, 4, 7, 8, 9, 0, 2, 3][r % 8]).collect();
+    dn_rec_launch(dev, &mut g, (2, 6, 128), &lens, true)?;
     Ok(())
 }
 
@@ -1062,10 +1073,14 @@ pub fn quant_forms<D: QwenDevice>(
     seed: u64,
 ) -> Result<(), String> {
     let mut g = Lcg(seed);
+    // Rows a CTA at decode sizes, and four a CTA (`quant_grid`) at 448 × 5,120 and
+    // 2,048 × 1,280.
     for &(rows, k, x_stride) in &[
         (1usize, 5120usize, 5120usize),
         (37, 640, 768),
         (300, 128, 128),
+        (448, 5120, 5120),
+        (2047, 1280, 1408),
     ] {
         let m_pad = rows.next_multiple_of(4) + 4;
         let x = quant_edge_rows(&mut g, rows, x_stride, k);
@@ -1160,9 +1175,133 @@ pub fn conversions<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// The grouped row copy against its reading: three groups of different widths (one of
+/// whole 16-byte units, an odd one, one word) in one launch, each over buffers of its
+/// width, its items copying between buffers and within one, onto their own rows (which
+/// copies nothing), and out of range (which copies nothing and raises the status bit);
+/// then a launch of one group whose rows are not 16-byte aligned.
+pub fn copies<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
+    let mut g = Lcg(seed);
+    let widths = [1028usize, 37, 1];
+    let rows_of = [5usize, 9, 3];
+    // Per group: three buffers (contents), and items (src buf, src row, dst buf, dst row).
+    let mut host: Vec<Vec<Vec<u32>>> = Vec::new();
+    let mut items: Vec<Vec<[u32; 4]>> = Vec::new();
+    for (gi, (&w, &rows)) in widths.iter().zip(&rows_of).enumerate() {
+        let bufs: Vec<Vec<u32>> = (0..3)
+            .map(|_| (0..w * rows).map(|_| (g.next_u64() >> 32) as u32).collect())
+            .collect();
+        // Destinations are distinct and never a source, so the launch has one outcome.
+        let mut it = vec![[0, 0, 1, 0], [2, 1, 1, 1], [0, 2, 2, 0], [1, 2, 1, 2]];
+        it.push([0, 1, 0, 1]); // onto its own row
+        it.push([3, 0, 2, 1]); // a buffer past the table
+        it.push([0, u(rows), 2, 2]); // a row past the buffer
+        if gi == 0 {
+            it.push([0, 3, 0, 4]); // within one buffer
+        }
+        host.push(bufs);
+        items.push(it);
+    }
+    let mut want = host.clone();
+    for (gi, it) in items.iter().enumerate() {
+        let w = widths[gi];
+        for &[sb, sr, db, dr] in it {
+            let (sb, sr, db, dr) = (sb as usize, sr as usize, db as usize, dr as usize);
+            if sb >= 3 || db >= 3 || sr >= rows_of[gi] || dr >= rows_of[gi] {
+                continue;
+            }
+            let row: Vec<u32> = want[gi][sb][sr * w..(sr + 1) * w].to_vec();
+            want[gi][db][dr * w..(dr + 1) * w].copy_from_slice(&row);
+        }
+    }
+    let dbufs: Vec<Vec<super::Buf>> = host
+        .iter()
+        .map(|bs| bs.iter().map(|b| buf(dev, b)).collect())
+        .collect();
+    let arrays: Vec<[super::Buf; 4]> = items
+        .iter()
+        .map(|it| {
+            let col = |c: usize| buf(dev, &it.iter().map(|x| x[c]).collect::<Vec<u32>>());
+            [col(0), col(1), col(2), col(3)]
+        })
+        .collect();
+    let status = zeros(dev, 4);
+    let mut p = CopyParams {
+        status: status.addr,
+        groups: 3,
+        ..CopyParams::default()
+    };
+    for gi in 0..3 {
+        let grp = &mut p.group[gi];
+        for (b, d) in dbufs[gi].iter().enumerate() {
+            grp.buf[b] = d.addr;
+            grp.rows[b] = rows_of[gi] as u64;
+        }
+        grp.src_buf = arrays[gi][0].addr;
+        grp.src_row = arrays[gi][1].addr;
+        grp.dst_buf = arrays[gi][2].addr;
+        grp.dst_row = arrays[gi][3].addr;
+        grp.width = u(widths[gi]);
+        grp.items = u(items[gi].len());
+    }
+    // SAFETY: the buffers hold what the struct names.
+    unsafe { dev.copy_rows(&p) }.map_err(|e| e.to_string())?;
+    for gi in 0..3 {
+        for b in 0..3 {
+            same(
+                &format!("copies: group {gi} buffer {b}"),
+                &read::<D, u32>(dev, &dbufs[gi][b], widths[gi] * rows_of[gi]),
+                &want[gi][b],
+            )?;
+        }
+    }
+    same(
+        "copies: status",
+        &read::<D, u32>(dev, &status, 1),
+        &[STATUS_BAD_INDEX],
+    )?;
+    // Rows one word off 16-byte alignment: the word-at-a-time path.
+    let w = 8usize;
+    let src: Vec<u32> = (0..w * 4 + 1)
+        .map(|_| (g.next_u64() >> 32) as u32)
+        .collect();
+    let sbuf = buf(dev, &src);
+    let dst = zeros(dev, (w * 4 + 1) * 4);
+    let one = |x: u32| buf(dev, &[x]);
+    let (s0, s1, d0, d1) = (one(0), one(2), one(1), one(3));
+    let mut q = CopyParams {
+        status: status.addr,
+        groups: 1,
+        ..CopyParams::default()
+    };
+    q.group[0] = CopyGroup {
+        src_buf: s0.addr,
+        src_row: s1.addr,
+        dst_buf: d0.addr,
+        dst_row: d1.addr,
+        width: u(w),
+        items: 1,
+        ..CopyGroup::default()
+    };
+    q.group[0].buf[0] = sbuf.addr + 4;
+    q.group[0].rows[0] = 4;
+    q.group[0].buf[1] = dst.addr + 4;
+    q.group[0].rows[1] = 4;
+    // SAFETY: as above.
+    unsafe { dev.copy_rows(&q) }.map_err(|e| e.to_string())?;
+    let got = read::<D, u32>(dev, &dst, w * 4 + 1);
+    same(
+        "copies: unaligned rows",
+        &got[1 + 3 * w..1 + 4 * w],
+        &src[1 + 2 * w..1 + 3 * w],
+    )?;
+    Ok(())
+}
+
 /// Every case, named.
 pub fn all<D: QwenDevice>(dev: &D) -> Vec<(&'static str, Result<(), String>)> {
     vec![
+        ("copies", copies(dev, 10)),
         ("norm", norm(dev, 1)),
         ("quant", quant(dev, 7)),
         ("conversions", conversions(dev, 8)),
@@ -1497,4 +1636,390 @@ pub fn small_gemm_on<D: QwenDevice>(dev: &D) -> impl SmallGemmRun + '_ {
         unsafe { dev.gemm_bf16(&p) }.map_err(|e| e.to_string())?;
         Ok(read::<D, f32>(dev, &out, rows * n))
     }
+}
+
+/// A reference form compiled for the host (`qwen_common::host_body`): `(params, grid x,
+/// grid y)` over host buffers.
+pub type Reference<'a, P> = &'a dyn Fn(&P, u32, u32);
+
+/// A BF16 bit pattern: mostly a random value of magnitude up to `scale`, with one in
+/// `rare` an edge (a NaN with or without a payload, an infinity, a subnormal, a signed
+/// zero, the largest finite, a tie-prone small integer).
+fn edge_bf16(g: &mut Lcg, scale: f32, rare: u64) -> u16 {
+    if g.below(rare) != 0 {
+        return eidola_engine_cuda::bf16::from_f32(g.f32() * scale);
+    }
+    [
+        0x7fc0u16, 0xffc1, 0x7f81, 0x7f80, 0xff80, 0x0001, 0x807f, 0x0080, 0x8000, 0x0000, 0x7f7f,
+        0xff7f, 0x3f80, 0xbfc0,
+    ][usize::try_from(g.below(14)).expect("small")]
+}
+
+/// The norm's kernel form against its reference form (`norm_reference_block`, compiled
+/// for the host): the residual and every output's bits, units a CTA and a warp each, in
+/// 16-byte vectors and element by element (odd widths, strides and unaligned arrays),
+/// with and without the residual add, rotated units, over random rows and rows of edge
+/// values (NaNs, infinities, subnormals, a residual add that overflows).
+pub fn norm_forms<D: QwenDevice>(
+    dev: &D,
+    reference: Reference<'_, NormParams>,
+    seed: u64,
+) -> Result<String, String> {
+    let mut g = Lcg(seed);
+    // (rows, units, n, x unit stride, out unit stride, residual add, rotary, element
+    // offset of x / add / out, f32 offset of the weight)
+    #[allow(clippy::type_complexity)]
+    let configs: &[(usize, usize, usize, usize, usize, bool, usize, usize, usize)] = &[
+        (3, 1, 5120, 0, 0, true, 0, 0, 0),
+        (2, 1, 8192, 0, 0, true, 0, 0, 0),
+        (2, 1, 1032, 0, 0, true, 0, 0, 0),
+        (4, 1, 5120, 0, 0, false, 0, 0, 0),
+        (64, 1, 5120, 0, 0, true, 0, 0, 0),
+        (2, 1, 8191, 0, 0, true, 0, 0, 0),
+        (3, 1, 5120, 0, 0, true, 0, 1, 0),
+        (2, 1, 5120, 0, 0, true, 0, 0, 1),
+        (5, 1, 200, 0, 0, true, 0, 0, 0),
+        (3, 1, 1024, 0, 0, true, 0, 0, 0),
+        (4, 1, 17, 0, 0, true, 0, 0, 0),
+        (1, 1, 1, 0, 0, true, 0, 0, 0),
+        (6, 1, 1001, 0, 0, true, 0, 0, 0),
+        (9, 3, 256, 512, 256, false, 0, 0, 0),
+        (4, 3, 256, 512, 256, false, 64, 0, 0),
+        (4, 3, 256, 513, 256, false, 64, 0, 0),
+        (3, 2, 128, 128, 128, false, 32, 0, 0),
+        (13, 4, 256, 256, 256, false, 64, 0, 0),
+        (300, 24, 256, 512, 256, false, 64, 0, 0),
+    ];
+    let max_pos = 4096usize;
+    let rot_tables = |rotary: usize, g: &mut Lcg| {
+        let cos: Vec<f32> = (0..max_pos * rotary).map(|_| g.f32()).collect();
+        let sin: Vec<f32> = (0..max_pos * rotary).map(|_| g.f32()).collect();
+        (cos, sin)
+    };
+    for &(rows, units, n, xu, ou, with_add, rotary, off, w_off) in configs {
+        let x_stride = if units == 1 { n } else { (units - 1) * xu + n };
+        let out_stride = if units == 1 { n } else { (units - 1) * ou + n };
+        let xs = off + rows * x_stride;
+        let mut x = vec![0u16; xs];
+        let mut add = vec![0u16; xs];
+        for r in 0..rows {
+            // Every third row carries edge values.
+            let rare = if r % 3 == 1 { 64 } else { u64::MAX };
+            for i in 0..x_stride {
+                x[off + r * x_stride + i] = edge_bf16(&mut g, 4.0, rare);
+                add[off + r * x_stride + i] = edge_bf16(&mut g, 2.0, rare);
+            }
+        }
+        if rows > 2 {
+            // A residual add past the largest finite.
+            x[off + 2 * x_stride] = 0x7f7f;
+            add[off + 2 * x_stride] = 0x7f7f;
+        }
+        let w: Vec<f32> = (0..w_off + n).map(|_| 1.0 + g.bf16(0.5)).collect();
+        let (cos, sin) = if rotary > 0 {
+            rot_tables(rotary, &mut g)
+        } else {
+            (vec![0.0], vec![0.0])
+        };
+        let positions: Vec<u32> = (0..rows)
+            .map(|_| u32::try_from(g.below(max_pos as u64)).expect("small"))
+            .collect();
+        let out0 = vec![0x5555u16; off + rows * out_stride];
+        let (xb, ab, wb, ob) = (buf(dev, &x), buf(dev, &add), buf(dev, &w), buf(dev, &out0));
+        let (cb, sb, pb) = (buf(dev, &cos), buf(dev, &sin), buf(dev, &positions));
+        let p = NormParams {
+            x: xb.addr + 2 * off as u64,
+            add: if with_add {
+                ab.addr + 2 * off as u64
+            } else {
+                0
+            },
+            weight: wb.addr + 4 * w_off as u64,
+            out: ob.addr + 2 * off as u64,
+            rope_cos: if rotary > 0 { cb.addr } else { 0 },
+            rope_sin: if rotary > 0 { sb.addr } else { 0 },
+            positions: if rotary > 0 { pb.addr } else { 0 },
+            rows: u(rows),
+            units: u(units),
+            n: u(n),
+            x_stride: u(x_stride),
+            x_unit_stride: u(xu),
+            add_stride: u(x_stride),
+            out_stride: u(out_stride),
+            out_unit_stride: u(ou),
+            rotary: u(rotary),
+            eps: 1e-6,
+        };
+        // SAFETY: every buffer holds what the struct names.
+        unsafe { dev.norm(&p) }.map_err(|e| e.to_string())?;
+        let (mut hx, mut hout) = (x.clone(), out0.clone());
+        let h = NormParams {
+            x: hx.as_mut_ptr() as u64 + 2 * off as u64,
+            add: if with_add {
+                add.as_ptr() as u64 + 2 * off as u64
+            } else {
+                0
+            },
+            weight: w.as_ptr() as u64 + 4 * w_off as u64,
+            out: hout.as_mut_ptr() as u64 + 2 * off as u64,
+            rope_cos: if rotary > 0 { cos.as_ptr() as u64 } else { 0 },
+            rope_sin: if rotary > 0 { sin.as_ptr() as u64 } else { 0 },
+            positions: if rotary > 0 {
+                positions.as_ptr() as u64
+            } else {
+                0
+            },
+            ..p
+        };
+        reference(&h, u(units), u(rows));
+        let what = format!("norm forms {rows}×{units}×{n} (rotary {rotary}, offset {off}/{w_off})");
+        same(
+            &format!("{what}: residual"),
+            &read::<D, u16>(dev, &xb, xs),
+            &hx,
+        )?;
+        same(
+            &format!("{what}: out"),
+            &read::<D, u16>(dev, &ob, out0.len()),
+            &hout,
+        )?;
+    }
+    Ok(format!("{} launches", configs.len()))
+}
+
+/// The gated norm's kernel form against its reference form (`dn_norm_reference_block`,
+/// compiled for the host): every output's bits, heads moved four values a lane and
+/// element by element (odd head widths and strides, an unaligned array), over random
+/// heads and heads of edge values.
+pub fn dn_norm_forms<D: QwenDevice>(
+    dev: &D,
+    reference: Reference<'_, DnNormParams>,
+    seed: u64,
+) -> Result<String, String> {
+    let mut g = Lcg(seed);
+    // (rows, value heads, value dim, z's extra stride, f32 offset of `o`)
+    let configs: &[(usize, usize, usize, usize, usize)] = &[
+        (5, 48, 128, 0, 0),
+        (3, 6, 128, 3, 0),
+        (7, 4, 64, 0, 0),
+        (4, 3, 33, 1, 0),
+        (2, 5, 17, 0, 0),
+        (3, 4, 128, 0, 1),
+        (130, 48, 128, 0, 0),
+    ];
+    for &(rows, vh, vd, z_extra, o_off) in configs {
+        let width = vh * vd;
+        let z_stride = width + z_extra;
+        let o: Vec<f32> = (0..o_off + rows * width)
+            .map(|i| {
+                // Every fifth head carries edge values.
+                let rare = if (i / vd) % 5 == 2 { 32 } else { u64::MAX };
+                eidola_engine_cuda::bf16::to_f32(edge_bf16(&mut g, 3.0, rare))
+            })
+            .collect();
+        let z: Vec<u16> = (0..rows * z_stride)
+            .map(|i| {
+                let rare = if (i / vd) % 7 == 3 { 16 } else { u64::MAX };
+                edge_bf16(&mut g, 12.0, rare)
+            })
+            .collect();
+        let w: Vec<f32> = (0..vd).map(|_| g.bf16(1.5)).collect();
+        let out0 = vec![0x5555u16; rows * width];
+        let (obuf, zb, wb, outb) = (buf(dev, &o), buf(dev, &z), buf(dev, &w), buf(dev, &out0));
+        let p = DnNormParams {
+            o: obuf.addr + 4 * o_off as u64,
+            z: zb.addr,
+            weight: wb.addr,
+            out: outb.addr,
+            rows: u(rows),
+            v_heads: u(vh),
+            v_dim: u(vd),
+            z_stride: u(z_stride),
+            eps: 1e-6,
+            reserved: 0,
+        };
+        // SAFETY: every buffer holds what the struct names.
+        unsafe { dev.dn_norm(&p) }.map_err(|e| e.to_string())?;
+        let mut hout = out0.clone();
+        let h = DnNormParams {
+            o: o.as_ptr() as u64 + 4 * o_off as u64,
+            z: z.as_ptr() as u64,
+            weight: w.as_ptr() as u64,
+            out: hout.as_mut_ptr() as u64,
+            ..p
+        };
+        reference(&h, u(vh), u(rows));
+        same(
+            &format!("gated norm forms {rows}×{vh}×{vd} (z stride {z_stride}, offset {o_off})"),
+            &read::<D, u16>(dev, &outb, out0.len()),
+            &hout,
+        )?;
+    }
+    Ok(format!("{} launches", configs.len()))
+}
+
+/// The widening's kernel form against its reference form (`widen_thread`, compiled for
+/// the host): every output's bits (NaN payloads included), eight elements a thread in
+/// 16-byte vectors and element by element (odd widths and strides, unaligned arrays).
+pub fn widen_forms<D: QwenDevice>(
+    dev: &D,
+    reference: Reference<'_, WidenParams>,
+    seed: u64,
+) -> Result<String, String> {
+    let mut g = Lcg(seed);
+    // (rows, width, x stride, out stride, element offset of x, of out)
+    let configs: &[(usize, usize, usize, usize, usize, usize)] = &[
+        (5, 10_240, 10_240, 10_240, 0, 0),
+        (3, 48, 96, 48, 0, 0),
+        (4, 300, 304, 300, 0, 0),
+        (3, 2056, 2056, 2060, 1, 0),
+        (2, 2048, 2048, 2048, 0, 1),
+        (1, 7, 7, 7, 0, 0),
+        (2, 4104, 4104, 4106, 0, 0),
+    ];
+    for &(rows, width, xs, os, xo, oo) in configs {
+        let x: Vec<u16> = (0..xo + rows * xs)
+            .map(|_| u16::try_from(g.below(1 << 16)).expect("16 bits"))
+            .collect();
+        let out0 = vec![0x5555_5555u32; oo + rows * os];
+        let (xb, ob) = (buf(dev, &x), buf(dev, &out0));
+        let p = WidenParams {
+            x: xb.addr + 2 * xo as u64,
+            out: ob.addr + 4 * oo as u64,
+            rows: u(rows),
+            width: u(width),
+            x_stride: u(xs),
+            out_stride: u(os),
+        };
+        // SAFETY: every buffer holds what the struct names.
+        unsafe { dev.widen(&p) }.map_err(|e| e.to_string())?;
+        let mut hout = out0.clone();
+        let h = WidenParams {
+            x: x.as_ptr() as u64 + 2 * xo as u64,
+            out: hout.as_mut_ptr() as u64 + 4 * oo as u64,
+            ..p
+        };
+        reference(&h, u(width.div_ceil(256)), u(rows));
+        same(
+            &format!("widen forms {rows}×{width} (strides {xs}/{os}, offsets {xo}/{oo})"),
+            &read::<D, u32>(dev, &ob, out0.len()),
+            &hout,
+        )?;
+    }
+    Ok(format!("{} launches", configs.len()))
+}
+
+/// The quantiser's kernel form against its reference form (`quant_thread`, compiled for
+/// the host) over every BF16 value: for each of 96 block maxima (the edges of the
+/// format, of E4M3's range and of the scale's, and random ones), blocks holding that
+/// maximum and every bit pattern whose magnitude is at most it (NaNs included), both
+/// signs; every code's and scale's bits.
+pub fn quant_sweep<D: QwenDevice>(
+    dev: &D,
+    reference: &dyn Fn(&QuantParams, u32, u32),
+    seed: u64,
+) -> Result<String, String> {
+    let mut g = Lcg(seed);
+    let mut maxima: Vec<u16> = vec![
+        0x0001, 0x0002, 0x007f, 0x0080, 0x0081, 0x0100, 0x1000, 0x3a00, 0x3b00, 0x3c00, 0x3c80,
+        0x3f80, 0x3fc0, 0x4000, 0x43df, 0x43e0, 0x43e1, 0x4400, 0x5000, 0x6000, 0x7000, 0x7f00,
+        0x7f7e, 0x7f7f, 0x7f80, 0x0000,
+    ];
+    while maxima.len() < 96 {
+        maxima.push(u16::try_from(g.below(0x7f80)).expect("16 bits"));
+    }
+    let k = 1024usize;
+    let mut x: Vec<u16> = Vec::new();
+    for &m in &maxima {
+        // Every pattern of magnitude at most `m`, and every NaN, in a block order of its
+        // own; each block's first element is `m` (or `-m`).
+        let mut pats: Vec<u16> = (0..=0xffffu16)
+            .filter(|&b| (b & 0x7fff) <= m || (b & 0x7fff) > 0x7f80)
+            .collect();
+        for i in (1..pats.len()).rev() {
+            let j = usize::try_from(g.below(i as u64 + 1)).expect("small");
+            pats.swap(i, j);
+        }
+        for (c, chunk) in pats.chunks(127).enumerate() {
+            x.push(if c % 2 == 0 { m } else { m | 0x8000 });
+            x.extend_from_slice(chunk);
+            x.resize(x.len().next_multiple_of(128), m);
+        }
+    }
+    x.resize(x.len().next_multiple_of(k), 0);
+    let rows = x.len() / k;
+    let m_pad = rows.next_multiple_of(4);
+    let xb = buf(dev, &x);
+    let cb = zeros(dev, rows * k);
+    let sb = zeros(dev, (k / 128) * m_pad * 4);
+    let q = QuantParams {
+        x: xb.addr,
+        codes: cb.addr,
+        scales: sb.addr,
+        rows: u(rows),
+        k: u(k),
+        x_stride: u(k),
+        m_pad: u(m_pad),
+    };
+    // SAFETY: the buffers hold what the struct names.
+    unsafe { dev.quant(&q) }.map_err(|e| e.to_string())?;
+    let mut want_codes = vec![0u8; rows * k];
+    let mut want_scales = vec![0.0f32; (k / 128) * m_pad];
+    let h = QuantParams {
+        x: x.as_ptr() as u64,
+        codes: want_codes.as_mut_ptr() as u64,
+        scales: want_scales.as_mut_ptr() as u64,
+        ..q
+    };
+    reference(&h, u((k / 128).div_ceil(128)), u(rows));
+    same(
+        "quant sweep codes",
+        &read::<D, u8>(dev, &cb, rows * k),
+        &want_codes,
+    )?;
+    same(
+        "quant sweep scales",
+        &f32_bits(&read::<D, f32>(dev, &sb, (k / 128) * m_pad)),
+        &f32_bits(&want_scales),
+    )?;
+    Ok(format!("{} maxima, {rows} rows of {k}", maxima.len()))
+}
+
+/// The small-N GEMM's two forms (`small`, `tiled`) give every row the same bits: a
+/// batch past the tiled form's rows, over the released shape and odd ones, against each
+/// other, and rows alone and in short batches at several offsets of the tiled form
+/// against the batch.
+pub fn small_gemm_forms(
+    small: SmallGemm<'_>,
+    tiled: SmallGemm<'_>,
+    seed: u64,
+) -> Result<String, String> {
+    let mut g = Lcg(seed);
+    let mut report = Vec::new();
+    for &(n, k, rows) in &[
+        (96usize, 5120usize, 300usize),
+        (16, 128, 133),
+        (37, 640, 129),
+        (5, 264, 17),
+    ] {
+        let x: Vec<f32> = (0..rows * k).map(|_| g.bf16(4.0)).collect();
+        let w: Vec<f32> = (0..n * k).map(|_| g.bf16(0.05)).collect();
+        let (xb, wb) = (bits(&x), bits(&w));
+        let want = small(&xb, &wb, rows, 0, n, k)?;
+        same(
+            &format!("small gemm forms {n}x{k}, {rows} rows"),
+            &f32_bits(&tiled(&xb, &wb, rows, 0, n, k)?),
+            &f32_bits(&want),
+        )?;
+        for &(r, first) in &[(1usize, 0usize), (1, 13), (9, 5), (17, 2)] {
+            let r = r.min(rows - first);
+            same(
+                &format!("small gemm forms {n}x{k}: rows {first}..{}", first + r),
+                &f32_bits(&tiled(&xb, &wb, r, first, n, k)?),
+                &f32_bits(&want[first * n..(first + r) * n]),
+            )?;
+        }
+        report.push(format!("{n}x{k}x{rows}"));
+    }
+    Ok(report.join(", "))
 }

@@ -81,6 +81,7 @@
     { "name": "qwen_ops_div", "source": "qwen_ops_div.cu", "profile": "exact" },
     { "name": "qwen_deltanet", "source": "qwen_deltanet.cu", "profile": "exact" },
     { "name": "qwen_fast", "source": "qwen_fast.cu", "profile": "own" },
+    { "name": "qwen_sampling", "source": "qwen_sampling.cu", "profile": "own" },
     { "name": "qwen_fast_deltanet", "source": "qwen_fast_deltanet.cu", "profile": "exact" },
     {
       "name": "flashinfer_fa2_sink_paged_d256",

@@ -6,11 +6,12 @@
 //! over that grid. So without a GPU the executor's scenarios exercise the structs it
 //! fills, the wrappers' preconditions, the grids and the C++ a GPU compiles. It computes
 //! the exact profile, and the fast profile's blocked DeltaNet (the intra kernel's body,
-//! and the state kernel's host form, which reads each tensor-core step its own way). The row copy, the sampler and chain acceptance have no host
-//! body: here they are this device's reading of `eidola_copy_rows` (every index bounded,
-//! as the kernel bounds it) and of `eidola_sample` and `eidola_chain_accept`
-//! (`eidola_engine::sampling`, which the device sampler equals bit for bit given equal
-//! logits). It captures no graphs: the executor's padded launch sequence runs on it
+//! and the state kernel's host form, which reads each tensor-core step its own way). The
+//! row copy, the sampler and chain acceptance have no host
+//! body: here they are this device's reading of `eidola_qwen_copy_rows` (every index
+//! bounded, as the kernel bounds it) and of Qwen's sampler and chain acceptance (`qwen_sampling`:
+//! `eidola_engine::sampling`, which the device sampler equals bit for bit given equal
+//! logits), refusing what the device's kernels refuse. It captures no graphs: the executor's padded launch sequence runs on it
 //! directly.
 
 use std::any::Any;
@@ -169,6 +170,13 @@ impl QwenKernels for HostDevice {
         self.run("dn_intra", p, dn_intra_grid(p))?;
         self.run("dn_state", p, dn_state_grid(p))
     }
+    /// The short form computes the general form's bits: the same host body.
+    unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()> {
+        if p.seq_count == 0 {
+            return Ok(());
+        }
+        self.run("dn_rec", p, dn_rec_grid(p))
+    }
     unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()> {
         if p.rows == 0 {
             return Ok(());
@@ -187,25 +195,30 @@ impl QwenKernels for HostDevice {
         }
         self.run("round", p, round_grid(p))
     }
-    unsafe fn copy_rows(&self, a: &CopyArgs) -> Result<()> {
-        copy_grid(a.items, a.width)?;
-        let w = a.width as usize;
-        for i in 0..a.items as usize {
-            // SAFETY: the caller's item arrays of `items` words and buffers of
-            // `rows[b] · width` words; every index is bounded below as the kernel does.
-            unsafe {
-                let sb = rd::<u32>(a.src_buf, i) as usize;
-                let db = rd::<u32>(a.dst_buf, i) as usize;
-                let sr = u64::from(rd::<u32>(a.src_row, i));
-                let dr = u64::from(rd::<u32>(a.dst_row, i));
-                if sb >= COPY_BUFFERS || db >= COPY_BUFFERS || sr >= a.rows[sb] || dr >= a.rows[db]
-                {
-                    *wr::<u32>(a.status, 1).first_mut().expect("a word") |= STATUS_BAD_INDEX;
-                    continue;
+    unsafe fn copy_rows(&self, p: &CopyParams) -> Result<()> {
+        copy_grid(p)?;
+        for a in &p.group[..p.groups as usize] {
+            let w = a.width as usize;
+            for i in 0..a.items as usize {
+                // SAFETY: the caller's item arrays of `items` words and buffers of
+                // `rows[b] · width` words; every index is bounded below as the kernel does.
+                unsafe {
+                    let sb = rd::<u32>(a.src_buf, i) as usize;
+                    let db = rd::<u32>(a.dst_buf, i) as usize;
+                    let sr = u64::from(rd::<u32>(a.src_row, i));
+                    let dr = u64::from(rd::<u32>(a.dst_row, i));
+                    if sb >= COPY_BUFFERS
+                        || db >= COPY_BUFFERS
+                        || sr >= a.rows[sb]
+                        || dr >= a.rows[db]
+                    {
+                        *wr::<u32>(p.status, 1).first_mut().expect("a word") |= STATUS_BAD_INDEX;
+                        continue;
+                    }
+                    let src = a.buf[sb] + sr * w as u64 * 4;
+                    let dst = a.buf[db] + dr * w as u64 * 4;
+                    std::ptr::copy(src as *const u32, dst as *mut u32, w);
                 }
-                let src = a.buf[sb] + sr * w as u64 * 4;
-                let dst = a.buf[db] + dr * w as u64 * 4;
-                std::ptr::copy(src as *const u32, dst as *mut u32, w);
             }
         }
         Ok(())
@@ -215,9 +228,7 @@ impl QwenKernels for HostDevice {
         if a.num_rows == 0 {
             return Ok(());
         }
-        if n == 0 || a.n as u64 > a.logits_stride || a.n > 1 << 20 {
-            return Err(CudaError::new(format!("sample: vocabulary {n}")));
-        }
+        super::sampler::sample_check(a)?;
         for r in 0..a.num_rows as usize {
             // SAFETY: the caller's rows, logits, distributions and tokens.
             unsafe {
@@ -248,6 +259,10 @@ impl QwenKernels for HostDevice {
         Ok(())
     }
     unsafe fn accept(&self, a: &AcceptLaunch) -> Result<()> {
+        if a.num_rows == 0 {
+            return Ok(());
+        }
+        super::sampler::accept_check(a)?;
         let n = a.n as usize;
         for r in 0..a.num_rows as usize {
             // SAFETY: the caller's rows, distributions, ids and outputs.

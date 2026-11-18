@@ -18,8 +18,9 @@ use eidola_engine::sampling::Stream;
 use super::super::abi::*;
 use super::super::attention::{Fa2Args, HEAD_DIM, PARTIAL_BYTES_PER_HEAD};
 use super::super::device::QwenDevice;
-use super::super::kernels::{AcceptLaunch, COPY_BUFFERS, CopyArgs, SampleArgs};
+use super::super::kernels::{AcceptLaunch, DN_SHORT_RUN, SampleArgs};
 use super::super::plan::{AttnAt, DrafterAt, Fa2At, ItemsAt, Layout, SAMPLE_WORDS, TargetAt};
+use super::super::sampler::{accept_work_bytes, sample_work_bytes};
 use super::super::weights::{AttentionW, DeltaNetW, LayerW, MixerW, ab_rows};
 use super::{Alloc, DRAFTER, QwenCudaExecutor, TARGET};
 use crate::mimo::attention::{AttnLayer, Partials, PlanView};
@@ -121,6 +122,7 @@ pub(super) struct Scratch {
     pub p_target: Alloc,
     pub q_draft: Alloc,
     pub accept_scratch: Alloc,
+    pub sample_work: Alloc,
     pub lanes: Alloc,
     pub pad_c: Alloc,
     pub pad_a: Alloc,
@@ -156,6 +158,16 @@ fn head_tmp(c: &Caps, d: &super::Dims) -> usize {
         .max(pad4(c.drafter) * d.hidden as usize)
         .max(pad4(c.rows.max(c.drafter)) * ab_rows(d.v_heads) as usize)
         * 4
+}
+
+/// One group of a row-copy launch: its items, its width in words, and its buffers
+/// (address, rows).
+type CopyGroupAt<'a> = (&'a ItemsAt, usize, &'a [(u64, u64)]);
+
+/// The most rows one sample launch takes: the plain draws, the target distributions, or
+/// one depth's drafts.
+fn sample_rows(c: &Caps) -> usize {
+    c.plain.max(c.targets).max(c.drafting)
 }
 
 /// `rows` rounded up to the quantiser's and the fast GEMM's 4.
@@ -256,7 +268,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             p_plain: a(c.plain.max(1) * n * 8)?,
             p_target: a(c.targets.max(1) * n * 8)?,
             q_draft: a((c.drafting * c.depth).max(1) * n * 8)?,
-            accept_scratch: a(c.drafting.max(1) * n * 8)?,
+            accept_scratch: a(accept_work_bytes(c.drafting))?,
+            sample_work: a(sample_work_bytes(sample_rows(&c)))?,
             lanes: a((c.drafting * c.depth).max(1) * 4)?,
             pad_c: a(c.pad_conv.max(1) * cd * 4)?,
             pad_a: a(c.pad_ab.max(1) * 2 * vh * 4)?,
@@ -361,7 +374,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             (s.p_plain.addr, c.plain.max(1) * vocab * 8),
             (s.p_target.addr, c.targets.max(1) * vocab * 8),
             (s.q_draft.addr, (c.drafting * c.depth).max(1) * vocab * 8),
-            (s.accept_scratch.addr, c.drafting.max(1) * vocab * 8),
+            (s.accept_scratch.addr, accept_work_bytes(c.drafting)),
+            (s.sample_work.addr, sample_work_bytes(sample_rows(c))),
             (s.lanes.addr, (c.drafting * c.depth).max(1) * 4),
             (s.pad_c.addr, c.pad_conv.max(1) * cd * 4),
             (s.pad_a.addr, c.pad_ab.max(1) * 2 * vh * 4),
@@ -392,27 +406,44 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
 
     /// One row-copy launch over `bufs` (address, rows) of `width` words.
     fn copies(&self, at: &ItemsAt, width: usize, bufs: &[(u64, u64)]) -> Result<()> {
-        if at.items == 0 {
-            return Ok(());
-        }
-        let mut a = CopyArgs {
-            src_buf: self.tw(at.src_buf),
-            src_row: self.tw(at.src_row),
-            dst_buf: self.tw(at.dst_buf),
-            dst_row: self.tw(at.dst_row),
+        self.copy_groups(&[(at, width, bufs)])
+    }
+
+    /// One row-copy launch over up to [`COPY_GROUPS`] groups, each its items over its
+    /// buffers (address, rows) of its width in words.
+    fn copy_groups(&self, groups: &[CopyGroupAt<'_>]) -> Result<()> {
+        let mut p = CopyParams {
             status: self.status_addr(),
-            width: u32::try_from(width).map_err(|_| CudaError::new("copy width"))?,
-            items: u32::try_from(at.items).map_err(|_| CudaError::new("copy items"))?,
-            ..CopyArgs::default()
+            ..CopyParams::default()
         };
-        assert!(bufs.len() <= COPY_BUFFERS);
-        for (i, &(addr, rows)) in bufs.iter().enumerate() {
-            a.buf[i] = addr;
-            a.rows[i] = rows;
+        assert!(groups.len() <= COPY_GROUPS);
+        for &(at, width, bufs) in groups {
+            if at.items == 0 {
+                continue;
+            }
+            let g = &mut p.group[p.groups as usize];
+            *g = CopyGroup {
+                src_buf: self.tw(at.src_buf),
+                src_row: self.tw(at.src_row),
+                dst_buf: self.tw(at.dst_buf),
+                dst_row: self.tw(at.dst_row),
+                width: u32::try_from(width).map_err(|_| CudaError::new("copy width"))?,
+                items: u32::try_from(at.items).map_err(|_| CudaError::new("copy items"))?,
+                ..CopyGroup::default()
+            };
+            assert!(bufs.len() <= COPY_BUFFERS);
+            for (i, &(addr, rows)) in bufs.iter().enumerate() {
+                g.buf[i] = addr;
+                g.rows[i] = rows;
+            }
+            p.groups += 1;
+        }
+        if p.groups == 0 {
+            return Ok(());
         }
         // SAFETY: every buffer holds `rows · width` words; the items are bounded by the
         // kernel against them.
-        unsafe { self.dev.copy_rows(&a) }
+        unsafe { self.dev.copy_rows(&p) }
     }
 
     /// The read-back's status word: its first.
@@ -520,6 +551,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                     probs: s.q_draft.addr + (off * self.n_sample() * 8) as u64,
                     tokens: s.lanes.addr + (off * 4) as u64,
                     status: self.status_addr(),
+                    work: s.sample_work.addr,
                 })?;
             }
         }
@@ -544,6 +576,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             probs: s.p_plain.addr,
             tokens: s.readback.addr + 4,
             status: self.status_addr(),
+            work: s.sample_work.addr,
         })?;
         if l.accepts > 0 {
             self.sample(SampleArgs {
@@ -556,6 +589,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 probs: s.p_target.addr,
                 tokens: 0,
                 status: self.status_addr(),
+                work: s.sample_work.addr,
             })?;
             let k1 = l.width as usize + 1;
             let out = s.readback.addr + 4 + (plain * 4) as u64;
@@ -833,8 +867,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 )?;
             }
         }
-        self.copies(&at.stage_conv, cd, &self.conv_bufs(dn))?;
-        self.copies(&at.stage_ab, 2 * vh, &self.ab_bufs(dn))?;
+        let (conv, ab) = (self.conv_bufs(dn), self.ab_bufs(dn));
+        self.copy_groups(&[(&at.stage_conv, cd, &conv), (&at.stage_ab, 2 * vh, &ab)])?;
         let prep = DnPrepParams {
             conv_in: s.conv_in.addr,
             window: self.tw(at.window),
@@ -906,22 +940,30 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         };
         // SAFETY: the staged arrays hold the shape's positions; every state address in the
         // sequences is a live image or a state buffer.
+        // The short form when the runs are a few positions each (a decode step, a draft
+        // check): both compute the same bits, so the choice is the launch's alone.
         if !self.blocked() {
+            let short = at.staged() <= DN_SHORT_RUN * at.runs;
             unsafe {
                 self.dev.dn_prep(&prep)?;
-                self.dev.dn_rec(&rec)?;
+                if short {
+                    self.dev.dn_rec_short(&rec)?;
+                } else {
+                    self.dev.dn_rec(&rec)?;
+                }
             }
         }
-        self.copies(&at.post_conv, cd, &self.conv_bufs(dn))?;
-        self.copies(&at.post_ab, 2 * vh, &self.ab_bufs(dn))?;
-        if t > 0 {
-            let o = [
-                (s.o.addr, at.staged().max(1) as u64),
-                (s.o_rows.addr, pad4(s.caps.rows.max(s.caps.drafter)) as u64),
-                (s.pad_o.addr, s.caps.pad_o as u64),
-            ];
-            self.copies(&at.o_rows, vd, &o)?;
-        }
+        let o = [
+            (s.o.addr, at.staged().max(1) as u64),
+            (s.o_rows.addr, pad4(s.caps.rows.max(s.caps.drafter)) as u64),
+            (s.pad_o.addr, s.caps.pad_o as u64),
+        ];
+        let none = ItemsAt::default();
+        self.copy_groups(&[
+            (&at.post_conv, cd, &conv),
+            (&at.post_ab, 2 * vh, &ab),
+            (if t > 0 { &at.o_rows } else { &none }, vd, &o),
+        ])?;
         Ok(())
     }
 

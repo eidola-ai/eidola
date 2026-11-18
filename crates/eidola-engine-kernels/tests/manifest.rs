@@ -172,6 +172,7 @@ fn sass_uses_the_intended_tensor_core_path() {
             "engine_ops_reference",
             "kv_cipher",
             "qwen_fast",
+            "qwen_sampling",
         ] {
             let cubin = manifest.cubin(own, arch).expect("cubin");
             assert!(cubin.mma_sass.is_empty(), "{own} {arch}");
@@ -335,9 +336,9 @@ fn entries_and_meta_records() {
     }
 }
 
-/// Sampling comes only from our own kernel (`sampling.cu`), which reproduces
-/// the serving core's sampling semantics bit for bit (see AGENTS.md): no
-/// upstream sampling entry is in the set.
+/// Sampling comes only from our own kernels (`sampling.cu`, and Qwen's
+/// `qwen_sampling.cu`), which reproduce the serving core's sampling semantics bit
+/// for bit (see AGENTS.md): no upstream sampling entry is in the set.
 #[test]
 fn no_third_party_sampling_kernels() {
     let manifest = Manifest::embedded();
@@ -477,6 +478,7 @@ fn qwen_kernels_fuse_nothing() {
             "qwen_ops",
             false,
             &[
+                "eidola_qwen_copy_rows",
                 "eidola_qwen_embed",
                 "eidola_qwen_kv_write",
                 "eidola_qwen_lin8",
@@ -497,7 +499,11 @@ fn qwen_kernels_fuse_nothing() {
                 "eidola_qwen_quant",
             ],
         ),
-        ("qwen_deltanet", false, &["eidola_qwen_dn_rec"]),
+        (
+            "qwen_deltanet",
+            false,
+            &["eidola_qwen_dn_rec", "eidola_qwen_dn_rec_short"],
+        ),
     ];
     for arch in ["sm_100a", "sm_103a", "sm_100f"] {
         for (name, divides, entries) in images {
@@ -568,8 +574,11 @@ fn qwen_fast_deltanet_is_unfused_on_mma_sync() {
 }
 
 /// The fast profile's own kernels: the `own` profile (contraction allowed: their bodies
-/// spell out the fused multiply-adds they mean), no tensor cores, exactly their two
-/// entries; and the swapped FP8 GEMM's image exactly its three tile instances.
+/// spell out the fused multiply-adds they mean), no tensor cores, exactly their three
+/// entries (the gates and the small-N GEMM's two forms); the swapped FP8 GEMM's image exactly its three tile instances; and Qwen's
+/// sampler, in both profiles, the `own` profile (every f64 operation it means rounded is
+/// an explicit round-to-nearest intrinsic, as the shared sampler's), its four sample and
+/// three acceptance kernels.
 #[test]
 fn qwen_fast_images_hold_their_entries() {
     let manifest = Manifest::embedded();
@@ -578,7 +587,11 @@ fn qwen_fast_images_hold_their_entries() {
             (
                 "qwen_fast",
                 "own",
-                &["eidola_qwen_fast_gate", "eidola_qwen_fast_gemm_bf16"][..],
+                &[
+                    "eidola_qwen_fast_gate",
+                    "eidola_qwen_fast_gemm_bf16",
+                    "eidola_qwen_fast_gemm_bf16_tiled",
+                ][..],
             ),
             (
                 "cutlass_fp8_blockwise_swap",
@@ -587,6 +600,19 @@ fn qwen_fast_images_hold_their_entries() {
                     "eidola_cutlass_fp8_blockwise_swap16_bf16",
                     "eidola_cutlass_fp8_blockwise_swap32_bf16",
                     "eidola_cutlass_fp8_blockwise_swap64_bf16",
+                ][..],
+            ),
+            (
+                "qwen_sampling",
+                "own",
+                &[
+                    "eidola_qwen_accept_decide",
+                    "eidola_qwen_accept_finish",
+                    "eidola_qwen_accept_sums",
+                    "eidola_qwen_sample_exp",
+                    "eidola_qwen_sample_norm",
+                    "eidola_qwen_sample_pick",
+                    "eidola_qwen_sample_top",
                 ][..],
             ),
         ] {

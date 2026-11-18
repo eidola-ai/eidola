@@ -11,6 +11,7 @@ pub mod executor;
 pub mod host;
 pub mod kernels;
 pub mod plan;
+pub mod sampler;
 pub mod weights;
 
 pub use device::{QwenDevice, QwenProfile};

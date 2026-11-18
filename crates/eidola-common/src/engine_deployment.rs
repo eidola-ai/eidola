@@ -450,6 +450,10 @@ pub const RECURRENT_SPLIT_KEYS: u64 = 1024;
 ///   sampler's f64 distributions: `S` plain, `S(k + 1)` target, `Sk` draft and
 ///   `S` acceptance rows;
 /// - the padding rows of the row copies, the draft lanes and the read-back;
+/// - the blocked DeltaNet's scratch: a block of
+///   [`HybridDims::chunk_tile_bytes`] for every `C` staged positions and one
+///   more a sequence and one besides, `C` the block size's largest
+///   power-of-two divisor, at most 16;
 /// - the step tables: the rungs' fixed table and the eager table, which grows
 ///   to a power of two, together at most three times
 ///   [`recurrent_table_words`] words;
@@ -478,6 +482,8 @@ pub fn recurrent_step_scratch_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
     let pad_ab = s * (1 + tail) + s;
     let pad_h = s * (k + 1) + s * ((k + 1) / b + 1) + s * k + s;
     let readback = 1 + s + s * (k + 1) + s;
+    let chunk = (b & b.wrapping_neg()).clamp(1, 16);
+    let chunk_tiles = staged.max(s * (k + 1 + tail)) / chunk + s + 1;
     r.saturating_mul(dims.program_row_bytes())
         .saturating_add((pad4(n) + pad4((s * k).max(1))) * h * 2)
         .saturating_add(staged.saturating_mul(dims.staged_position_bytes()))
@@ -496,6 +502,7 @@ pub fn recurrent_step_scratch_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
                 + n.max(s * k) * 4
                 + readback * 4,
         )
+        .saturating_add(chunk_tiles.saturating_mul(dims.chunk_tile_bytes()))
         .saturating_add(recurrent_table_words(sizing).saturating_mul(3 * 4))
         .saturating_add(RECURRENT_SCRATCH_FIXED_BYTES)
 }

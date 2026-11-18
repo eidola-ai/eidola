@@ -329,3 +329,37 @@ pub struct RoundParams {
     pub reserved: u32,
 }
 layout!(RoundParams, 40, { out_f32: 32 });
+
+/// Groups one [`CopyParams`] launch carries.
+pub const COPY_GROUPS: usize = 3;
+/// Buffers of one [`CopyGroup`].
+pub const COPY_BUFFERS: usize = 8;
+/// Status bit: a copy item's buffer or row out of range.
+pub const STATUS_BAD_INDEX: u32 = 4;
+
+/// One group of row copies: a table of buffers of `width`-word rows and `items` copies
+/// (device arrays of `items` words: source buffer and row, destination buffer and row).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyGroup {
+    pub buf: [u64; COPY_BUFFERS],
+    pub rows: [u64; COPY_BUFFERS],
+    pub src_buf: u64,
+    pub src_row: u64,
+    pub dst_buf: u64,
+    pub dst_row: u64,
+    pub width: u32,
+    pub items: u32,
+}
+layout!(CopyGroup, 168, { src_buf: 128, width: 160 });
+
+/// Row copies of up to [`COPY_GROUPS`] groups in one launch (`eidola_qwen_copy_rows`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyParams {
+    pub group: [CopyGroup; COPY_GROUPS],
+    pub status: u64,
+    pub groups: u32,
+    pub reserved: u32,
+}
+layout!(CopyParams, 520, { status: 504, groups: 512 });
