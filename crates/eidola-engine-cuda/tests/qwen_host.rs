@@ -184,6 +184,32 @@ fn blocked_deltanet_stays_near_the_reference_forward() {
     assert!(kl_mean < 3e-3 && top * 100 >= got.len() * 85);
 }
 
+/// With the DeltaNet in blocks, `dense_logits` cuts its pieces at whole blocks: a scratch
+/// of fewer rows than a block (one row, at blocks of 16) refuses it, before anything runs,
+/// rather than cutting a piece past its rows.
+#[test]
+fn blocked_dense_logits_refuse_a_scratch_smaller_than_a_block() {
+    use eidola_engine::spec::Bucket;
+    use eidola_engine_cuda::qwen::QwenCudaExecutor;
+    use qwen_common::pair::*;
+    let Some(lib) = qwen_common::library() else {
+        return;
+    };
+    let model = fixture();
+    let mut cfg = qwen_common::with_block_size(16, || cuda_config(&Geometry::plain(0)));
+    cfg.buckets = vec![Bucket {
+        max_seqs: 1,
+        max_tokens: 1,
+    }];
+    let mut ex =
+        QwenCudaExecutor::new(qwen_common::block_deltanet(lib), &model, cfg).expect("executor");
+    let err = ex
+        .dense_logits(0, &TestRng(8).tokens(20, VOCAB))
+        .expect_err("refused");
+    assert!(err.to_string().contains("whole block"), "{err}");
+    assert!(ex.slot_state_is_zero(0));
+}
+
 /// The padded rung path (a decode rung's launch sequence over its table, as a graph
 /// records it, run directly: the host captures no graphs) against the CPU reference
 /// executor: the same scenarios, and rungs must have run.

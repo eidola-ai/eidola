@@ -52,7 +52,7 @@ use eidola_engine::spec::{
     StateGroupSpec, StateSpec,
 };
 use eidola_engine_model::qwen::QwenModel;
-use eidola_engine_model::qwen::config::LayerKind;
+use eidola_engine_model::qwen::config::{LayerKind, QwenConfig};
 
 use super::abi::*;
 use super::device::{QwenDevice, QwenProfile};
@@ -157,6 +157,39 @@ struct Dims {
 }
 
 impl Dims {
+    fn of(c: &QwenConfig) -> Result<Dims> {
+        let a = &c.attention;
+        let d = &c.deltanet;
+        Ok(Dims {
+            hidden: u32of(c.hidden_size, "hidden")?,
+            inter: u32of(c.intermediate_size, "intermediate")?,
+            vocab: u32of(c.vocab_size, "vocabulary")?,
+            eps: c.rms_norm_eps,
+            kinds: c.layers.iter().map(|l| l.kind).collect(),
+            q_heads: u32of(a.num_q_heads, "query heads")?,
+            kv_heads: u32of(a.num_kv_heads, "kv heads")?,
+            head_dim: u32of(a.head_dim, "head dim")?,
+            rotary: u32of(a.rotary_dim, "rotary")?,
+            scale: a.softmax_scale,
+            k_heads: u32of(d.num_k_heads, "key heads")?,
+            v_heads: u32of(d.num_v_heads, "value heads")?,
+            k_dim: u32of(d.k_head_dim, "key dim")?,
+            v_dim: u32of(d.v_head_dim, "value dim")?,
+        })
+    }
+
+    /// The widest K of an FP8 linear.
+    fn k_max(&self) -> usize {
+        [
+            self.hidden,
+            self.inter,
+            self.q_heads * self.head_dim,
+            self.value_dim(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0) as usize
+    }
     fn key_dim(&self) -> u32 {
         self.k_heads * self.k_dim
     }
@@ -300,22 +333,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         if c.hidden_size > NORM_MAX as usize {
             return Err(CudaError::new("hidden size past the norm's staged width"));
         }
-        let dims = Dims {
-            hidden: u32of(c.hidden_size, "hidden")?,
-            inter: u32of(c.intermediate_size, "intermediate")?,
-            vocab: u32of(c.vocab_size, "vocabulary")?,
-            eps: c.rms_norm_eps,
-            kinds: c.layers.iter().map(|l| l.kind).collect(),
-            q_heads: u32of(a.num_q_heads, "query heads")?,
-            kv_heads: u32of(a.num_kv_heads, "kv heads")?,
-            head_dim: u32of(a.head_dim, "head dim")?,
-            rotary: u32of(a.rotary_dim, "rotary")?,
-            scale: a.softmax_scale,
-            k_heads: u32of(d.num_k_heads, "key heads")?,
-            v_heads: u32of(d.num_v_heads, "value heads")?,
-            k_dim: u32of(d.k_head_dim, "key dim")?,
-            v_dim: u32of(d.v_head_dim, "value dim")?,
-        };
+        let dims = Dims::of(c)?;
         let k = cfg.draft_tokens;
         let drafting = k > 0;
         let dn_layers = dims
@@ -434,15 +452,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             .map_err(|e| CudaError::new(format!("spec: {e:?}")))?;
         let width = spec.max_blocks_per_seq() as usize;
         let caps = capacities(&cfg, tail_cap);
-        let k_max = [
-            dims.hidden,
-            dims.inter,
-            dims.q_heads * dims.head_dim,
-            dims.value_dim(),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(0) as usize;
+        let k_max = dims.k_max();
         let scratch = Self::alloc_scratch(&dev, &dims, k_max, caps)?;
         let eager_table = Alloc::new(&dev, 64 * 4)?;
         let graphs = cfg.graphs;
@@ -2192,19 +2202,24 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             self.slots[slot as usize].base.is_none(),
             "slot {slot} is in use"
         );
+        let c = self.scratch.caps;
+        // Pieces of at most one head launch's rows: the logits are the vocabulary a row.
+        // In blocks, a whole number of blocks a piece, the live state between them a
+        // boundary's: a scratch of fewer rows than a block cannot take one.
+        let mut piece = c.rows.min(c.head).min(c.logits_t).max(1);
+        if self.blocked() {
+            let ch = self.chunk() as usize;
+            piece = piece / ch * ch;
+            if piece == 0 {
+                return Err(CudaError::new(
+                    "dense logits in blocks need the scratch's rows for a whole block",
+                ));
+            }
+        }
         for (i, b) in (1..=blocks).enumerate() {
             self.tables[slot as usize][TARGET][i] = b;
         }
         self.slots[slot as usize].base = Some((NULL_STATE, 0));
-        let c = self.scratch.caps;
-        // Pieces of at most one head launch's rows: the logits are the vocabulary a row.
-        // In blocks, a whole number of blocks a piece, the live state between them a
-        // boundary's.
-        let mut piece = c.rows.min(c.head).min(c.logits_t).max(1);
-        if self.blocked() {
-            let ch = self.chunk() as usize;
-            piece = (piece / ch * ch).max(ch);
-        }
         let vocab = self.dims.vocab as usize;
         let geo = self.geo();
         let mut logits = Vec::with_capacity(tokens.len());
@@ -2253,6 +2268,20 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         self.dev.synchronize()?;
         Ok(logits)
     }
+}
+
+/// The bytes of step scratch an executor of `cfg` over a model of `config` allocates at
+/// construction in `profile` (the DeltaNet in blocks in the fast profile), its step tables
+/// aside: what the node's deployment reserve is held to.
+pub fn step_scratch_bytes(
+    config: &QwenConfig,
+    cfg: &QwenCudaExecutorConfig,
+    profile: QwenProfile,
+) -> Result<u64> {
+    let dims = Dims::of(config)?;
+    let tail_cap = cfg.block_size - 1 + cfg.draft_tokens;
+    let fast = profile == QwenProfile::Fast;
+    program::scratch_bytes(&dims, dims.k_max(), capacities(cfg, tail_cap), fast, fast)
 }
 
 /// The blocked DeltaNet's block length for KV blocks of `block_size` positions: its

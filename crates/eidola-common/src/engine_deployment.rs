@@ -436,7 +436,7 @@ pub const RECURRENT_SPLIT_KEYS: u64 = 1024;
 ///
 /// - per row of `R`, [`HybridDims::program_row_bytes`]; pass A's and pass
 ///   B's normed rows;
-/// - the DeltaNet's staging: max(`N + ST`, `Sk`) staged positions
+/// - the DeltaNet's staging: max(`N + ST`, `S(k + 1 + T)`) staged positions
 ///   ([`HybridDims::staged_position_bytes`]) and three more convolution rows a
 ///   seat;
 /// - FA2's partial rows: `R` rows times the chunks of [`RECURRENT_SPLIT_KEYS`]
@@ -449,7 +449,9 @@ pub const RECURRENT_SPLIT_KEYS: u64 = 1024;
 ///   64) and `Sk` more, and the drafter's (`H`), f32 over the head's rows, and the
 ///   sampler's f64 distributions: `S` plain, `S(k + 1)` target, `Sk` draft and
 ///   `S` acceptance rows;
-/// - the padding rows of the row copies, the draft lanes and the read-back;
+/// - the padding rows of the row copies (a staged position's convolution and
+///   decay rows for every staged position, besides the rows' and the state
+///   writes' own), the draft lanes and the read-back;
 /// - the blocked DeltaNet's scratch: a block of
 ///   [`HybridDims::chunk_tile_bytes`] for every `C` staged positions and one
 ///   more a sequence and one besides, `C` the block size's largest
@@ -472,18 +474,20 @@ pub fn recurrent_step_scratch_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
     let rows = n.max(s * k);
     let r = pad4(rows);
     let head = s.max(s * k).max(64);
-    let staged = n.saturating_add(s.saturating_mul(tail)).max(s * k);
+    let staged = n
+        .saturating_add(s.saturating_mul(tail))
+        .max(s.saturating_mul(k + 1 + tail));
     let conv_rows = 3 * s + staged;
     let partial_rows = rows.saturating_mul(positions.div_ceil(RECURRENT_SPLIT_KEYS).max(1));
     let head_tmp = (pad4(head) * v).max(r * h).max(r * dims.ab_rows()) * 4;
     let logit_rows = s.max(64) + s * k + head;
     let distributions = s + s * (k + 1) + (s * k).max(1) + s;
-    let pad_conv = 3 * s + s * (1 + tail) + 3 * 4 * s + 4 * s;
-    let pad_ab = s * (1 + tail) + s;
+    let pad_conv = 3 * s + staged + 3 * 4 * s + 3 * s + s * (k + 1);
+    let pad_ab = staged + s * (k + 1);
     let pad_h = s * (k + 1) + s * ((k + 1) / b + 1) + s * k + s;
     let readback = 1 + s + s * (k + 1) + s;
     let chunk = (b & b.wrapping_neg()).clamp(1, 16);
-    let chunk_tiles = staged.max(s * (k + 1 + tail)) / chunk + s + 1;
+    let chunk_tiles = staged / chunk + s + 1;
     r.saturating_mul(dims.program_row_bytes())
         .saturating_add((pad4(n) + pad4((s * k).max(1))) * h * 2)
         .saturating_add(staged.saturating_mul(dims.staged_position_bytes()))

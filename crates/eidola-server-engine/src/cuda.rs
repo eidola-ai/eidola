@@ -2070,6 +2070,54 @@ mod tests {
         assert!(e.0.contains("fewer than two"), "{e}");
     }
 
+    /// The fast profile's step scratch, as the executor allocates it at construction
+    /// (`step_scratch_bytes`, its step tables aside), is within the shared bound
+    /// (`recurrent_step_scratch_bytes` less its tables' share) for the released model, at
+    /// sizings from one short sequence to a 65,536-token prefill budget of one sequence
+    /// and to 128 drafting sequences, at block sizes of 4, 16 and 64.
+    #[test]
+    fn the_released_step_scratch_is_within_the_shared_bound() {
+        use eidola_common::engine_deployment::{
+            recurrent_step_scratch_bytes, recurrent_table_words,
+        };
+        use eidola_engine_cuda::qwen::step_scratch_bytes;
+        let qwen = qwen_released();
+        let dims = qwen_dims(&qwen);
+        for (n, seqs, len, b, k) in [
+            (65_536u32, 1u32, 16_384u32, 16u32, 0u32),
+            (2048, 64, 32_768, 16, 3),
+            (8192, 128, 131_072, 16, 3),
+            (256, 1, 4096, 16, 0),
+            (2048, 64, 32_768, 64, 1),
+            (512, 8, 4096, 4, 2),
+        ] {
+            let sizing = Sizing {
+                kv_block_size: b,
+                max_model_len: len,
+                max_seqs: seqs,
+                max_batched_tokens: n,
+                max_prefill_chunk: n,
+                draft_tokens: k,
+                max_requests: seqs,
+            };
+            let config = qwen_config(
+                &qwen,
+                &sizing,
+                &cache(true),
+                1 << 40,
+                0,
+                CudaGraphs::Off,
+                248_320,
+            )
+            .unwrap();
+            let got = step_scratch_bytes(&qwen, &config, QwenProfile::Fast).unwrap();
+            let bound = recurrent_step_scratch_bytes(&dims, &sizing)
+                - recurrent_table_words(&sizing) * 3 * 4;
+            eprintln!("{sizing:?}: {got} of {bound}");
+            assert!(got <= bound, "{sizing:?}: {got} > {bound}");
+        }
+    }
+
     /// The configuration is the node's sizing, its decode graphs as configured; drafting
     /// without the MTP layer is refused before any device.
     #[test]

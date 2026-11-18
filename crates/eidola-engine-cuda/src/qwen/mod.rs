@@ -17,4 +17,5 @@ pub mod weights;
 pub use device::{QwenDevice, QwenProfile};
 pub use executor::{
     CudaGraphs, DecodePath, DecodeStats, QwenCudaExecutor, QwenCudaExecutorConfig, StateStrategy,
+    step_scratch_bytes,
 };

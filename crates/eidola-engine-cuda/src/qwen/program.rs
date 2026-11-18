@@ -137,6 +137,9 @@ pub(super) struct Scratch {
     pub dn_fac: Alloc,
     pub dn_qr: Alloc,
     pub dn_kr: Alloc,
+    /// Every allocation above but the table, the sink and the zero rows: what the idle
+    /// scrub zeroes besides the table.
+    pub ranges: Vec<(u64, usize)>,
 }
 
 /// Bytes of the blocked DeltaNet's six scratch arrays (8 each without blocks).
@@ -175,229 +178,186 @@ fn pad4(rows: usize) -> usize {
     rows.next_multiple_of(4).max(4)
 }
 
+/// Bytes [`build_scratch`] allocates for `c` (each allocation at least 8 bytes), without
+/// allocating them.
+pub(super) fn scratch_bytes(
+    d: &super::Dims,
+    k_max: usize,
+    c: Caps,
+    fast: bool,
+    blocked: bool,
+) -> Result<u64> {
+    let mut total = 0u64;
+    let mut next = 256u64;
+    build_scratch(
+        &mut |bytes| {
+            let b = bytes.max(8) as u64;
+            total += b;
+            let addr = next;
+            next += b.next_multiple_of(256);
+            Ok(Alloc {
+                addr,
+                _keep: Box::new(()),
+            })
+        },
+        d,
+        k_max,
+        c,
+        fast,
+        blocked,
+    )?;
+    Ok(total)
+}
+
+/// The program's scratch for `c`, each allocation made by `alloc` (the sink and the zero
+/// rows besides the rest, which the idle scrub's ranges list).
+fn build_scratch(
+    alloc: &mut dyn FnMut(usize) -> Result<Alloc>,
+    d: &super::Dims,
+    k_max: usize,
+    c: Caps,
+    fast: bool,
+    blocked: bool,
+) -> Result<Scratch> {
+    let (hid, cd, vd, vh) = (
+        d.hidden as usize,
+        d.conv_dim() as usize,
+        d.value_dim() as usize,
+        d.v_heads as usize,
+    );
+    let qw = (d.q_heads * d.head_dim) as usize;
+    let kvw = d.kv_width() as usize;
+    let rows = pad4(c.rows.max(c.drafter));
+    let vocab = d.vocab as usize;
+    let n = vocab;
+    let cb = chunk_bytes(&c, d, blocked);
+    let hq = d.q_heads as usize;
+    let sink = alloc(hq * 4)?;
+    let zero_rows = alloc(3 * cd * 4)?;
+    // The rungs' table is reallocated once their layouts are known (`caps.table`): the
+    // scrub reads its range then, not here.
+    let table = alloc(c.table.max(64) * 4)?;
+    let mut ranges = Vec::new();
+    // Every allocation below is one the idle scrub zeroes.
+    let mut a = |bytes: usize| -> Result<Alloc> {
+        let x = alloc(bytes)?;
+        ranges.push((x.addr, bytes.max(8)));
+        Ok(x)
+    };
+    Ok(Scratch {
+        table,
+        readback: a(c.readback * 4)?,
+        h: a(rows * hid * 2)?,
+        x: a(rows * hid * 2)?,
+        mix: a(rows * hid * 2)?,
+        m: a(rows * hid * 2)?,
+        normed: a(pad4(c.rows) * hid * 2)?,
+        codes: a(rows * k_max)?,
+        scales: a(k_max / 128 * rows * 4)?,
+        gate: a(rows * d.inter as usize * 2)?,
+        up: a(rows * d.inter as usize * 2)?,
+        hmid: a(rows * d.inter as usize * 2)?,
+        mixed: a(rows * cd * 2)?,
+        z: a(rows * vd * 2)?,
+        aa: a(rows * vh * 2)?,
+        bb: a(rows * vh * 2)?,
+        nrm: a(rows * vd * 2)?,
+        conv_in: a(c.conv_rows.max(4) * cd * 4)?,
+        new_f32: a(rows * cd * 4)?,
+        ab_new: a(rows * 2 * vh * 4)?,
+        ab: a(c.staged.max(1) * 2 * vh * 4)?,
+        dq: a(c.staged.max(1) * d.key_dim() as usize * 4)?,
+        dk: a(c.staged.max(1) * d.key_dim() as usize * 4)?,
+        dv: a(c.staged.max(1) * vd * 4)?,
+        beta: a(c.staged.max(1) * vh * 4)?,
+        alpha: a(c.staged.max(1) * vh * 4)?,
+        o: a(c.staged.max(1) * vd * 4)?,
+        o_rows: a(rows * vd * 4)?,
+        zero_rows,
+        qg: a(rows * 2 * qw * 2)?,
+        kk: a(rows * kvw * 2)?,
+        vv: a(rows * kvw * 2)?,
+        q: a(rows * qw * 2)?,
+        kr: a(rows * kvw * 2)?,
+        attn: a(rows * qw * 2)?,
+        y: a(rows * qw * 2)?,
+        scores: a(if fast {
+            8
+        } else {
+            rows * hq * c.score_stride * 4
+        })?,
+        part_v: a(if fast {
+            c.partial_rows * hq * HEAD_DIM as usize * 2
+        } else {
+            8
+        })?,
+        part_s: a(if fast { c.partial_rows * hq * 4 } else { 8 })?,
+        sink,
+        d_tokens: a(c.drafter.max(1) * 4)?,
+        d_e: a(rows * hid * 2)?,
+        d_hid: a(rows * hid * 2)?,
+        d_cat: a(rows * 2 * hid * 2)?,
+        d_h: a(rows * hid * 2)?,
+        d_normed: a(rows * hid * 2)?,
+        head_in: a(pad4(c.head) * hid * 2)?,
+        head_tmp: a(if fast { head_tmp(&c, d) } else { 8 })?,
+        logits_t: a(c.logits_t.max(1) * vocab * 4)?,
+        logits_d: a(c.logits_d.max(1) * vocab * 4)?,
+        p_plain: a(c.plain.max(1) * n * 8)?,
+        p_target: a(c.targets.max(1) * n * 8)?,
+        q_draft: a((c.drafting * c.depth).max(1) * n * 8)?,
+        accept_scratch: a(accept_work_bytes(c.drafting))?,
+        sample_work: a(sample_work_bytes(sample_rows(&c)))?,
+        lanes: a((c.drafting * c.depth).max(1) * 4)?,
+        pad_c: a(c.pad_conv.max(1) * cd * 4)?,
+        pad_a: a(c.pad_ab.max(1) * 2 * vh * 4)?,
+        pad_o: a(c.pad_o.max(1) * vd * 4)?,
+        pad_h: a(c.pad_h.max(1) * hid * 2)?,
+        pad_t: a(c.pad_t.max(1) * 4)?,
+        dn_w: a(cb[0])?,
+        dn_u: a(cb[1])?,
+        dn_pm: a(cb[2])?,
+        dn_fac: a(cb[3])?,
+        dn_qr: a(cb[4])?,
+        dn_kr: a(cb[5])?,
+        caps: c,
+        ranges,
+    })
+}
+
 impl<D: QwenDevice> QwenCudaExecutor<D> {
-    /// The program's scratch for `c`.
+    /// The program's scratch for `c` on `dev`.
     pub(super) fn alloc_scratch(
         dev: &D,
         d: &super::Dims,
         k_max: usize,
         c: Caps,
     ) -> Result<Scratch> {
-        let a = |bytes: usize| Alloc::new(dev, bytes);
-        let (hid, cd, vd, vh) = (
-            d.hidden as usize,
-            d.conv_dim() as usize,
-            d.value_dim() as usize,
-            d.v_heads as usize,
-        );
-        let qw = (d.q_heads * d.head_dim) as usize;
-        let kvw = d.kv_width() as usize;
-        let rows = pad4(c.rows.max(c.drafter));
-        let vocab = d.vocab as usize;
-        let n = vocab;
         let fast = dev.profile() == super::QwenProfile::Fast;
-        let cb = chunk_bytes(&c, d, dev.block_deltanet());
+        let s = build_scratch(
+            &mut |bytes| Alloc::new(dev, bytes),
+            d,
+            k_max,
+            c,
+            fast,
+            dev.block_deltanet(),
+        )?;
         let hq = d.q_heads as usize;
-        let sink = a(hq * 4)?;
-        // SAFETY: `hq` f32 of the allocation just made.
+        // SAFETY: `hq` f32 of the sink's allocation.
         unsafe {
             let inf: Vec<u8> = (0..hq)
                 .flat_map(|_| f32::NEG_INFINITY.to_le_bytes())
                 .collect();
-            dev.upload(sink.addr, &inf)?;
+            dev.upload(s.sink.addr, &inf)?;
         }
-        Ok(Scratch {
-            table: a(c.table.max(64) * 4)?,
-            readback: a(c.readback * 4)?,
-            h: a(rows * hid * 2)?,
-            x: a(rows * hid * 2)?,
-            mix: a(rows * hid * 2)?,
-            m: a(rows * hid * 2)?,
-            normed: a(pad4(c.rows) * hid * 2)?,
-            codes: a(rows * k_max)?,
-            scales: a(k_max / 128 * rows * 4)?,
-            gate: a(rows * d.inter as usize * 2)?,
-            up: a(rows * d.inter as usize * 2)?,
-            hmid: a(rows * d.inter as usize * 2)?,
-            mixed: a(rows * cd * 2)?,
-            z: a(rows * vd * 2)?,
-            aa: a(rows * vh * 2)?,
-            bb: a(rows * vh * 2)?,
-            nrm: a(rows * vd * 2)?,
-            conv_in: a(c.conv_rows.max(4) * cd * 4)?,
-            new_f32: a(rows * cd * 4)?,
-            ab_new: a(rows * 2 * vh * 4)?,
-            ab: a(c.staged.max(1) * 2 * vh * 4)?,
-            dq: a(c.staged.max(1) * d.key_dim() as usize * 4)?,
-            dk: a(c.staged.max(1) * d.key_dim() as usize * 4)?,
-            dv: a(c.staged.max(1) * vd * 4)?,
-            beta: a(c.staged.max(1) * vh * 4)?,
-            alpha: a(c.staged.max(1) * vh * 4)?,
-            o: a(c.staged.max(1) * vd * 4)?,
-            o_rows: a(rows * vd * 4)?,
-            zero_rows: a(3 * cd * 4)?,
-            qg: a(rows * 2 * qw * 2)?,
-            kk: a(rows * kvw * 2)?,
-            vv: a(rows * kvw * 2)?,
-            q: a(rows * qw * 2)?,
-            kr: a(rows * kvw * 2)?,
-            attn: a(rows * qw * 2)?,
-            y: a(rows * qw * 2)?,
-            scores: a(if fast {
-                8
-            } else {
-                rows * hq * c.score_stride * 4
-            })?,
-            part_v: a(if fast {
-                c.partial_rows * hq * HEAD_DIM as usize * 2
-            } else {
-                8
-            })?,
-            part_s: a(if fast { c.partial_rows * hq * 4 } else { 8 })?,
-            sink,
-            d_tokens: a(c.drafter.max(1) * 4)?,
-            d_e: a(rows * hid * 2)?,
-            d_hid: a(rows * hid * 2)?,
-            d_cat: a(rows * 2 * hid * 2)?,
-            d_h: a(rows * hid * 2)?,
-            d_normed: a(rows * hid * 2)?,
-            head_in: a(pad4(c.head) * hid * 2)?,
-            head_tmp: a(if fast { head_tmp(&c, d) } else { 8 })?,
-            logits_t: a(c.logits_t.max(1) * vocab * 4)?,
-            logits_d: a(c.logits_d.max(1) * vocab * 4)?,
-            p_plain: a(c.plain.max(1) * n * 8)?,
-            p_target: a(c.targets.max(1) * n * 8)?,
-            q_draft: a((c.drafting * c.depth).max(1) * n * 8)?,
-            accept_scratch: a(accept_work_bytes(c.drafting))?,
-            sample_work: a(sample_work_bytes(sample_rows(&c)))?,
-            lanes: a((c.drafting * c.depth).max(1) * 4)?,
-            pad_c: a(c.pad_conv.max(1) * cd * 4)?,
-            pad_a: a(c.pad_ab.max(1) * 2 * vh * 4)?,
-            pad_o: a(c.pad_o.max(1) * vd * 4)?,
-            pad_h: a(c.pad_h.max(1) * hid * 2)?,
-            pad_t: a(c.pad_t.max(1) * 4)?,
-            dn_w: a(cb[0])?,
-            dn_u: a(cb[1])?,
-            dn_pm: a(cb[2])?,
-            dn_fac: a(cb[3])?,
-            dn_qr: a(cb[4])?,
-            dn_kr: a(cb[5])?,
-            caps: c,
-        })
+        Ok(s)
     }
-
     /// Every scratch range the program writes, for the idle scrub.
     pub(super) fn scratch_ranges(&self) -> Vec<(u64, usize)> {
         let s = &self.scratch;
-        let c = &s.caps;
-        let d = &self.dims;
-        let (hid, cd, vd, vh) = (
-            d.hidden as usize,
-            d.conv_dim() as usize,
-            d.value_dim() as usize,
-            d.v_heads as usize,
-        );
-        let qw = (d.q_heads * d.head_dim) as usize;
-        let kvw = d.kv_width() as usize;
-        let rows = pad4(c.rows.max(c.drafter));
-        let vocab = d.vocab as usize;
-        let hq = d.q_heads as usize;
-        let fast = self.dev.profile() == super::QwenProfile::Fast;
-        let cb = chunk_bytes(c, d, self.blocked());
-        let kmax = self.k_max();
-        vec![
-            (s.table.addr, c.table.max(64) * 4),
-            (s.readback.addr, c.readback * 4),
-            (s.h.addr, rows * hid * 2),
-            (s.x.addr, rows * hid * 2),
-            (s.mix.addr, rows * hid * 2),
-            (s.m.addr, rows * hid * 2),
-            (s.normed.addr, pad4(c.rows) * hid * 2),
-            (s.codes.addr, rows * kmax),
-            (s.scales.addr, kmax / 128 * rows * 4),
-            (s.gate.addr, rows * d.inter as usize * 2),
-            (s.up.addr, rows * d.inter as usize * 2),
-            (s.hmid.addr, rows * d.inter as usize * 2),
-            (s.mixed.addr, rows * cd * 2),
-            (s.z.addr, rows * vd * 2),
-            (s.aa.addr, rows * vh * 2),
-            (s.bb.addr, rows * vh * 2),
-            (s.nrm.addr, rows * vd * 2),
-            (s.conv_in.addr, c.conv_rows.max(4) * cd * 4),
-            (s.new_f32.addr, rows * cd * 4),
-            (s.ab_new.addr, rows * 2 * vh * 4),
-            (s.ab.addr, c.staged.max(1) * 2 * vh * 4),
-            (s.dq.addr, c.staged.max(1) * d.key_dim() as usize * 4),
-            (s.dk.addr, c.staged.max(1) * d.key_dim() as usize * 4),
-            (s.dv.addr, c.staged.max(1) * vd * 4),
-            (s.beta.addr, c.staged.max(1) * vh * 4),
-            (s.alpha.addr, c.staged.max(1) * vh * 4),
-            (s.o.addr, c.staged.max(1) * vd * 4),
-            (s.o_rows.addr, rows * vd * 4),
-            (s.qg.addr, rows * 2 * qw * 2),
-            (s.kk.addr, rows * kvw * 2),
-            (s.vv.addr, rows * kvw * 2),
-            (s.q.addr, rows * qw * 2),
-            (s.kr.addr, rows * kvw * 2),
-            (s.attn.addr, rows * qw * 2),
-            (s.y.addr, rows * qw * 2),
-            (
-                s.scores.addr,
-                if fast {
-                    8
-                } else {
-                    rows * hq * c.score_stride * 4
-                },
-            ),
-            (
-                s.part_v.addr,
-                if fast {
-                    c.partial_rows * hq * HEAD_DIM as usize * 2
-                } else {
-                    8
-                },
-            ),
-            (
-                s.part_s.addr,
-                if fast { c.partial_rows * hq * 4 } else { 8 },
-            ),
-            (s.d_tokens.addr, c.drafter.max(1) * 4),
-            (s.d_e.addr, rows * hid * 2),
-            (s.d_hid.addr, rows * hid * 2),
-            (s.d_cat.addr, rows * 2 * hid * 2),
-            (s.d_h.addr, rows * hid * 2),
-            (s.d_normed.addr, rows * hid * 2),
-            (s.head_in.addr, pad4(c.head) * hid * 2),
-            (s.head_tmp.addr, if fast { head_tmp(c, d) } else { 8 }),
-            (s.logits_t.addr, c.logits_t.max(1) * vocab * 4),
-            (s.logits_d.addr, c.logits_d.max(1) * vocab * 4),
-            (s.p_plain.addr, c.plain.max(1) * vocab * 8),
-            (s.p_target.addr, c.targets.max(1) * vocab * 8),
-            (s.q_draft.addr, (c.drafting * c.depth).max(1) * vocab * 8),
-            (s.accept_scratch.addr, accept_work_bytes(c.drafting)),
-            (s.sample_work.addr, sample_work_bytes(sample_rows(c))),
-            (s.lanes.addr, (c.drafting * c.depth).max(1) * 4),
-            (s.pad_c.addr, c.pad_conv.max(1) * cd * 4),
-            (s.pad_a.addr, c.pad_ab.max(1) * 2 * vh * 4),
-            (s.pad_o.addr, c.pad_o.max(1) * vd * 4),
-            (s.pad_h.addr, c.pad_h.max(1) * hid * 2),
-            (s.pad_t.addr, c.pad_t.max(1) * 4),
-            (s.dn_w.addr, cb[0]),
-            (s.dn_u.addr, cb[1]),
-            (s.dn_pm.addr, cb[2]),
-            (s.dn_fac.addr, cb[3]),
-            (s.dn_qr.addr, cb[4]),
-            (s.dn_kr.addr, cb[5]),
-        ]
-    }
-
-    /// The widest K of an FP8 linear.
-    pub(super) fn k_max(&self) -> usize {
-        let d = &self.dims;
-        [d.hidden, d.inter, d.q_heads * d.head_dim, d.value_dim()]
-            .into_iter()
-            .max()
-            .unwrap_or(0) as usize
+        let mut r = vec![(s.table.addr, s.caps.table.max(64) * 4)];
+        r.extend_from_slice(&s.ranges);
+        r
     }
 
     fn tw(&self, a: super::super::plan::Arr) -> u64 {
