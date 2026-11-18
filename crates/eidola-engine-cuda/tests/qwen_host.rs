@@ -210,6 +210,75 @@ fn blocked_dense_logits_refuse_a_scratch_smaller_than_a_block() {
     assert!(ex.slot_state_is_zero(0));
 }
 
+/// In blocks a step prepares only the positions it computes: a decode row its host token
+/// and drafts (its block's earlier positions are in the tail cache), a prefill its
+/// chunk. On the eager and the rung path, at blocks of 16 and widths 0 and 3, every
+/// DeltaNet layer's preparation covers exactly its runs' new positions.
+#[test]
+fn blocked_deltanet_prepares_only_new_positions() {
+    use eidola_engine_cuda::qwen::abi::{DnChunkParams, DnSeq};
+    use eidola_engine_cuda::qwen::host::HostDevice;
+    use eidola_engine_cuda::qwen::{CudaGraphs, DecodePath};
+    use std::sync::{Arc, Mutex};
+    let Some(lib) = qwen_common::library() else {
+        return;
+    };
+    // (positions prepared, the runs' new positions) a layer.
+    let seen = Arc::new(Mutex::new(Vec::<(u32, u32)>::new()));
+    let make = || {
+        let inner = qwen_common::host_launch(lib.clone());
+        let seen = seen.clone();
+        let prepared = Mutex::new(None::<u32>);
+        HostDevice::block_deltanet(Box::new(move |family, params, gx, gy| {
+            if family == "dn_prep" {
+                *prepared.lock().expect("lock") = Some(gy);
+            }
+            if family == "dn_intra" {
+                // SAFETY: the host device hands `dn_intra` its `DnChunkParams`, whose runs
+                // are a host array of `seq_count` descriptors.
+                let new: u32 = unsafe {
+                    let p = &*params.cast::<DnChunkParams>();
+                    std::slice::from_raw_parts(p.seqs as *const DnSeq, p.seq_count as usize)
+                        .iter()
+                        .map(|s| s.count - s.out_from)
+                        .sum()
+                };
+                let got = prepared.lock().expect("lock").take().unwrap_or(u32::MAX);
+                seen.lock().expect("lock").push((got, new));
+            }
+            inner(family, params, gx, gy);
+        }))
+    };
+    qwen_common::with_block_size(16, || {
+        for path in [DecodePath::Eager, DecodePath::Direct] {
+            for k in [0u32, 3] {
+                seen.lock().expect("lock").clear();
+                let before = qwen_common::rung_steps();
+                qwen_common::with_path(CudaGraphs::Off, path, || {
+                    qwen_common::invariance::workload(&make, k)
+                });
+                let seen = seen.lock().expect("lock");
+                assert!(
+                    !seen.is_empty(),
+                    "{path:?} at width {k}: no blocked layer ran"
+                );
+                assert!(
+                    path == DecodePath::Eager || qwen_common::rung_steps() > before,
+                    "{path:?} at width {k}: no step ran a rung"
+                );
+                let off: Vec<_> = seen.iter().filter(|(got, new)| got != new).collect();
+                assert!(
+                    off.is_empty(),
+                    "{path:?} at width {k}: {} of {} layers prepared other than their new positions, e.g. {:?}",
+                    off.len(),
+                    seen.len(),
+                    &off[..off.len().min(4)]
+                );
+            }
+        }
+    });
+}
+
 /// The padded rung path (a decode rung's launch sequence over its table, as a graph
 /// records it, run directly: the host captures no graphs) against the CPU reference
 /// executor: the same scenarios, and rungs must have run.

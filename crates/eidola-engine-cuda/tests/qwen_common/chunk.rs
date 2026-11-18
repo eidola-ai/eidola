@@ -156,15 +156,13 @@ pub fn model(r: &HeadRun<'_>, s0: &[f32], chunk: usize) -> (Vec<f32>, Vec<Vec<f3
         let mut y = vec![vec![0.0f32; vd]; TILE];
         for row in 0..TILE {
             for col in 0..vd {
-                // Each half of the key dimension its own sum, the low half's first.
-                let (mut x, mut yy) = ([0.0f32; 2], [0.0f32; 2]);
+                let (mut x, mut yy) = (0.0f32, 0.0f32);
                 for ks_ in 0..KD / 8 {
-                    let half = ks_ / (KD / 16);
-                    x[half] += kstep(|k| w[row][k], |k| s[k * vd + col], 8 * ks_);
-                    yy[half] += kstep(|k| qs[row][k], |k| s[k * vd + col], 8 * ks_);
+                    x += kstep(|k| w[row][k], |k| s[k * vd + col], 8 * ks_);
+                    yy += kstep(|k| qs[row][k], |k| s[k * vd + col], 8 * ks_);
                 }
-                delta[row][col] = uu[row][col] - (x[0] + x[1]);
-                y[row][col] = yy[0] + yy[1];
+                delta[row][col] = uu[row][col] - x;
+                y[row][col] = yy;
             }
         }
         for row in 0..n {

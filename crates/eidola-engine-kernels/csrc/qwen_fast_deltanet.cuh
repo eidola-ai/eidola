@@ -167,35 +167,76 @@ DS_FN uint32_t cached_rows(const QwDnSeq& s, uint32_t from, uint32_t n) {
   return s.out_from - from < n ? s.out_from - from : n;
 }
 
-// Keeps a new position's intermediates, but `Δ`, in the tail cache, for the state
-// CTA of value head `h` and the slice of `cols` columns from `vbase`: the value's
-// columns, and from the first slice the row of `T`, `β`, `G` and (the key
-// head's first value head) the key, from what the intra kernel left of block
-// `tile`'s row `r`. The state kernel writes them, after every intra CTA has read
-// the cache: a long run's cached and kept positions can share a ring row.
-DS_FN void keep_row(const QwDnChunkParams& p, const QwDnSeq& s, uint32_t tile, uint32_t from,
-                    uint32_t r, uint32_t h, uint32_t vbase, uint32_t cols, uint32_t t,
-                    uint32_t threads) {
-  float* entry = entry_at(p, s, from + r);
-  float* rec = rec_at(p, entry, h);
-  const float* v = p.v + (staged_at(s, from + r) * p.v_heads + h) * p.v_dim + vbase;
-  for (uint32_t c = t; c < cols; c += threads) rec[vbase + c] = v[c];
-  if (vbase != 0) return;
-  const float* rs = p.rec + (tile_head(p, tile, h) * kTile + r) * kRec;
-  for (uint32_t j = t; j < kTile + 2; j += threads) rec[2 * p.v_dim + j] = rs[j];
+// The run holding block `x` of the launch (the one whose blocks `tile ..` reach past
+// it) into `seq`, `found` 1; `found` 0 when no run does.
+template <class P>
+DS_FN void find_run(const QwDnChunkParams& p, uint32_t x, const P& par, uint32_t& seq,
+                    uint32_t& found) {
+  par.run([&](uint32_t t) {
+    if (t == 0) found = 0;
+  });
+  par.run([&](uint32_t t) {
+    for (uint32_t i = t; i < p.seq_count; i += kThreads) {
+      const QwDnSeq& s = p.seqs[i];
+      if (x >= s.tile && x - s.tile < run_tiles(s, p.chunk)) {
+        seq = i;
+        found = 1;
+      }
+    }
+  });
+}
+
+// ---- keeping the new positions (`eidola_qwen_fast_dn_keep`) ----
+//
+// CTA (`x`, key head `kh`), after the state kernel: block `x`'s kept new positions'
+// key, and each of the key head's value heads' value, row of `T`, `β` and `G`, from
+// what the intra kernel left, into the tail cache (the state kernel writes `Δ`). It
+// runs after both kernels have read the cache: a long run's cached and kept
+// positions can share a ring row.
+
+struct QD_ALIGN32 KeepShared {
+  uint32_t seq;
+  uint32_t found;
+};
+
+template <class P>
+DS_FN void dn_keep_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, const P& par,
+                         KeepShared& sh) {
+  find_run(p, x, par, sh.seq, sh.found);
+  if (sh.found == 0 || x >= p.tiles) return;
+  const QwDnSeq& s = p.seqs[sh.seq];
+  const uint32_t from = (x - s.tile) * p.chunk;
+  const uint32_t n = s.count - from < p.chunk ? s.count - from : p.chunk;
+  const uint32_t lo = cached_rows(s, from, n);
   const uint32_t group = p.v_heads / p.k_heads;
-  if (h % group != 0) return;
-  const uint32_t kh = h / group;
-  const float* k = p.kraw + (tile_key(p, tile, kh) * kTile + r) * kKey;
-  for (uint32_t i = t; i < kKey; i += threads) entry[kh * kKey + i] = k[i];
+  par.run([&](uint32_t t) {
+    for (uint32_t r = lo; r < n; ++r) {
+      if (from + r < s.keep_from) continue;
+      float* entry = entry_at(p, s, from + r);
+      const float* k = p.kraw + (tile_key(p, x, kh) * kTile + r) * kKey;
+      for (uint32_t i = t; i < kKey; i += kThreads) entry[kh * kKey + i] = k[i];
+      const uint64_t at = staged_at(s, from + r);
+      for (uint32_t e = t; e < group * p.v_dim; e += kThreads) {
+        const uint32_t h = kh * group + e / p.v_dim;
+        const uint32_t c = e % p.v_dim;
+        rec_at(p, entry, h)[c] = p.v[(at * p.v_heads + h) * p.v_dim + c];
+      }
+      for (uint32_t e = t; e < group * (kTile + 2); e += kThreads) {
+        const uint32_t h = kh * group + e / (kTile + 2);
+        const uint32_t j = e % (kTile + 2);
+        rec_at(p, entry, h)[2 * p.v_dim + j] = p.rec[(tile_head(p, x, h) * kTile + r) * kRec + j];
+      }
+    }
+  });
 }
 
 // ---- the block's state-free parts (`eidola_qwen_fast_dn_intra`) ----
 //
-// Every row past the block's `n` positions is zero in what it writes (`W`, `U`,
-// `P`, the rounded queries and keys), every row before its first new one (a
-// cached row) zero in `W`, `U`, `P` and the queries, and every loop over rows
-// runs over the new ones: a decode step's block costs its new position.
+// Every loop over rows runs over the block's new ones, and it writes the rows the
+// state kernel reads: the new rows of `W`, `U` and the rounded queries (the state
+// kernel reads the others as zeros), and the rounded keys of every row only for a
+// whole block, the only one whose update reads them (zero past its `n` positions).
+// So a decode step's block costs its new position.
 
 // The key and query rows are 129 floats apart, so the threads of a pair's dot,
 // each reading another row at one column, meet in distinct banks.
@@ -228,24 +269,13 @@ struct QD_ALIGN32 IntraShared {
 template <class P>
 DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, const P& par,
                           IntraShared& sh) {
-  par.run([&](uint32_t t) {
-    if (t == 0) sh.found = 0;
-  });
-  // The run holding block `x`: the one whose blocks `tile ..` reach past it.
-  par.run([&](uint32_t t) {
-    for (uint32_t i = t; i < p.seq_count; i += kThreads) {
-      const QwDnSeq& s = p.seqs[i];
-      if (x >= s.tile && x - s.tile < run_tiles(s, p.chunk)) {
-        sh.seq = i;
-        sh.found = 1;
-      }
-    }
-  });
+  find_run(p, x, par, sh.seq, sh.found);
   if (sh.found == 0 || x >= p.tiles) return;
   const QwDnSeq& s = p.seqs[sh.seq];
   const uint32_t from = (x - s.tile) * p.chunk;
   const uint32_t n = s.count - from < p.chunk ? s.count - from : p.chunk;
   const uint32_t lo = cached_rows(s, from, n);
+  const bool whole = n == p.chunk;
   const uint32_t key_dim = p.k_heads * kKey;
   const uint32_t group = p.v_heads / p.k_heads;
   const uint32_t tr = 2 * p.v_dim;  // a record's row of `T`
@@ -268,9 +298,11 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
       }
       sh.q[r][i] = q;
       sh.k[r][i] = k;
-      p.qr[tk + e] = tf32_rna(q);
-      p.kr[tk + e] = tf32_rna(k);
-      p.kraw[tk + e] = k;
+      if (r >= lo && r < n) {
+        p.qr[tk + e] = tf32_rna(q);
+        p.kraw[tk + e] = k;
+      }
+      if (whole) p.kr[tk + e] = tf32_rna(k);
     }
     for (uint32_t e = t; e < group * kTile; e += kThreads) {
       const uint32_t gi = e / kTile;
@@ -395,10 +427,9 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
       for (uint32_t gi = 0; gi < group; ++gi) {
         float* w = p.w + tile_head(p, x, kh * group + gi) * kTile * kKey;
         for (uint32_t r = 0; r < kTile; ++r) {
+          if (r < lo || r >= n) continue;
           float acc = 0.0f;
-          if (r >= lo && r < n) {
-            for (uint32_t j = 0; j <= r; ++j) acc = acc + sh.tc[gi][r][j] * col[j];
-          }
+          for (uint32_t j = 0; j <= r; ++j) acc = acc + sh.tc[gi][r][j] * col[j];
           w[r * kKey + i] = tf32_rna(acc);
         }
       }
@@ -419,10 +450,9 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
         col[j] = v;
       }
       for (uint32_t r = 0; r < kTile; ++r) {
+        if (r < lo || r >= n) continue;
         float acc = 0.0f;
-        if (r >= lo && r < n) {
-          for (uint32_t j = 0; j <= r; ++j) acc = acc + sh.tb[gi][r][j] * col[j];
-        }
+        for (uint32_t j = 0; j <= r; ++j) acc = acc + sh.tb[gi][r][j] * col[j];
         u[r * p.v_dim + c] = acc;
       }
     }
@@ -431,28 +461,28 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
 
 // ---- the state kernel (`eidola_qwen_fast_dn_state`) ----
 //
-// A CTA owns one run, one value head and `kSlice` of its value columns (two warps
-// 16 of them, each warp half the key dimension; columns are independent in the
-// recurrence), and keeps that slice of the state in registers across the run's
-// blocks, transposed (`Sᵀ`, value rows by key columns), in the tensor core's
-// accumulator layout. Per block, on tensor cores (`mma.sync` m16n8k8, TF32):
-// `Xᵀ = Sᵀ Wᵀ` and `Yᵀ = Sᵀ qᵀ` as two sums of 8 K-steps, one a half of the key
-// dimension (`Sᵀ` read as the left operand straight from its accumulator
-// registers), added low half first; then element by element `Δ = U − X`, `o =
-// exp(G) · Y + Z` (`ztree`, over `Δ` staged in shared memory), and for a whole
-// block `Sᵀ ← Sᵀ · γ + Δ′ᵀ K` (each warp its 16 rows by its half's eight
-// eight-column tiles, two K-steps, from zero accumulators). A K-step's eight products pair `Sᵀ`'s
+// A CTA owns one run, one value head and `kSlice` of its value columns (a warp 16
+// of them; columns are independent in the recurrence), and keeps that slice of
+// the state in registers across the run's blocks, transposed (`Sᵀ`, value rows by
+// key columns), in the tensor core's accumulator layout. Per block, on tensor
+// cores (`mma.sync` m16n8k8, TF32): `Xᵀ = Sᵀ Wᵀ` and `Yᵀ = Sᵀ qᵀ` (16 K-steps
+// over the key dimension, `Sᵀ` read as the left operand straight from its
+// accumulator registers), then element by element `Δ = U − X` (a cached row's
+// from the tail cache, a kept new row's into it), `o = exp(G) · Y + Z` (`ztree`,
+// over `Δ` staged in shared memory), and for a whole block `Sᵀ ← Sᵀ · γ + Δ′ᵀ K`
+// (each warp its 16 rows by 16 eight-column tiles, two K-steps, from zero
+// accumulators). The rows of `W`, `q` and `U` outside the block's new ones are
+// read as zeros, and the keys only for a whole block. A K-step's eight products pair `Sᵀ`'s
 // (or `Δ′ᵀ`'s) columns `2t, 2t + 1` with the right operand's rows `2t, 2t + 1`,
 // which is how the accumulator layout hands them over; a product's column is
 // its right operand's column alone, so a position's results read only its own
 // rows of `W`, `q` and `U`.
 
 constexpr uint32_t kSlice = 64;     // value columns of a state CTA
-constexpr uint32_t kStateThreads = 256;  // a state CTA: two warps a 16 columns
 constexpr uint32_t kWP = kKey + 8;  // W's and the queries' row stride
 constexpr uint32_t kKP = kKey + 4;  // the keys' row stride
 constexpr uint32_t kUP = kSlice + 4;
-constexpr uint32_t kDP = kTile + 4; // a column group's Δ and Y rows
+constexpr uint32_t kDP = kTile + 4; // a warp's Δ rows
 
 struct QD_ALIGN32 StateShared {
   float w[kTile][kWP];
@@ -461,9 +491,8 @@ struct QD_ALIGN32 StateShared {
   float u[kTile][kUP];
   float pm[kTile][kTile];
   float fac[kFac];
-  // Per 16 columns `[v][r]`: the high key half's X, then Δ; its Y, then the sum.
-  float d[kSlice / 16][16][kDP];
-  float y[kSlice / 16][16][kDP];
+  float cd[kTile][kUP];  // the cached rows' `Δ`, the slice's columns
+  float d[kThreads / 32][16][kDP];
 };
 
 // The stores due once `done` positions have run (`done` a block boundary: the
@@ -529,21 +558,25 @@ inline void dn_state_host(const QwDnChunkParams& p, uint32_t x, uint32_t h) {
     const float* kr = p.kr + tk * kTile * kKey;
     float d[kTile][kSlice];
     float y[kTile][kSlice];
-    for (uint32_t r = 0; r < kTile; ++r)
-      for (uint32_t c = 0; c < cols; ++c) {
-        // Each half of the key dimension its own sum, then the halves added.
-        float xh[2] = {0.0f, 0.0f};
-        float yh[2] = {0.0f, 0.0f};
-        for (uint32_t ks = 0; ks < kKey / 8; ++ks) {
-          const uint32_t half = ks / (kKey / 16);
-          xh[half] = xh[half] + host_kstep(w + r * kKey + 8 * ks, 1, st + 8 * ks * kSlice + c, kSlice);
-          yh[half] = yh[half] + host_kstep(qr + r * kKey + 8 * ks, 1, st + 8 * ks * kSlice + c, kSlice);
-        }
-        d[r][c] = u[r * p.v_dim + vbase + c] - (xh[0] + xh[1]);
-        y[r][c] = yh[0] + yh[1];
-      }
-    // A cached row's `Δ` as it was computed; a kept new row's into the tail cache.
     const uint32_t lo = cached_rows(s, from, n);
+    // The rows of `W`, `q` and `U` outside the new ones read as zeros.
+    static const float zero[kKey] = {};
+    for (uint32_t r = 0; r < kTile; ++r) {
+      const bool fresh = r >= lo && r < n;
+      const float* wr = fresh ? w + r * kKey : zero;
+      const float* qrr = fresh ? qr + r * kKey : zero;
+      for (uint32_t c = 0; c < cols; ++c) {
+        float xa = 0.0f;
+        float ya = 0.0f;
+        for (uint32_t ks = 0; ks < kKey / 8; ++ks) {
+          xa = xa + host_kstep(wr + 8 * ks, 1, st + 8 * ks * kSlice + c, kSlice);
+          ya = ya + host_kstep(qrr + 8 * ks, 1, st + 8 * ks * kSlice + c, kSlice);
+        }
+        d[r][c] = (fresh ? u[r * p.v_dim + vbase + c] : 0.0f) - xa;
+        y[r][c] = ya;
+      }
+    }
+    // A cached row's `Δ` as it was computed; a kept new row's into the tail cache.
     for (uint32_t r = 0; r < n; ++r)
       for (uint32_t c = 0; c < cols; ++c) {
         float* rec = rec_at(p, entry_at(p, s, from + r), h);
@@ -553,8 +586,6 @@ inline void dn_state_host(const QwDnChunkParams& p, uint32_t x, uint32_t h) {
           rec[p.v_dim + vbase + c] = d[r][c];
         }
       }
-    for (uint32_t r = lo; r < n; ++r)
-      if (from + r >= s.keep_from) keep_row(p, s, s.tile + b, from, r, h, vbase, cols, 0, 1);
     for (uint32_t r = 0; r < n; ++r) {
       if (from + r < s.out_from) continue;
       for (uint32_t c = 0; c < cols; ++c) {

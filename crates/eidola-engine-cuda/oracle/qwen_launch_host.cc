@@ -287,8 +287,8 @@ void qwen_host_dn_rec(const QwDnRecParams* p, uint32_t gx, uint32_t gy) {
     }
 }
 
-// The fast profile's blocked DeltaNet: the intra kernel's body, and the state
-// kernel's host form (`qwd::dn_state_host`).
+// The fast profile's blocked DeltaNet: the intra and keep kernels' bodies, and the
+// state kernel's host form (`qwd::dn_state_host`).
 void qwen_host_dn_intra(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
   qwd::IntraShared sh;
   const ds::Par par{qwd::kThreads, true};
@@ -302,6 +302,16 @@ void qwen_host_dn_intra(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
 void qwen_host_dn_state(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
   for (uint32_t y = gy; y-- > 0;)
     for (uint32_t x = gx; x-- > 0;) qwd::dn_state_host(*p, x, y);
+}
+
+void qwen_host_dn_keep(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
+  qwd::KeepShared sh;
+  const ds::Par par{qwd::kThreads, true};
+  for (uint32_t y = gy; y-- > 0;)
+    for (uint32_t x = gx; x-- > 0;) {
+      garbage(&sh);
+      qwd::dn_keep_block(*p, x, y, par, sh);
+    }
 }
 
 // `eidola_qwen_dn_norm`'s entry: a warp a (row, head), four a CTA, numbered

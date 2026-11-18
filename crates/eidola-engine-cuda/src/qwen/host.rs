@@ -168,7 +168,8 @@ impl QwenKernels for HostDevice {
             return Ok(());
         }
         self.run("dn_intra", p, dn_intra_grid(p))?;
-        self.run("dn_state", p, dn_state_grid(p))
+        self.run("dn_state", p, dn_state_grid(p))?;
+        self.run("dn_keep", p, dn_intra_grid(p))
     }
     /// The short form computes the general form's bits: the same host body.
     unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()> {

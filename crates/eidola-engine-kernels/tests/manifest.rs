@@ -567,7 +567,11 @@ fn qwen_fast_deltanet_is_unfused_on_mma_sync() {
         symbols.sort_unstable();
         assert_eq!(
             symbols,
-            ["eidola_qwen_fast_dn_intra", "eidola_qwen_fast_dn_state"],
+            [
+                "eidola_qwen_fast_dn_intra",
+                "eidola_qwen_fast_dn_keep",
+                "eidola_qwen_fast_dn_state"
+            ],
             "{arch}"
         );
     }

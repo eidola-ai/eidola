@@ -81,7 +81,10 @@ pub fn host_device(lib: Arc<libloading::Library>) -> HostDevice {
     HostDevice::new(host_launch(lib))
 }
 
-fn host_launch(lib: Arc<libloading::Library>) -> Box<eidola_engine_cuda::qwen::host::HostLaunch> {
+/// Each launch run by its family's host body (`qwen_host_<family>`).
+pub fn host_launch(
+    lib: Arc<libloading::Library>,
+) -> Box<eidola_engine_cuda::qwen::host::HostLaunch> {
     Box::new(move |family, params, gx, gy| {
         let name = format!("qwen_host_{family}\0");
         // SAFETY: every `qwen_host_*` symbol has this signature, and takes the family's

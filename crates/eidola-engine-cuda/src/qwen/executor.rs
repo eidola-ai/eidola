@@ -1659,11 +1659,17 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         };
         let writes = ((fold + 1) / bs + 1).min(SEQ_WRITES);
         let wu = w as usize;
-        // A row: its folds, its host token and its drafts staged; the state writes, the
-        // live image and every new position into the tail kept.
+        // A row: its folds, its host token and its drafts staged (in blocks only the
+        // host token and the drafts: the folded positions' intermediates are in the
+        // tail cache, the blocks they span counted); the state writes, the live image
+        // and every new position into the tail kept.
         let t = &mut s.target;
         t.tiles = r * (fold + 1 + wu).div_ceil(self.chunk() as usize);
-        t.staged = r * (fold + 1 + wu);
+        t.staged = if self.blocked() {
+            r * (1 + wu)
+        } else {
+            r * (fold + 1 + wu)
+        };
         t.conv_rows = 3 * r + t.staged;
         t.stage_conv = 3 * r + t.staged;
         t.stage_ab = t.staged;

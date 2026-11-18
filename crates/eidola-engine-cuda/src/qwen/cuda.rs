@@ -97,6 +97,7 @@ struct Fast {
     gate: Kernel,
     dn_intra: Kernel,
     dn_state: Kernel,
+    dn_keep: Kernel,
     attention: QwenAttention,
     _modules: Vec<KernelModule>,
 }
@@ -185,6 +186,7 @@ impl CudaDevice {
                         FAST_DN_IMAGE,
                         "eidola_qwen_fast_dn_state",
                     )?,
+                    dn_keep: bound::<DnChunkParams>(&d, FAST_DN_IMAGE, "eidola_qwen_fast_dn_keep")?,
                     attention: QwenAttention::from_module(a)?,
                     _modules: vec![f, sw, b, q, d],
                 })
@@ -347,6 +349,22 @@ impl CudaDevice {
             .ok_or_else(|| CudaError::new("the blocked DeltaNet runs in the fast profile"))?;
         // SAFETY: the caller's.
         unsafe { self.go(&f.dn_state, p, g) }
+    }
+
+    /// The blocked DeltaNet's keep kernel alone: the kept new positions into the tail
+    /// cache, after the state kernel.
+    ///
+    /// # Safety
+    ///
+    /// As [`QwenKernels::dn_chunk`].
+    pub unsafe fn dn_keep(&self, p: &DnChunkParams) -> Result<()> {
+        let g = dn_intra_grid(p)?;
+        let f = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the blocked DeltaNet runs in the fast profile"))?;
+        // SAFETY: the caller's.
+        unsafe { self.go(&f.dn_keep, p, g) }
     }
 
     /// The small-N BF16 GEMM of `p` in the form named (`tiled`: eight rows by four outputs
@@ -518,7 +536,8 @@ impl QwenKernels for CudaDevice {
         // SAFETY: the caller's.
         unsafe {
             self.dn_intra(p)?;
-            self.dn_state(p)
+            self.dn_state(p)?;
+            self.dn_keep(p)
         }
     }
     unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()> {

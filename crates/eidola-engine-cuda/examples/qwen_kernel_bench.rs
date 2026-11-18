@@ -466,12 +466,16 @@ fn main() {
         let intra = time(&fast, n, || {
             unsafe { fast.dn_intra(&p) }.unwrap_or_else(|e| fail(e))
         });
+        let state = time(&fast, n, || {
+            unsafe { fast.dn_state(&p) }.unwrap_or_else(|e| fail(e))
+        });
         let tokens = f64::from(outs * rows);
         println!(
-            "{{\"bench\":\"dn_chunk\",\"rows\":{rows},\"fold\":{fold},\"outputs\":{outs},\"us_per_layer\":{:.1},\"intra_us\":{:.1},\"state_us\":{:.1},\"tokens_per_s_per_layer\":{:.0},\"ms_48_layers\":{:.3}}}",
+            "{{\"bench\":\"dn_chunk\",\"rows\":{rows},\"fold\":{fold},\"outputs\":{outs},\"us_per_layer\":{:.1},\"intra_us\":{:.1},\"state_us\":{:.1},\"keep_us\":{:.1},\"tokens_per_s_per_layer\":{:.0},\"ms_48_layers\":{:.3}}}",
             s * 1e6,
             intra * 1e6,
-            (s - intra) * 1e6,
+            state * 1e6,
+            (s - intra - state) * 1e6,
             tokens / s,
             s * 48.0 * 1e3
         );
