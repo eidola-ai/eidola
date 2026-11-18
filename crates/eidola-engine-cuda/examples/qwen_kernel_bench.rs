@@ -17,7 +17,9 @@
 //!   256 and 2,048 rows;
 //! - `norm` (the hidden norm with the residual add; its fused forms, `quant` (the normed
 //!   rows quantised in the same launch), `parts` (the residual add from a split GEMM's
-//!   three partials) and `parts_quant`; and `q_rope`: the query heads' norm
+//!   three partials) and `parts_quant`, beside the launches each stands for
+//!   (`sum_then_norm`, `norm_then_quant`, `sum_norm_quant`); and `q_rope`: the query
+//!   heads' norm
 //!   with RoPE), `widen` (the DeltaNet's conv inputs, 10,240 wide), `quant` (over
 //!   activation-like values), `gate` (fast f32 and exact f64), `dn_prep`, `dn_norm`: one
 //!   launch at the released widths, at 1, 8, 16, 32, 64, 256 and 2,048 rows;
@@ -57,7 +59,7 @@ use eidola_engine_cuda::qwen::QwenProfile;
 use eidola_engine_cuda::qwen::abi::*;
 use eidola_engine_cuda::qwen::cuda::{CudaDevice, FP8_KINDS};
 use eidola_engine_cuda::qwen::kernels::{
-    AcceptLaunch, MAX_SPLITS, QwenKernels, SampleArgs, fp8_splits,
+    AcceptLaunch, MAX_SPLITS, QwenKernels, SampleArgs, fp8_splits, split_sum_grid,
 };
 use eidola_engine_cuda::qwen::sampler::{accept_work_bytes, sample_work_bytes};
 use eidola_engine_cuda::sampler::SampleRow;
@@ -605,6 +607,47 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
             // and scales 2,048 rows of the hidden width.
             let s = time(fast, it, || {
                 unsafe { fast.norm(&f) }.unwrap_or_else(|e| fail(e))
+            });
+            line("norm", form, rows, s);
+        }
+        // The launches each fused form stands for, back to back: the split sum into a
+        // BF16 row then the norm adding it, the norm then the quantiser over its output,
+        // and all three. The program picks a form by these against the fused lines
+        // (`kernels::NORM_FUSED_PARTS_ROWS`, `NORM_FUSED_QUANT_ROWS`).
+        let sum = SplitSumParams {
+            parts,
+            out: y,
+            rows,
+            n: hidden,
+            splits: 3,
+            part_rows: w32(rows_max),
+            out_stride: hidden,
+            reserved: 0,
+        };
+        let sum_grid = split_sum_grid(&sum).unwrap_or_else(|e| fail(e));
+        let q = QuantParams {
+            x: out,
+            codes,
+            scales,
+            rows,
+            k: hidden,
+            x_stride: hidden,
+            m_pad,
+        };
+        for (form, with_sum, quantise) in [
+            ("sum_then_norm", true, false),
+            ("norm_then_quant", false, true),
+            ("sum_norm_quant", true, true),
+        ] {
+            // SAFETY: as above; the sum writes 2,048 rows of the hidden width at `y`.
+            let s = time(fast, it, || unsafe {
+                if with_sum {
+                    fast.split_sum(&sum, sum_grid).unwrap_or_else(|e| fail(e));
+                }
+                fast.norm(&norm).unwrap_or_else(|e| fail(e));
+                if quantise {
+                    fast.quant(&q).unwrap_or_else(|e| fail(e));
+                }
             });
             line("norm", form, rows, s);
         }

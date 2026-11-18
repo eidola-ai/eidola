@@ -49,9 +49,11 @@ static void host_norm(const QwNormParams* p, uint32_t gx, uint32_t gy, bool fuse
       garbage(&sh);
       if (p->n > qwk::kNormWarpMax) {
         if (fused) {
-          qwk::norm_item<qwk::kElementThreads, true>(*p, y, x, kPar, sh.ln[0], sh.row, sh.gm);
+          qwk::norm_item<qwk::kElementThreads, true>(*p, y, x, kPar, sh.ln[0], sh.row, sh.gm,
+                                                     sh.sc);
         } else {
-          qwk::norm_item<qwk::kElementThreads, false>(*p, y, x, kPar, sh.ln[0], sh.row, sh.gm);
+          qwk::norm_item<qwk::kElementThreads, false>(*p, y, x, kPar, sh.ln[0], sh.row, sh.gm,
+                                                      sh.sc);
         }
         continue;
       }
@@ -61,11 +63,12 @@ static void host_norm(const QwNormParams* p, uint32_t gx, uint32_t gy, bool fuse
         const uint32_t r = static_cast<uint32_t>(item / p->units);
         const uint32_t u = static_cast<uint32_t>(item % p->units);
         uint16_t* b = sh.row + w * qwk::kNormWarpMax;
-        uint32_t* g = sh.gm + w * (qwk::kNormWarpMax / 4);
+        uint32_t* g = sh.gm + w * qwk::kNormWarpQuantWords;
+        qwk::QuantScale* c = sh.sc + w * (qwk::kNormWarpMax / QW_BLOCK);
         if (fused) {
-          qwk::norm_item<qwk::kWarp, true>(*p, r, u, qwk::WarpPar{}, sh.ln[w], b, g);
+          qwk::norm_item<qwk::kWarp, true>(*p, r, u, qwk::WarpPar{}, sh.ln[w], b, g, c);
         } else {
-          qwk::norm_item<qwk::kWarp, false>(*p, r, u, qwk::WarpPar{}, sh.ln[w], b, g);
+          qwk::norm_item<qwk::kWarp, false>(*p, r, u, qwk::WarpPar{}, sh.ln[w], b, g, c);
         }
       }
     }

@@ -18,7 +18,10 @@ use eidola_engine::sampling::Stream;
 use super::super::abi::*;
 use super::super::attention::{Fa2Args, HEAD_DIM, PARTIAL_BYTES_PER_HEAD};
 use super::super::device::QwenDevice;
-use super::super::kernels::{AcceptLaunch, DN_SHORT_RUN, SampleArgs, fp8_splits, split_width};
+use super::super::kernels::{
+    AcceptLaunch, DN_SHORT_RUN, NORM_FUSED_PARTS_ROWS, NORM_FUSED_QUANT_ROWS, SampleArgs,
+    fp8_splits, split_width,
+};
 use super::super::plan::{AttnAt, DrafterAt, Fa2At, ItemsAt, Layout, SAMPLE_WORDS, TargetAt};
 use super::super::sampler::{accept_work_bytes, sample_work_bytes};
 use super::super::weights::{AttentionW, DeltaNetW, LayerW, MixerW, ab_rows};
@@ -658,8 +661,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
 
     /// The residual norm of `rows` rows of `x` (`n` wide) into `out`, the residual add's
     /// input `add`; with `quant`, its normed rows also quantised into the codes and scales
-    /// scratch, as [`Self::quant`] would, for the FP8 GEMM that reads them
-    /// ([`Self::gemm8`]).
+    /// scratch for the FP8 GEMM that reads them ([`Self::gemm8`]): by the norm itself from
+    /// [`NORM_FUSED_QUANT_ROWS`] rows, by [`Self::quant`] after it below, the same bits.
     #[allow(clippy::too_many_arguments)]
     fn norm(
         &self,
@@ -693,14 +696,19 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 p.add_part_rows = part_rows;
             }
         }
-        if quant {
+        let fused = quant && rows >= NORM_FUSED_QUANT_ROWS;
+        if fused {
             p.codes = self.scratch.codes.addr;
             p.scales = self.scratch.scales.addr;
             p.m_pad = n32(pad4(rows));
         }
         // SAFETY: `rows · n` BF16 values at each; the partials are the parts scratch's,
         // the codes and scales the quantiser's scratch, which hold the capacity's rows.
-        unsafe { self.dev.norm(&p) }
+        unsafe { self.dev.norm(&p)? };
+        if quant && !fused {
+            self.quant(out, rows, n)?;
+        }
+        Ok(())
     }
 
     /// The FP8 linear of `rows` rows of `x` by `w` into `out`: the quantiser, then
@@ -712,7 +720,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
 
     /// The FP8 linear of `rows` rows of `x` by `w` whose output only the next norm's
     /// residual add reads: in the fast profile a split shape's partial sums, left in the
-    /// parts scratch for that norm to add; otherwise its BF16 rows in `out`.
+    /// parts scratch for that norm to add, from [`NORM_FUSED_PARTS_ROWS`] rows; otherwise
+    /// its BF16 rows in `out` (the same bits).
     fn lin8_residual(
         &self,
         x: u64,
@@ -721,7 +730,10 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         out: u64,
     ) -> Result<Residual> {
         let splits = fp8_splits(w.n, w.k);
-        if self.dev.profile() == super::QwenProfile::Exact || splits < 2 {
+        if self.dev.profile() == super::QwenProfile::Exact
+            || splits < 2
+            || rows < NORM_FUSED_PARTS_ROWS
+        {
             self.lin8(x, rows, w, out)?;
             return Ok(Residual::Bf16(out));
         }

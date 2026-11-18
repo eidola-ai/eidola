@@ -229,6 +229,23 @@ pub fn norm_grid(p: &NormParams) -> Result<[u32; 3]> {
     )
 }
 
+/// Rows from which the program's residual norms add a split FP8 GEMM's partial sums
+/// themselves (`NormParams::add_parts`) rather than after `eidola_qwen_fast_split_sum`'s
+/// launch, and from which they quantise their output for the FP8 GEMM after them
+/// themselves (`NormParams::codes`) rather than before `eidola_qwen_quant`'s. Each form
+/// gives a row the same bits as the launches it stands for (`cases::norm_fused`,
+/// `fast_norm_split_residual`), so these are choices of speed alone, of a launch's row
+/// count. A fused norm is one CTA a row and does all of its row's extra work there, where
+/// the split sum and the quantiser spread a row over CTAs: at one decode row a B200
+/// measured the fused norm with both forms at about 15 µs a launch, against about 9 for
+/// the three launches it stood for. So both start at prefill sizes, where the launches
+/// they save are the costlier; the kernel bench's `norm` lines (`parts`, `quant`,
+/// `parts_quant` against `sum_then_norm`, `norm_then_quant`, `sum_norm_quant`) give
+/// each crossover.
+pub const NORM_FUSED_PARTS_ROWS: usize = 128;
+/// See [`NORM_FUSED_PARTS_ROWS`].
+pub const NORM_FUSED_QUANT_ROWS: usize = 128;
+
 /// Whether a norm takes its fused forms' kernel (`eidola_qwen_norm_fused`): a residual
 /// add from partial sums, or the normed rows quantised.
 pub fn norm_is_fused(p: &NormParams) -> bool {
