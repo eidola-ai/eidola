@@ -1,5 +1,6 @@
 // The Qwen3.8 kernels' bodies (`eidola-engine-kernels`' `csrc/qwen_ops.cuh`
-// and the fast profile's `csrc/qwen_fast.cuh`, the C++ a GPU compiles) as a
+// and the fast profile's `csrc/qwen_fast.cuh` and `csrc/qwen_fast_deltanet.cuh`,
+// the C++ a GPU compiles, and the blocked DeltaNet's state kernel's host form) as a
 // host library: one function per launch, each repeating its kernel's entry
 // over the grid the Rust wrapper computed. Blocks
 // and threads run in descending order and shared memory starts as garbage, so
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "qwen_fast.cuh"
+#include "qwen_fast_deltanet.cuh"
 #include "qwen_ops.cuh"
 
 namespace {
@@ -215,6 +217,27 @@ void qwen_host_dn_rec(const QwDnRecParams* p, uint32_t gx, uint32_t gy) {
           for (uint32_t t = kT; t-- > 0;) qwk::dn_rec_put(f[t], t, sh, b ^ 1);
         }
       }
+    }
+}
+
+// The fast profile's blocked DeltaNet: the intra kernel's body, and the state
+// kernel's host form (`qwd::dn_state_host`).
+void qwen_host_dn_intra(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
+  qwd::IntraShared sh;
+  const ds::Par par{qwd::kThreads, true};
+  for (uint32_t y = gy; y-- > 0;)
+    for (uint32_t x = gx; x-- > 0;) {
+      garbage(&sh);
+      qwd::dn_intra_block(*p, x, y, par, sh);
+    }
+}
+
+void qwen_host_dn_state(const QwDnChunkParams* p, uint32_t gx, uint32_t gy) {
+  qwd::StateShared sh;
+  for (uint32_t y = gy; y-- > 0;)
+    for (uint32_t x = gx; x-- > 0;) {
+      garbage(&sh);
+      qwd::dn_state_host(*p, x, y, sh);
     }
 }
 

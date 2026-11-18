@@ -108,7 +108,7 @@ fn buckets() -> Vec<Bucket> {
 
 pub fn cpu_config(g: &Geometry) -> QwenCpuExecutorConfig {
     QwenCpuExecutorConfig {
-        block_size: 4,
+        block_size: super::block_size_now(),
         num_blocks: g.blocks,
         host_blocks: g.host,
         state_buffers: g.buffers,
@@ -124,7 +124,7 @@ pub fn cpu_config(g: &Geometry) -> QwenCpuExecutorConfig {
 
 pub fn cuda_config(g: &Geometry) -> QwenCudaExecutorConfig {
     QwenCudaExecutorConfig {
-        block_size: 4,
+        block_size: super::block_size_now(),
         num_blocks: g.blocks,
         host_blocks: g.host,
         state_buffers: g.buffers,

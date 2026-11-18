@@ -71,6 +71,8 @@ pub trait QwenKernels {
     unsafe fn attention(&self, p: &AttnParams) -> Result<()>;
     unsafe fn dn_prep(&self, p: &DnPrepParams) -> Result<()>;
     unsafe fn dn_rec(&self, p: &DnRecParams) -> Result<()>;
+    /// The fast profile's blocked DeltaNet: the intra kernel, then the state kernel.
+    unsafe fn dn_chunk(&self, p: &DnChunkParams) -> Result<()>;
     unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()>;
     unsafe fn widen(&self, p: &WidenParams) -> Result<()>;
     unsafe fn round(&self, p: &RoundParams) -> Result<()>;
@@ -309,7 +311,7 @@ pub fn dn_prep_grid(p: &DnPrepParams) -> Result<[u32; 3]> {
         p.k_heads > 0 && p.v_heads.is_multiple_of(p.k_heads) && p.v_dim > 0,
         "dn prep: heads",
     )?;
-    ensure(p.reserved == 0, "dn prep: reserved")?;
+    ensure(p.log_decay <= 1, "dn prep: log decay flag")?;
     rows_grid(p.k_heads, p.positions)
 }
 
@@ -341,6 +343,53 @@ pub fn dn_rec_grid(p: &DnRecParams) -> Result<[u32; 3]> {
         .max(1)
         .checked_mul(slices)
         .ok_or_else(|| refuse("dn rec: sequences"))?;
+    Ok([x, p.v_heads, 1])
+}
+
+fn dn_chunk_check(p: &DnChunkParams) -> Result<()> {
+    ensure(
+        [
+            p.seqs, p.q, p.k, p.v, p.beta, p.g, p.out, p.w, p.u, p.pm, p.fac,
+        ]
+        .iter()
+        .all(|&a| a != 0),
+        "dn chunk: null",
+    )?;
+    ensure(p.k_dim == KEY_DIM, "dn chunk: key dim 128")?;
+    ensure(
+        p.v_dim > 0 && p.v_dim <= KEY_DIM && p.v_dim.is_multiple_of(DN_COLS),
+        "dn chunk: value dim a multiple of 32, at most 128",
+    )?;
+    ensure(
+        p.k_heads > 0 && p.v_heads.is_multiple_of(p.k_heads),
+        "dn chunk: heads",
+    )?;
+    ensure(
+        p.chunk >= 1 && p.chunk <= CHUNK_TILE,
+        "dn chunk: a block of 1 to 16 positions",
+    )?;
+    ensure(p.reserved == 0, "dn chunk: reserved")?;
+    ensure(
+        p.k_heads <= MAX_GRID_Y && p.v_heads <= MAX_GRID_Y,
+        "dn chunk: heads",
+    )?;
+    Ok(())
+}
+
+/// The intra kernel's grid: a CTA per (block of the scratch, key head).
+pub fn dn_intra_grid(p: &DnChunkParams) -> Result<[u32; 3]> {
+    dn_chunk_check(p)?;
+    Ok([p.tiles.max(1), p.k_heads, 1])
+}
+
+/// The state kernel's grid: a CTA per (run, 32 value columns, value head).
+pub fn dn_state_grid(p: &DnChunkParams) -> Result<[u32; 3]> {
+    dn_chunk_check(p)?;
+    let x = p
+        .seq_count
+        .max(1)
+        .checked_mul(p.v_dim / DN_COLS)
+        .ok_or_else(|| refuse("dn chunk: sequences"))?;
     Ok([x, p.v_heads, 1])
 }
 

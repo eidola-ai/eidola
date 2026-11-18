@@ -111,6 +111,79 @@ fn dense_logits_equal_the_reference_forward() {
     assert!((1..=10).all(|b| ex.block_is_zero(0, b)));
 }
 
+/// The blocked DeltaNet's distance from the model crate's forward over one sequence of
+/// 160 positions at blocks of 16 (`dense_logits`, every other launch the exact profile's):
+/// the mean and largest KL divergence of the softmax over the sampleable ids and the top-1
+/// agreement, bounded. The fixture's random weights amplify any difference: moving one
+/// exact DeltaNet output in eight by a BF16 unit measured KL 1.7e-3 and top-1 141/160
+/// here, the blocked form 1.4e-3 and 147/160.
+#[test]
+fn blocked_deltanet_stays_near_the_reference_forward() {
+    use eidola_engine_cuda::qwen::QwenCudaExecutor;
+    use eidola_engine_model::qwen::{LogitRows, QwenForwardOptions};
+    use qwen_common::pair::*;
+    let Some(lib) = qwen_common::library() else {
+        return;
+    };
+    let model = fixture();
+    let tokens = TestRng(6).tokens(160, VOCAB);
+    let got = qwen_common::with_block_size(16, || {
+        let mut ex = QwenCudaExecutor::new(
+            qwen_common::block_deltanet(lib),
+            &model,
+            cuda_config(&Geometry::plain(0)),
+        )
+        .expect("executor");
+        ex.dense_logits(3, &tokens).expect("logits")
+    });
+    let opts = QwenForwardOptions {
+        logits: LogitRows::All,
+        keep_streams: false,
+    };
+    let want = model
+        .forward(&mut model.new_state(), &tokens, &opts)
+        .expect("forward");
+    let n = (SAMPLEABLE as usize).min(model.config().vocab_size);
+    let softmax = |x: &[f32]| -> Vec<f64> {
+        let m = x[..n].iter().fold(f64::MIN, |a, &b| a.max(f64::from(b)));
+        let e: Vec<f64> = x[..n].iter().map(|&v| (f64::from(v) - m).exp()).collect();
+        let s: f64 = e.iter().sum();
+        e.iter().map(|v| v / s).collect()
+    };
+    let argmax = |x: &[f32]| {
+        (0..n)
+            .max_by(|&i, &j| x[i].total_cmp(&x[j]).then(j.cmp(&i)))
+            .unwrap_or(0)
+    };
+    let (mut kl_sum, mut kl_max, mut top) = (0.0f64, 0.0f64, 0usize);
+    for (q, row) in got.iter().enumerate() {
+        let w = want.logits.row(q);
+        let (p, r) = (softmax(w), softmax(row));
+        let kl: f64 = p
+            .iter()
+            .zip(&r)
+            .map(|(&a, &b)| {
+                if a > 0.0 {
+                    a * (a / b.max(1e-300)).ln()
+                } else {
+                    0.0
+                }
+            })
+            .sum();
+        kl_sum += kl;
+        kl_max = kl_max.max(kl);
+        top += usize::from(argmax(w) == argmax(row));
+    }
+    let kl_mean = kl_sum / got.len() as f64;
+    eprintln!(
+        "blocked against the forward over {} positions: KL mean {kl_mean:.3e}, largest \
+         {kl_max:.3e}, top-1 {top}/{}",
+        got.len(),
+        got.len()
+    );
+    assert!(kl_mean < 3e-3 && top * 100 >= got.len() * 85);
+}
+
 /// The padded rung path (a decode rung's launch sequence over its table, as a graph
 /// records it, run directly: the host captures no graphs) against the CPU reference
 /// executor: the same scenarios, and rungs must have run.
@@ -169,6 +242,54 @@ fn the_rung_path_and_the_eager_path_agree() {
                     failed.push(name.to_string());
                 }
             }
+        }
+    });
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
+/// The fast profile's blocked DeltaNet through the real scheduler on the host: every
+/// launch but the DeltaNet's the exact profile's bodies, the DeltaNet in blocks (the intra
+/// kernel's body, the state kernel's host form). Reproducibility between calls
+/// (`invariance::all`, at blocks of 4 positions from KV blocks of 4) and across block
+/// boundaries at blocks of 16 (`invariance::blocks`), and the same workloads on the eager
+/// and the rung path: tokens and every logit's bits.
+#[test]
+fn blocked_deltanet_is_reproducible_through_the_scheduler() {
+    use eidola_engine_cuda::qwen::{CudaGraphs, DecodePath};
+    let Some(lib) = qwen_common::library() else {
+        return;
+    };
+    let make = || qwen_common::block_deltanet(lib.clone());
+    let paths = [
+        (CudaGraphs::Off, DecodePath::Eager),
+        (CudaGraphs::Off, DecodePath::Direct),
+    ];
+    let mut failed = Vec::new();
+    let mut report = |name: String, r: Result<String, String>| match r {
+        Ok(what) => eprintln!("ok      {name}: {what}"),
+        Err(e) => {
+            eprintln!("FAILED  {name}: {e}");
+            failed.push(name);
+        }
+    };
+    for (name, r) in qwen_common::invariance::all(&make) {
+        report(format!("blocks of 4: {name}"), r);
+    }
+    for (name, r) in qwen_common::invariance::across_paths(&make, &paths) {
+        report(format!("blocks of 4: {name}"), r);
+    }
+    let exact = || qwen_common::host_device(lib.clone());
+    let deviation = qwen_common::invariance::deviation(
+        &qwen_common::invariance::reference_book(&make),
+        &qwen_common::invariance::reference_book(&exact),
+    );
+    eprintln!("the blocked DeltaNet's deviation from the exact profile: {deviation}");
+    qwen_common::with_block_size(16, || {
+        for (name, r) in qwen_common::invariance::blocks(&make) {
+            report(format!("blocks of 16: {name}"), r);
+        }
+        for (name, r) in qwen_common::invariance::across_paths(&make, &paths) {
+            report(format!("blocks of 16: {name}"), r);
         }
     });
     assert!(failed.is_empty(), "{failed:?}");

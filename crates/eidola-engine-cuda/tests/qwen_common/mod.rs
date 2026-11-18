@@ -1,10 +1,12 @@
 //! What the Qwen3.8 tests share: the kernels' bodies compiled for the host
-//! (`oracle/qwen_launch_host.cc` over `eidola-engine-kernels`' `csrc/qwen_ops.cuh`) as a
+//! (`oracle/qwen_launch_host.cc` over `eidola-engine-kernels`' `csrc/qwen_ops.cuh`,
+//! `qwen_fast.cuh` and `qwen_fast_deltanet.cuh`) as a
 //! [`HostDevice`], buffers on any [`QwenDevice`], a seeded generator, and the loud skip of
 //! a device test.
 #![allow(dead_code)]
 
 pub mod cases;
+pub mod chunk;
 pub mod invariance;
 pub mod pair;
 pub mod scenarios;
@@ -160,10 +162,41 @@ pub fn small_gemm_host(lib: Arc<libloading::Library>) -> impl cases::SmallGemmRu
     }
 }
 
-/// A [`HostDevice`] planning as the fast profile: the compiled bodies, and FA2's launches
-/// checked and computing nothing.
+/// A [`HostDevice`] planning as the fast profile: the compiled bodies, the DeltaNet in
+/// blocks, and FA2's launches checked and computing nothing.
 pub fn planning_fast(lib: Arc<libloading::Library>) -> HostDevice {
     HostDevice::planning_fast(host_launch(lib))
+}
+
+/// A [`HostDevice`] computing the exact profile but for the DeltaNet, which runs in
+/// blocks as the fast profile's does (the intra kernel's body and the state kernel's host
+/// form).
+pub fn block_deltanet(lib: Arc<libloading::Library>) -> HostDevice {
+    HostDevice::block_deltanet(host_launch(lib))
+}
+
+/// The intra kernel's body compiled for the host (`qwen_host_dn_intra`), over host
+/// buffers.
+pub fn dn_intra_host(
+    lib: Arc<libloading::Library>,
+) -> impl Fn(&eidola_engine_cuda::qwen::abi::DnChunkParams) -> Result<(), String> {
+    move |p| {
+        let [gx, gy, _] =
+            eidola_engine_cuda::qwen::kernels::dn_intra_grid(p).map_err(|e| e.to_string())?;
+        // SAFETY: `qwen_host_dn_intra` takes a `QwDnChunkParams` and the grid; the caller's
+        // addresses are host buffers holding what the struct names.
+        unsafe {
+            let f: libloading::Symbol<HostFn> = lib
+                .get(b"qwen_host_dn_intra\0")
+                .expect("the intra kernel's body");
+            f(
+                (p as *const eidola_engine_cuda::qwen::abi::DnChunkParams).cast(),
+                gx,
+                gy,
+            );
+        }
+        Ok(())
+    }
 }
 
 /// The compiled-bodies device, or `None` without a compiler.
@@ -303,6 +336,21 @@ thread_local! {
         const { std::cell::Cell::new((CudaGraphs::Off, DecodePath::Eager)) };
     static RUNG_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FIXTURE_256: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BLOCK_SIZE: std::cell::Cell<u32> = const { std::cell::Cell::new(4) };
+}
+
+/// Runs `f` with every executor the harnesses build on this thread at KV blocks of `bs`
+/// positions (4 otherwise).
+pub fn with_block_size<R>(bs: u32, f: impl FnOnce() -> R) -> R {
+    let old = BLOCK_SIZE.with(|c| c.replace(bs));
+    let r = f();
+    BLOCK_SIZE.with(|c| c.set(old));
+    r
+}
+
+/// The block size executors built now take.
+pub fn block_size_now() -> u32 {
+    BLOCK_SIZE.with(std::cell::Cell::get)
 }
 
 /// Runs `f` with every harness on this thread over the fixture with 256-wide attention

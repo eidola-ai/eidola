@@ -198,9 +198,10 @@ pub struct DnPrepParams {
     pub v_heads: u32,
     pub k_dim: u32,
     pub v_dim: u32,
-    pub reserved: u32,
+    /// 1: `alpha` gets the log decay `g` (the fast profile's blocked DeltaNet).
+    pub log_decay: u32,
 }
-layout!(DnPrepParams, 112, { positions: 88, reserved: 108 });
+layout!(DnPrepParams, 112, { positions: 88, log_decay: 108 });
 
 /// One sequence's run through a DeltaNet layer's recurrence (`QwDnSeq`).
 #[repr(C)]
@@ -215,9 +216,11 @@ pub struct DnSeq {
     pub live_after: u32,
     pub write_after: [u32; SEQ_WRITES],
     pub writes: u32,
-    pub reserved: u32,
+    /// The run's first block among the launch's, for the blocked form
+    /// ([`DnChunkParams`]); the token recurrence ignores it.
+    pub tile: u32,
 }
-layout!(DnSeq, 88, { first: 48, writes: 80 });
+layout!(DnSeq, 88, { first: 48, writes: 80, tile: 84 });
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -238,6 +241,45 @@ pub struct DnRecParams {
     pub reserved: u32,
 }
 layout!(DnRecParams, 88, { state_offset: 56, seq_count: 64 });
+
+/// The fast profile's DeltaNet in blocks (`QwDnChunkParams`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DnChunkParams {
+    pub seqs: u64,
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub beta: u64,
+    /// The log decay per position and value head.
+    pub g: u64,
+    pub out: u64,
+    pub w: u64,
+    pub u: u64,
+    pub pm: u64,
+    pub fac: u64,
+    pub state_offset: u64,
+    pub seq_count: u32,
+    /// Blocks the scratch holds: the intra kernel's grid.
+    pub tiles: u32,
+    pub k_heads: u32,
+    pub v_heads: u32,
+    pub k_dim: u32,
+    pub v_dim: u32,
+    /// Positions a block, 1 to [`CHUNK_TILE`].
+    pub chunk: u32,
+    pub reserved: u32,
+}
+layout!(DnChunkParams, 128, { state_offset: 88, seq_count: 96, chunk: 120 });
+
+/// The rows of a block's tile: the longest block of the blocked DeltaNet.
+pub const CHUNK_TILE: u32 = 16;
+/// Floats of the blocked DeltaNet's scratch per (block, value head): `W` (16 × 128), `U`
+/// (16 × `v_dim`), `P` (16 × 16) and the factors (48).
+pub fn chunk_scratch_floats(v_dim: u32) -> (usize, usize, usize, usize) {
+    let t = CHUNK_TILE as usize;
+    (t * KEY_DIM as usize, t * v_dim as usize, t * t, 48)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

@@ -884,6 +884,24 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         self.cfg.num_blocks
     }
 
+    /// Whether the DeltaNet runs in blocks (the fast profile's form, `dn_chunk`).
+    pub(super) fn blocked(&self) -> bool {
+        self.dev.block_deltanet()
+    }
+
+    /// Whether every row starts from its base and folds the slot's tail: the lagging
+    /// strategy, and always in blocks (a state exists at block boundaries only).
+    fn lagging(&self) -> bool {
+        self.cfg.strategy == StateStrategy::Lagging || self.blocked()
+    }
+
+    /// Positions of a block of the blocked DeltaNet: the block size's largest power-of-two
+    /// divisor, at most 16, so every boundary the serving core stores a state at is a
+    /// block's.
+    pub(super) fn chunk(&self) -> u32 {
+        block_chunk(self.cfg.block_size)
+    }
+
     /// Rows of one tail layer: every slot's ring.
     pub(super) fn tail_layer_rows(&self) -> usize {
         self.slot_count() * self.tail_ring() as usize
@@ -995,7 +1013,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
     fn source(&self, slot: Slot, upto: u32, writes_after: u32) -> (Src, u32) {
         let rec = &self.slots[slot as usize];
         let (base, base_len) = rec.base.expect("a slot with a base");
-        if self.cfg.strategy == StateStrategy::Live
+        if !self.lagging()
             && let Some(lp) = rec.live_pos
             && lp >= base_len
             && lp <= upto
@@ -1028,14 +1046,36 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let bs = self.cfg.block_size;
         let rpi = self.rows_per_image();
         let fast = self.dev.profile() == QwenProfile::Fast;
+        let (blocked, chunk) = (self.blocked(), self.chunk());
         let mut tp = TargetPass::default();
-        let (mut t, mut st, mut cv) = (0u32, 0u32, 0u32);
+        let (mut t, mut st, mut cv, mut tile) = (0u32, 0u32, 0u32, 0u32);
         for r in runs {
             let (f, nh, n) = (r.fold(), r.n_host(), r.n());
             assert!(
                 r.writes.len() <= SEQ_WRITES,
                 "more state writes in one row than the kernel takes"
             );
+            if blocked {
+                // Blocks stand at absolute positions: a run starts at one's boundary (the
+                // padding row's position is never read) and stores whole blocks only.
+                assert!(
+                    r.slot == self.pad_slot() || r.src_pos.is_multiple_of(chunk),
+                    "slot {}: a blocked run off a block boundary",
+                    r.slot
+                );
+                assert!(
+                    !r.live_store || (r.host_end() - r.src_pos).is_multiple_of(chunk),
+                    "slot {}: a live state inside a block",
+                    r.slot
+                );
+                assert!(
+                    r.writes
+                        .iter()
+                        .all(|&(len, _)| (len - r.src_pos).is_multiple_of(chunk)),
+                    "slot {}: a state write inside a block",
+                    r.slot
+                );
+            }
             let mut seq = DnSeq {
                 src: self.src_addr(r.src),
                 live: if r.live_store {
@@ -1048,8 +1088,12 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 out_from: f,
                 live_after: if r.live_store { f + nh } else { f + n + 1 },
                 writes: n32(r.writes.len()),
+                tile,
                 ..DnSeq::default()
             };
+            if blocked {
+                tile += (f + n).div_ceil(chunk);
+            }
             for (j, &(len, b)) in r.writes.iter().enumerate() {
                 seq.write_after[j] = len - r.src_pos;
                 seq.write_dst[j] = self.state_addr(b);
@@ -1447,9 +1491,10 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let mut s = Shape::of(&p, &geo)?;
         let r = rows as usize;
         let bs = self.cfg.block_size as usize;
-        let fold = match self.cfg.strategy {
-            StateStrategy::Live => self.cfg.draft_tokens as usize,
-            StateStrategy::Lagging => self.tail_cap as usize,
+        let fold = if self.lagging() {
+            self.tail_cap as usize
+        } else {
+            self.cfg.draft_tokens as usize
         };
         let writes = ((fold + 1) / bs + 1).min(SEQ_WRITES);
         let wu = w as usize;
@@ -1544,7 +1589,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 src: Src::Zero,
                 src_pos: 0,
                 writes: writes.iter().map(|w| (w.len, w.buffer)).collect(),
-                live_store: true,
+                live_store: !self.blocked(),
                 tail_from: 0,
             },
             toks,
@@ -1834,6 +1879,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             }
         }
 
+        let live = !self.lagging();
         for r in &rows {
             let (nb, nl) = r.new_base;
             let rec = &mut self.slots[r.slot as usize];
@@ -1844,7 +1890,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 "slot {}: a tail past its capacity",
                 r.slot
             );
-            rec.live_pos = (self.cfg.strategy == StateStrategy::Live).then_some(r.e());
+            rec.live_pos = live.then_some(r.e());
             if drafting_exec {
                 rec.hiddens = (r.p()..=r.p() + r.k).collect();
             }
@@ -2152,7 +2198,13 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         self.slots[slot as usize].base = Some((NULL_STATE, 0));
         let c = self.scratch.caps;
         // Pieces of at most one head launch's rows: the logits are the vocabulary a row.
-        let piece = c.rows.min(c.head).min(c.logits_t).max(1);
+        // In blocks, a whole number of blocks a piece, the live state between them a
+        // boundary's.
+        let mut piece = c.rows.min(c.head).min(c.logits_t).max(1);
+        if self.blocked() {
+            let ch = self.chunk() as usize;
+            piece = (piece / ch * ch).max(ch);
+        }
         let vocab = self.dims.vocab as usize;
         let geo = self.geo();
         let mut logits = Vec::with_capacity(tokens.len());
@@ -2171,7 +2223,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 },
                 src_pos: start,
                 writes: Vec::new(),
-                live_store: true,
+                live_store: !self.blocked() || (start + m).is_multiple_of(self.chunk()),
                 tail_from: u32::MAX,
             };
             let p = StepPlan {
@@ -2201,6 +2253,18 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         self.dev.synchronize()?;
         Ok(logits)
     }
+}
+
+/// The blocked DeltaNet's block length for KV blocks of `block_size` positions: its
+/// largest power-of-two divisor, at most 16.
+pub(super) fn block_chunk(block_size: u32) -> u32 {
+    (block_size & block_size.wrapping_neg()).clamp(1, CHUNK_TILE)
+}
+
+/// Blocks of the blocked DeltaNet a pass of `staged` positions over `runs` runs can hold:
+/// each run's are `⌈count / chunk⌉`.
+pub(super) fn chunk_tiles(staged: usize, runs: usize, chunk: u32) -> usize {
+    staged / chunk as usize + runs
 }
 
 fn lcm(a: usize, b: usize) -> usize {
@@ -2241,6 +2305,7 @@ fn capacities(cfg: &QwenCudaExecutorConfig, tail_cap: u32) -> Caps {
         pad_h: r * (k + 1) + r * ((k + 1) / bs.max(1) + 1) + r * k + r,
         pad_t: r * k + r,
         table: 64,
+        tiles: chunk_tiles(staged, r + 1, block_chunk(cfg.block_size)),
         readback: 1 + r + r * (k + 1) + r,
         score_stride: positions as usize,
         partial_rows: plan::partial_rows(n32(rows), positions) as usize,

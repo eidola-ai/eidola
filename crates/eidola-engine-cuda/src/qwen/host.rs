@@ -5,7 +5,8 @@
 //! function ([`super::kernels`]), exactly as a device launch does, and then runs the body
 //! over that grid. So without a GPU the executor's scenarios exercise the structs it
 //! fills, the wrappers' preconditions, the grids and the C++ a GPU compiles. It computes
-//! only the exact profile. The row copy, the sampler and chain acceptance have no host
+//! the exact profile, and the fast profile's blocked DeltaNet (the intra kernel's body,
+//! and the state kernel's host form, which reads each tensor-core step its own way). The row copy, the sampler and chain acceptance have no host
 //! body: here they are this device's reading of `eidola_copy_rows` (every index bounded,
 //! as the kernel bounds it) and of `eidola_sample` and `eidola_chain_accept`
 //! (`eidola_engine::sampling`, which the device sampler equals bit for bit given equal
@@ -34,6 +35,7 @@ pub type HostLaunch = dyn Fn(&'static str, *const c_void, u32, u32) + Send + Syn
 pub struct HostDevice {
     launch: Box<HostLaunch>,
     profile: QwenProfile,
+    block_deltanet: bool,
 }
 
 impl HostDevice {
@@ -41,17 +43,32 @@ impl HostDevice {
         HostDevice {
             launch,
             profile: QwenProfile::Exact,
+            block_deltanet: false,
         }
     }
 
-    /// A device that plans as the fast profile does, for the plans' tests: every
-    /// launch but FA2 computes as in the exact profile, and each FA2 launch is checked
-    /// (its plan against its layer and scratch) and computes nothing, leaving its output
-    /// as it was.
+    /// The exact profile's kernels but for the DeltaNet, which runs in blocks as the
+    /// fast profile's does (the intra kernel's body and the state kernel's host form):
+    /// the blocked form through the real scheduler, with every other launch computing,
+    /// for the tests that hold its staging, its states and its reproducibility without a
+    /// GPU.
+    pub fn block_deltanet(launch: Box<HostLaunch>) -> HostDevice {
+        HostDevice {
+            launch,
+            profile: QwenProfile::Exact,
+            block_deltanet: true,
+        }
+    }
+
+    /// A device that plans as the fast profile does, for the plans' tests: the DeltaNet
+    /// runs in blocks as on [`HostDevice::block_deltanet`], every other launch but FA2
+    /// computes as in the exact profile, and each FA2 launch is checked (its plan against
+    /// its layer and scratch) and computes nothing, leaving its output as it was.
     pub fn planning_fast(launch: Box<HostLaunch>) -> HostDevice {
         HostDevice {
             launch,
             profile: QwenProfile::Fast,
+            block_deltanet: true,
         }
     }
 
@@ -144,6 +161,13 @@ impl QwenKernels for HostDevice {
             return Ok(());
         }
         self.run("dn_rec", p, dn_rec_grid(p))
+    }
+    unsafe fn dn_chunk(&self, p: &DnChunkParams) -> Result<()> {
+        if p.seq_count == 0 {
+            return Ok(());
+        }
+        self.run("dn_intra", p, dn_intra_grid(p))?;
+        self.run("dn_state", p, dn_state_grid(p))
     }
     unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()> {
         if p.rows == 0 {
@@ -317,6 +341,10 @@ fn host_alloc(bytes: usize) -> (u64, Box<dyn Any>) {
 impl QwenDevice for HostDevice {
     fn profile(&self) -> QwenProfile {
         self.profile
+    }
+
+    fn block_deltanet(&self) -> bool {
+        self.block_deltanet
     }
 
     fn alloc(&self, bytes: usize) -> Result<(u64, Box<dyn Any>)> {

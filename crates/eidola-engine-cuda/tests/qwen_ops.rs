@@ -5,7 +5,8 @@
 //! (the DeltaNet's stacked `a` and `b`) against the exact ones (deviation recorded, and
 //! bounded for the BF16 GEMM; a row's bits alone and in every batch asserted equal); every
 //! FP8 GEMM the fast profile routes rows to giving every row the same bits
-//! (`fast_fp8_configs_agree`); and the small-N BF16 GEMM against the order it documents.
+//! (`fast_fp8_configs_agree`); the small-N BF16 GEMM against the order it documents; and
+//! the blocked DeltaNet (`blocked_deltanet`).
 //! Skipped, saying why, without a device or `EIDOLA_ENGINE_KERNELS_DIR`.
 
 mod qwen_common;
@@ -97,7 +98,64 @@ fn qwen_kernels_on_the_device() {
             failed.push("fast small-N gemm");
         }
     }
+    for (name, outcome) in blocked_deltanet(&fast) {
+        match outcome {
+            Ok(report) => {
+                eprintln!("ok      {name}: {report}");
+                qwen_common::record(&format!("qwen_ops_{}", name.replace(' ', "_")), &report);
+            }
+            Err(e) => {
+                eprintln!("FAILED  {name}: {e}");
+                failed.push(name);
+            }
+        }
+    }
     assert!(failed.is_empty(), "{failed:?}");
+}
+
+/// The fast profile's blocked DeltaNet on the device (`qwen_common::chunk`): the intra
+/// kernel's scratch bit for bit its body's compiled for the host; the whole form within
+/// a bound of its definition written out (the tensor cores sum a K-step their own way;
+/// the largest deviation recorded); its distance from the token recurrence (in BF16 units
+/// from the exact profile's, and from f64), recorded; and reproducibility bit for bit: a
+/// block's row the same with 1 to 16 of its positions present (decoded from the boundary,
+/// the later positions zeros in every operand, against prefilled with them real), the run
+/// cut into chunks of 1 to 65 positions, and beside other runs.
+fn blocked_deltanet(fast: &CudaDevice) -> Vec<(&'static str, Result<String, String>)> {
+    use qwen_common::chunk;
+    let mut out = Vec::new();
+    let intra = match qwen_common::library() {
+        None => Err("no C++ compiler for the host body".to_string()),
+        Some(lib) => {
+            let host = qwen_common::host_device(lib.clone());
+            let on_host = qwen_common::dn_intra_host(lib);
+            let on_dev = |p: &eidola_engine_cuda::qwen::abi::DnChunkParams| {
+                // SAFETY: the case's buffers hold what the struct names.
+                unsafe { fast.dn_intra(p) }.map_err(|e| e.to_string())
+            };
+            chunk::intra_scratch(&host, &on_host, 31).and_then(|want| {
+                let got = chunk::intra_scratch(fast, &on_dev, 31)?;
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    cases::same(&format!("intra scratch array {i}"), g, w)?;
+                }
+                Ok(format!("{} arrays bit for bit", got.len()))
+            })
+        }
+    };
+    out.push(("blocked deltanet intra", intra));
+    out.push((
+        "blocked deltanet against its model",
+        chunk::against_model(fast, 21, false, 1e-4),
+    ));
+    out.push((
+        "blocked deltanet against the recurrence",
+        chunk::against_recurrence(fast, 22, 2048, 1e-3),
+    ));
+    out.push((
+        "blocked deltanet reproducible",
+        chunk::invariant(fast, 23, 70),
+    ));
+    out
 }
 
 /// Every FP8 GEMM the fast profile can route a row to (`fp8_kind`: the swapped kernel

@@ -49,6 +49,12 @@ impl QwenProfile {
 pub trait QwenDevice: QwenKernels {
     /// The profile this device computes in.
     fn profile(&self) -> QwenProfile;
+    /// Whether the DeltaNet runs in blocks (`dn_chunk`): the fast profile's definition
+    /// of it. A host device may say so in the exact profile, to run the blocked form
+    /// through the scheduler beside exact attention ([`super::host::HostDevice`]).
+    fn block_deltanet(&self) -> bool {
+        self.profile() == QwenProfile::Fast
+    }
     /// `bytes` zeroed bytes at an address aligned to 256, and what keeps them allocated.
     fn alloc(&self, bytes: usize) -> Result<(u64, Box<dyn Any>)>;
     /// # Safety

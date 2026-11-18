@@ -15,6 +15,11 @@
 //! - `dn_rec`: one DeltaNet layer's recurrence at the released width, 1 to 64 rows, with
 //!   a fold of 0 and 9 positions before 4 outputs; one row prefilling 2,048 and 10,240
 //!   positions; 64 rows each prefilling 1,760 positions of their own;
+//! - `dn_chunk`: the fast profile's blocked DeltaNet at the same width, blocks of 16
+//!   (both kernels, and the intra kernel alone): prefills of 2,048 positions as one, two
+//!   and four runs, one of 10,240 and 64 of 1,760 (tokens a second a layer, and the
+//!   48 layers' time); one and 64 decode rows recomputing their block from its boundary
+//!   with 0, 7 and 15 of its positions before the new one;
 //! - `cipher`: the idle cipher over one 157 MB state image;
 //! - `host`: a 157 MB image to and from page-locked host memory.
 //!
@@ -287,6 +292,112 @@ fn main() {
         );
     }
 
+    // The fast profile's blocked DeltaNet (`dn_chunk`, blocks of 16) on the same inputs,
+    // the log decay of 0.99 a position: prefills of 2,048 positions as one, two and four
+    // runs, one of 10,240, 64 runs of 1,760; decode rows recomputing their block from its
+    // boundary with 0, 7 and 15 positions of it before the new one.
+    let lg: Vec<u8> = (0..max_pos * vh as usize)
+        .flat_map(|_| 0.99f32.ln().to_le_bytes())
+        .collect();
+    let g = alloc(&fast, lg.len(), &mut keep);
+    // SAFETY: the log-decay array.
+    unsafe { fast.upload(g, &lg) }.unwrap_or_else(|e| fail(e));
+    let chunk = CHUNK_TILE;
+    let max_tiles = max_pos / chunk as usize + 64;
+    let (fw, fu, fp, ff) = chunk_scratch_floats(vd);
+    let per = max_tiles * vh as usize * 4;
+    let (sw, su, sp, sf) = (
+        alloc(&fast, per * fw, &mut keep),
+        alloc(&fast, per * fu, &mut keep),
+        alloc(&fast, per * fp, &mut keep),
+        alloc(&fast, per * ff, &mut keep),
+    );
+    // (rows, fold, outputs).
+    for (rows, fold, outs) in [
+        (1u32, 0u32, 2048u32),
+        (2, 0, 1024),
+        (4, 0, 512),
+        (1, 0, 10240),
+        (64, 0, 1760),
+        (1, 0, 1),
+        (64, 0, 1),
+        (64, 7, 1),
+        (64, 15, 1),
+    ] {
+        let mut tile = 0;
+        let seqs: Vec<DnSeq> = (0..rows)
+            .map(|r| {
+                let d = DnSeq {
+                    src: states + u64::from(r) * state as u64,
+                    first: r * (fold + outs),
+                    count: fold + outs,
+                    out_from: fold,
+                    live_after: fold + outs + 1,
+                    tile,
+                    ..DnSeq::default()
+                };
+                tile += (fold + outs).div_ceil(chunk);
+                d
+            })
+            .collect();
+        let sb = alloc(&fast, seqs.len() * std::mem::size_of::<DnSeq>(), &mut keep);
+        let bytes: Vec<u8> = seqs
+            .iter()
+            .flat_map(|s| {
+                // SAFETY: a `repr(C)` struct's bytes.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        (s as *const DnSeq).cast::<u8>(),
+                        std::mem::size_of::<DnSeq>(),
+                    )
+                }
+                .to_vec()
+            })
+            .collect();
+        // SAFETY: the descriptor array.
+        unsafe { fast.upload(sb, &bytes) }.unwrap_or_else(|e| fail(e));
+        let p = DnChunkParams {
+            seqs: sb,
+            q,
+            k: kk,
+            v,
+            beta,
+            g,
+            out: o,
+            w: sw,
+            u: su,
+            pm: sp,
+            fac: sf,
+            state_offset: 0,
+            seq_count: rows,
+            tiles: tile,
+            k_heads: kh,
+            v_heads: vh,
+            k_dim: kd,
+            v_dim: vd,
+            chunk,
+            reserved: 0,
+        };
+        let n = if outs > 100 { 3 } else { it };
+        // SAFETY: every position, state and scratch block the descriptors name is
+        // allocated.
+        let s = time(&fast, n, || {
+            unsafe { fast.dn_chunk(&p) }.unwrap_or_else(|e| fail(e))
+        });
+        let intra = time(&fast, n, || {
+            unsafe { fast.dn_intra(&p) }.unwrap_or_else(|e| fail(e))
+        });
+        let tokens = f64::from(outs * rows);
+        println!(
+            "{{\"bench\":\"dn_chunk\",\"rows\":{rows},\"fold\":{fold},\"outputs\":{outs},\"us_per_layer\":{:.1},\"intra_us\":{:.1},\"state_us\":{:.1},\"tokens_per_s_per_layer\":{:.0},\"ms_48_layers\":{:.3}}}",
+            s * 1e6,
+            intra * 1e6,
+            (s - intra) * 1e6,
+            tokens / s,
+            s * 48.0 * 1e3
+        );
+    }
+
     let image = 156_893_184usize;
     let img = alloc(&fast, image, &mut keep);
     let key = KvKey::from_bytes([7; 32]);
@@ -447,7 +558,7 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
             v_heads: vh,
             k_dim: kd,
             v_dim: vd,
-            reserved: 0,
+            log_decay: 0,
         };
         // SAFETY: the prep reads at most 2,048 + 3 rows of 10,240 f32 values from `out`
         // (2,048 × 17,408 f32) and writes 2,048 rows of 6,144 f32 values into `y`.

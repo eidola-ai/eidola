@@ -610,7 +610,7 @@ pub fn deltanet<D: QwenDevice>(dev: &D, seed: u64) -> Result<(), String> {
             v_heads: u(v_heads),
             k_dim: 128,
             v_dim: u(v_dim),
-            reserved: 0,
+            log_decay: 0,
         };
         // SAFETY: the buffers hold what the struct names.
         unsafe { dev.dn_prep(&prep) }.map_err(|e| e.to_string())?;

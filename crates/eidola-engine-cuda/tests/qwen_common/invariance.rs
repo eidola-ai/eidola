@@ -325,6 +325,121 @@ pub fn all<D: QwenDevice>(make: &dyn Fn() -> D) -> Vec<(&'static str, Result<Str
     out
 }
 
+/// Reproducibility across the blocked DeltaNet's block boundaries, for executors whose
+/// blocks are 16 positions (KV blocks of 16): a 70-token prompt, greedy, prefilled whole
+/// and in chunks of 1, 3, 7, 16, 17, 64 and 65 positions, alone and beside traffic;
+/// positions decoded and prefilled; a second turn from a snapshot and fresh; and greedy at
+/// every draft width. Every comparison is tokens and every logit's bits.
+pub fn blocks<D: QwenDevice>(make: &dyn Fn() -> D) -> Vec<(&'static str, Result<String, String>)> {
+    let g = SamplingParams::greedy();
+    let mut rng = TestRng(5151);
+    let prompt = rng.tokens(70, VOCAB);
+    let crowd: Vec<Vec<u32>> = [5usize, 33, 17, 40]
+        .iter()
+        .map(|&n| rng.tokens(n, VOCAB))
+        .collect();
+    let mut out = Vec::new();
+    let alone = {
+        let mut r = Run::new(make(), 0, 256);
+        r.submit(1, prompt.clone(), g, 24, keyed(1));
+        r.run();
+        r
+    };
+    let res = (|| {
+        let mut total = 0;
+        for chunk in [1u32, 3, 7, 16, 17, 64, 65] {
+            let mut r = Run::new(make(), 0, chunk);
+            r.submit(1, prompt.clone(), g, 24, keyed(1));
+            r.run();
+            ensure(
+                r.outputs[&1] == alone.outputs[&1],
+                format!("tokens differ at chunk {chunk}"),
+            )?;
+            total += agree(&format!("chunk {chunk}"), alone.book(), r.book())?;
+        }
+        Ok(format!(
+            "{total} prefixes over chunks 1, 3, 7, 16, 17, 64, 65"
+        ))
+    })();
+    out.push(("block chunkings", res));
+    let res = (|| {
+        let mut r = Run::new(make(), 0, 7);
+        for (i, c) in crowd.iter().enumerate() {
+            let id = 10 + u64::try_from(i).expect("small");
+            r.submit(id, c.clone(), super::pair::params(id), 9, keyed(2));
+            if i == 1 {
+                r.submit(1, prompt.clone(), g, 24, keyed(1));
+            }
+            for e in r.eng.step(r.now).expect("step") {
+                r.outputs.entry(e.id).or_default().extend(&e.tokens);
+            }
+            r.now += 1;
+        }
+        r.run();
+        ensure(
+            r.outputs[&1] == alone.outputs[&1],
+            "tokens differ beside traffic".into(),
+        )?;
+        let n = agree("beside traffic", alone.book(), r.book())?;
+        ensure(n >= 24, format!("only {n} prefixes compared"))?;
+        Ok(format!("{n} prefixes"))
+    })();
+    out.push(("block traffic", res));
+    let res = (|| {
+        let mut total = 0;
+        let generated = alone.outputs[&1].clone();
+        for m in [1usize, 9, 10, 11, 23] {
+            let mut p = prompt.clone();
+            p.extend_from_slice(&generated[..m]);
+            let mut r = Run::new(make(), 0, 64);
+            r.submit(1, p, g, 1, CacheScope::Private);
+            r.run();
+            total += agree(&format!("prefilled through {m}"), alone.book(), r.book())?;
+        }
+        ensure(total == 5, format!("{total} positions compared"))?;
+        Ok(format!("{total} positions"))
+    })();
+    out.push(("block decoded and prefilled", res));
+    let res = (|| {
+        let mut turn = prompt.clone();
+        turn.extend_from_slice(&alone.outputs[&1]);
+        turn.extend(TestRng(79).tokens(13, VOCAB));
+        let mut hit = Run::new(make(), 0, 256);
+        hit.submit(1, prompt.clone(), g, 24, keyed(1));
+        hit.run();
+        hit.submit(2, turn.clone(), g, 12, keyed(1));
+        hit.run();
+        let cached = hit.cached[&2];
+        ensure(cached > 0, "the second turn did not hit a snapshot".into())?;
+        let mut fresh = Run::new(make(), 0, 256);
+        fresh.submit(2, turn, g, 12, CacheScope::Private);
+        fresh.run();
+        ensure(
+            hit.outputs[&2] == fresh.outputs[&2],
+            "tokens differ after a hit".into(),
+        )?;
+        let n = agree("hit and fresh", hit.book(), fresh.book())?;
+        Ok(format!("{n} prefixes, {cached} positions from the cache"))
+    })();
+    out.push(("block cache hit", res));
+    let res = (|| {
+        let mut total = 0;
+        for k in 1..=3u32 {
+            let mut r = Run::new(make(), k, 256);
+            r.submit(1, prompt.clone(), g, 24, keyed(1));
+            r.run();
+            ensure(
+                r.outputs[&1] == alone.outputs[&1],
+                format!("tokens differ at width {k}"),
+            )?;
+            total += agree(&format!("width {k}"), alone.book(), r.book())?;
+        }
+        Ok(format!("{total} prefixes over widths 1 to 3"))
+    })();
+    out.push(("block draft widths", res));
+    out
+}
+
 /// With drafting on (width 3): a greedy and a seeded sampled request each alone, beside
 /// traffic arriving at varied steps and prefilled in chunks, and a second turn resumed
 /// from a snapshot against the same turn computed fresh: the same tokens and logits bits.

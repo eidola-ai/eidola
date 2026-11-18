@@ -10,7 +10,8 @@
 //! (the head, the drafter's input projection) CUTLASS's BF16 GEMM into an f32 scratch the
 //! caller names, rounded to BF16 by `eidola_qwen_round`, and the DeltaNet's stacked `a`
 //! and `b` projections (`gemm_bf16`) our small-N kernel (`qwen_fast.cu`); the gates are
-//! computed in f32 there too (`eidola_qwen_fast_gate`); and
+//! computed in f32 there too (`eidola_qwen_fast_gate`); the DeltaNet runs in blocks
+//! (`dn_chunk`, `qwen_fast_deltanet.cu`); and
 //! attention runs FA2 at head dimension 256 ([`super::attention`]). Both profiles load the
 //! shared sampler (`sampling`) and the row copy (`engine_ops`'s `eidola_copy_rows`). Graphs
 //! are captured on the device's one stream ([`QwenDevice::capture`]).
@@ -40,6 +41,9 @@ pub const IMAGES: [&str; 3] = ["qwen_ops", "qwen_ops_div", "qwen_deltanet"];
 
 /// The fast profile's own kernels (`qwen_fast.cu`).
 pub const FAST_IMAGE: &str = "qwen_fast";
+
+/// The fast profile's blocked DeltaNet (`qwen_fast_deltanet.cu`).
+pub const FAST_DN_IMAGE: &str = "qwen_fast_deltanet";
 
 struct Kernels {
     embed: Kernel,
@@ -87,6 +91,8 @@ struct Fast {
     bf16: Gemm,
     small: Kernel,
     gate: Kernel,
+    dn_intra: Kernel,
+    dn_state: Kernel,
     attention: QwenAttention,
     _modules: Vec<KernelModule>,
 }
@@ -146,6 +152,7 @@ impl CudaDevice {
                     KernelModule::load(&gpu, dir, GemmKind::Fp8Swap(SwapTile::T16).kernel().0)?;
                 let b = KernelModule::load(&gpu, dir, GemmKind::Bf16.kernel().0)?;
                 let q = KernelModule::load(&gpu, dir, FAST_IMAGE)?;
+                let d = KernelModule::load(&gpu, dir, FAST_DN_IMAGE)?;
                 let a = KernelModule::load(&gpu, dir, super::attention::IMAGE)?;
                 let swap = |t| Gemm::from_module(GemmKind::Fp8Swap(t), &sw);
                 Some(Fast {
@@ -158,8 +165,18 @@ impl CudaDevice {
                     bf16: Gemm::from_module(GemmKind::Bf16, &b)?,
                     small: bound::<LinearParams>(&q, FAST_IMAGE, "eidola_qwen_fast_gemm_bf16")?,
                     gate: bound::<GateParams>(&q, FAST_IMAGE, "eidola_qwen_fast_gate")?,
+                    dn_intra: bound::<DnChunkParams>(
+                        &d,
+                        FAST_DN_IMAGE,
+                        "eidola_qwen_fast_dn_intra",
+                    )?,
+                    dn_state: bound::<DnChunkParams>(
+                        &d,
+                        FAST_DN_IMAGE,
+                        "eidola_qwen_fast_dn_state",
+                    )?,
                     attention: QwenAttention::from_module(a)?,
-                    _modules: vec![f, sw, b, q],
+                    _modules: vec![f, sw, b, q, d],
                 })
             }
         };
@@ -293,6 +310,37 @@ impl CudaDevice {
         unsafe { f.bf16.launch(&self.gpu, &a) }
     }
 
+    /// The blocked DeltaNet's intra kernel alone (the tests hold its bits to its body
+    /// compiled for the host).
+    ///
+    /// # Safety
+    ///
+    /// As [`QwenKernels::dn_chunk`].
+    pub unsafe fn dn_intra(&self, p: &DnChunkParams) -> Result<()> {
+        let g = dn_intra_grid(p)?;
+        let f = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the blocked DeltaNet runs in the fast profile"))?;
+        // SAFETY: the caller's.
+        unsafe { self.go(&f.dn_intra, p, g) }
+    }
+
+    /// The blocked DeltaNet's state kernel alone, over a scratch the intra kernel filled.
+    ///
+    /// # Safety
+    ///
+    /// As [`QwenKernels::dn_chunk`].
+    pub unsafe fn dn_state(&self, p: &DnChunkParams) -> Result<()> {
+        let g = dn_state_grid(p)?;
+        let f = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the blocked DeltaNet runs in the fast profile"))?;
+        // SAFETY: the caller's.
+        unsafe { self.go(&f.dn_state, p, g) }
+    }
+
     unsafe fn go<P: Copy>(&self, kernel: &Kernel, p: &P, grid: [u32; 3]) -> Result<()> {
         let mut v = *p;
         let mut args = [(&mut v as *mut P).cast::<c_void>()];
@@ -420,6 +468,16 @@ impl QwenKernels for CudaDevice {
         }
         let g = dn_rec_grid(p)?;
         unsafe { self.go(&self.k.dn_rec, p, g) }
+    }
+    unsafe fn dn_chunk(&self, p: &DnChunkParams) -> Result<()> {
+        if p.seq_count == 0 {
+            return Ok(());
+        }
+        // SAFETY: the caller's.
+        unsafe {
+            self.dn_intra(p)?;
+            self.dn_state(p)
+        }
     }
     unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()> {
         if p.rows == 0 {

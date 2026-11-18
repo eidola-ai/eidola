@@ -213,9 +213,10 @@
 //! dependence on the past is a state of fixed size, the same at every position (a
 //! linear-attention recurrence and the last inputs of its short convolution). The state
 //! *at* position `t`, after positions `0 .. t` have run, is a function of those tokens
-//! alone: the recurrence is applied token by token in one fixed order, whatever the step,
-//! row or chunk, so its result does not depend on how the positions were split between
-//! rows.
+//! alone, and so is every output: the executor applies the recurrence in an order fixed by
+//! the positions alone (token by token, or in blocks of positions between fixed boundaries,
+//! a state existing only at a block's end), whatever the step, row or chunk, so its result
+//! does not depend on how the positions were split between rows.
 //!
 //! * **Buffers.** The executor keeps a pool of state buffers (ids `1..num_buffers`;
 //!   [`NULL_STATE`](crate::spec::NULL_STATE) reads as the state at 0 and is never
@@ -229,8 +230,8 @@
 //! * **Base and tail.** Each row names its base ([`StateRow`]): a buffer holding the
 //!   state at `base_len`, a block boundary at most the row's `context_len`. The executor
 //!   keeps per slot the inputs of the positions past the base that earlier rows of the
-//!   slot ran (its tail, at most `tail_positions` positions), and builds the state at
-//!   `context_len` by applying the recurrence to them in order from the base.
+//!   slot ran (its tail, at most `tail_positions` positions), and runs the row from the
+//!   base over them in order.
 //!   `ResetSlot` zeroes the tail.
 //! * **Writes.** For each [`StateWrite`] the executor stores the state at `len` into
 //!   `buffer` during the row. `len` is a block boundary past the base and within the

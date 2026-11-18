@@ -2,7 +2,9 @@
 //! contract): greedy tokens and every logit's bits the same alone and beside traffic,
 //! under every chunking, decoded and prefilled, from a cache hit and computed fresh, at
 //! every draft width, and with drafting on, greedy and seeded sampled rows alone, beside
-//! traffic and after a hit (`qwen_common::invariance`), eagerly and with decode steps
+//! traffic and after a hit (`qwen_common::invariance`), at KV blocks of 4 and, across the
+//! blocked DeltaNet's 16-position blocks, of 16 (a 70-token prompt in chunks of 1 to 65,
+//! `invariance::blocks`), eagerly and with decode steps
 //! replaying their captured graphs; and the same workloads giving the same tokens and
 //! logits bits on every path (eager, a rung's launches run directly, its graph replayed). The fast
 //! profile's attention is FA2 at head dimension 256. The exact profile is run the same way
@@ -55,6 +57,15 @@ fn run(dir: &str) {
                         &mut failed,
                     );
                 }
+                qwen_common::with_block_size(16, || {
+                    for (name, r) in invariance::blocks(&make) {
+                        report(
+                            format!("{} {path:?} blocks of 16: {name}", profile.name()),
+                            r,
+                            &mut failed,
+                        );
+                    }
+                });
             });
         }
         let paths = [
@@ -65,6 +76,15 @@ fn run(dir: &str) {
         for (name, r) in invariance::across_paths(&make, &paths) {
             report(format!("{} {name}", profile.name()), r, &mut failed);
         }
+        qwen_common::with_block_size(16, || {
+            for (name, r) in invariance::across_paths(&make, &paths) {
+                report(
+                    format!("{} blocks of 16: {name}", profile.name()),
+                    r,
+                    &mut failed,
+                );
+            }
+        });
         books.push(invariance::reference_book(&make));
     }
     let (fast, exact) = (&books[0], &books[1]);

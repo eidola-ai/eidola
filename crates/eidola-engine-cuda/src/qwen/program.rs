@@ -55,6 +55,8 @@ pub(super) struct Caps {
     pub pad_t: usize,
     /// Words of the largest table and read-back.
     pub table: usize,
+    /// Blocks of the blocked DeltaNet's scratch.
+    pub tiles: usize,
     pub readback: usize,
     /// The exact attention's score stride, and FA2's partial rows.
     pub score_stride: usize,
@@ -125,6 +127,22 @@ pub(super) struct Scratch {
     pub pad_o: Alloc,
     pub pad_h: Alloc,
     pub pad_t: Alloc,
+    /// The blocked DeltaNet's scratch (`W`, `U`, `P`, the factors), when the DeltaNet
+    /// runs in blocks.
+    pub dn_w: Alloc,
+    pub dn_u: Alloc,
+    pub dn_pm: Alloc,
+    pub dn_fac: Alloc,
+}
+
+/// Bytes of the blocked DeltaNet's four scratch arrays (8 each without blocks).
+fn chunk_bytes(c: &Caps, d: &super::Dims, blocked: bool) -> [usize; 4] {
+    if !blocked {
+        return [8; 4];
+    }
+    let (w, u, pm, fac) = chunk_scratch_floats(d.v_dim);
+    let n = c.tiles.max(1) * d.v_heads as usize * 4;
+    [n * w, n * u, n * pm, n * fac]
 }
 
 /// Bytes of the fast BF16 linears' f32 scratch: the head's rows of the vocabulary, the
@@ -163,6 +181,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let vocab = d.vocab as usize;
         let n = vocab;
         let fast = dev.profile() == super::QwenProfile::Fast;
+        let cb = chunk_bytes(&c, d, dev.block_deltanet());
         let hq = d.q_heads as usize;
         let sink = a(hq * 4)?;
         // SAFETY: `hq` f32 of the allocation just made.
@@ -241,6 +260,10 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             pad_o: a(c.pad_o.max(1) * vd * 4)?,
             pad_h: a(c.pad_h.max(1) * hid * 2)?,
             pad_t: a(c.pad_t.max(1) * 4)?,
+            dn_w: a(cb[0])?,
+            dn_u: a(cb[1])?,
+            dn_pm: a(cb[2])?,
+            dn_fac: a(cb[3])?,
             caps: c,
         })
     }
@@ -262,6 +285,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let vocab = d.vocab as usize;
         let hq = d.q_heads as usize;
         let fast = self.dev.profile() == super::QwenProfile::Fast;
+        let cb = chunk_bytes(c, d, self.blocked());
         let kmax = self.k_max();
         vec![
             (s.table.addr, c.table.max(64) * 4),
@@ -339,6 +363,10 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             (s.pad_o.addr, c.pad_o.max(1) * vd * 4),
             (s.pad_h.addr, c.pad_h.max(1) * hid * 2),
             (s.pad_t.addr, c.pad_t.max(1) * 4),
+            (s.dn_w.addr, cb[0]),
+            (s.dn_u.addr, cb[1]),
+            (s.dn_pm.addr, cb[2]),
+            (s.dn_fac.addr, cb[3]),
         ]
     }
 
@@ -817,8 +845,40 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             v_heads: d.v_heads,
             k_dim: d.k_dim,
             v_dim: d.v_dim,
-            reserved: 0,
+            log_decay: u32::from(self.blocked()),
         };
+        if self.blocked() {
+            let tiles = super::chunk_tiles(at.staged(), at.runs, self.chunk());
+            assert!(tiles <= s.caps.tiles, "the blocked DeltaNet's scratch");
+            let ch = DnChunkParams {
+                seqs: self.tw(at.seqs),
+                q: s.dq.addr,
+                k: s.dk.addr,
+                v: s.dv.addr,
+                beta: s.beta.addr,
+                g: s.alpha.addr,
+                out: s.o.addr,
+                w: s.dn_w.addr,
+                u: s.dn_u.addr,
+                pm: s.dn_pm.addr,
+                fac: s.dn_fac.addr,
+                state_offset: (dn * self.layer_bytes() + 3 * cd * 4) as u64,
+                seq_count: n32(at.runs),
+                tiles: n32(tiles),
+                k_heads: d.k_heads,
+                v_heads: d.v_heads,
+                k_dim: d.k_dim,
+                v_dim: d.v_dim,
+                chunk: self.chunk(),
+                reserved: 0,
+            };
+            // SAFETY: as below; the scratch holds `tiles` blocks (asserted), and every run's
+            // blocks are numbered within them by the pass.
+            unsafe {
+                self.dev.dn_prep(&prep)?;
+                self.dev.dn_chunk(&ch)?;
+            }
+        }
         let rec = DnRecParams {
             seqs: self.tw(at.seqs),
             q: s.dq.addr,
@@ -837,9 +897,11 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         };
         // SAFETY: the staged arrays hold the shape's positions; every state address in the
         // sequences is a live image or a state buffer.
-        unsafe {
-            self.dev.dn_prep(&prep)?;
-            self.dev.dn_rec(&rec)?;
+        if !self.blocked() {
+            unsafe {
+                self.dev.dn_prep(&prep)?;
+                self.dev.dn_rec(&rec)?;
+            }
         }
         self.copies(&at.post_conv, cd, &self.conv_bufs(dn))?;
         self.copies(&at.post_ab, 2 * vh, &self.ab_bufs(dn))?;

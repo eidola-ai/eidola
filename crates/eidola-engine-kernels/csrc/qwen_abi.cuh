@@ -236,17 +236,17 @@ struct QwDnPrepParams {
   float* k;                 // [positions, k_heads · k_dim]
   float* v;                 // [positions, v_heads · v_dim]
   float* beta;              // [positions, v_heads]
-  float* alpha;             // [positions, v_heads]
+  float* alpha;             // [positions, v_heads]: `α`, or with `log_decay` `g`
   uint32_t positions;
   uint32_t k_heads;
   uint32_t v_heads;
   uint32_t k_dim;
   uint32_t v_dim;
-  uint32_t reserved;
+  uint32_t log_decay;       // 1: `alpha` gets the log decay `g` (the fast profile's blocks)
 };
 QW_ABI_STRUCT(QwDnPrepParams, 112);
 QW_ABI_FIELD(QwDnPrepParams, positions, 88);
-QW_ABI_FIELD(QwDnPrepParams, reserved, 108);
+QW_ABI_FIELD(QwDnPrepParams, log_decay, 108);
 
 // One sequence's run through a DeltaNet layer's recurrence: positions
 // `first .. first + count` of the prep arrays, in order, from the state at
@@ -256,7 +256,9 @@ QW_ABI_FIELD(QwDnPrepParams, reserved, 108);
 // to `write_dst[i]`. The state of a layer is `[v_heads][k_dim][v_dim]` f32,
 // key dimension major (`DeltaNetState::recurrent`), at the address given plus
 // the layer's offset, which the launch's `state_offset` adds to every
-// address.
+// address. `tile` is the run's first block among the launch's blocks for the
+// fast profile's blocked form (`QwDnChunkParams`); the token recurrence
+// ignores it.
 struct QwDnSeq {
   uint64_t src;
   uint64_t live;
@@ -267,11 +269,12 @@ struct QwDnSeq {
   uint32_t live_after;
   uint32_t write_after[4];
   uint32_t writes;
-  uint32_t reserved;
+  uint32_t tile;
 };
 QW_ABI_STRUCT(QwDnSeq, 88);
 QW_ABI_FIELD(QwDnSeq, first, 48);
 QW_ABI_FIELD(QwDnSeq, writes, 80);
+QW_ABI_FIELD(QwDnSeq, tile, 84);
 
 // `deltanet::recurrent_step` per value head and token, every sequence of
 // `seqs`; the output `o` (rounded to BF16, as f32) of every position at or
@@ -295,6 +298,46 @@ struct QwDnRecParams {
 QW_ABI_STRUCT(QwDnRecParams, 88);
 QW_ABI_FIELD(QwDnRecParams, state_offset, 56);
 QW_ABI_FIELD(QwDnRecParams, seq_count, 64);
+
+// The fast profile's Gated DeltaNet in blocks (`qwen_fast_deltanet.cuh`): the
+// runs of `seqs` as the token recurrence does, but each run's positions in
+// blocks of `chunk` positions from its source (which stands at a block
+// boundary), every block computed in its chunked form from the state at its
+// start. A run is `tiles(count) = ⌈count / chunk⌉` blocks, its first at the
+// sequence's `tile`; the launch's blocks are `0 .. tiles`, `tiles` the
+// scratch's capacity. A store (`live_after`, `write_after`) happens only at 0
+// or a whole number of blocks: the state exists at block boundaries only.
+// `g` is the per-position log decay (`QwDnPrepParams::log_decay`). Two
+// kernels: `eidola_qwen_fast_dn_intra` (grid `(tiles, k_heads)`) fills the
+// scratch with every block's state-free parts, and `eidola_qwen_fast_dn_state`
+// (grid `(seq_count · v_dim / 32, v_heads)`) runs each run's blocks in order
+// from its source, writing the outputs and the states.
+struct QwDnChunkParams {
+  const QwDnSeq* seqs;
+  const float* q;           // as QwDnPrepParams
+  const float* k;
+  const float* v;
+  const float* beta;
+  const float* g;           // [positions, v_heads]: the log decay
+  float* out;               // [positions, v_heads · v_dim]
+  float* w;                 // [tiles, v_heads, 16, k_dim]
+  float* u;                 // [tiles, v_heads, 16, v_dim]
+  float* pm;                // [tiles, v_heads, 16, 16]
+  float* fac;               // [tiles, v_heads, 48]
+  uint64_t state_offset;    // bytes added to every state address
+  uint32_t seq_count;
+  uint32_t tiles;
+  uint32_t k_heads;
+  uint32_t v_heads;
+  uint32_t k_dim;
+  uint32_t v_dim;
+  uint32_t chunk;           // positions a block, 1 to 16
+  uint32_t reserved;
+};
+QW_ABI_STRUCT(QwDnChunkParams, 128);
+QW_ABI_FIELD(QwDnChunkParams, state_offset, 88);
+QW_ABI_FIELD(QwDnChunkParams, seq_count, 96);
+QW_ABI_FIELD(QwDnChunkParams, chunk, 120);
 
 // The DeltaNet's gated RMS norm per value head (`deltanet::gated_norm`):
 // `bf16(bf16(w · bf16(o · r)) · silu(z))`, `r = rsqrt(Σo² / v_dim + eps)`.

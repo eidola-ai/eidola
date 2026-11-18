@@ -14,9 +14,11 @@
 #   named only: serve_b_eager serve_profile
 #
 # - `perf_host`: every kernel body compiled for this host against the model
-#   crate (the quantiser's warp form against its reference form too), and the
-#   executor on those bodies against the CPU reference executor, eagerly and on
-#   the padded rung path; the fast profile's plans packed on every path;
+#   crate (the quantiser's warp form against its reference form too), the
+#   blocked DeltaNet's host form against its definition and reproducible, and
+#   the executor on those bodies against the CPU reference executor, eagerly and
+#   on the padded rung path; the blocked DeltaNet through the scheduler,
+#   reproducible; the fast profile's plans packed on every path;
 # - `perf_tiny`: every kernel on the device against the model crate, the
 #   quantiser's kernel against its reference form, the fast linears and BF16
 #   GEMM against the exact ones (a row's bits alone and in batches, asserted;
@@ -24,18 +26,26 @@
 #   routes rows to (the swapped kernel's three tiles and the unswapped one)
 #   giving each row the same bits, the small-N BF16 GEMM against its order and
 #   the f32 gates against the exact ones (asserted within two BF16 units;
-#   histogram in $OUT/qwen_ops_fast_gates.txt); then the exact profile on the
+#   histogram in $OUT/qwen_ops_fast_gates.txt), the blocked DeltaNet (its intra
+#   kernel bit for bit its host body, the whole form within a bound of its
+#   definition, its distance from the token recurrence in
+#   $OUT/qwen_ops_blocked_deltanet_*.txt, and reproducible bit for bit: a
+#   block's rows with 1 to 16 of its positions present, chunks of 1 to 65,
+#   beside other runs); then the exact profile on the
 #   device against the CPU reference executor, eagerly and replaying graphs
 #   (graphs keep it exact);
-# - `perf_fast`: both profiles' reproducibility between calls, asserted,
-#   eagerly and replaying graphs, and the same workloads on every path (eager,
+# - `perf_fast`: both profiles' reproducibility between calls, asserted, at KV
+#   blocks of 4 and of 16 (a 70-token prompt in chunks of 1 to 65 across the
+#   blocked DeltaNet's blocks), eagerly and replaying graphs, and the same
+#   workloads on every path (eager,
 #   a rung run directly, its graph replayed) equal in tokens and logits bits;
 #   the fast profile's deviation recorded in $OUT/qwen_fast_deviation.txt;
 # - `perf_kernels`: the kernel bench (`examples/qwen_kernel_bench.rs`) as JSON
 #   lines in $OUT/qwen_kernel_bench.jsonl: every FP8 GEMM form at 1 to 2,048
 #   rows at the released shapes, the small-N and CUTLASS `a`/`b` projection,
 #   the norm, quantiser, gates, DeltaNet preparation and gated norm at 1, 8, 64
-#   and 2,048 rows, the recurrence, the cipher and the host copies;
+#   and 2,048 rows, the recurrence, the blocked DeltaNet (prefills of 2,048
+#   positions in one to four runs, decode rows), the cipher and the host copies;
 # - `serve_b`, `serve_b_mtp`: workload B (1,024 in, 256 out, greedy) at
 #   concurrency 1, 8, 32, 64 and 128, without drafts and with three, graphs
 #   on: $OUT/serve_b*.jsonl;

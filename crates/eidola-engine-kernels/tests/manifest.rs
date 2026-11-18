@@ -540,6 +540,33 @@ fn qwen_fa2_d256_is_the_mma_sync_path() {
     }
 }
 
+/// The fast profile's blocked DeltaNet: built without contraction (the intra kernel's
+/// body is the one the host check runs, and both kernels' scalar steps round as written),
+/// exactly its two entries, and its products with the state on the `mma.sync` tensor-core
+/// path (`HMMA`), no tcgen05.
+#[test]
+fn qwen_fast_deltanet_is_unfused_on_mma_sync() {
+    let manifest = Manifest::embedded();
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        let name = "qwen_fast_deltanet";
+        let cubin = manifest
+            .cubin(name, arch)
+            .unwrap_or_else(|| panic!("no cubin {name} {arch}"));
+        assert_eq!(cubin.profile, "exact", "{arch}");
+        let ops = cubin.float_ops.as_ref().expect("float_ops");
+        assert_eq!(ops.ptx_fma, 0, "{arch}");
+        assert!(mma(manifest, name, arch, "HMMA") > 0, "{arch}");
+        assert_eq!(mma(manifest, name, arch, "UTC"), 0, "{arch}");
+        let mut symbols: Vec<&str> = cubin.entries.iter().map(|e| e.symbol.as_str()).collect();
+        symbols.sort_unstable();
+        assert_eq!(
+            symbols,
+            ["eidola_qwen_fast_dn_intra", "eidola_qwen_fast_dn_state"],
+            "{arch}"
+        );
+    }
+}
+
 /// The fast profile's own kernels: the `own` profile (contraction allowed: their bodies
 /// spell out the fused multiply-adds they mean), no tensor cores, exactly their two
 /// entries; and the swapped FP8 GEMM's image exactly its three tile instances.

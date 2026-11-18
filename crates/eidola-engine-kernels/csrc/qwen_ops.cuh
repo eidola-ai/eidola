@@ -470,6 +470,7 @@ DS_FN void attn_block(const QwAttnParams& p, uint32_t row, uint32_t head, const 
 struct DnPrepShared {
   float q[kKeyDim];
   float k[kKeyDim];
+  float lanes[2][16];
   float rq;
   float rk;
 };
@@ -490,7 +491,8 @@ DS_FN float dn_conv(const QwDnPrepParams& p, uint32_t pos, uint32_t ch) {
 constexpr uint32_t kDnPrepBatch = 4;
 
 // Block (position, key head): the key head's queries and keys, its value
-// heads' values, `β` and `α`.
+// heads' values, `β` and `α` (or, with `log_decay`, `g` itself, which the
+// fast profile's blocked form takes).
 template <class P>
 DS_FN void dn_prep_block(const QwDnPrepParams& p, uint32_t pos, uint32_t kh, const P& par,
                          DnPrepShared& sh) {
@@ -523,9 +525,32 @@ DS_FN void dn_prep_block(const QwDnPrepParams& p, uint32_t pos, uint32_t kh, con
       }
     }
   });
+  // `pinned_sum_sq` of the queries and of the keys, its 16 lanes a thread each (their
+  // sums in the reference's order), then the tree and the tail on one thread.
+  const uint32_t full = kd & ~15u;
   par.run([&](uint32_t t) {
-    if (t == 0) sh.rq = ds::rsqrt32(pinned_sum_sq(sh.q, kd) + kL2Eps);
-    if (t == 1) sh.rk = ds::rsqrt32(pinned_sum_sq(sh.k, kd) + kL2Eps);
+    if (t < 32) {
+      const float* x = t < 16 ? sh.q : sh.k;
+      const uint32_t j = t % 16;
+      float acc = 0.0f;
+      for (uint32_t i = j; i < full; i += 16) acc = acc + x[i] * x[i];
+      sh.lanes[t / 16][j] = acc;
+    }
+  });
+  par.run([&](uint32_t t) {
+    if (t < 2) {
+      const float* x = t == 0 ? sh.q : sh.k;
+      float tail = 0.0f;
+      for (uint32_t i = full; i < kd; ++i) tail = tail + x[i] * x[i];
+      float acc[16];
+      for (uint32_t j = 0; j < 16; ++j) acc[j] = sh.lanes[t][j];
+      const float r = ds::rsqrt32(ds::pinned_reduce(acc, tail) + kL2Eps);
+      if (t == 0) {
+        sh.rq = r;
+      } else {
+        sh.rk = r;
+      }
+    }
   });
   par.run([&](uint32_t t) {
     const float d = static_cast<float>(sqrt(static_cast<double>(kd)));
@@ -541,7 +566,7 @@ DS_FN void dn_prep_block(const QwDnPrepParams& p, uint32_t pos, uint32_t kh, con
       const float b = ab[p.v_heads + h];
       const float g = -p.exp_a_log[h] * ds::softplus32(a + p.dt_bias[h]);
       p.beta[static_cast<uint64_t>(pos) * p.v_heads + h] = ds::bf16_round(ds::sigmoid32(b));
-      p.alpha[static_cast<uint64_t>(pos) * p.v_heads + h] = ds::exp32(g);
+      p.alpha[static_cast<uint64_t>(pos) * p.v_heads + h] = p.log_decay != 0 ? g : ds::exp32(g);
     }
   });
 }
