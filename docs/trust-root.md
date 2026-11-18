@@ -33,7 +33,7 @@ The enclave block (`cvm_version`, `igvm_sha256`, `sev_snp.{measurement, host_dat
 
 `artifact-manifest.json` records the eidola-cli OCI digest and the Nix desktop artifacts' `narHash` / `archiveSha256` among other artifacts. If the cli build COPYed (Docker) or filtered-in (Nix) the manifest as a build input, every regeneration of the manifest would also be an input to the build it's describing — a self-reference that produces a different digest on every run instead of converging.
 
-`server-enclave.json` is the minimum slice of the manifest the cli build needs, so it can be COPYed without dragging the cli's own digest into the build context. CI re-asserts the consistency: `scripts/artifact-manifest.sh verify-full` recomputes the enclave block from `tinfoil-config.yml` and rejects the build if either `server-enclave.json` or `artifact-manifest.json`'s `enclave` field disagrees with it.
+`server-enclave.json` is the minimum slice of the manifest the cli build needs, so it can be COPYed without dragging the cli's own digest into the build context. CI re-asserts the consistency: `scripts/artifact-manifest.sh verify-full` recomputes the enclave block from `deploy/gateway/tinfoil-config.yml` and rejects the build if either `server-enclave.json` or `artifact-manifest.json`'s `enclave` field disagrees with it.
 
 ## Schema versions: explicit and breaking
 
@@ -133,6 +133,7 @@ artifact-manifest.json                  # full deployment record (output, signed
 crates/eidola-app-core/
   build.rs                              # generator: server-enclave.json + trust-constants.json + … → trust_root.gen.rs
   src/trust_root.rs                     # exposes the generated constants
+deploy/gateway/tinfoil-config.yml       # the gateway's deployment config: its SHA-256 is the pinned HOST_DATA
 deploy/engine/<name>/<variant>/         # one engine deployment: tinfoil-config.yml + deployment.json (pinned by engine-enclaves.json)
 models/<family>/<label>.toml            # one catalog row per weights hash, bound to the engine pins at build time
 crates/eidola-server-gateway/
@@ -141,7 +142,7 @@ crates/eidola-server-gateway/
   src/models/                           # the model catalog, its build-time checks and binding, and model references
 ```
 
-The generator (`build.rs`) reads `releases/trust/server-enclave.json` — never the per-artifact digests. The chain that invalidates the pin: gateway source changes → gateway image digest changes → `tinfoil-config.yml` changes → its SHA-256, the pinned HOST_DATA, changes → `server-enclave.json` changes → client rebuilds with the new pin. Because the client build context never reads `artifact-manifest.json`, regenerating the manifest after a client build doesn't trigger another client rebuild, so `just update-manifest` reaches a fixed point in a single run.
+The generator (`build.rs`) reads `releases/trust/server-enclave.json` — never the per-artifact digests. The chain that invalidates the pin: gateway source changes → gateway image digest changes → `deploy/gateway/tinfoil-config.yml` changes → its SHA-256, the pinned HOST_DATA, changes → `server-enclave.json` changes → client rebuilds with the new pin. Because the client build context never reads `artifact-manifest.json`, regenerating the manifest after a client build doesn't trigger another client rebuild, so `just update-manifest` reaches a fixed point in a single run.
 
 ## Known gaps
 

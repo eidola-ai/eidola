@@ -235,7 +235,7 @@ BUILDER_NAME="eidola"
 ENSURE_BUILDER=0
 CLI_PATH=""
 GUI_PATH=""
-CONFIG_FILE="$REPO_ROOT/tinfoil-config.yml"
+CONFIG_FILE="$REPO_ROOT/deploy/gateway/tinfoil-config.yml"
 VERIFY_ATTESTATIONS=0
 PUSH_MODE=0
 ARTIFACT_DIR=""
@@ -339,7 +339,7 @@ compute_sha256() {
   fi
 }
 
-# Read the cvm-version field from tinfoil-config.yml into CVM_VERSION and its
+# Read the cvm-version field from deploy/gateway/tinfoil-config.yml into CVM_VERSION and its
 # inline release-manifest pin into CVM_MANIFEST_PIN. The pin is required:
 # it is what names the image the config launches. measure-enclave applies the
 # same grammar (`eidola_common::engine_deployment::parse_cvm_version`) to the
@@ -445,7 +445,7 @@ fetch_cvm_artifacts() {
 
 # ── Enclave measurement ──────────────────────────────────────────────────────
 
-# Update the gateway image digest in tinfoil-config.yml from build metadata.
+# Update the gateway image digest in deploy/gateway/tinfoil-config.yml from build metadata.
 # (Only the gateway runs inside the enclave; the database is hosted
 # externally, so eidola-postgres's digest doesn't feed the measurement.)
 # The gateway is built by the `server` bake target — see
@@ -1094,7 +1094,7 @@ build_linux_deb_artifact() {
 # whether built natively on CI's x86_64 runner or emulated under linux/amd64
 # on an arm64 Mac — the same emulation determinism the StageX OCI digests
 # already depend on. The build reads the *working tree* (dirty or not) exactly
-# as CI does — CI writes the stamped tinfoil-config.yml + server-enclave.json
+# as CI does — CI writes the stamped deploy/gateway/tinfoil-config.yml + server-enclave.json
 # into its checkout before building — so the freshly stamped files from the
 # earlier phases are what get built.
 #
@@ -1515,7 +1515,7 @@ verify_full_manifest() {
 
   # Consistency check: the committed `releases/trust/server-enclave.json`
   # must match the enclave block we just recomputed from
-  # `tinfoil-config.yml`. CI overwrites the committed file with the
+  # `deploy/gateway/tinfoil-config.yml`. CI overwrites the committed file with the
   # recomputed value before the cli builds run (see the `enclave` job in
   # ci.yml), so the merged partials already contain reliable cli digests
   # even when the committed file is stale; this check is what surfaces
@@ -1625,8 +1625,9 @@ verify_oci_manifest() {
 #
 #   Phase 1: build {server, postgres}. Neither image consumes the enclave
 #            measurement, so they can be built first.
-#   Phase 2: stamp the new gateway digest into `tinfoil-config.yml`, recompute
-#            the enclave block, and write `releases/trust/server-enclave.json`.
+#   Phase 2: stamp the new gateway digest into
+#            `deploy/gateway/tinfoil-config.yml`, recompute the enclave
+#            block, and write `releases/trust/server-enclave.json`.
 #   Phase 3: build the cli OCI image, take the static Linux CLI out of it,
 #            and build the current host's native desktop artifacts — the
 #            macOS GUI .app (and, below CLI_ARTIFACT_SET_SCHEMA, the macOS
@@ -1806,8 +1807,8 @@ case "$COMMAND" in
     ;;
   stamp-config)
     # Stamp the freshly-built gateway digest from --metadata-file into
-    # tinfoil-config.yml. Used by CI's two-phase oci job after the gateway
-    # bake completes and before the enclave is recomputed.
+    # deploy/gateway/tinfoil-config.yml. Used by CI's two-phase oci job after
+    # the gateway bake completes and before the enclave is recomputed.
     stamp_config_digests
     echo "Stamped $CONFIG_FILE with server digest from $METADATA_FILE"
     ;;

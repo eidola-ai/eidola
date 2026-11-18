@@ -19,6 +19,13 @@ pub struct AccountRow {
 
 pub use eidola_billing::connection::create_pool;
 
+/// The root a test database's certificate chains to, from `DATABASE_SSL_CERT`
+/// as the gateway itself reads it (`scripts/dev-postgres-tls.sh` makes one).
+#[cfg(test)]
+pub(crate) fn test_ssl_cert() -> Option<String> {
+    std::env::var("DATABASE_SSL_CERT").ok()
+}
+
 /// Maximum tolerated clock skew between this server and the database.
 /// Anything beyond this is treated as a misconfigured time source and
 /// causes time-sensitive operations to fail closed.
@@ -1307,13 +1314,6 @@ pub async fn get_ledger_entries(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn normalizes_verify_full_sslmode() {
-        let normalized = "postgres://user@db.example.com/postgres?sslmode=verify-full"
-            .replace("sslmode=verify-full", "sslmode=require");
-        assert!(normalized.contains("sslmode=require"));
-    }
-
     // -----------------------------------------------------------------------
     // Integration tests (require running postgres: just db && just db-reset)
     // -----------------------------------------------------------------------
@@ -1366,7 +1366,8 @@ mod tests {
         const BALANCE: i64 = 1_000_000;
 
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        let pool = create_pool(&url, None, None).expect("failed to create test pool");
+        let pool = create_pool(&url, None, test_ssl_cert().as_deref())
+            .expect("failed to create test pool");
         let key_id = insert_dummy_issuer_key(&pool).await;
 
         let mut overdrawn = Vec::new();

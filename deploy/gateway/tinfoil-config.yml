@@ -4,8 +4,18 @@
 # enclave produces: the host passes it at launch, and the guest refuses to
 # boot unless it hashes the config it was given to that value. Clients pin
 # it beside the launch digest of the release image `cvm-version` names, so
-# any change here — image digest, secret hash, resource allocation — is a
-# different server identity.
+# any change here — image digest, a variable, the secrets' names, resource
+# allocation — is a different server identity.
+#
+# What this file says is what a client can hold the gateway to without
+# trusting the operator: the code it runs and how that code is set up.
+# Everything that only says which of the operator's services the gateway
+# uses (the database, Stripe, telemetry, the website its legal documents
+# are published on), and the key that encrypts issuer keys at rest, is a
+# secret: named here, its value supplied at deployment and never committed.
+# Those services are trusted as their operator is, whatever they are
+# configured with, so no value of theirs is measured, and one release can
+# be deployed against another set of them, a staging one, unchanged.
 #
 # `cvm-version` pins the platform release manifest inline; that manifest
 # names the SEV-SNP IGVM image, whose launch digest measure-enclave
@@ -13,10 +23,6 @@
 # gateway image is recorded there under its artifact key, `eidola-server`).
 # After building, run `just update-manifest` to stamp in the current digests
 # and recompute the enclave record.
-#
-# Secret hashes are generated with:
-#   cargo run -p hash-secret -- "<secret>"
-# and verified at server startup via verify_measured_secrets().
 
 # Platform release 0.15.3-rc.1 was rebuilt from source on 2026-11-11 and every
 # published file was byte-identical (docs/contributing/
@@ -40,19 +46,13 @@ containers:
       - egress
     secrets:
       - CREDENTIAL_MASTER_KEY
-      - DATABASE_PASSWORD
+      - DATABASE_URL
+      - OTEL_EXPORTER_OTLP_ENDPOINT
       - OTEL_EXPORTER_OTLP_HEADERS
       - STRIPE_API_KEY
+      - TERMS_FEED_BASE_URL
     env:
       - BIND_ADDR: "0.0.0.0:8080"
-      - OTEL_EXPORTER_OTLP_ENDPOINT: "https://otlp-gateway-prod-us-west-0.grafana.net/otlp"
-      - DATABASE_URL: "postgresql://gateway@ep-little-bar-akwznszs.c-3.us-west-2.aws.neon.tech/eidola?sslmode=require&channel_binding=disable"
-
-      # Measured secret hashes — Argon2id hashes of the actual secrets.
-      - CREDENTIAL_MASTER_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$QA6ZPLR29CAPeushQ+ujFA$cOkF1JJdZoKDDzei5pyDrcsfiDBCuqUDoJaYwXG1G5k"
-      - DATABASE_PASSWORD_HASH: "$argon2id$v=19$m=19456,t=2,p=1$cysXhP6SVPuB83IC4iD4yw$ygvRvdmSVfH5zq5+8P/Fgnyz6q93VwCuiZxU0GfjtLs"
-      - OTEL_EXPORTER_OTLP_HEADERS_HASH: "$argon2id$v=19$m=19456,t=2,p=1$BU7g3wAtS+gxm9ADqglQrw$KPSjwJlNFppw1/JncRV9Oby1BCNc/53TRPdBv0j3uOw"
-      - STRIPE_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$qucRiGbS8rYcqJINDlHDcw$qdu/tD4Ymq1by0uPVawIFFneCq757OzZ3/5EPeyFQ4Q"
 
 shim:
   upstream-port: 8080

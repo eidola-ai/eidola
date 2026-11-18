@@ -7,7 +7,6 @@ use deadpool_postgres::{Manager, Pool};
 use eidola_billing::store::{
     DisputeObservation, Purchase, RefundObservation, RefundRequest, Store,
 };
-use tokio_postgres::NoTls;
 use uuid::Uuid;
 
 struct Fixture {
@@ -30,7 +29,15 @@ fn now() -> SystemTime {
 async fn fixture() -> Fixture {
     let url = std::env::var("BILLING_TEST_DATABASE_URL")
         .expect("BILLING_TEST_DATABASE_URL must name a disposable PostgreSQL database");
-    let (root, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let tls = eidola_billing::connection::tls_connector(
+        std::env::var("DATABASE_SSL_CERT").ok().as_deref(),
+    )
+    .unwrap();
+    let (root, connection) = eidola_billing::connection::parse_database_url(&url)
+        .unwrap()
+        .connect(tls.clone())
+        .await
+        .unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
     let schema = format!("billing_test_{}", Uuid::new_v4().simple());
     root.batch_execute(&format!(
@@ -43,9 +50,9 @@ async fn fixture() -> Fixture {
     ))
     .await
     .unwrap();
-    let mut config: tokio_postgres::Config = url.parse().unwrap();
+    let mut config = eidola_billing::connection::parse_database_url(&url).unwrap();
     config.options(format!("-c search_path={schema}"));
-    let pool = Pool::builder(Manager::new(config, NoTls))
+    let pool = Pool::builder(Manager::new(config, tls))
         .max_size(8)
         .build()
         .unwrap();
