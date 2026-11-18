@@ -1,0 +1,74 @@
+# Tinfoil Container configuration for one Eidola inference node serving
+# Qwen3.8-27B (weights 4fc667ee…, models/qwen/qwen3.8-27b.toml) on one
+# NVIDIA B200, Intel TDX.
+#
+# The SHA-256 of this file is the deployment's MRCONFIGID: the guest refuses
+# to boot under any other config, and the gateway pins that hash beside the
+# MRTD of the release image `cvm-version` names (releases/trust/
+# engine-enclaves.json, from `measure-engine-enclaves`). Any change here is a
+# different engine identity, and needs a re-measure and a gateway release.
+#
+# GATEWAY_TOKEN_HASH below is the Argon2id hash of a placeholder token that
+# was generated and discarded: no gateway holds it, so a node booted from
+# this exact file accepts no caller. Before deploying, replace it with the
+# hash of the token the gateway's ENGINE_TOKEN secret carries
+# (`cargo run -p hash-secret`) and re-measure.
+#
+# The weights pack is the modelwrap schema 1 pack of the repo below; its
+# reference is reproducible from the repo at that revision (`modelwrap
+# --schema 1 <repo>@<revision>`, the packer image of modelwrap v0.3.0).
+#
+# The sizing is the whole 262,144-position context at 64 seats, steps of
+# 2,048 tokens of prefill chunks of 256 (the serving chunk), decode graphs on:
+# what one B200 holds beside the weights and the CUDA executor's reserve, the
+# state pool growing with the seats (eidola-common's
+# `qwen_fits_one_b200_at_its_whole_context`).
+cvm-version: 0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f
+cpus: 24
+memory: 196608
+gpus: 1
+
+models:
+  - name: "weights"
+    repo: "Qwen/Qwen3.8-27B-FP8@c3a462cc3d38cf351f3b26cbd763469eeb74ef81"
+    mpk: "eb71be46ee520ce64401fb88b7d2b34ccb383bdaa8e56a85f9c7c1d31e9b8e14_30890057728_b9f97056-df6a-592f-a2a0-6e8998548668"
+    schema: 1
+
+containers:
+  - name: "eidola-server-engine"
+    image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:116eac9f2c20df313006f9c21a9940bcf5a406c76a99a5c72ea8d0d955b6b13d"
+    runtime: nvidia
+    models: ["weights"]
+    gpus: all
+    secrets:
+      - GATEWAY_TOKEN
+    env:
+      - EIDOLA_ENGINE_MODEL_ID: "4fc667ee21b46b0f7127370ea42c8766988e62433a7737b7eb434f77b93035e1"
+      - EIDOLA_ENGINE_WEIGHTS_DIR: "/tinfoil/models/weights"
+      - EIDOLA_ENGINE_WEIGHTS_SHA256: "4fc667ee21b46b0f7127370ea42c8766988e62433a7737b7eb434f77b93035e1"
+      - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
+      - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$YnP+HUZjI0xMXVVdzdLstg$snezWkujWWxWuLu4j1nTwopyn7h7oY/Mw23gIPeUdHE"
+      - EIDOLA_ENGINE_EXECUTOR: "cuda"
+      - EIDOLA_ENGINE_BIND_ADDR: "0.0.0.0:8080"
+      - EIDOLA_ENGINE_KV_BLOCK_SIZE: "16"
+      - EIDOLA_ENGINE_KV_DEVICE_BYTES: "123480309760"
+      - EIDOLA_ENGINE_KERNELS_DIR: "/opt/eidola/kernels"
+      - EIDOLA_ENGINE_CUDA_GRAPHS: "on"
+      - EIDOLA_ENGINE_GPU_CC: "required"
+      - EIDOLA_ENGINE_MAX_MODEL_LEN: "262144"
+      - EIDOLA_ENGINE_MAX_SEQS: "64"
+      - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "2048"
+      - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "256"
+      - EIDOLA_ENGINE_DRAFT_TOKENS: "3"
+      - EIDOLA_ENGINE_MAX_REQUESTS: "64"
+      - EIDOLA_ENGINE_PREFIX_CACHE: "true"
+      - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
+      - EIDOLA_ENGINE_CACHE_MAX_AGE_SECS: "7200"
+      - EIDOLA_ENGINE_KV_HOST_BYTES: "68719476736"
+
+shim:
+  upstream-port: 8080
+  paths:
+    - /v1/chat/completions
+    - /v1/engine/info
+    - /healthz
