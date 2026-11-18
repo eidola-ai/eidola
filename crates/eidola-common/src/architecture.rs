@@ -224,12 +224,6 @@ pub struct HybridDims {
     pub v_dim: u64,
 }
 
-/// Bytes of an FP8 linear's quantised input for one row of `k` columns: the
-/// codes and an f32 scale per 128 columns.
-const fn lin8_row_bytes(k: u64) -> u64 {
-    k + k / 128 * 4
-}
-
 impl HybridDims {
     const fn key_dim(&self) -> u64 {
         self.k_heads * self.k_dim
@@ -269,12 +263,15 @@ impl HybridDims {
 
     /// Device bytes of one state buffer: every DeltaNet layer's convolution
     /// history (three inputs of the convolved width) and state matrix, f32,
-    /// then a 4-byte tag, padded to 256 bytes. A seat's live image is one
-    /// more of the same.
+    /// then a 4-byte tag, padded to a whole number of convolution rows
+    /// (`4 × conv_dim` bytes) at a multiple of 256, as the executor strides
+    /// its images. A seat's live image is one more of the same.
     pub const fn state_image_bytes(&self) -> u64 {
         let data =
             self.deltanet_layers * (3 * self.conv_dim() + self.v_heads * self.k_dim * self.v_dim);
-        (data * 4 + 4).div_ceil(256) * 256
+        let row = self.conv_dim() * 4;
+        let stride = lcm(256, row);
+        (data * 4 + 4).div_ceil(stride) * stride
     }
 
     /// Device bytes one position of a seat's tail takes: every DeltaNet
@@ -294,58 +291,57 @@ impl HybridDims {
         2 * self.rotary * 4
     }
 
-    /// The scratch one attention layer's mixer takes per padded row beside
-    /// its scores: the gated query projection, K, V, the normed query and
-    /// key, the attention output and its gated form, BF16, and the four FP8
-    /// linears' quantised inputs.
-    const fn attention_row_bytes(&self) -> u64 {
-        let (q, kv) = (self.q_width(), self.kv_width());
-        (2 * q + 3 * kv + 3 * q) * 2 + 3 * lin8_row_bytes(self.hidden) + lin8_row_bytes(q)
+    /// The widest input of an FP8 linear: the quantiser's scratch width.
+    pub const fn widest_input(&self) -> u64 {
+        let mut k = self.hidden;
+        if self.intermediate > k {
+            k = self.intermediate;
+        }
+        if self.q_width() > k {
+            k = self.q_width();
+        }
+        if self.value_dim() > k {
+            k = self.value_dim();
+        }
+        k
     }
 
-    /// The scratch one layer's MLP takes per padded row: the gate, up and
-    /// gated rows, BF16, and its three FP8 linears' quantised inputs.
-    const fn mlp_row_bytes(&self) -> u64 {
-        3 * self.intermediate * 2
-            + 2 * lin8_row_bytes(self.hidden)
-            + lin8_row_bytes(self.intermediate)
-    }
-
-    /// A target forward's scratch per padded row, its attention scores, block
-    /// tables and DeltaNet staging aside: the residual stream and its four
-    /// working rows, the DeltaNet's projections, and every layer's mixer and
-    /// MLP, all held until the forward ends.
-    pub const fn target_row_bytes(&self) -> u64 {
-        let (h, v) = (self.hidden, self.value_dim());
-        let fixed = 5 * h * 2 + self.conv_dim() * 2 + 2 * v * 2 + 2 * self.v_heads * 2 + 4 + 12;
-        let deltanet = 2 * lin8_row_bytes(h) + lin8_row_bytes(v);
-        let layers = self.attention_layers + self.deltanet_layers;
-        fixed
-            + self.deltanet_layers * deltanet
-            + self.attention_layers * self.attention_row_bytes()
-            + layers * self.mlp_row_bytes()
-    }
-
-    /// A drafter forward's scratch per padded row, its scores and block
-    /// tables aside: the token's embedding, the hidden it continues and their
-    /// concatenation, the residual stream and its four working rows, and its
-    /// one layer's mixer and MLP.
-    pub const fn drafter_row_bytes(&self) -> u64 {
-        let h = self.hidden;
-        4 + 12
+    /// The step program's scratch per row of its widest forward (the
+    /// executor's `program::alloc_scratch`): the residual stream and its
+    /// three working rows; the quantised input and its scales; the MLP's
+    /// gate, up and gated rows; the DeltaNet's projections, gated norm,
+    /// widened inputs, decay and write rows and output rows; the attention's
+    /// gated query, K, V, normed query and key, output and gated output; and
+    /// the drafter's embedding, hidden, concatenation, residual and normed
+    /// rows.
+    pub const fn program_row_bytes(&self) -> u64 {
+        let (h, cd, vd, vh) = (self.hidden, self.conv_dim(), self.value_dim(), self.v_heads);
+        let (qw, kvw) = (self.q_width(), self.kv_width());
+        let k = self.widest_input();
+        4 * h * 2
+            + k
+            + k / 128 * 4
+            + 3 * self.intermediate * 2
+            + cd * 2
+            + vd * 2
+            + 2 * vh * 2
+            + vd * 2
+            + cd * 4
+            + 2 * vh * 4
+            + vd * 4
+            + 2 * qw * 2
+            + 3 * kvw * 2
+            + 3 * qw * 2
+            + 4 * h * 2
             + 2 * h * 2
-            + 2 * h * 2
-            + 5 * h * 2
-            + self.attention_row_bytes()
-            + self.mlp_row_bytes()
     }
 
     /// The DeltaNet's staging per staged position (a row's new positions and
     /// the kept ones it folds first): decay and write inputs, queries, keys,
-    /// values, both gates, the output, f32, and the window index.
+    /// values, both gates and the output, f32.
     pub const fn staged_position_bytes(&self) -> u64 {
         let v = self.value_dim();
-        2 * self.v_heads * 4 + 2 * self.key_dim() * 4 + v * 4 + 2 * self.v_heads * 4 + v * 4 + 4
+        2 * self.v_heads * 4 + 2 * self.key_dim() * 4 + v * 4 + 2 * self.v_heads * 4 + v * 4
     }
 
     /// One convolution input row of the staging, f32.
@@ -353,17 +349,37 @@ impl HybridDims {
         self.conv_dim() * 4
     }
 
-    /// Attention scores per row, layer and visible position: an f32 per
-    /// query head.
-    pub const fn score_bytes(&self) -> u64 {
-        self.q_heads * 4
+    /// One FA2 partial row: every query head's BF16 output and f32
+    /// log-sum-exp.
+    pub const fn partial_row_bytes(&self) -> u64 {
+        self.q_heads * (self.head_dim * 2 + 4)
     }
 
-    /// The head's scratch per padded row: the gathered BF16 input and the
-    /// f32 logits over every row of the head.
-    pub const fn head_row_bytes(&self) -> u64 {
-        self.hidden * 2 + self.vocab * 4
+    /// The rows of the stacked DeltaNet `a` and `b` weight: `2 × v_heads`,
+    /// to a multiple of 8.
+    pub const fn ab_rows(&self) -> u64 {
+        (2 * self.v_heads).next_multiple_of(8)
     }
+
+    /// The decay and write rows' bytes, f32.
+    pub const fn ab_row_bytes(&self) -> u64 {
+        2 * self.v_heads * 4
+    }
+
+    pub const fn value_row_bytes(&self) -> u64 {
+        self.value_dim() * 4
+    }
+}
+
+/// The least common multiple of two positive numbers.
+const fn lcm(a: u64, b: u64) -> u64 {
+    let (mut x, mut y) = (a, b);
+    while y != 0 {
+        let t = x % y;
+        x = y;
+        y = t;
+    }
+    a / x * b
 }
 
 /// A device's step scratch, as an executor sizes it beside its weights and KV
@@ -792,8 +808,9 @@ mod tests {
         assert_eq!(shape.kv_bytes_per_position(), 65_536);
         assert_eq!(shape.drafter_kv_bytes_per_position, 4096);
         assert_eq!(dims.tap_bytes(), 10_240);
-        // 48 × (3 × 10,240 + 48 × 128 × 128) f32 and a tag, to 256.
-        assert_eq!(dims.state_image_bytes(), 156_893_440);
+        // 48 × (3 × 10,240 + 48 × 128 × 128) f32 and a tag, to whole conv rows of
+        // 40,960 bytes.
+        assert_eq!(dims.state_image_bytes(), 156_917_760);
         assert_eq!(dims.tail_bytes_per_position(), 48 * 10_336 * 4);
         assert_eq!(dims.rope_bytes_per_position(), 512);
         assert_eq!(shape.weights_bytes, None);

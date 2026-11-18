@@ -31,6 +31,8 @@ pub const GATE_SIGMOID: u32 = 1;
 pub const KEY_DIM: u32 = 128;
 /// Widest unit a rotated norm stages.
 pub const ROPE_MAX: u32 = 512;
+/// Widest unit a norm stages (`kNormMax`).
+pub const NORM_MAX: u32 = 8192;
 /// State writes one [`DnSeq`] carries.
 pub const SEQ_WRITES: usize = 4;
 

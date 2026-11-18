@@ -6,10 +6,12 @@
 //! profile the FP8 linears run CUTLASS's blockwise tcgen05 GEMM
 //! (`cutlass_fp8_blockwise_gemm`, the same image MiMo's executor runs: f32 scales per
 //! 1×128 of the activations and 128×128 of the weights, exactly the kernels' layouts),
-//! and the large BF16 linears (the head, the drafter's input projection) CUTLASS's BF16
-//! GEMM into f32, rounded to BF16 by `eidola_qwen_round`. Attention stays the exact
-//! kernel in both profiles until the FA2 head-dim-256 path is wired (its images are built:
-//! `flashinfer_fa2_sink_paged_d256`).
+//! and the BF16 linears (the head, the drafter's input projection, the DeltaNet's stacked
+//! `a` and `b` projections) CUTLASS's BF16 GEMM into an f32 scratch the caller names,
+//! rounded to BF16 by `eidola_qwen_round`; and
+//! attention runs FA2 at head dimension 256 ([`super::attention`]). Both profiles load the
+//! shared sampler (`sampling`) and the row copy (`engine_ops`'s `eidola_copy_rows`). Graphs
+//! are captured on the device's one stream ([`QwenDevice::capture`]).
 
 use std::any::Any;
 use std::ffi::c_void;
@@ -20,12 +22,15 @@ use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::secret::KvKey;
 
 use super::abi::*;
+use super::attention::{Fa2Args, QwenAttention};
 use super::device::{QwenDevice, QwenProfile};
 use super::kernels::*;
 use crate::kv_cipher::{CipherItem, CipherItems, KvCipher};
 use crate::launch::dptr;
+use crate::mimo::engine_ops::EngineOps;
 use crate::mimo::gemm::{Gemm, GemmArgs, GemmKind};
 use crate::module::{Kernel, KernelDir, KernelModule};
+use crate::sampler::{SampleLaunch, Sampler};
 use crate::{CudaError, Gpu, Result};
 
 /// The Qwen3.8 kernel images.
@@ -47,10 +52,11 @@ struct Kernels {
     round: Kernel,
 }
 
-/// The fast profile's GEMMs.
+/// The fast profile's GEMMs and attention.
 struct Fast {
     fp8: Gemm,
     bf16: Gemm,
+    attention: QwenAttention,
     _modules: Vec<KernelModule>,
 }
 
@@ -60,6 +66,8 @@ pub struct CudaDevice {
     profile: QwenProfile,
     k: Kernels,
     fast: Option<Fast>,
+    rows: EngineOps,
+    sampler: Sampler,
     cipher: Mutex<KvCipher>,
     _modules: Vec<KernelModule>,
 }
@@ -104,18 +112,24 @@ impl CudaDevice {
             QwenProfile::Fast => {
                 let f = KernelModule::load(&gpu, dir, GemmKind::Fp8Blockwise.kernel().0)?;
                 let b = KernelModule::load(&gpu, dir, GemmKind::Bf16.kernel().0)?;
+                let a = KernelModule::load(&gpu, dir, super::attention::IMAGE)?;
                 Some(Fast {
                     fp8: Gemm::from_module(GemmKind::Fp8Blockwise, &f)?,
                     bf16: Gemm::from_module(GemmKind::Bf16, &b)?,
+                    attention: QwenAttention::from_module(a)?,
                     _modules: vec![f, b],
                 })
             }
         };
+        let rows = EngineOps::load(&gpu, dir)?;
+        let sampler = Sampler::load(&gpu, dir)?;
         Ok(CudaDevice {
             gpu,
             profile,
             k,
             fast,
+            rows,
+            sampler,
             cipher: Mutex::new(cipher),
             _modules: vec![ops, div, dn],
         })
@@ -128,6 +142,26 @@ impl CudaDevice {
     fn bind(&self) -> Result<()> {
         self.gpu.context().bind_to_thread()?;
         Ok(())
+    }
+
+    /// The CUTLASS BF16 GEMM of `p`'s rows and weight into `d` (`rows · n` f32), checked.
+    fn bf16_args(p: &LinearParams, d: u64) -> Result<GemmArgs> {
+        if p.x_stride != p.k {
+            return Err(CudaError::new("the fast BF16 linear reads dense rows"));
+        }
+        let a = GemmArgs {
+            m: p.rows,
+            n: p.n,
+            k: p.k,
+            a: p.x,
+            b: p.w,
+            d,
+            sfa: 0,
+            sfb: 0,
+            alpha: 1.0,
+        };
+        GemmKind::Bf16.check(&a)?;
+        Ok(a)
     }
 
     /// Launches `kernel` with `p` by value over `grid`.
@@ -195,32 +229,16 @@ impl QwenKernels for CudaDevice {
             }
         }
     }
-    unsafe fn linear(&self, p: &LinearParams, large: bool) -> Result<()> {
+    unsafe fn linear(&self, p: &LinearParams, fast: Option<u64>) -> Result<()> {
         if p.rows == 0 {
             return Ok(());
         }
         let g = linear_grid(p)?;
-        match (&self.fast, large) {
-            (Some(f), true) => {
-                if p.x_stride != p.k {
-                    return Err(CudaError::new("the fast BF16 linear reads dense rows"));
-                }
-                let s = self.gpu.stream();
-                let tmp = s.alloc_zeros::<f32>(p.rows as usize * p.n as usize)?;
-                let a = GemmArgs {
-                    m: p.rows,
-                    n: p.n,
-                    k: p.k,
-                    a: p.x,
-                    b: p.w,
-                    d: dptr(&tmp, s),
-                    sfa: 0,
-                    sfb: 0,
-                    alpha: 1.0,
-                };
-                GemmKind::Bf16.check(&a)?;
+        match (&self.fast, fast) {
+            (Some(f), Some(tmp)) => {
+                let a = Self::bf16_args(p, tmp)?;
                 let r = RoundParams {
-                    x: a.d,
+                    x: tmp,
                     out: p.out,
                     rows: p.rows,
                     width: p.n,
@@ -230,17 +248,31 @@ impl QwenKernels for CudaDevice {
                     reserved: 0,
                 };
                 let rg = round_grid(&r)?;
-                // SAFETY: `rows` input rows, the weight, the f32 scratch above.
+                // SAFETY: `rows` input rows, the weight, the caller's f32 scratch of
+                // `rows · n` values.
                 unsafe {
                     f.bf16.launch(&self.gpu, &a)?;
-                    self.go(&self.k.round, &r, rg)?;
+                    self.go(&self.k.round, &r, rg)
                 }
-                // The scratch is freed in stream order.
-                drop(tmp);
-                Ok(())
             }
             _ => unsafe { self.go(&self.k.linear, p, g) },
         }
+    }
+    unsafe fn gemm_bf16(&self, p: &LinearParams) -> Result<()> {
+        if p.rows == 0 {
+            return Ok(());
+        }
+        linear_grid(p)?;
+        let f = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the BF16 GEMM runs in the fast profile"))?;
+        if p.out_stride != p.n || p.out_f32 != 1 {
+            return Err(CudaError::new("the fast BF16 GEMM writes dense f32 rows"));
+        }
+        let a = Self::bf16_args(p, p.out)?;
+        // SAFETY: `rows` input rows, the weight, `rows · n` f32 outputs: the caller's.
+        unsafe { f.bf16.launch(&self.gpu, &a) }
     }
     unsafe fn gate(&self, p: &GateParams) -> Result<()> {
         if p.rows == 0 {
@@ -297,6 +329,37 @@ impl QwenKernels for CudaDevice {
         }
         let g = round_grid(p)?;
         unsafe { self.go(&self.k.round, p, g) }
+    }
+    unsafe fn copy_rows(&self, a: &CopyArgs) -> Result<()> {
+        // SAFETY: the caller's buffers and item arrays.
+        unsafe { self.rows.copy_rows(&self.gpu, *a) }
+    }
+    unsafe fn sample(&self, a: &SampleArgs) -> Result<()> {
+        let l = SampleLaunch {
+            logits: a.logits,
+            logits_stride: a.logits_stride,
+            n: a.n,
+            rows: a.rows,
+            num_rows: a.num_rows,
+            draw: a.draw,
+            probs: a.probs,
+            tokens: a.tokens,
+            status: a.status,
+        };
+        // SAFETY: the caller's rows and buffers.
+        unsafe { self.sampler.launch_sample(&self.gpu, l) }
+    }
+    unsafe fn accept(&self, a: &AcceptLaunch) -> Result<()> {
+        // SAFETY: the caller's rows and buffers.
+        unsafe { self.sampler.launch_accept(&self.gpu, *a) }
+    }
+    unsafe fn fa2(&self, a: &Fa2Args) -> Result<()> {
+        let f = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("FA2 runs in the fast profile"))?;
+        // SAFETY: the caller's plan, pool and buffers.
+        unsafe { f.attention.run(&self.gpu, a) }
     }
 }
 
@@ -412,5 +475,31 @@ impl QwenDevice for CudaDevice {
 
     fn synchronize(&self) -> Result<()> {
         self.gpu.synchronize()
+    }
+
+    fn capture(&self, run: &mut dyn FnMut() -> Result<()>) -> Result<Box<dyn Any>> {
+        self.bind()?;
+        let s = self.gpu.stream();
+        s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let recorded = run();
+        let graph = s.end_capture(sys::CUgraphInstantiate_flags(0));
+        recorded?;
+        let graph = graph?.ok_or_else(|| CudaError::new("the capture is empty"))?;
+        graph.upload()?;
+        Ok(Box::new(graph))
+    }
+
+    fn replay(&self, graph: &dyn Any) -> Result<()> {
+        self.bind()?;
+        let g = graph
+            .downcast_ref::<cudarc::driver::CudaGraph>()
+            .ok_or_else(|| CudaError::new("not a graph this device captured"))?;
+        Ok(g.launch()?)
+    }
+
+    fn free_memory(&self) -> Result<i64> {
+        self.bind()?;
+        let (free, _) = cudarc::driver::result::mem_get_info()?;
+        crate::narrow(free, "free device memory")
     }
 }

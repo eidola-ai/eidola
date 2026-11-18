@@ -201,7 +201,7 @@ check "a fresh machine writes the token sequences again" \
     [ -f "$T/fresh/checkpoint/golden/health.safetensors" ]
 
 # Every session script dry-runs to its end, marking nothing.
-for s in qwen_probe_session.sh qwen_gpu_session.sh qwen_real_session.sh; do
+for s in qwen_probe_session.sh qwen_gpu_session.sh qwen_real_session.sh qwen_perf_session.sh; do
     WORK="$T/dry-$s" DRY_RUN=1 bash "$HERE/$s" > "$T/log-$s" 2>&1
     check "$s dry-runs" grep -q "results in" "$T/log-$s"
     check "$s dry run marks nothing" [ -z "$(ls "$T/dry-$s/out/done")" ]

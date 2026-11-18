@@ -7,25 +7,35 @@
 //! `csrc/qwen_abi.cuh`, batched over a step's rows) and how the recurrent state between
 //! steps is kept ([`StateStrategy`]).
 //!
-//! A step:
+//! A step is one launch sequence over fixed scratch ([`program`]), reading every per-step
+//! value from one table ([`super::plan`]):
 //!
-//! 1. Maintenance in order, then table updates.
+//! 1. Maintenance in order, then table updates; the rows checked and planned.
 //! 2. **Pass A**: the target over every row's host tokens, all rows in one forward. A
 //!    DeltaNet layer's recurrence starts each row from its source (the slot's live state,
 //!    or its base buffer), folds the kept positions between the source and the row's
 //!    `context_len` without output, runs the host tokens with output, stores every named
 //!    state write as the recurrence passes it, and stores the state after the host tokens
 //!    into the slot's live image.
-//! 3. The drafter's rows over the host positions (with drafting), then the draft chain,
-//!    depth by depth over every drafting row.
+//! 3. The drafter over the host positions (with drafting), then the draft chain, depth by
+//!    depth over every drafting row, each depth's drafts drawn on the device.
 //! 4. **Pass B**: the target over the drafts, from the live image; nothing stored but the
 //!    drafts' KV in reserved positions and their inputs in the tail.
-//! 5. Sampling and chain acceptance on the host (`eidola_engine::sampling`, as the
-//!    reference executor).
-//! 6. The drafter's canonical rewrite at the accepted drafts, the boundary taps, the kept
-//!    normed states and the tail.
+//! 5. Plain rows drawn and chain acceptance on the device (the shared sampler, equal to
+//!    `eidola_engine::sampling` bit for bit given equal logits).
+//! 6. The drafter's canonical KV at every draft's position (a rejected draft's is
+//!    rewritten when its position is computed again, before anything reads it), the
+//!    boundary taps and the kept normed states.
+//!
+//! The step's one read-back is the status word and the tokens. A uniform decode step runs
+//! a rung's padded launch sequence: replayed from its captured graph, or directly; any
+//! other step runs the sequence laid out for itself (the eager path).
+
+#[path = "program.rs"]
+mod program;
 
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use eidola_engine::executor::{
@@ -33,7 +43,7 @@ use eidola_engine::executor::{
     StepOutput,
 };
 use eidola_engine::kv_cipher::KvNonce;
-use eidola_engine::sampling::{self, Logits, SamplingParams, Stream};
+use eidola_engine::sampling::SamplingParams;
 use eidola_engine::secret::KvKey;
 use eidola_engine::spec::{
     AttentionKind, Bucket, Coverage, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK, NULL_STATE,
@@ -44,8 +54,16 @@ use eidola_engine_model::qwen::config::LayerKind;
 
 use super::abi::*;
 use super::device::{QwenDevice, QwenProfile};
-use super::weights::{DevWeights, Fp8W, LayerW, MixerW};
+use super::plan::{
+    self, AttnRows, DrafterPass, Fa2Geometry, Geo, Item, Layout, SAMPLE_WORDS, Shape, StepPlan,
+    TargetPass, buf,
+};
+use super::weights::DevWeights;
+use crate::mimo::attention::{PassCaps, Reduction};
+pub use crate::mimo::graph::{CudaGraphs, DecodePath};
+use crate::sampler::SampleRow;
 use crate::{CudaError, Result, narrow};
+use program::{Caps, Scratch};
 
 /// KV group of the target's attention layers.
 const TARGET: usize = 0;
@@ -94,6 +112,8 @@ pub struct QwenCudaExecutorConfig {
     pub draft_tokens: u32,
     pub sampleable_vocab_size: u32,
     pub strategy: StateStrategy,
+    /// Whether uniform decode steps replay graphs captured at construction.
+    pub graphs: CudaGraphs,
 }
 
 /// A device allocation and what keeps it.
@@ -150,10 +170,6 @@ impl Dims {
     /// f32 values of one DeltaNet layer in a state image: the conv history, then `S`.
     fn layer_floats(&self) -> usize {
         3 * self.conv_dim() as usize + (self.v_heads * self.k_dim * self.v_dim) as usize
-    }
-    /// f32 values one tail position takes per layer: `mixed`, `a`, `b`.
-    fn tail_floats(&self) -> usize {
-        (self.conv_dim() + 2 * self.v_heads) as usize
     }
 }
 
@@ -212,10 +228,12 @@ pub struct QwenCudaExecutor<D: QwenDevice> {
     states: Alloc,
     host_states: Option<HostAlloc>,
     image_stride: usize,
-    /// Live images, one per slot.
+    /// Live images, one per slot and the padding slot.
     live: Alloc,
-    /// Tails: per slot, `[cap][dn layers][tail floats]` f32.
-    tails: Alloc,
+    /// Tails, per DeltaNet layer `[slot][cap]` rows: the raw conv inputs (`conv_dim` f32)
+    /// and the `a`, `b` rows (`2 · v_heads` f32).
+    tails_conv: Alloc,
+    tails_ab: Alloc,
     tail_cap: u32,
     /// Kept normed states: per slot `[k + 1][hidden]` BF16.
     hiddens: Alloc,
@@ -230,7 +248,16 @@ pub struct QwenCudaExecutor<D: QwenDevice> {
     host_state_encrypted: Vec<bool>,
     host_state_tags: Vec<u32>,
     steps: u64,
-    status: Alloc,
+    scratch: Scratch,
+    /// The table the program reads: a rung's fixed one, or the eager one.
+    table_base: Cell<u64>,
+    eager_table: Alloc,
+    eager_words: usize,
+    rungs: Vec<Rung>,
+    path: DecodePath,
+    stats: DecodeStats,
+    had_rows: bool,
+    idle_scrubs: u64,
 }
 
 fn ex(e: CudaError) -> ExecutorError {
@@ -260,8 +287,16 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         if a.head_dim > 256 || a.head_dim > ROPE_MAX as usize || a.rotary_dim > a.head_dim {
             return Err(CudaError::new("attention head dim past the kernels'"));
         }
+        if dev.profile() == QwenProfile::Fast && a.head_dim != super::attention::HEAD_DIM as usize {
+            return Err(CudaError::new(
+                "the fast profile's attention is compiled for 256-wide heads",
+            ));
+        }
         if !c.hidden_size.is_multiple_of(128) || !c.intermediate_size.is_multiple_of(128) {
             return Err(CudaError::new("widths must be whole 128-blocks"));
+        }
+        if c.hidden_size > NORM_MAX as usize {
+            return Err(CudaError::new("hidden size past the norm's staged width"));
         }
         let dims = Dims {
             hidden: u32of(c.hidden_size, "hidden")?,
@@ -296,10 +331,11 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         for g in 0..groups {
             let layers = if g == TARGET { attn_layers } else { 1 };
             let block_bytes = layers * 2 * bs as usize * w * 2;
-            let data = Alloc::new(&dev, cfg.num_blocks as usize * block_bytes)?;
+            // One pad block past the seam's ids, for padding rows.
+            let data = Alloc::new(&dev, (cfg.num_blocks as usize + 1) * block_bytes)?;
             let tap_bytes = dims.hidden as usize * 2;
             let taps = if g == DRAFTER {
-                Some(Alloc::new(&dev, cfg.num_blocks as usize * tap_bytes)?)
+                Some(Alloc::new(&dev, (cfg.num_blocks as usize + 1) * tap_bytes)?)
             } else {
                 None
             };
@@ -327,7 +363,10 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             }
         }
         let data_bytes = dn_layers * dims.layer_floats() * 4;
-        let image_stride = (data_bytes + 4).next_multiple_of(256);
+        // Images a whole number of conv rows apart (and of 256 bytes), so the row copies
+        // address any image's conv history as rows of one buffer.
+        let row = dims.conv_dim() as usize * 4;
+        let image_stride = (data_bytes + 4).next_multiple_of(lcm(256, row));
         let states = Alloc::new(&dev, cfg.state_buffers as usize * image_stride)?;
         let host_states = if tiered {
             let (ptr, keep) = dev.alloc_host(cfg.host_state_buffers as usize * image_stride)?;
@@ -336,14 +375,18 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             None
         };
         let slots_n = cfg.num_state_slots as usize;
-        let live = Alloc::new(&dev, slots_n * image_stride)?;
+        // The padding slot's state after every real slot's.
+        let live = Alloc::new(&dev, (slots_n + 1) * image_stride)?;
         let tail_cap = bs - 1 + k;
-        let tails = Alloc::new(
+        // A ring of at least one row a slot: with one-position blocks and no drafts a
+        // slot keeps no tail, and nothing is addressed in it.
+        let tail_rows = dn_layers * (slots_n + 1) * tail_cap.max(1) as usize;
+        let tails_conv = Alloc::new(&dev, tail_rows * dims.conv_dim() as usize * 4)?;
+        let tails_ab = Alloc::new(&dev, tail_rows * 2 * dims.v_heads as usize * 4)?;
+        let hiddens = Alloc::new(
             &dev,
-            slots_n * tail_cap as usize * dn_layers * dims.tail_floats() * 4,
+            (slots_n + 1) * (k as usize + 1) * dims.hidden as usize * 2,
         )?;
-        let hiddens = Alloc::new(&dev, slots_n * (k as usize + 1) * dims.hidden as usize * 2)?;
-        let status = Alloc::new(&dev, 8)?;
         let group = |name: &str, role, layers: usize| KvGroupSpec {
             name: name.into(),
             role,
@@ -388,7 +431,20 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         spec.validate()
             .map_err(|e| CudaError::new(format!("spec: {e:?}")))?;
         let width = spec.max_blocks_per_seq() as usize;
-        Ok(Self {
+        let caps = capacities(&cfg, tail_cap);
+        let k_max = [
+            dims.hidden,
+            dims.inter,
+            dims.q_heads * dims.head_dim,
+            dims.value_dim(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0) as usize;
+        let scratch = Self::alloc_scratch(&dev, &dims, k_max, caps)?;
+        let eager_table = Alloc::new(&dev, 64 * 4)?;
+        let graphs = cfg.graphs;
+        let mut ex = Self {
             tables: vec![vec![vec![NULL_BLOCK; width]; groups]; slots_n],
             slots: vec![SlotRec::default(); slots_n],
             kv_encrypted: vec![vec![false; cfg.num_blocks as usize]; groups],
@@ -409,14 +465,25 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             host_states,
             image_stride,
             live,
-            tails,
+            tails_conv,
+            tails_ab,
             tail_cap,
             hiddens,
             spec,
             cfg,
             steps: 0,
-            status,
-        })
+            table_base: Cell::new(scratch.table.addr),
+            scratch,
+            eager_table,
+            eager_words: 64,
+            rungs: Vec::new(),
+            path: DecodePath::Eager,
+            stats: DecodeStats::default(),
+            had_rows: false,
+            idle_scrubs: 0,
+        };
+        ex.prepare_rungs(graphs == CudaGraphs::On)?;
+        Ok(ex)
     }
 
     pub fn device(&self) -> &D {
@@ -464,19 +531,21 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         self.dims.layer_floats() * 4
     }
 
-    /// A slot's whole tail: its address and bytes (none with one-token blocks and no
-    /// drafts).
-    fn slot_tail(&self, slot: Slot) -> (u64, usize) {
-        let bytes = self.tail_cap as usize * self.dn_layers() * self.dims.tail_floats() * 4;
-        (self.tails.addr + u64::from(slot) * bytes as u64, bytes)
-    }
-
-    /// The row of tail position `pos` of a DeltaNet layer; only a slot with a tail has one.
-    fn tail_row(&self, slot: Slot, pos: u32, layer: usize) -> u64 {
-        let tf = self.dims.tail_floats();
-        let per_pos = self.dn_layers() * tf;
-        let i = u64::from(pos % self.tail_cap) * per_pos as u64 + (layer * tf) as u64;
-        self.slot_tail(slot).0 + i * 4
+    /// A slot's tail rows of every layer: per layer one range of each tail array.
+    fn tail_ranges(&self, slot: Slot) -> Vec<(u64, usize)> {
+        let cap = self.tail_ring() as usize;
+        let layer_rows = self.tail_layer_rows();
+        let mut r = Vec::new();
+        for (arr, row) in [
+            (&self.tails_conv, self.dims.conv_dim() as usize * 4),
+            (&self.tails_ab, 2 * self.dims.v_heads as usize * 4),
+        ] {
+            for l in 0..self.dn_layers() {
+                let at = (l * layer_rows + slot as usize * cap) * row;
+                r.push((arr.addr + at as u64, cap * row));
+            }
+        }
+        r
     }
 
     fn hidden_row(&self, slot: Slot, i: usize) -> u64 {
@@ -566,12 +635,13 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             g.fill(NULL_BLOCK);
         }
         self.slots[s] = SlotRec::default();
-        let (tail, tail_bytes) = self.slot_tail(slot);
         let k1 = self.cfg.draft_tokens as usize + 1;
         // SAFETY: the slot's own ranges of the live images, tails and hiddens.
         unsafe {
             self.dev.zero(self.live_addr(slot), self.image_stride)?;
-            self.dev.zero(tail, tail_bytes)?;
+            for (a, n) in self.tail_ranges(slot) {
+                self.dev.zero(a, n)?;
+            }
             self.dev
                 .zero(self.hidden_row(slot, 0), k1 * self.dims.hidden as usize * 2)?;
         }
@@ -686,83 +756,48 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         }
         Ok(())
     }
+}
 
-    /// The source a slot's recurrence starts from for positions up to `upto`: its live
-    /// image when the strategy keeps one and it stands at or before `upto` past the base,
-    /// else its base buffer (the zero state for `NULL_STATE`). `(address, position)`.
-    fn source(&self, slot: Slot, upto: u32, writes_after: u32) -> (u64, u32) {
-        let rec = &self.slots[slot as usize];
-        let (base, base_len) = rec.base.expect("a slot with a base");
-        if self.cfg.strategy == StateStrategy::Live
-            && let Some(lp) = rec.live_pos
-            && lp >= base_len
-            && lp <= upto
-            && lp < writes_after
-        {
-            return (self.live_addr(slot), lp);
-        }
-        if base == NULL_STATE {
-            assert_eq!(
-                base_len, 0,
-                "the zero state named as the state at {base_len}"
-            );
-            return (0, 0);
-        }
-        assert!(
-            !self.state_encrypted[base as usize],
-            "state buffer {base}: read while encrypted"
-        );
-        assert_eq!(
-            self.state_tags[base as usize],
-            base_len + 1,
-            "state buffer {base}: holds another boundary's state"
-        );
-        (self.state_addr(base), base_len)
-    }
+// ---- the step's plan ----
 
-    fn save_state(&mut self, slot: Slot, len: u32, buffer: u32) -> Result<()> {
-        let (base, _) = self.slots[slot as usize]
-            .base
-            .expect("a state saved from a slot that holds none");
-        assert!(
-            len.is_multiple_of(self.cfg.block_size),
-            "a state saved off a boundary"
-        );
-        assert!(
-            buffer == base
-                || (self.state_tags[buffer as usize] == 0
-                    && !self.state_encrypted[buffer as usize]),
-            "state buffer {buffer}: saved into while it holds a state"
-        );
-        let (src, src_pos) = self.source(slot, len, len + 1);
-        let run = Run {
-            slot,
-            start: len,
-            tokens: Vec::new(),
-            src,
-            src_pos,
-            writes: vec![(len, buffer)],
-            live_store: false,
-            tail_from: u32::MAX,
-            kv: false,
-        };
-        self.dn_only(&run)?;
-        self.set_tag(buffer, len)
+/// Where a run's recurrence starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Src {
+    /// The zero state.
+    Zero,
+    /// A slot's live image.
+    Live(Slot),
+    /// A state buffer.
+    Buffer(u32),
+}
+
+/// Where a run's tokens come from.
+#[derive(Clone, Debug)]
+enum Toks {
+    /// Host ids.
+    Host(Vec<u32>),
+    /// Draft lanes, by lane index.
+    Lanes(Vec<u32>),
+}
+
+impl Toks {
+    fn len(&self) -> u32 {
+        match self {
+            Toks::Host(t) | Toks::Lanes(t) => n32(t.len()),
+        }
     }
 }
 
-// ---- the forward ----
-
-/// One sequence's positions through the target (or, with no tokens, a fold alone).
+/// One run through the target (or, with no tokens, a fold alone).
 #[derive(Clone, Debug)]
 struct Run {
     slot: Slot,
-    /// The first new position; the run's tokens are at `start ..`.
+    /// The first new position.
     start: u32,
-    tokens: Vec<u32>,
-    /// The DeltaNet source image (0: the zero state) and the position it stands at; the
-    /// kept positions `src_pos .. start` are folded from the tail first.
-    src: u64,
+    toks: Toks,
+    src: Src,
+    /// The position the source stands at: the kept positions `src_pos .. start` are
+    /// folded from the tail first.
     src_pos: u32,
     /// State writes `(len, buffer)`, ascending.
     writes: Vec<(u32, u32)>,
@@ -770,8 +805,6 @@ struct Run {
     live_store: bool,
     /// New positions at or past this join the tail.
     tail_from: u32,
-    /// Write the target's KV at the new positions.
-    kv: bool,
 }
 
 impl Run {
@@ -779,476 +812,119 @@ impl Run {
         self.start - self.src_pos
     }
     fn n(&self) -> u32 {
-        n32(self.tokens.len())
+        self.toks.len()
     }
     fn end(&self) -> u32 {
         self.start + self.n()
     }
 }
 
-/// A forward's scratch: allocated per forward, zeroed.
-struct Scratch {
-    bufs: Vec<Alloc>,
-}
-
-impl Scratch {
-    fn get<D: QwenDevice>(&mut self, dev: &D, bytes: usize) -> Result<u64> {
-        let a = Alloc::new(dev, bytes)?;
-        let addr = a.addr;
-        self.bufs.push(a);
-        Ok(addr)
-    }
-}
-
-/// Where a forward's runs sit.
-struct Layout {
-    /// Row offset of each run's new positions.
-    rows: Vec<u32>,
-    /// Staged-position offset of each run (its folds, then its new positions).
-    staged: Vec<u32>,
-    /// Conv-row offset of each run (three history rows, then the staged ones).
-    conv: Vec<u32>,
-    t: u32,
-    p: u32,
-    conv_rows: u32,
-}
-
-impl Layout {
-    fn of(runs: &[Run]) -> Layout {
-        let (mut rows, mut staged, mut conv) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut t, mut p, mut c) = (0u32, 0u32, 0u32);
-        for r in runs {
-            rows.push(t);
-            staged.push(p);
-            conv.push(c);
-            t += r.n();
-            p += r.fold() + r.n();
-            c += 3 + r.fold() + r.n();
-        }
-        Layout {
-            rows,
-            staged,
-            conv,
-            t,
-            p,
-            conv_rows: c,
-        }
-    }
-}
-
-impl<D: QwenDevice> QwenCudaExecutor<D> {
-    fn norm(&self, x: u64, add: u64, w: u64, out: u64, rows: u32, n: u32) -> Result<()> {
-        let p = NormParams {
-            x,
-            add,
-            weight: w,
-            out,
-            rows,
-            units: 1,
-            n,
-            x_stride: n,
-            add_stride: n,
-            out_stride: n,
-            eps: self.dims.eps,
-            ..NormParams::default()
-        };
-        // SAFETY: `rows · n` BF16 values at `x`, `add` and `out`; `n` f32 at `w`.
-        unsafe { self.dev.norm(&p) }
-    }
-
-    /// The FP8 linear of `rows` BF16 rows at `x` (stride `w.k`) into `out` (stride `w.n`).
-    fn lin8(&self, sc: &mut Scratch, x: u64, rows: u32, w: &Fp8W, out: u64) -> Result<()> {
-        let m_pad = rows.next_multiple_of(4).max(4);
-        let codes = sc.get(&self.dev, m_pad as usize * w.k as usize)?;
-        let scales = sc.get(&self.dev, (w.k / BLOCK) as usize * m_pad as usize * 4)?;
-        let q = QuantParams {
-            x,
-            codes,
-            scales,
-            rows,
-            k: w.k,
-            x_stride: w.k,
-            m_pad,
-        };
-        let l = Lin8Params {
-            a: codes,
-            a_scales: scales,
-            w: w.codes,
-            w_scales: w.scales,
-            out,
-            rows,
-            n: w.n,
-            k: w.k,
-            m_pad,
-            out_stride: w.n,
-            reserved: 0,
-        };
-        // SAFETY: scratch sized for `m_pad` rows; `out` holds `m_pad · n` (the fast form
-        // writes the padding rows).
-        unsafe {
-            self.dev.quant(&q)?;
-            self.dev.lin8(&l)
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn linear(
-        &self,
-        x: u64,
-        rows: u32,
-        w: u64,
-        n: u32,
-        k: u32,
-        out: u64,
-        f32_out: bool,
-        large: bool,
-    ) -> Result<()> {
-        let p = LinearParams {
-            x,
-            w,
-            out,
-            rows,
-            n,
-            k,
-            x_stride: k,
-            out_stride: n,
-            out_f32: u32::from(f32_out),
-        };
-        // SAFETY: the caller's buffers.
-        unsafe { self.dev.linear(&p, large) }
-    }
-
-    fn widen(
-        &self,
-        x: u64,
-        x_stride: u32,
-        out: u64,
-        out_stride: u32,
-        rows: u32,
-        width: u32,
-    ) -> Result<()> {
-        let p = WidenParams {
-            x,
-            out,
-            rows,
-            width,
-            x_stride,
-            out_stride,
-        };
-        // SAFETY: the caller's buffers.
-        unsafe { self.dev.widen(&p) }
-    }
-
-    /// The MLP of `rows` normed rows `x` into `m`.
-    fn mlp(&self, sc: &mut Scratch, l: &LayerW, x: u64, rows: u32, m: u64) -> Result<()> {
-        let pad = rows.next_multiple_of(4).max(4) as usize;
-        let inter = self.dims.inter;
-        let g = sc.get(&self.dev, pad * inter as usize * 2)?;
-        let u = sc.get(&self.dev, pad * inter as usize * 2)?;
-        let hmid = sc.get(&self.dev, pad * inter as usize * 2)?;
-        self.lin8(sc, x, rows, &l.gate, g)?;
-        self.lin8(sc, x, rows, &l.up, u)?;
-        let p = GateParams {
-            a: u,
-            g,
-            out: hmid,
-            rows,
-            width: inter,
-            a_stride: inter,
-            g_stride: inter,
-            out_stride: inter,
-            unit: inter,
-            g_unit_stride: 0,
-            kind: GATE_SWIGLU,
-        };
-        // SAFETY: `rows · inter` values in each.
-        unsafe { self.dev.gate(&p)? };
-        self.lin8(sc, hmid, rows, &l.down, m)
-    }
-}
-
-// ---- the DeltaNet layer ----
-
-/// A DeltaNet layer's per-forward arrays, shared by its layers.
-struct DnBufs {
-    conv_in: u64,
-    ab: u64,
-    q: u64,
-    k: u64,
-    v: u64,
-    beta: u64,
-    alpha: u64,
-    o: u64,
-    window: u64,
-    seqs: u64,
-}
-
-impl<D: QwenDevice> QwenCudaExecutor<D> {
-    fn dn_bufs(&self, sc: &mut Scratch, runs: &[Run], lay: &Layout) -> Result<DnBufs> {
-        let d = &self.dims;
-        let p = lay.p.max(1) as usize;
-        let mut window = Vec::with_capacity(lay.p as usize);
-        for (i, r) in runs.iter().enumerate() {
-            for j in 0..r.fold() + r.n() {
-                window.push(lay.conv[i] + j);
-            }
-        }
-        let bufs = DnBufs {
-            conv_in: sc.get(
-                &self.dev,
-                lay.conv_rows.max(1) as usize * d.conv_dim() as usize * 4,
-            )?,
-            ab: sc.get(&self.dev, p * 2 * d.v_heads as usize * 4)?,
-            q: sc.get(&self.dev, p * d.key_dim() as usize * 4)?,
-            k: sc.get(&self.dev, p * d.key_dim() as usize * 4)?,
-            v: sc.get(&self.dev, p * d.value_dim() as usize * 4)?,
-            beta: sc.get(&self.dev, p * d.v_heads as usize * 4)?,
-            alpha: sc.get(&self.dev, p * d.v_heads as usize * 4)?,
-            o: sc.get(&self.dev, p * d.value_dim() as usize * 4)?,
-            window: sc.get(&self.dev, p * 4)?,
-            seqs: sc.get(&self.dev, runs.len().max(1) * std::mem::size_of::<DnSeq>())?,
-        };
-        let mut seqs = Vec::with_capacity(runs.len());
-        for (i, r) in runs.iter().enumerate() {
-            let mut s = DnSeq {
-                src: r.src,
-                live: if r.live_store {
-                    self.live_addr(r.slot)
-                } else {
-                    0
-                },
-                first: lay.staged[i],
-                count: r.fold() + r.n(),
-                out_from: r.fold(),
-                live_after: r.fold() + r.n(),
-                ..DnSeq::default()
-            };
-            if r.writes.len() > SEQ_WRITES {
-                return Err(CudaError::new(
-                    "more state writes in one row than the kernel takes",
-                ));
-            }
-            for (j, &(len, buf)) in r.writes.iter().enumerate() {
-                s.write_after[j] = len - r.src_pos;
-                s.write_dst[j] = self.state_addr(buf);
-            }
-            s.writes = n32(r.writes.len());
-            seqs.push(s);
-        }
-        // SAFETY: the arrays were sized above.
-        unsafe {
-            self.dev.upload(bufs.window, bytes_of(&window))?;
-            self.dev.upload(bufs.seqs, bytes_of(&seqs))?;
-        }
-        Ok(bufs)
-    }
-
-    /// Stages one DeltaNet layer's inputs: per run its source's conv history, its folded
-    /// positions' kept inputs from the tail, and its new positions' `mixed`, `a` and `b`
-    /// (`mixed`, `a`, `b` BF16 rows at the run's rows; null for a fold alone).
-    #[allow(clippy::too_many_arguments)]
-    fn dn_stage(
-        &self,
-        runs: &[Run],
-        lay: &Layout,
-        b: &DnBufs,
-        dn: usize,
-        mixed: u64,
-        a: u64,
-        bb: u64,
-    ) -> Result<()> {
-        let d = &self.dims;
-        let (cd, vh) = (d.conv_dim() as usize, d.v_heads as usize);
-        let hist = 3 * cd * 4;
-        for (i, r) in runs.iter().enumerate() {
-            let conv0 = b.conv_in + u64::from(lay.conv[i]) * (cd * 4) as u64;
-            // SAFETY: rows of the staging arrays and the slot's tail and source image.
-            unsafe {
-                if r.src == 0 {
-                    self.dev.zero(conv0, hist)?;
-                } else {
-                    self.dev
-                        .copy(conv0, r.src + (dn * self.layer_bytes()) as u64, hist)?;
-                }
-                for j in 0..r.fold() {
-                    let t = self.tail_row(r.slot, r.src_pos + j, dn);
-                    let row = conv0 + u64::from(3 + j) * (cd * 4) as u64;
-                    self.dev.copy(row, t, cd * 4)?;
-                    let abr = b.ab + u64::from(lay.staged[i] + j) * (2 * vh * 4) as u64;
-                    self.dev.copy(abr, t + (cd * 4) as u64, 2 * vh * 4)?;
-                }
-            }
-            if r.n() > 0 {
-                let (cdu, vhu) = (d.conv_dim(), d.v_heads);
-                let row0 = u64::from(lay.rows[i]);
-                let conv_new = conv0 + u64::from(3 + r.fold()) * (cd * 4) as u64;
-                let ab_new = b.ab + u64::from(lay.staged[i] + r.fold()) * (2 * vh * 4) as u64;
-                let two = u32of(2 * vh, "ab")?;
-                self.widen(
-                    mixed + row0 * (cd * 2) as u64,
-                    cdu,
-                    conv_new,
-                    cdu,
-                    r.n(),
-                    cdu,
-                )?;
-                self.widen(a + row0 * (vh * 2) as u64, vhu, ab_new, two, r.n(), vhu)?;
-                self.widen(
-                    bb + row0 * (vh * 2) as u64,
-                    vhu,
-                    ab_new + (vh * 4) as u64,
-                    two,
-                    r.n(),
-                    vhu,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// The recurrence of one DeltaNet layer over the staged positions, its stores, and
-    /// what follows it: the conv history of every store and the tail.
-    fn dn_recur(
-        &self,
-        runs: &[Run],
-        lay: &Layout,
-        b: &DnBufs,
-        dn: usize,
-        w: &super::weights::DeltaNetW,
-    ) -> Result<()> {
-        let d = &self.dims;
-        let prep = DnPrepParams {
-            conv_in: b.conv_in,
-            window: b.window,
-            ab: b.ab,
-            conv_w: w.conv,
-            exp_a_log: w.exp_a_log,
-            dt_bias: w.dt_bias,
-            q: b.q,
-            k: b.k,
-            v: b.v,
-            beta: b.beta,
-            alpha: b.alpha,
-            positions: lay.p,
-            k_heads: d.k_heads,
-            v_heads: d.v_heads,
-            k_dim: d.k_dim,
-            v_dim: d.v_dim,
-            reserved: 0,
-        };
-        let rec = DnRecParams {
-            seqs: b.seqs,
-            q: b.q,
-            k: b.k,
-            v: b.v,
-            beta: b.beta,
-            alpha: b.alpha,
-            out: b.o,
-            state_offset: (dn * self.layer_bytes() + 3 * d.conv_dim() as usize * 4) as u64,
-            seq_count: u32of(runs.len(), "runs")?,
-            k_heads: d.k_heads,
-            v_heads: d.v_heads,
-            k_dim: d.k_dim,
-            v_dim: d.v_dim,
-            reserved: 0,
-        };
-        // SAFETY: the staged arrays hold `lay.p` positions; every state address is a live
-        // image or a state buffer.
-        unsafe {
-            self.dev.dn_prep(&prep)?;
-            self.dev.dn_rec(&rec)?;
-        }
-        let (cd, vh) = (d.conv_dim() as usize, d.v_heads as usize);
-        for (i, r) in runs.iter().enumerate() {
-            let conv0 = b.conv_in + u64::from(lay.conv[i]) * (cd * 4) as u64;
-            // The conv history after `len`: positions `len - 3 .. len`, staged rows
-            // `3 + (len - 3 - src_pos) ..`.
-            let hist_at = |len: u32| conv0 + u64::from(len - r.src_pos) * (cd * 4) as u64;
-            let layer_off = (dn * self.layer_bytes()) as u64;
-            // SAFETY: staging rows and image ranges.
-            unsafe {
-                for &(len, buf) in &r.writes {
-                    self.dev
-                        .copy(self.state_addr(buf) + layer_off, hist_at(len), 3 * cd * 4)?;
-                }
-                if r.live_store {
-                    self.dev.copy(
-                        self.live_addr(r.slot) + layer_off,
-                        hist_at(r.end()),
-                        3 * cd * 4,
-                    )?;
-                }
-                for j in 0..r.n() {
-                    let pos = r.start + j;
-                    if pos < r.tail_from {
-                        continue;
-                    }
-                    let t = self.tail_row(r.slot, pos, dn);
-                    let row = conv0 + u64::from(3 + r.fold() + j) * (cd * 4) as u64;
-                    self.dev.copy(t, row, cd * 4)?;
-                    let abr = b.ab + u64::from(lay.staged[i] + r.fold() + j) * (2 * vh * 4) as u64;
-                    self.dev.copy(t + (cd * 4) as u64, abr, 2 * vh * 4)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// A fold alone, every DeltaNet layer (`SaveState`).
-    fn dn_only(&self, run: &Run) -> Result<()> {
-        let runs = std::slice::from_ref(run);
-        let lay = Layout::of(runs);
-        let mut sc = Scratch { bufs: Vec::new() };
-        let b = self.dn_bufs(&mut sc, runs, &lay)?;
-        let mut dn = 0;
-        for (l, kind) in self.dims.kinds.iter().enumerate() {
-            if *kind != LayerKind::DeltaNet {
-                continue;
-            }
-            let MixerW::DeltaNet(w) = self.weights.layers[l].mixer else {
-                unreachable!("a DeltaNet layer's weights")
-            };
-            self.dn_stage(runs, &lay, &b, dn, 0, 0, 0)?;
-            self.dn_recur(runs, &lay, &b, dn, &w)?;
-            dn += 1;
-        }
-        self.dev.synchronize()
-    }
-}
-
-/// A slice's bytes.
-fn bytes_of<T: Copy>(x: &[T]) -> &[u8] {
-    // SAFETY: any initialized `Copy` value's bytes may be read; the ABI structs are
-    // `repr(C)` with no padding that carries data the kernels read.
-    unsafe { std::slice::from_raw_parts(x.as_ptr().cast(), std::mem::size_of_val(x)) }
-}
-
-// ---- attention, the target forward, the drafter and the head ----
-
-/// Per-row attention inputs of one forward: RoPE positions, query positions, KV
-/// targets and block tables, uploaded once.
-struct AttnRows {
-    rope: u64,
-    query: u64,
-    targets: u64,
-    tables: u64,
-    table_stride: u32,
-    score_stride: u32,
-}
-
-/// One drafter row: the token at `s`, the target's (or a chain step's) normed state
-/// before it at `hidden` (a BF16 row on the device).
-#[derive(Clone, Copy, Debug)]
-struct MtpRow {
+/// One row of a step: a real row, or a padding row of a graph rung.
+#[derive(Clone, Debug)]
+struct Row {
     slot: Slot,
-    s: u32,
-    token: u32,
-    hidden: u64,
+    c: u32,
+    toks: Vec<u32>,
+    k: u32,
+    sample: bool,
+    params: SamplingParams,
+    run: Run,
+    /// The new base `(buffer, len)` after the row's writes.
+    new_base: (u32, u32),
+    /// The drafter's hidden input for its first host position: a kept row or a tap.
+    hidden_before: Option<(u32, u32)>,
 }
 
+impl Row {
+    fn p(&self) -> u32 {
+        self.c + n32(self.toks.len()) - 1
+    }
+    fn e(&self) -> u32 {
+        self.p() + 1
+    }
+}
+
+/// Where a step's rows sit in its plan, for reading the results.
+#[derive(Clone, Debug, Default)]
+struct Placed {
+    /// Per row: its head row in pass A, its drafting index, its first pass-B row.
+    head_a: Vec<Option<u32>>,
+    drafting: Vec<Option<u32>>,
+    row_b: Vec<u32>,
+    /// Per row: its index among the plain draws.
+    plain: Vec<Option<u32>>,
+}
+
+/// A captured decode rung: its rows and draft width, its shape and layout, and its graph.
+struct Rung {
+    width: u32,
+    rows: u32,
+    shape: Shape,
+    layout: Layout,
+    graph: Option<Box<dyn Any>>,
+}
+
+/// Steps run by each path ([`QwenCudaExecutor::decode_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodeStats {
+    pub eager: u64,
+    pub direct: u64,
+    pub replay: u64,
+}
+
+/// The token a padding row embeds.
+const PAD_TOKEN: u32 = 0;
+
 impl<D: QwenDevice> QwenCudaExecutor<D> {
-    fn pad(rows: u32) -> usize {
-        rows.next_multiple_of(4).max(4) as usize
+    pub(super) fn slot_count(&self) -> usize {
+        self.cfg.num_state_slots as usize + 1
+    }
+
+    /// The padding rows' slot: past every slot the seam names.
+    fn pad_slot(&self) -> Slot {
+        self.cfg.num_state_slots
+    }
+
+    /// The pad block of each pool: past every block the seam names.
+    fn pad_block(&self) -> u32 {
+        self.cfg.num_blocks
+    }
+
+    /// Rows of one tail layer: every slot's ring.
+    pub(super) fn tail_layer_rows(&self) -> usize {
+        self.slot_count() * self.tail_ring() as usize
+    }
+
+    /// Rows of a slot's tail ring: its capacity, at least one.
+    fn tail_ring(&self) -> u32 {
+        self.tail_cap.max(1)
+    }
+
+    fn tail_index(&self, slot: Slot, pos: u32) -> u32 {
+        slot * self.tail_ring() + pos % self.tail_ring()
+    }
+
+    /// Conv rows (of `conv_dim` f32) per image: images are laid out a whole number of
+    /// them apart.
+    fn rows_per_image(&self) -> u32 {
+        n32(self.image_stride / (self.dims.conv_dim() as usize * 4))
+    }
+
+    fn src_addr(&self, s: Src) -> u64 {
+        match s {
+            Src::Zero => 0,
+            Src::Live(slot) => self.live_addr(slot),
+            Src::Buffer(b) => self.state_addr(b),
+        }
+    }
+
+    /// Row `j` of a source's conv history at any layer, as a conv-buffer row.
+    fn hist_row(&self, s: Src, j: u32) -> (u32, u32) {
+        match s {
+            Src::Zero => (buf::C_ZERO, j),
+            Src::Live(slot) => (buf::C_LIVE, slot * self.rows_per_image() + j),
+            Src::Buffer(b) => (buf::C_STATES, b * self.rows_per_image() + j),
+        }
     }
 
     fn block_of(&self, slot: Slot, group: usize, pos: u32) -> u32 {
@@ -1280,402 +956,551 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         b
     }
 
-    fn attn_rows(
-        &self,
-        sc: &mut Scratch,
-        group: usize,
-        rows: &[(Slot, u32, u32)],
-        write: &[bool],
-    ) -> Result<AttnRows> {
-        let bs = self.cfg.block_size;
-        let width = self.tables[0][group].len();
-        let (mut rope, mut query, mut targets) = (Vec::new(), Vec::new(), Vec::new());
-        let mut tables: Vec<i32> = Vec::with_capacity(rows.len() * width);
-        let mut most = 0;
-        for (i, &(slot, q, r)) in rows.iter().enumerate() {
-            rope.push(r);
-            query.push(q);
-            most = most.max(q + 1);
-            targets.push(if write[i] {
-                self.writable_block(slot, group, q) * bs + q % bs
-            } else {
-                NO_TARGET
-            });
-            for &b in &self.tables[slot as usize][group] {
-                tables.push(i32::try_from(b).map_err(|_| CudaError::new("block id"))?);
-            }
+    /// The block holding `pos` (the pad block for the padding slot).
+    fn blk(&self, slot: Slot, group: usize, pos: u32) -> u32 {
+        if slot == self.pad_slot() {
+            self.pad_block()
+        } else {
+            self.block_of(slot, group, pos)
         }
-        let a = AttnRows {
-            rope: sc.get(&self.dev, rows.len().max(1) * 4)?,
-            query: sc.get(&self.dev, rows.len().max(1) * 4)?,
-            targets: sc.get(&self.dev, rows.len().max(1) * 4)?,
-            tables: sc.get(&self.dev, tables.len().max(1) * 4)?,
-            table_stride: u32of(width, "table")?,
-            score_stride: most.max(1),
-        };
-        // SAFETY: sized above.
-        unsafe {
-            self.dev.upload(a.rope, bytes_of(&rope))?;
-            self.dev.upload(a.query, bytes_of(&query))?;
-            self.dev.upload(a.targets, bytes_of(&targets))?;
-            self.dev.upload(a.tables, bytes_of(&tables))?;
-        }
-        Ok(a)
     }
 
-    /// One attention layer's mixer over `rows` normed rows `x` into `mix`.
-    #[allow(clippy::too_many_arguments)]
-    fn attention_mix(
-        &self,
-        sc: &mut Scratch,
-        w: &super::weights::AttentionW,
-        x: u64,
-        rows: u32,
-        group: usize,
-        layer: u32,
-        key_first: u32,
-        ar: &AttnRows,
-        mix: u64,
-    ) -> Result<()> {
-        let d = &self.dims;
-        let pad = Self::pad(rows);
-        let (hq, hd, kvw) = (d.q_heads, d.head_dim, d.kv_width());
-        let qw = hq * hd;
-        let qg = sc.get(&self.dev, pad * 2 * qw as usize * 2)?;
-        let kk = sc.get(&self.dev, pad * kvw as usize * 2)?;
-        let vv = sc.get(&self.dev, pad * kvw as usize * 2)?;
-        let q = sc.get(&self.dev, pad * qw as usize * 2)?;
-        let kr = sc.get(&self.dev, pad * kvw as usize * 2)?;
-        let attn = sc.get(&self.dev, pad * qw as usize * 2)?;
-        let y = sc.get(&self.dev, pad * qw as usize * 2)?;
-        let scores = sc.get(
-            &self.dev,
-            rows as usize * hq as usize * ar.score_stride as usize * 4,
-        )?;
-        self.lin8(sc, x, rows, &w.q, qg)?;
-        self.lin8(sc, x, rows, &w.k, kk)?;
-        self.lin8(sc, x, rows, &w.v, vv)?;
-        let rot =
-            |src: u64, units: u32, stride: u32, unit_stride: u32, out: u64, wt: u64| NormParams {
-                x: src,
-                weight: wt,
-                out,
-                rope_cos: self.weights.rope_cos,
-                rope_sin: self.weights.rope_sin,
-                positions: ar.rope,
-                rows,
-                units,
-                n: hd,
-                x_stride: stride,
-                x_unit_stride: unit_stride,
-                out_stride: units * hd,
-                out_unit_stride: hd,
-                rotary: d.rotary,
-                eps: d.eps,
-                ..NormParams::default()
-            };
-        let pool = &self.pools[group];
-        let kvp = KvWriteParams {
-            k: kr,
-            v: vv,
-            pool: pool.data.addr,
-            targets: ar.targets,
-            rows,
-            width: kvw,
-            k_stride: kvw,
-            v_stride: kvw,
-            layer,
-            layers: pool.layers,
-            block_size: self.cfg.block_size,
-            reserved: 0,
-        };
-        let ap = AttnParams {
-            q,
-            pool: pool.data.addr,
-            tables: ar.tables,
-            positions: ar.query,
-            out: attn,
-            scores,
-            rows,
-            q_heads: hq,
-            kv_heads: d.kv_heads,
-            head_dim: hd,
-            q_stride: qw,
-            q_head_stride: hd,
-            out_stride: qw,
-            table_stride: ar.table_stride,
-            layer,
-            layers: pool.layers,
-            block_size: self.cfg.block_size,
-            score_stride: ar.score_stride,
-            key_first,
-            scale: d.scale,
-        };
-        let gp = GateParams {
-            a: attn,
-            g: qg + u64::from(hd) * 2,
-            out: y,
-            rows,
-            width: qw,
-            a_stride: qw,
-            g_stride: 2 * qw,
-            out_stride: qw,
-            unit: hd,
-            g_unit_stride: 2 * hd,
-            kind: GATE_SIGMOID,
-        };
-        // SAFETY: every buffer was sized for `rows` (padded) above; the targets are blocks
-        // the rows' slots alone map, the tables cover every visible position.
-        unsafe {
-            self.dev.norm(&rot(qg, hq, 2 * qw, 2 * hd, q, w.q_norm))?;
-            self.dev.norm(&rot(kk, d.kv_heads, kvw, hd, kr, w.k_norm))?;
-            self.dev.kv_write(&kvp)?;
-            self.dev.attention(&ap)?;
-            self.dev.gate(&gp)?;
+    fn wblk(&self, slot: Slot, group: usize, pos: u32) -> u32 {
+        if slot == self.pad_slot() {
+            self.pad_block()
+        } else {
+            self.writable_block(slot, group, pos)
         }
-        self.lin8(sc, y, rows, &w.o, mix)
     }
-}
 
-/// What a target forward leaves: the normed final rows (BF16 `[t, hidden]`) and where each
-/// run's rows are; the scratch stays alive with it.
-struct Forward {
-    normed: u64,
-    rows: Vec<u32>,
-    _scratch: Scratch,
-}
-
-impl<D: QwenDevice> QwenCudaExecutor<D> {
-    /// The target over every run's tokens, all runs in one forward.
-    fn target(&self, runs: &[Run]) -> Result<Forward> {
-        let d = self.dims.clone();
-        let lay = Layout::of(runs);
-        let mut sc = Scratch { bufs: Vec::new() };
-        let t = lay.t;
-        let pad = Self::pad(t);
-        let hsz = d.hidden as usize;
-        let h = sc.get(&self.dev, pad * hsz * 2)?;
-        let x = sc.get(&self.dev, pad * hsz * 2)?;
-        let mix = sc.get(&self.dev, pad * hsz * 2)?;
-        let m = sc.get(&self.dev, pad * hsz * 2)?;
-        let normed = sc.get(&self.dev, pad * hsz * 2)?;
-        let tokens: Vec<u32> = runs.iter().flat_map(|r| r.tokens.iter().copied()).collect();
-        let tok = sc.get(&self.dev, tokens.len().max(1) * 4)?;
-        // SAFETY: sized above.
-        unsafe { self.dev.upload(tok, bytes_of(&tokens))? };
-        self.embed(tok, t, h)?;
-        let mut rows = Vec::new();
-        let mut write = Vec::new();
-        for r in runs {
-            for j in 0..r.n() {
-                let pos = r.start + j;
-                rows.push((r.slot, pos, pos));
-                write.push(r.kv);
-            }
+    fn table_row(&self, slot: Slot, group: usize) -> Vec<u32> {
+        if slot == self.pad_slot() {
+            vec![self.pad_block(); self.tables[0][group].len()]
+        } else {
+            self.tables[slot as usize][group].clone()
         }
-        let ar = self.attn_rows(&mut sc, TARGET, &rows, &write)?;
-        let dnb = self.dn_bufs(&mut sc, runs, &lay)?;
-        let (cd, vd, vh) = (
-            d.conv_dim() as usize,
-            d.value_dim() as usize,
-            d.v_heads as usize,
-        );
-        let mixed = sc.get(&self.dev, pad * cd * 2)?;
-        let z = sc.get(&self.dev, pad * vd * 2)?;
-        let aa = sc.get(&self.dev, pad * vh * 2)?;
-        let bb = sc.get(&self.dev, pad * vh * 2)?;
-        let nrm = sc.get(&self.dev, pad * vd * 2)?;
-        let (mut dn, mut at) = (0usize, 0u32);
-        let mut prev_m = 0u64;
-        for (l, lw) in self.weights.layers.iter().enumerate() {
-            self.norm(h, prev_m, lw.input_norm, x, t, d.hidden)?;
-            match &lw.mixer {
-                MixerW::DeltaNet(w) => {
-                    self.lin8(&mut sc, x, t, &w.qkv, mixed)?;
-                    self.lin8(&mut sc, x, t, &w.z, z)?;
-                    self.linear(x, t, w.a, d.v_heads, d.hidden, aa, false, false)?;
-                    self.linear(x, t, w.b, d.v_heads, d.hidden, bb, false, false)?;
-                    self.dn_stage(runs, &lay, &dnb, dn, mixed, aa, bb)?;
-                    self.dn_recur(runs, &lay, &dnb, dn, w)?;
-                    for (i, r) in runs.iter().enumerate() {
-                        if r.n() == 0 {
-                            continue;
-                        }
-                        let o = dnb.o + u64::from(lay.staged[i] + r.fold()) * (vd * 4) as u64;
-                        let p = DnNormParams {
-                            o,
-                            z: z + u64::from(lay.rows[i]) * (vd * 2) as u64,
-                            weight: w.norm,
-                            out: nrm + u64::from(lay.rows[i]) * (vd * 2) as u64,
-                            rows: r.n(),
-                            v_heads: d.v_heads,
-                            v_dim: d.v_dim,
-                            z_stride: d.value_dim(),
-                            eps: d.eps,
-                            reserved: 0,
-                        };
-                        // SAFETY: the run's rows of each array.
-                        unsafe { self.dev.dn_norm(&p)? };
-                    }
-                    self.lin8(&mut sc, nrm, t, &w.out, mix)?;
-                    dn += 1;
-                }
-                MixerW::Attention(w) => {
-                    self.attention_mix(&mut sc, w, x, t, TARGET, at, 0, &ar, mix)?;
-                    at += 1;
-                }
-            }
-            debug_assert_eq!(
-                self.dims.kinds[l] == LayerKind::DeltaNet,
-                matches!(lw.mixer, MixerW::DeltaNet(_))
+    }
+
+    fn geo(&self) -> Geo {
+        let g = |page_size| Fa2Geometry {
+            group_size: self.dims.q_heads / self.dims.kv_heads,
+            page_size,
+            partial_rows: n32(self.scratch.caps.partial_rows),
+        };
+        Geo {
+            fast: self.dev.profile() == QwenProfile::Fast,
+            table_width: self.tables[0][TARGET].len(),
+            target: g(self.cfg.block_size),
+            drafter: g(1),
+        }
+    }
+
+    /// The source a slot's recurrence starts from for positions up to `upto`: its live
+    /// image when the strategy keeps one and it stands at or before `upto` past the base,
+    /// else its base buffer (the zero state for `NULL_STATE`), and its position.
+    fn source(&self, slot: Slot, upto: u32, writes_after: u32) -> (Src, u32) {
+        let rec = &self.slots[slot as usize];
+        let (base, base_len) = rec.base.expect("a slot with a base");
+        if self.cfg.strategy == StateStrategy::Live
+            && let Some(lp) = rec.live_pos
+            && lp >= base_len
+            && lp <= upto
+            && lp < writes_after
+        {
+            return (Src::Live(slot), lp);
+        }
+        if base == NULL_STATE {
+            assert_eq!(
+                base_len, 0,
+                "the zero state named as the state at {base_len}"
             );
-            self.norm(h, mix, lw.post_norm, x, t, d.hidden)?;
-            self.mlp(&mut sc, lw, x, t, m)?;
-            prev_m = m;
+            return (Src::Zero, 0);
         }
-        self.norm(h, prev_m, self.weights.final_norm, normed, t, d.hidden)?;
-        Ok(Forward {
-            normed,
-            rows: lay.rows,
-            _scratch: sc,
-        })
+        assert!(
+            !self.state_encrypted[base as usize],
+            "state buffer {base}: read while encrypted"
+        );
+        assert_eq!(
+            self.state_tags[base as usize],
+            base_len + 1,
+            "state buffer {base}: holds another boundary's state"
+        );
+        (Src::Buffer(base), base_len)
     }
 
-    fn embed(&self, tokens: u64, rows: u32, out: u64) -> Result<()> {
-        let p = EmbedParams {
-            tokens,
-            table: self.weights.embed,
-            out,
-            status: self.status.addr,
-            rows,
-            width: self.dims.hidden,
-            vocab: self.dims.vocab,
-            out_stride: self.dims.hidden,
+    /// One target pass over `runs`: its DeltaNet sequences, staging and keeping copies,
+    /// and attention rows, the runs' token rows consecutive from 0.
+    fn target_pass(&self, runs: &[Run], kv: bool) -> TargetPass {
+        let bs = self.cfg.block_size;
+        let rpi = self.rows_per_image();
+        let fast = self.dev.profile() == QwenProfile::Fast;
+        let mut tp = TargetPass::default();
+        let (mut t, mut st, mut cv) = (0u32, 0u32, 0u32);
+        for r in runs {
+            let (f, n) = (r.fold(), r.n());
+            assert!(
+                r.writes.len() <= SEQ_WRITES,
+                "more state writes in one row than the kernel takes"
+            );
+            let mut seq = DnSeq {
+                src: self.src_addr(r.src),
+                live: if r.live_store {
+                    self.live_addr(r.slot)
+                } else {
+                    0
+                },
+                first: st,
+                count: f + n,
+                out_from: f,
+                live_after: if r.live_store { f + n } else { f + n + 1 },
+                writes: n32(r.writes.len()),
+                ..DnSeq::default()
+            };
+            for (j, &(len, b)) in r.writes.iter().enumerate() {
+                seq.write_after[j] = len - r.src_pos;
+                seq.write_dst[j] = self.state_addr(b);
+            }
+            tp.seqs.push(seq);
+            tp.window.extend((0..f + n).map(|j| cv + j));
+            for j in 0..3 {
+                let (b, row) = self.hist_row(r.src, j);
+                tp.stage_conv.push(Item::new(b, row, buf::C_CONV, cv + j));
+            }
+            for j in 0..f {
+                let ti = self.tail_index(r.slot, r.src_pos + j);
+                tp.stage_conv
+                    .push(Item::new(buf::C_TAIL, ti, buf::C_CONV, cv + 3 + j));
+                tp.stage_ab
+                    .push(Item::new(buf::A_TAIL, ti, buf::A_STAGED, st + j));
+            }
+            for j in 0..n {
+                tp.stage_conv
+                    .push(Item::new(buf::C_NEW, t + j, buf::C_CONV, cv + 3 + f + j));
+                tp.stage_ab
+                    .push(Item::new(buf::A_NEW, t + j, buf::A_STAGED, st + f + j));
+            }
+            // The conv history after `len`: positions `len - 3 .. len`.
+            let hist = |len: u32| cv + (len - r.src_pos);
+            for &(len, b) in &r.writes {
+                for j in 0..3 {
+                    tp.post_conv.push(Item::new(
+                        buf::C_CONV,
+                        hist(len) + j,
+                        buf::C_STATES,
+                        b * rpi + j,
+                    ));
+                }
+            }
+            if r.live_store {
+                for j in 0..3 {
+                    tp.post_conv.push(Item::new(
+                        buf::C_CONV,
+                        hist(r.end()) + j,
+                        buf::C_LIVE,
+                        r.slot * rpi + j,
+                    ));
+                }
+            }
+            for j in 0..n {
+                let pos = r.start + j;
+                if pos >= r.tail_from {
+                    let ti = self.tail_index(r.slot, pos);
+                    tp.post_conv
+                        .push(Item::new(buf::C_CONV, cv + 3 + f + j, buf::C_TAIL, ti));
+                    tp.post_ab
+                        .push(Item::new(buf::A_STAGED, st + f + j, buf::A_TAIL, ti));
+                }
+                tp.o_rows
+                    .push(Item::new(buf::O_STAGED, st + f + j, buf::O_ROWS, t + j));
+                tp.attn.rope.push(pos);
+                tp.attn.query.push(pos);
+                tp.attn.targets.push(if kv {
+                    self.wblk(r.slot, TARGET, pos) * bs + pos % bs
+                } else {
+                    NO_TARGET
+                });
+                if !fast {
+                    tp.attn.tables.extend(self.table_row(r.slot, TARGET));
+                }
+            }
+            match &r.toks {
+                Toks::Host(h) => tp.tokens.extend_from_slice(h),
+                Toks::Lanes(l) => tp.token_copies.extend(
+                    l.iter()
+                        .enumerate()
+                        .map(|(j, &lane)| Item::new(buf::T_LANES, lane, buf::T_DST, t + n32(j))),
+                ),
+            }
+            if fast && n > 0 {
+                tp.attn
+                    .requests
+                    .push(plan::request(t, n, r.end() - 1, bs, &mut |j| {
+                        self.blk(r.slot, TARGET, j * bs)
+                    }));
+            }
+            t += n;
+            st += f + n;
+            cv += 3 + f + n;
+        }
+        tp.conv_rows = cv;
+        tp
+    }
+
+    /// The drafter's attention rows for rows at positions `s` of `slot`s, consecutive
+    /// positions of one slot sharing a request.
+    fn drafter_attn(&self, rows: &[(Slot, u32)]) -> AttnRows {
+        let bs = self.cfg.block_size;
+        let fast = self.dev.profile() == QwenProfile::Fast;
+        let mut a = AttnRows::default();
+        let mut i = 0;
+        while i < rows.len() {
+            let (slot, s0) = rows[i];
+            let mut j = i + 1;
+            while j < rows.len() && rows[j].0 == slot && rows[j].1 == rows[j - 1].1 + 1 {
+                j += 1;
+            }
+            for &(_, s) in &rows[i..j] {
+                a.rope.push(s - 1);
+                a.query.push(s);
+                a.targets.push(self.wblk(slot, DRAFTER, s) * bs + s % bs);
+                if !fast {
+                    a.tables.extend(self.table_row(slot, DRAFTER));
+                }
+            }
+            if fast {
+                let last = rows[j - 1].1;
+                // Keys from position 1: relative key `x` is position `x + 1`.
+                a.requests
+                    .push(plan::request(n32(i), n32(j - i), last - 1, 1, &mut |x| {
+                        let pos = x + 1;
+                        let page = super::attention::drafter_page(
+                            self.blk(slot, DRAFTER, pos),
+                            pos % bs,
+                            bs,
+                        );
+                        u32::try_from(page).expect("a page id within the pool")
+                    }));
+            }
+            let _ = s0;
+            i = j;
+        }
+        a
+    }
+
+    /// The step's plan over `rows` (real rows, then any padding rows).
+    fn plan(&self, rows: &[Row], drafting_exec: bool) -> (StepPlan, Placed) {
+        let bs = self.cfg.block_size;
+        let k1 = self.cfg.draft_tokens + 1;
+        let width = rows.iter().map(|r| r.k).max().unwrap_or(0);
+        let mut pl = Placed::default();
+        let mut p = StepPlan {
+            width,
+            ..StepPlan::default()
         };
-        // SAFETY: `rows` tokens and output rows.
-        unsafe { self.dev.embed(&p) }
-    }
-
-    /// The drafter over `rows`: KV written at each row's position, the normed output
-    /// (BF16 `[n, hidden]`) returned with its scratch.
-    fn drafter(&self, rows: &[MtpRow]) -> Result<Forward> {
-        let mtp = self.weights.mtp.as_ref().expect("a drafter");
-        let d = self.dims.clone();
-        let n = u32of(rows.len(), "drafter rows")?;
-        let mut sc = Scratch { bufs: Vec::new() };
-        let pad = Self::pad(n);
-        let hsz = d.hidden as usize;
-        let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
-        let tok = sc.get(&self.dev, rows.len().max(1) * 4)?;
-        let e = sc.get(&self.dev, pad * hsz * 2)?;
-        let hid = sc.get(&self.dev, pad * hsz * 2)?;
-        let cat = sc.get(&self.dev, pad * 2 * hsz * 2)?;
-        let h = sc.get(&self.dev, pad * hsz * 2)?;
-        let x = sc.get(&self.dev, pad * hsz * 2)?;
-        let mix = sc.get(&self.dev, pad * hsz * 2)?;
-        let m = sc.get(&self.dev, pad * hsz * 2)?;
-        let normed = sc.get(&self.dev, pad * hsz * 2)?;
-        // SAFETY: sized above; every hidden is a live BF16 row.
-        unsafe {
-            self.dev.upload(tok, bytes_of(&tokens))?;
+        let runs_a: Vec<Run> = rows.iter().map(|r| r.run.clone()).collect();
+        p.a = self.target_pass(&runs_a, true);
+        let mut t_first = Vec::with_capacity(rows.len());
+        let mut t = 0;
+        for r in rows {
+            t_first.push(t);
+            t += n32(r.toks.len());
+        }
+        // Pass A's head: every sampled row's last host position.
+        for (i, r) in rows.iter().enumerate() {
+            if r.sample {
+                pl.head_a.push(Some(n32(p.head_a.len())));
+                p.head_a.push(Item::new(
+                    buf::H_A,
+                    t_first[i] + n32(r.toks.len()) - 1,
+                    buf::H_DST,
+                    n32(p.head_a.len()),
+                ));
+            } else {
+                pl.head_a.push(None);
+            }
+        }
+        let ha = n32(p.head_a.len());
+        let draft_rows: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].k > 0).collect();
+        let dn = n32(draft_rows.len());
+        p.drafting = dn;
+        pl.drafting = vec![None; rows.len()];
+        for (d, &i) in draft_rows.iter().enumerate() {
+            pl.drafting[i] = Some(n32(d));
+        }
+        if drafting_exec {
+            // The drafter over the host positions.
+            let mut pass = DrafterPass::default();
+            let mut at = Vec::new();
+            let mut at_p = vec![0u32; rows.len()];
             for (i, r) in rows.iter().enumerate() {
-                self.dev
-                    .copy(hid + (i * hsz * 2) as u64, r.hidden, hsz * 2)?;
+                for s in r.c.max(1)..=r.p() {
+                    let m = n32(at.len());
+                    pass.token_copies.push(Item::new(
+                        buf::T_HOST,
+                        t_first[i] + s - r.c,
+                        buf::T_DST,
+                        m,
+                    ));
+                    let (hb, hr) = if s == r.c {
+                        r.hidden_before.expect("a hidden state before the row")
+                    } else {
+                        (buf::H_A, t_first[i] + s - r.c - 1)
+                    };
+                    pass.hidden_copies.push(Item::new(hb, hr, buf::H_DST, m));
+                    if s == r.p() {
+                        at_p[i] = m;
+                    }
+                    at.push((r.slot, s));
+                }
+            }
+            pass.attn = self.drafter_attn(&at);
+            for (d, &i) in draft_rows.iter().enumerate() {
+                pass.head
+                    .push(Item::new(buf::H_DRAFT, at_p[i], buf::H_DST, n32(d)));
+                pass.draws
+                    .push(SampleRow::new(&rows[i].params, rows[i].p() + 1, n32(d)));
+            }
+            p.drafter.push(pass);
+            // The chain: depth `j` drafts from the previous depth's normed rows.
+            let mut prev: Vec<u32> = draft_rows.iter().map(|&i| at_p[i]).collect();
+            for j in 1..width {
+                let mut pass = DrafterPass::default();
+                let mut at = Vec::new();
+                let mut now = vec![0u32; draft_rows.len()];
+                for (d, &i) in draft_rows.iter().enumerate() {
+                    let r = &rows[i];
+                    if r.k > j {
+                        let m = n32(at.len());
+                        pass.token_copies.push(Item::new(
+                            buf::T_LANES,
+                            (j - 1) * dn + n32(d),
+                            buf::T_DST,
+                            m,
+                        ));
+                        pass.hidden_copies
+                            .push(Item::new(buf::H_DRAFT, prev[d], buf::H_DST, m));
+                        pass.head.push(Item::new(buf::H_DRAFT, m, buf::H_DST, m));
+                        now[d] = m;
+                        at.push((r.slot, r.p() + j));
+                    }
+                }
+                pass.attn = self.drafter_attn(&at);
+                for (d, &i) in draft_rows.iter().enumerate() {
+                    let r = &rows[i];
+                    let row = if r.k > j { now[d] } else { 0 };
+                    pass.draws
+                        .push(SampleRow::new(&r.params, r.p() + 1 + j, row));
+                }
+                prev = now;
+                p.drafter.push(pass);
             }
         }
-        self.embed(tok, n, e)?;
-        let half = |src: u64, w: u64, off: u64| NormParams {
-            x: src,
-            weight: w,
-            out: cat + off,
-            rows: n,
-            units: 1,
-            n: d.hidden,
-            x_stride: d.hidden,
-            out_stride: 2 * d.hidden,
-            eps: d.eps,
-            ..NormParams::default()
-        };
-        // SAFETY: `n` rows of each.
-        unsafe {
-            self.dev.norm(&half(e, mtp.pre_fc_norm_embedding, 0))?;
-            self.dev
-                .norm(&half(hid, mtp.pre_fc_norm_hidden, (hsz * 2) as u64))?;
+        // Pass B: the drafts, from the live images.
+        if dn > 0 {
+            let runs_b: Vec<Run> = draft_rows
+                .iter()
+                .enumerate()
+                .map(|(d, &i)| {
+                    let r = &rows[i];
+                    Run {
+                        slot: r.slot,
+                        start: r.e(),
+                        toks: Toks::Lanes((0..r.k).map(|j| j * dn + n32(d)).collect()),
+                        src: Src::Live(r.slot),
+                        src_pos: r.e(),
+                        writes: Vec::new(),
+                        live_store: false,
+                        tail_from: r.new_base.1,
+                    }
+                })
+                .collect();
+            let b = self.target_pass(&runs_b, true);
+            let mut tb = 0;
+            pl.row_b = vec![0; rows.len()];
+            for &i in &draft_rows {
+                pl.row_b[i] = tb;
+                for j in 0..rows[i].k {
+                    p.head_b
+                        .push(Item::new(buf::H_B, tb + j, buf::H_DST, tb + j));
+                }
+                tb += rows[i].k;
+            }
+            p.b = Some(b);
         }
-        self.linear(cat, n, mtp.fc, d.hidden, 2 * d.hidden, h, false, true)?;
-        let ar_rows: Vec<(Slot, u32, u32)> = rows.iter().map(|r| (r.slot, r.s, r.s - 1)).collect();
-        let ar = self.attn_rows(&mut sc, DRAFTER, &ar_rows, &vec![true; rows.len()])?;
-        let lw = &mtp.layer;
-        let MixerW::Attention(w) = &lw.mixer else {
-            unreachable!("the drafter's layer is an attention layer")
-        };
-        self.norm(h, 0, lw.input_norm, x, n, d.hidden)?;
-        self.attention_mix(&mut sc, w, x, n, DRAFTER, 0, 1, &ar, mix)?;
-        self.norm(h, mix, lw.post_norm, x, n, d.hidden)?;
-        self.mlp(&mut sc, lw, x, n, m)?;
-        self.norm(h, m, mtp.norm, normed, n, d.hidden)?;
-        Ok(Forward {
-            normed,
-            rows: (0..n).collect(),
-            _scratch: sc,
-        })
+        // Draws, target distributions, acceptance.
+        pl.plain = vec![None; rows.len()];
+        for (i, r) in rows.iter().enumerate() {
+            if r.sample && r.k == 0 {
+                pl.plain[i] = Some(n32(p.plain.len()));
+                p.plain.push(SampleRow::new(
+                    &r.params,
+                    r.p() + 1,
+                    pl.head_a[i].expect("a sampled row's head row"),
+                ));
+            }
+        }
+        for &i in &draft_rows {
+            let r = &rows[i];
+            let first = n32(p.targets.len());
+            p.targets.push(SampleRow::new(
+                &r.params,
+                r.p() + 1,
+                pl.head_a[i].expect("a drafting row samples"),
+            ));
+            for j in 0..r.k {
+                p.targets
+                    .push(SampleRow::new(&r.params, r.p() + 1, ha + pl.row_b[i] + j));
+            }
+            p.accept
+                .push((SampleRow::new(&r.params, r.p() + 1, 0), first, r.k));
+        }
+        if drafting_exec {
+            let normed = |i: usize, q: u32| -> (u32, u32) {
+                let r = &rows[i];
+                if q <= r.p() {
+                    (buf::H_A, t_first[i] + q - r.c)
+                } else {
+                    (buf::H_B, pl.row_b[i] + q - r.e())
+                }
+            };
+            // The canonical rewrite at every draft's position.
+            if dn > 0 {
+                let mut pass = DrafterPass {
+                    kv_only: true,
+                    ..DrafterPass::default()
+                };
+                let mut at = Vec::new();
+                for (d, &i) in draft_rows.iter().enumerate() {
+                    let r = &rows[i];
+                    for j in 0..r.k {
+                        let m = n32(at.len());
+                        pass.token_copies.push(Item::new(
+                            buf::T_LANES,
+                            j * dn + n32(d),
+                            buf::T_DST,
+                            m,
+                        ));
+                        let (hb, hr) = normed(i, r.p() + j);
+                        pass.hidden_copies.push(Item::new(hb, hr, buf::H_DST, m));
+                        at.push((r.slot, r.e() + j));
+                    }
+                }
+                pass.attn = self.drafter_attn(&at);
+                p.rewrite = Some(pass);
+            }
+            // Taps at every block's last position, and the kept normed states (none for
+            // padding rows, which keep nothing).
+            for (i, r) in rows.iter().enumerate() {
+                if r.slot == self.pad_slot() {
+                    continue;
+                }
+                for q in r.c..=r.p() + r.k {
+                    if (q + 1).is_multiple_of(bs) {
+                        let (hb, hr) = normed(i, q);
+                        p.keep.push(Item::new(
+                            hb,
+                            hr,
+                            buf::H_TAPS,
+                            self.wblk(r.slot, DRAFTER, q),
+                        ));
+                    }
+                }
+                for j in 0..=r.k {
+                    let (hb, hr) = normed(i, r.p() + j);
+                    p.keep.push(Item::new(hb, hr, buf::H_KEPT, r.slot * k1 + j));
+                }
+            }
+        }
+        (p, pl)
     }
 
-    /// Logits (f32 of BF16 values, the whole head) of the BF16 rows at `rows`.
-    fn head(&self, rows: &[u64]) -> Result<Vec<Vec<f32>>> {
-        if rows.is_empty() {
-            return Ok(Vec::new());
+    /// A padding row of a rung of draft width `w`: the pad slot at position `K`, every
+    /// read and write in the pad block and the pad slot's own state.
+    fn pad_row(&self, w: u32) -> Row {
+        let k = self.cfg.draft_tokens;
+        let slot = self.pad_slot();
+        Row {
+            slot,
+            c: k,
+            toks: vec![PAD_TOKEN],
+            k: w,
+            sample: true,
+            params: SamplingParams::greedy(),
+            run: Run {
+                slot,
+                start: k,
+                toks: Toks::Host(vec![PAD_TOKEN]),
+                src: Src::Zero,
+                src_pos: k,
+                writes: Vec::new(),
+                live_store: false,
+                tail_from: u32::MAX,
+            },
+            new_base: (NULL_STATE, k),
+            hidden_before: (k > 0).then_some((buf::H_KEPT, slot * (k + 1))),
         }
-        let d = &self.dims;
-        let n = u32of(rows.len(), "head rows")?;
-        let hsz = d.hidden as usize;
-        let mut sc = Scratch { bufs: Vec::new() };
-        let x = sc.get(&self.dev, Self::pad(n) * hsz * 2)?;
-        let out = sc.get(&self.dev, Self::pad(n) * d.vocab as usize * 4)?;
-        // SAFETY: live BF16 rows into the gathered input.
-        unsafe {
-            for (i, &r) in rows.iter().enumerate() {
-                self.dev.copy(x + (i * hsz * 2) as u64, r, hsz * 2)?;
+    }
+
+    /// The shape of a decode rung of `rows` rows at draft width `w`: an all-padding
+    /// step's, with room for the variable lists of any step that fits it.
+    fn rung_shape(&self, rows: u32, w: u32) -> Result<Shape> {
+        let pads: Vec<Row> = (0..rows).map(|_| self.pad_row(w)).collect();
+        let drafting_exec = self.cfg.draft_tokens > 0;
+        let (p, _) = self.plan(&pads, drafting_exec);
+        let geo = self.geo();
+        let mut s = Shape::of(&p, &geo)?;
+        let r = rows as usize;
+        let bs = self.cfg.block_size as usize;
+        let fold = match self.cfg.strategy {
+            StateStrategy::Live => self.cfg.draft_tokens as usize,
+            StateStrategy::Lagging => self.tail_cap as usize,
+        };
+        let writes = ((fold + 1) / bs + 1).min(SEQ_WRITES);
+        s.a.staged = r * (1 + fold);
+        s.a.conv_rows = 3 * r + s.a.staged;
+        s.a.stage_conv = 3 * r + s.a.staged;
+        s.a.stage_ab = s.a.staged;
+        s.a.post_conv = 3 * writes * r + 3 * r + r;
+        s.a.post_ab = r;
+        if drafting_exec {
+            let wu = w as usize;
+            s.keep = r * (wu + 1) + r * ((wu + 1) / bs + 1);
+        }
+        if geo.fast {
+            let len = self.cfg.max_model_len + self.cfg.draft_tokens + 1;
+            let blocks = self.spec.max_blocks_per_seq();
+            let caps = |queries: u32, g: &Fa2Geometry, pages: u32| {
+                PassCaps::with_max_tile(
+                    Reduction::Split,
+                    rows,
+                    queries,
+                    g.group_size,
+                    g.page_size,
+                    pages,
+                    len,
+                    super::attention::MAX_TILE,
+                )
+            };
+            s.a.attn.fa2 = Some(caps(1, &geo.target, blocks)?);
+            for d in &mut s.drafter {
+                d.attn.fa2 = Some(caps(1, &geo.drafter, len)?);
+            }
+            if let Some(b) = &mut s.b {
+                b.attn.fa2 = Some(caps(w, &geo.target, blocks)?);
             }
         }
-        self.linear(x, n, self.weights.head, d.vocab, d.hidden, out, true, true)?;
-        let mut host = vec![0f32; rows.len() * d.vocab as usize];
-        // SAFETY: `n · vocab` f32.
-        unsafe {
-            let dst =
-                std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), host.len() * 4);
-            self.dev.download(out, dst)?;
-        }
-        Ok(host.chunks(d.vocab as usize).map(<[f32]>::to_vec).collect())
+        Ok(s)
     }
+}
+
+/// A slice's bytes.
+fn bytes_of<T: Copy>(x: &[T]) -> &[u8] {
+    // SAFETY: any initialized `Copy` value's bytes may be read; the ABI structs are
+    // `repr(C)` with no padding that carries data the kernels read.
+    unsafe { std::slice::from_raw_parts(x.as_ptr().cast(), std::mem::size_of_val(x)) }
 }
 
 // ---- a step ----
-
-/// What one row carries through a step.
-struct Row {
-    slot: Slot,
-    c: u32,
-    /// The last host position.
-    p: u32,
-    k: u32,
-    sample: bool,
-    params: SamplingParams,
-    toks: Vec<u32>,
-    base: StateRow,
-    writes: Vec<StateWrite>,
-    drafts: Vec<u32>,
-    q_rows: Vec<Vec<f64>>,
-    chain_logits: Vec<Vec<f32>>,
-    produced: Vec<u32>,
-    target_logits: HashMap<u32, Vec<f32>>,
-}
-
-impl Row {
-    fn e(&self) -> u32 {
-        self.p + 1
-    }
-}
 
 impl<D: QwenDevice> QwenCudaExecutor<D> {
     fn row_of(&self, step: &StepInput, i: usize, e: &SeqEntry, writes: Vec<StateWrite>) -> Row {
@@ -1701,30 +1526,44 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             "slot {}: drafts requested at position 0",
             e.slot
         );
+        assert!(
+            k == 0 || e.num_tokens == 1,
+            "slot {}: drafts on a row of {} host tokens",
+            e.slot,
+            e.num_tokens
+        );
+        let base = step.aux.state_rows[i];
+        let toks = step.token_ids[start..end].to_vec();
         Row {
             slot: e.slot,
             c: e.context_len,
-            p,
             k,
             sample: e.sample,
             params: e.sampling,
-            toks: step.token_ids[start..end].to_vec(),
-            base: step.aux.state_rows[i],
-            writes,
-            drafts: Vec::new(),
-            q_rows: Vec::new(),
-            chain_logits: Vec::new(),
-            produced: Vec::new(),
-            target_logits: HashMap::new(),
+            run: Run {
+                slot: e.slot,
+                start: e.context_len,
+                toks: Toks::Host(toks.clone()),
+                src: Src::Zero,
+                src_pos: 0,
+                writes: writes.iter().map(|w| (w.len, w.buffer)).collect(),
+                live_store: true,
+                tail_from: 0,
+            },
+            toks,
+            new_base: writes
+                .last()
+                .map_or((base.base, base.base_len), |w| (w.buffer, w.len)),
+            hidden_before: None,
         }
     }
 
-    /// Checks a row's base and writes as the reference executor does, and starts a fresh
-    /// slot at its base.
-    fn check_row(&mut self, row: &Row) {
+    /// Checks a row's base and writes as the reference executor does, starts a fresh
+    /// slot at its base, and fixes the row's source and drafter input.
+    fn check_row(&mut self, row: &mut Row, base: StateRow) {
         let slot = row.slot;
         let bs = self.cfg.block_size;
-        let StateRow { base, base_len } = row.base;
+        let StateRow { base, base_len } = base;
         let rec = &mut self.slots[slot as usize];
         match rec.base {
             Some(b) => assert_eq!(
@@ -1746,70 +1585,99 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             base_len.is_multiple_of(bs) && base_len <= row.c,
             "slot {slot}: base off a boundary"
         );
-        for (i, w) in row.writes.iter().enumerate() {
+        let writes = &row.run.writes;
+        for (i, &(len, buffer)) in writes.iter().enumerate() {
             assert!(
-                w.len > base_len && w.len <= row.e() && w.len.is_multiple_of(bs),
-                "slot {slot}: a state write at {} outside ({base_len}, {}]",
-                w.len,
+                len > base_len && len <= row.e() && len.is_multiple_of(bs),
+                "slot {slot}: a state write at {len} outside ({base_len}, {}]",
                 row.e()
             );
+            assert!(i == 0 || writes[i - 1].0 < len, "state writes out of order");
             assert!(
-                i == 0 || row.writes[i - 1].len < w.len,
-                "state writes out of order"
+                buffer != NULL_STATE && buffer < self.cfg.state_buffers,
+                "a state write into buffer {buffer}"
             );
-            assert!(
-                w.buffer != NULL_STATE && w.buffer < self.cfg.state_buffers,
-                "a state write into buffer {}",
-                w.buffer
-            );
-            if w.buffer == base {
+            if buffer == base {
                 assert_eq!(
                     i + 1,
-                    row.writes.len(),
+                    writes.len(),
                     "slot {slot}: its base overwritten early"
                 );
             } else {
                 assert!(
-                    self.state_tags[w.buffer as usize] == 0
-                        && !self.state_encrypted[w.buffer as usize],
-                    "state buffer {}: written while it holds a state",
-                    w.buffer
+                    self.state_tags[buffer as usize] == 0 && !self.state_encrypted[buffer as usize],
+                    "state buffer {buffer}: written while it holds a state"
                 );
             }
         }
+        let first_write = writes.first().map_or(u32::MAX, |w| w.0);
+        let (src, src_pos) = self.source(slot, row.c, first_write);
+        row.run.src = src;
+        row.run.src_pos = src_pos;
+        row.run.tail_from = row.new_base.1;
+        if self.cfg.draft_tokens > 0 && row.c >= 1 {
+            row.hidden_before = Some(self.hidden_before(slot, row.c - 1));
+        }
     }
 
-    /// The target's normed state at `pos` for `slot`, as a device row: what its last row
-    /// kept, or the tap of the drafter block ending there (after a resume).
-    fn hidden_before(&self, slot: Slot, pos: u32) -> u64 {
+    /// The target's normed state at `pos` for `slot`: what its last row kept, or the tap
+    /// of the drafter block ending there (after a resume).
+    fn hidden_before(&self, slot: Slot, pos: u32) -> (u32, u32) {
+        let k1 = self.cfg.draft_tokens + 1;
         if let Some(i) = self.slots[slot as usize]
             .hiddens
             .iter()
             .position(|&q| q == pos)
         {
-            return self.hidden_row(slot, i);
+            return (buf::H_KEPT, slot * k1 + n32(i));
         }
-        let b = self.block_of(slot, DRAFTER, pos);
-        let pool = &self.pools[DRAFTER];
-        pool.taps.as_ref().expect("taps").addr + u64::from(b) * pool.tap_bytes as u64
+        (buf::H_TAPS, self.block_of(slot, DRAFTER, pos))
     }
 
-    fn draw(&self, row: &mut Row, logits: &[f32]) {
-        let logits = Logits::new(logits, self.spec.sampleable_vocab_size);
-        let pos = row.p as u64 + 1 + row.drafts.len() as u64;
-        let (d, q) = if row.params.is_greedy() {
-            let d = sampling::argmax(logits);
-            let mut q = vec![0.0; logits.len()];
-            q[d as usize] = 1.0;
-            (d, q)
+    /// Uploads `words` as the table the program reads: the rung's fixed table, or the
+    /// eager table (grown as needed).
+    fn upload_table(&mut self, words: &[u32], fixed: bool) -> Result<()> {
+        let addr = if fixed {
+            self.scratch.table.addr
         } else {
-            let q = sampling::processed_probs(logits, &row.params);
-            let d =
-                sampling::sample_from(&q, sampling::uniform(row.params.seed(), pos, Stream::Draft));
-            (d, q)
+            if self.eager_words < words.len() {
+                let n = words.len().next_power_of_two();
+                self.eager_table = Alloc::new(&self.dev, n * 4)?;
+                self.eager_words = n;
+            }
+            self.eager_table.addr
         };
-        row.drafts.push(d);
-        row.q_rows.push(q);
+        self.table_base.set(addr);
+        // SAFETY: the table holds `words`.
+        unsafe { self.dev.upload(addr, bytes_of(words)) }
+    }
+
+    fn readback(&self, words: usize) -> Result<Vec<u32>> {
+        let mut out = vec![0u8; words * 4];
+        // SAFETY: the read-back holds the capacity's words.
+        unsafe { self.dev.download(self.scratch.readback.addr, &mut out)? };
+        Ok(out
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    /// The rung a step of `rows` uniform decode rows at draft width `w` replays, if any.
+    fn rung_for(&self, rows: &[Row]) -> Option<usize> {
+        let drafting = self.cfg.draft_tokens > 0;
+        let w = rows.first()?.k;
+        let uniform = rows
+            .iter()
+            .all(|r| r.toks.len() == 1 && r.sample && r.k == w && (!drafting || r.c >= 1));
+        if !uniform {
+            return None;
+        }
+        self.rungs
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.width == w && g.rows as usize >= rows.len())
+            .min_by_key(|(_, g)| g.rows)
+            .map(|(i, _)| i)
     }
 
     fn step(&mut self, step: &StepInput) -> Result<StepOutput> {
@@ -1855,284 +1723,316 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         for (i, e) in step.seqs.iter().enumerate() {
             rows.push(self.row_of(step, i, e, by_row.remove(&n32(i)).unwrap_or_default()));
         }
-        for row in &rows {
-            self.check_row(row);
+        for (i, row) in rows.iter_mut().enumerate() {
+            self.check_row(row, step.aux.state_rows[i]);
         }
-        let hsz = u64::from(self.dims.hidden) * 2;
-        let hsz_us = self.dims.hidden as usize * 2;
-        let drafting = self.pools.len() > DRAFTER;
+        let real = rows.len();
+        if real == 0 {
+            if std::mem::take(&mut self.had_rows) {
+                self.idle_scrub()?;
+            }
+            return Ok(StepOutput {
+                tokens: Vec::new(),
+                stride: self.spec.max_draft_tokens + 1,
+                num_tokens: Vec::new(),
+                logits: step.return_logits.then(Vec::new),
+            });
+        }
+        self.had_rows = true;
+        let drafting_exec = self.cfg.draft_tokens > 0;
+        let geo = self.geo();
 
-        // Pass A: every row's host tokens.
-        let mut new_base = Vec::with_capacity(rows.len());
-        let runs_a: Vec<Run> = rows
-            .iter()
-            .map(|r| {
-                let first_write = r.writes.first().map_or(u32::MAX, |w| w.len);
-                let (src, src_pos) = self.source(r.slot, r.c, first_write);
-                let (nb, nl) = r
-                    .writes
-                    .last()
-                    .map_or((r.base.base, r.base.base_len), |w| (w.buffer, w.len));
-                new_base.push((nb, nl));
-                Run {
-                    slot: r.slot,
-                    start: r.c,
-                    tokens: r.toks.clone(),
-                    src,
-                    src_pos,
-                    writes: r.writes.iter().map(|w| (w.len, w.buffer)).collect(),
-                    live_store: true,
-                    tail_from: nl,
-                    kv: true,
+        // A rung's padded step when one fits, else the step's own.
+        let mut ran: Option<(Layout, Placed)> = None;
+        if self.path != DecodePath::Eager
+            && let Some(g) = self.rung_for(&rows)
+        {
+            let (width, rung_rows) = (self.rungs[g].width, self.rungs[g].rows);
+            let mut padded = rows.clone();
+            padded.extend((real..rung_rows as usize).map(|_| self.pad_row(width)));
+            let (p, placed) = self.plan(&padded, drafting_exec);
+            if let Ok(words) = plan::pack(&p, &self.rungs[g].layout, &geo) {
+                self.upload_table(&words, true)?;
+                if self.path == DecodePath::Replay {
+                    let graph = self.rungs[g]
+                        .graph
+                        .as_ref()
+                        .ok_or_else(|| CudaError::new("no graph captured for this rung"))?;
+                    self.dev.replay(graph.as_ref())?;
+                    self.stats.replay += 1;
+                } else {
+                    self.program(&self.rungs[g].layout.clone())?;
+                    self.stats.direct += 1;
                 }
-            })
-            .collect();
-        let fa = self.target(&runs_a)?;
+                ran = Some((self.rungs[g].layout.clone(), placed));
+            }
+        }
+        let (layout, placed) = match ran {
+            Some(x) => x,
+            None => {
+                let (p, placed) = self.plan(&rows, drafting_exec);
+                let layout = Layout::new(&Shape::of(&p, &geo)?);
+                let words = plan::pack(&p, &layout, &geo)?;
+                self.upload_table(&words, false)?;
+                self.program(&layout)?;
+                self.stats.eager += 1;
+                (layout, placed)
+            }
+        };
+        let rb = self.readback(layout.readback_words())?;
+        if rb[0] != 0 {
+            return Err(CudaError::new(format!("step status {:#x}", rb[0])));
+        }
+        let plain_n = layout.plain.len / SAMPLE_WORDS;
+        let k1 = layout.width as usize + 1;
+        let out_at = 1 + plain_n;
+        let counts_at = out_at + layout.accepts * k1;
         for r in &rows {
-            for w in &r.writes {
-                self.set_tag(w.buffer, w.len)?;
-            }
-        }
-        let normed_a =
-            |i: usize, q: u32, r: &Row| fa.normed + u64::from(fa.rows[i] + q - r.c) * hsz;
-        let sampled: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].sample).collect();
-        let la = self.head(
-            &sampled
-                .iter()
-                .map(|&i| normed_a(i, rows[i].p, &rows[i]))
-                .collect::<Vec<_>>(),
-        )?;
-        for (&i, l) in sampled.iter().zip(la) {
-            let p = rows[i].p;
-            rows[i].target_logits.insert(p, l);
-        }
-
-        // The drafter over the host positions, then the chain.
-        let mut keep_alive = Vec::new();
-        if drafting {
-            let mut mrows = Vec::new();
-            let mut at_p = Vec::new();
-            for (i, r) in rows.iter().enumerate() {
-                for s in r.c.max(1)..=r.p {
-                    let hidden = if s == r.c {
-                        self.hidden_before(r.slot, s - 1)
-                    } else {
-                        normed_a(i, s - 1, r)
-                    };
-                    if s == r.p && r.k > 0 {
-                        at_p.push((i, mrows.len()));
-                    }
-                    mrows.push(MtpRow {
-                        slot: r.slot,
-                        s,
-                        token: r.toks[(s - r.c) as usize],
-                        hidden,
-                    });
-                }
-            }
-            if !mrows.is_empty() {
-                let fd = self.drafter(&mrows)?;
-                let logits = self.head(
-                    &at_p
-                        .iter()
-                        .map(|&(_, m)| fd.normed + m as u64 * hsz)
-                        .collect::<Vec<_>>(),
-                )?;
-                let mut prev: HashMap<usize, u64> = HashMap::new();
-                for (&(i, m), l) in at_p.iter().zip(logits) {
-                    rows[i].chain_logits.push(l);
-                    prev.insert(i, fd.normed + m as u64 * hsz);
-                }
-                keep_alive.push(fd);
-                let depth = rows.iter().map(|r| r.k).max().unwrap_or(0);
-                for j in 0..depth {
-                    let mut next = Vec::new();
-                    #[allow(clippy::needless_range_loop)]
-                    for i in 0..rows.len() {
-                        if rows[i].k > j {
-                            let l = rows[i].chain_logits[j as usize].clone();
-                            self.draw(&mut rows[i], &l);
-                            if j + 1 < rows[i].k {
-                                next.push(i);
-                            }
-                        }
-                    }
-                    if next.is_empty() {
-                        continue;
-                    }
-                    let crow: Vec<MtpRow> = next
-                        .iter()
-                        .map(|&i| MtpRow {
-                            slot: rows[i].slot,
-                            s: rows[i].p + j + 1,
-                            token: rows[i].drafts[j as usize],
-                            hidden: prev[&i],
-                        })
-                        .collect();
-                    let fc = self.drafter(&crow)?;
-                    let logits = self.head(
-                        &(0..next.len())
-                            .map(|m| fc.normed + m as u64 * hsz)
-                            .collect::<Vec<_>>(),
-                    )?;
-                    for (m, (&i, l)) in next.iter().zip(logits).enumerate() {
-                        rows[i].chain_logits.push(l);
-                        prev.insert(i, fc.normed + m as u64 * hsz);
-                    }
-                    keep_alive.push(fc);
-                }
+            for &(len, b) in &r.run.writes {
+                self.set_tag(b, len)?;
             }
         }
 
-        // Pass B: the drafts, from the live images.
-        let with_drafts: Vec<usize> = (0..rows.len())
-            .filter(|&i| !rows[i].drafts.is_empty())
-            .collect();
-        let runs_b: Vec<Run> = with_drafts
-            .iter()
-            .map(|&i| {
-                let r = &rows[i];
-                Run {
-                    slot: r.slot,
-                    start: r.e(),
-                    tokens: r.drafts.clone(),
-                    src: self.live_addr(r.slot),
-                    src_pos: r.e(),
-                    writes: Vec::new(),
-                    live_store: false,
-                    tail_from: new_base[i].1,
-                    kv: true,
-                }
-            })
-            .collect();
-        let fb = if runs_b.is_empty() {
-            None
-        } else {
-            Some(self.target(&runs_b)?)
+        let stride = self.spec.max_draft_tokens + 1;
+        let mut out = StepOutput {
+            tokens: vec![0; real * stride as usize],
+            stride,
+            num_tokens: vec![0; real],
+            logits: step.return_logits.then(Vec::new),
         };
-        let normed_at = |i: usize, q: u32, rows: &[Row]| -> u64 {
-            let r = &rows[i];
-            if q <= r.p {
-                normed_a(i, q, r)
-            } else {
-                let b = with_drafts
-                    .iter()
-                    .position(|&x| x == i)
-                    .expect("a drafting row");
-                let fb = fb.as_ref().expect("pass B");
-                fb.normed + u64::from(fb.rows[b] + q - r.e()) * hsz
-            }
-        };
-        let mut want = Vec::new();
-        for &i in &with_drafts {
-            for q in rows[i].e()..rows[i].e() + n32(rows[i].drafts.len()) {
-                want.push((i, q));
-            }
-        }
-        let lb = self.head(
-            &want
-                .iter()
-                .map(|&(i, q)| normed_at(i, q, &rows))
-                .collect::<Vec<_>>(),
-        )?;
-        for (&(i, q), l) in want.iter().zip(lb) {
-            rows[i].target_logits.insert(q, l);
-        }
-
-        // Sampling and chain acceptance.
-        for r in rows.iter_mut().filter(|r| r.sample) {
-            let params = r.params;
-            r.produced = if r.k == 0 {
-                vec![sampling::sample(
-                    self.spec.logits(&r.target_logits[&r.p]),
-                    &params,
-                    r.p as u64 + 1,
-                )]
-            } else {
-                let p_rows: Vec<Vec<f64>> = (r.p..=r.p + r.k)
-                    .map(|pos| {
-                        sampling::processed_probs(self.spec.logits(&r.target_logits[&pos]), &params)
-                    })
-                    .collect();
-                sampling::chain_accept(&p_rows, &r.q_rows, &r.drafts, &params, r.p as u64 + 1)
-            };
-        }
-
-        // The drafter's canonical rows at the accepted drafts, taps and kept states.
-        if drafting {
-            let mut rw = Vec::new();
-            for (i, r) in rows.iter().enumerate() {
-                let a = n32(r.produced.len().saturating_sub(1));
-                for j in 0..a {
-                    rw.push(MtpRow {
-                        slot: r.slot,
-                        s: r.e() + j,
-                        token: r.drafts[j as usize],
-                        hidden: normed_at(i, r.p + j, &rows),
-                    });
-                }
-            }
-            if !rw.is_empty() {
-                keep_alive.push(self.drafter(&rw)?);
-            }
-            let bs = self.cfg.block_size;
-            for (i, r) in rows.iter().enumerate() {
-                let a = n32(r.produced.len().saturating_sub(1));
-                for q in r.c..=r.p + a {
-                    if (q + 1).is_multiple_of(bs) {
-                        let b = self.writable_block(r.slot, DRAFTER, q);
-                        let pool = &self.pools[DRAFTER];
-                        let tap = pool.taps.as_ref().expect("taps").addr
-                            + u64::from(b) * pool.tap_bytes as u64;
-                        // SAFETY: a normed row into the block's tap.
-                        unsafe { self.dev.copy(tap, normed_at(i, q, &rows), hsz_us)? };
-                    }
-                }
-                let keep: Vec<u32> = (r.p..=r.p + r.k).collect();
-                for (j, &q) in keep.iter().enumerate() {
-                    let dst = self.hidden_row(r.slot, j);
-                    // SAFETY: a normed row into the slot's kept states.
-                    unsafe { self.dev.copy(dst, normed_at(i, q, &rows), hsz_us)? };
-                }
-                self.slots[r.slot as usize].hiddens = keep;
-            }
-        }
-        self.dev.synchronize()?;
-        drop(keep_alive);
-
+        let vocab = self.dims.vocab as usize;
         for (i, r) in rows.iter().enumerate() {
-            let (nb, nl) = new_base[i];
+            let produced: Vec<u32> = if !r.sample {
+                Vec::new()
+            } else if let Some(d) = placed.drafting[i] {
+                let d = d as usize;
+                let n = rb[counts_at + d] as usize;
+                assert!(n >= 1 && n <= r.k as usize + 1, "accepted {n} tokens");
+                rb[out_at + d * k1..out_at + d * k1 + n].to_vec()
+            } else {
+                vec![rb[1 + placed.plain[i].expect("a plain row") as usize]]
+            };
+            let base = i * stride as usize;
+            out.tokens[base..base + produced.len()].copy_from_slice(&produced);
+            out.num_tokens[i] = n32(produced.len());
+            if let Some(l) = out.logits.as_mut() {
+                let mut rows_l = Vec::new();
+                for j in 0..produced.len() {
+                    let lr = if j == 0 {
+                        placed.head_a[i].expect("a sampled row") as usize
+                    } else {
+                        layout.head_a.items + (placed.row_b[i] as usize) + j - 1
+                    };
+                    let mut v = vec![0f32; vocab];
+                    let at = self.scratch.logits_t.addr + (lr * vocab * 4) as u64;
+                    // SAFETY: a logit row the head wrote.
+                    unsafe {
+                        let dst =
+                            std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), vocab * 4);
+                        self.dev.download(at, dst)?;
+                    }
+                    rows_l.push(v);
+                }
+                l.push(rows_l);
+            }
+        }
+
+        for r in &rows {
+            let (nb, nl) = r.new_base;
             let rec = &mut self.slots[r.slot as usize];
             rec.base = Some((nb, nl));
-            rec.tail_len = r.e() + n32(r.drafts.len()) - nl;
+            rec.tail_len = r.e() + r.k - nl;
             assert!(
                 rec.tail_len <= self.tail_cap,
                 "slot {}: a tail past its capacity",
                 r.slot
             );
             rec.live_pos = (self.cfg.strategy == StateStrategy::Live).then_some(r.e());
-        }
-
-        let stride = self.spec.max_draft_tokens + 1;
-        let mut out = StepOutput {
-            tokens: vec![0; rows.len() * stride as usize],
-            stride,
-            num_tokens: vec![0; rows.len()],
-            logits: step.return_logits.then(Vec::new),
-        };
-        for (i, r) in rows.iter().enumerate() {
-            let base = i * stride as usize;
-            out.tokens[base..base + r.produced.len()].copy_from_slice(&r.produced);
-            out.num_tokens[i] = n32(r.produced.len());
-            if let Some(l) = out.logits.as_mut() {
-                l.push(
-                    (0..n32(r.produced.len()))
-                        .map(|j| r.target_logits[&(r.p + j)].clone())
-                        .collect(),
-                );
+            if drafting_exec {
+                rec.hiddens = (r.p()..=r.p() + r.k).collect();
             }
         }
         Ok(out)
+    }
+
+    /// Zeroes every buffer a step leaves its working data in, in place (the graphs
+    /// captured these addresses): the program's scratch and tables, each pool's pad
+    /// block and the padding slot's state. Nothing a real row computes reads their
+    /// earlier contents. Run by the first rowless step after a step with rows.
+    fn idle_scrub(&mut self) -> Result<()> {
+        let mut ranges = self.scratch_ranges();
+        ranges.push((self.eager_table.addr, self.eager_words * 4));
+        let pad = self.pad_block();
+        for g in 0..self.pools.len() {
+            ranges.extend(self.pools[g].ranges(pad));
+        }
+        let ps = self.pad_slot();
+        ranges.push((self.live_addr(ps), self.image_stride));
+        ranges.extend(self.tail_ranges(ps));
+        let k1 = self.cfg.draft_tokens as usize + 1;
+        ranges.push((self.hidden_row(ps, 0), k1 * self.dims.hidden as usize * 2));
+        for (a, n) in ranges {
+            // SAFETY: ranges of live allocations of this executor.
+            unsafe { self.dev.zero(a, n)? };
+        }
+        self.idle_scrubs += 1;
+        self.dev.synchronize()
+    }
+
+    /// Idle scrubs run so far.
+    pub fn idle_scrubs(&self) -> u64 {
+        self.idle_scrubs
+    }
+
+    /// Steps run by each path so far.
+    pub fn decode_stats(&self) -> DecodeStats {
+        self.stats
+    }
+
+    /// How decode steps that fit a rung run: `Replay` needs the graphs captured.
+    pub fn set_decode_path(&mut self, path: DecodePath) -> Result<()> {
+        if path == DecodePath::Replay && self.rungs.iter().any(|r| r.graph.is_none()) {
+            return Err(CudaError::new("replay needs the graphs captured"));
+        }
+        self.path = path;
+        Ok(())
+    }
+
+    /// The rungs: `(draft width, rows)`.
+    pub fn rungs(&self) -> Vec<(u32, u32)> {
+        self.rungs.iter().map(|r| (r.width, r.rows)).collect()
+    }
+
+    /// Lays out every rung and, with graphs on, captures each: run directly over an
+    /// all-padding step, captured, replayed once over it.
+    fn prepare_rungs(&mut self, capture: bool) -> Result<()> {
+        let k = self.cfg.draft_tokens;
+        let mut ladders = vec![(0, crate::mimo::draft::draft_ladder(&self.cfg.buckets, 0))];
+        if k > 0 {
+            ladders.push((k, crate::mimo::draft::draft_ladder(&self.cfg.buckets, k)));
+        }
+        let mut rungs = Vec::new();
+        for (w, ladder) in ladders {
+            for rows in ladder {
+                if rows as usize > self.scratch.caps.drafting.max(1) {
+                    continue;
+                }
+                let shape = self.rung_shape(rows, w)?;
+                let layout = Layout::new(&shape);
+                rungs.push(Rung {
+                    width: w,
+                    rows,
+                    shape,
+                    layout,
+                    graph: None,
+                });
+            }
+        }
+        let words = rungs.iter().map(|r| r.layout.words).max().unwrap_or(64);
+        self.scratch.table = Alloc::new(&self.dev, words * 4)?;
+        self.scratch.caps.table = words;
+        for r in &rungs {
+            self.check_rung_fits(&r.shape)?;
+        }
+        self.rungs = rungs;
+        let geo = self.geo();
+        for g in 0..self.rungs.len() {
+            let (w, rows) = (self.rungs[g].width, self.rungs[g].rows);
+            let pads: Vec<Row> = (0..rows).map(|_| self.pad_row(w)).collect();
+            let (p, _) = self.plan(&pads, k > 0);
+            let layout = self.rungs[g].layout.clone();
+            // Every rung's all-padding step packs into its layout, on any device.
+            let words = plan::pack(&p, &layout, &geo)?;
+            if capture {
+                self.upload_table(&words, true)?;
+                self.program(&layout)?;
+                self.check_pad_status(&layout, w, rows)?;
+                let this = &*self;
+                let graph = this.dev.capture(&mut || this.program(&layout))?;
+                self.dev.replay(graph.as_ref())?;
+                self.check_pad_status(&layout, w, rows)?;
+                self.rungs[g].graph = Some(graph);
+            }
+        }
+        if capture {
+            self.path = DecodePath::Replay;
+        }
+        Ok(())
+    }
+
+    fn check_pad_status(&self, l: &Layout, w: u32, rows: u32) -> Result<()> {
+        let rb = self.readback(l.readback_words())?;
+        if rb[0] != 0 {
+            return Err(CudaError::new(format!(
+                "rung of {rows} rows at width {w}: status {:#x} over padding",
+                rb[0]
+            )));
+        }
+        Ok(())
+    }
+
+    /// A rung's every list within the scratch's pad rows and capacities.
+    fn check_rung_fits(&self, s: &Shape) -> Result<()> {
+        let c = &self.scratch.caps;
+        let bad = |what: &str| Err(CudaError::new(format!("rung past the scratch: {what}")));
+        let a = &s.a;
+        if a.staged > c.staged || a.conv_rows > c.conv_rows {
+            return bad("staged positions");
+        }
+        if a.stage_conv.max(a.post_conv) > c.pad_conv || a.stage_ab.max(a.post_ab) > c.pad_ab {
+            return bad("pad rows");
+        }
+        if let Some(b) = &s.b
+            && (b.staged > c.staged
+                || b.stage_conv.max(b.post_conv) > c.pad_conv
+                || b.stage_ab.max(b.post_ab) > c.pad_ab)
+        {
+            return bad("pass B");
+        }
+        if s.keep > c.pad_h {
+            return bad("kept rows");
+        }
+        Ok(())
+    }
+
+    fn save_state(&mut self, slot: Slot, len: u32, buffer: u32) -> Result<()> {
+        assert!(
+            self.slots[slot as usize].base.is_some(),
+            "a state saved from a slot that holds none"
+        );
+        let (base, _) = self.slots[slot as usize].base.expect("checked");
+        assert!(
+            len.is_multiple_of(self.cfg.block_size),
+            "a state saved off a boundary"
+        );
+        assert!(
+            buffer == base
+                || (self.state_tags[buffer as usize] == 0
+                    && !self.state_encrypted[buffer as usize]),
+            "state buffer {buffer}: saved into while it holds a state"
+        );
+        let (src, src_pos) = self.source(slot, len, len + 1);
+        let run = Run {
+            slot,
+            start: len,
+            toks: Toks::Host(Vec::new()),
+            src,
+            src_pos,
+            writes: vec![(len, buffer)],
+            live_store: false,
+            tail_from: u32::MAX,
+        };
+        let p = StepPlan {
+            a: self.target_pass(std::slice::from_ref(&run), false),
+            ..StepPlan::default()
+        };
+        let geo = self.geo();
+        let layout = Layout::new(&Shape::of(&p, &geo)?);
+        let words = plan::pack(&p, &layout, &geo)?;
+        self.upload_table(&words, false)?;
+        self.fold_program(&layout.a)?;
+        self.dev.synchronize()?;
+        self.set_tag(buffer, len)
     }
 }
 
@@ -2214,7 +2114,6 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
     /// image, tail and kept states all zero.
     pub fn slot_state_is_zero(&self, slot: Slot) -> bool {
         let s = slot as usize;
-        let (tail, tail_bytes) = self.slot_tail(slot);
         let k1 = self.cfg.draft_tokens as usize + 1;
         self.tables[s].iter().flatten().all(|&b| b == NULL_BLOCK)
             && self.slots[s].base.is_none()
@@ -2222,7 +2121,10 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 .read_words(self.live_addr(slot), self.image_stride)
                 .iter()
                 .all(|&x| x == 0)
-            && self.read_words(tail, tail_bytes).iter().all(|&x| x == 0)
+            && self
+                .tail_ranges(slot)
+                .into_iter()
+                .all(|(a, n)| self.read_words(a, n).iter().all(|&x| x == 0))
             && self
                 .read_words(self.hidden_row(slot, 0), k1 * self.dims.hidden as usize * 2)
                 .iter()
@@ -2257,34 +2159,98 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             self.tables[slot as usize][TARGET][i] = b;
         }
         self.slots[slot as usize].base = Some((NULL_STATE, 0));
-        let run = Run {
-            slot,
-            start: 0,
-            tokens: tokens.to_vec(),
-            src: 0,
-            src_pos: 0,
-            writes: Vec::new(),
-            live_store: false,
-            tail_from: u32::MAX,
-            kv: true,
-        };
-        let f = self.target(std::slice::from_ref(&run))?;
-        let hsz = u64::from(self.dims.hidden) * 2;
+        let c = self.scratch.caps;
+        // Pieces of at most the head's rows of pass A: the logits are the vocabulary a row.
+        let piece = c.rows_a.min(c.logits_t - c.rows_b).max(1);
+        let vocab = self.dims.vocab as usize;
+        let geo = self.geo();
         let mut logits = Vec::with_capacity(tokens.len());
-        // In pieces of 64 rows: the head's output is the whole vocabulary a row.
-        for piece in (0..n).collect::<Vec<_>>().chunks(64) {
-            let rows: Vec<u64> = piece
-                .iter()
-                .map(|&q| f.normed + u64::from(q) * hsz)
-                .collect();
-            logits.extend(self.head(&rows)?);
+        for (i, chunk) in tokens.chunks(piece).enumerate() {
+            let start = n32(i * piece);
+            let m = n32(chunk.len());
+            let run = Run {
+                slot,
+                start,
+                toks: Toks::Host(chunk.to_vec()),
+                src: if start == 0 {
+                    Src::Zero
+                } else {
+                    Src::Live(slot)
+                },
+                src_pos: start,
+                writes: Vec::new(),
+                live_store: true,
+                tail_from: u32::MAX,
+            };
+            let p = StepPlan {
+                a: self.target_pass(std::slice::from_ref(&run), true),
+                head_a: (0..m)
+                    .map(|j| Item::new(buf::H_A, j, buf::H_DST, j))
+                    .collect(),
+                ..StepPlan::default()
+            };
+            let layout = Layout::new(&Shape::of(&p, &geo)?);
+            let words = plan::pack(&p, &layout, &geo)?;
+            self.upload_table(&words, false)?;
+            self.program(&layout)?;
+            let mut host = vec![0f32; chunk.len() * vocab];
+            // SAFETY: `m · vocab` f32 the head wrote.
+            unsafe {
+                let dst =
+                    std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), host.len() * 4);
+                self.dev.download(self.scratch.logits_t.addr, dst)?;
+            }
+            logits.extend(host.chunks(vocab).map(<[f32]>::to_vec));
         }
-        drop(f);
         for b in 1..=blocks {
             self.zero_block(0, b)?;
         }
         self.reset_slot(slot)?;
         self.dev.synchronize()?;
         Ok(logits)
+    }
+}
+
+fn lcm(a: usize, b: usize) -> usize {
+    let (mut x, mut y) = (a, b);
+    while y != 0 {
+        (x, y) = (y, x % y);
+    }
+    a / x * b
+}
+
+/// What the scratch is sized for: the largest bucket's rows and tokens, every slot's
+/// drafts, and any decode rung's padded lists.
+fn capacities(cfg: &QwenCudaExecutorConfig, tail_cap: u32) -> Caps {
+    let r = cfg.buckets.iter().map(|b| b.max_seqs).max().unwrap_or(1) as usize;
+    let t = cfg.buckets.iter().map(|b| b.max_tokens).max().unwrap_or(1) as usize;
+    let k = cfg.draft_tokens as usize;
+    let tc = tail_cap as usize;
+    let bs = cfg.block_size as usize;
+    let rows = t.max(r * k);
+    let staged = (t + r * tc).max(r * k);
+    let positions = cfg.max_model_len + cfg.draft_tokens + 1;
+    Caps {
+        rows,
+        rows_a: t,
+        rows_b: (r * k).max(1),
+        staged,
+        conv_rows: 3 * r + staged,
+        drafter: rows,
+        head: r.max(r * k).max(64),
+        logits_t: r.max(64) + r * k,
+        drafting: r,
+        depth: k,
+        plain: r,
+        targets: r * (k + 1),
+        pad_conv: 3 * r + r * (1 + tc) + 3 * SEQ_WRITES * r + 4 * r,
+        pad_ab: r * (1 + tc) + r,
+        pad_o: r.max(r * k),
+        pad_h: r * (k + 1) + r * ((k + 1) / bs.max(1) + 1) + r * k + r,
+        pad_t: r * k + r,
+        table: 64,
+        readback: 1 + r + r * (k + 1) + r,
+        score_stride: positions as usize,
+        partial_rows: plan::partial_rows(n32(rows), positions) as usize,
     }
 }

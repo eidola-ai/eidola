@@ -1,7 +1,8 @@
 //! The Qwen3.8 kernels' bodies, compiled for the host, against the model crate's
 //! functions bit for bit (`qwen_common::cases`): every family through its grid function
 //! and the body a GPU compiles, threads in descending order and shared memory starting as
-//! garbage. Skipped, saying why, without a C++ compiler.
+//! garbage; and the quantiser's warp form against its reference form over edge blocks.
+//! Skipped, saying why, without a C++ compiler.
 
 mod qwen_common;
 
@@ -9,11 +10,15 @@ use qwen_common::cases;
 
 #[test]
 fn qwen_kernel_bodies_equal_the_model_crate() {
-    let Some(dev) = qwen_common::compiled() else {
+    let Some(lib) = qwen_common::library() else {
         return;
     };
+    let dev = qwen_common::host_device(lib.clone());
+    let reference = qwen_common::quant_thread_reference(lib);
     let mut failed = Vec::new();
-    for (name, outcome) in cases::all(&dev) {
+    let mut outcomes = cases::all(&dev);
+    outcomes.push(("quant forms", cases::quant_forms(&dev, &reference, 12)));
+    for (name, outcome) in outcomes {
         match outcome {
             Ok(()) => eprintln!("ok      {name}"),
             Err(e) => {

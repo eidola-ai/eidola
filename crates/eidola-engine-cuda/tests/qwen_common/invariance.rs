@@ -17,7 +17,7 @@ use eidola_engine::engine::{CacheScope, Engine};
 use eidola_engine::executor::{Executor, ExecutorError, Maintenance, StepInput, StepOutput};
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::ModelSpec;
-use eidola_engine_cuda::qwen::{QwenCudaExecutor, QwenDevice};
+use eidola_engine_cuda::qwen::{CudaGraphs, DecodePath, QwenCudaExecutor, QwenDevice};
 
 use super::pair::{Geometry, TestRng, VOCAB, cuda_config, fixture, keyed, request, sched};
 
@@ -104,8 +104,9 @@ pub struct Run<D: QwenDevice> {
 impl<D: QwenDevice> Run<D> {
     pub fn new(dev: D, k: u32, chunk: u32) -> Self {
         let model = fixture();
-        let ex =
+        let mut ex =
             QwenCudaExecutor::new(dev, &model, cuda_config(&Geometry::plain(k))).expect("executor");
+        super::apply_path(&mut ex);
         let rec = Recorder {
             inner: ex,
             book: Book::new(),
@@ -155,6 +156,8 @@ impl<D: QwenDevice> Run<D> {
             assert!(guard < 100_000, "no progress");
         }
         self.eng.flush().expect("flush");
+        let s = self.eng.executor().inner.decode_stats();
+        super::note_rung_steps(s.direct + s.replay);
     }
 
     pub fn book(&self) -> &Book {
@@ -377,4 +380,59 @@ pub fn deviation(a: &Book, b: &Book) -> String {
     format!(
         "{n} positions, top-1 {top}/{n}, BF16 ulp 0/1/2/3/4/5+ = {hist:?}, largest |Δlogit| {worst}"
     )
+}
+
+/// A workload decoding most of its steps as uniform decode rows: a greedy request beside
+/// sampled traffic of varied sizes, prefilled in chunks, at draft width `k`.
+pub fn workload<D: QwenDevice>(make: &dyn Fn() -> D, k: u32) -> (Book, HashMap<u64, Vec<u32>>) {
+    let mut rng = TestRng(3131);
+    let mut r = Run::new(make(), k, 6);
+    for (i, n) in [9usize, 4, 17, 12].into_iter().enumerate() {
+        let id = u64::try_from(i).expect("small");
+        let params = if i == 0 {
+            SamplingParams::greedy()
+        } else {
+            super::pair::params(id)
+        };
+        r.submit(id, rng.tokens(n, VOCAB), params, 12, CacheScope::Private);
+    }
+    r.run();
+    (r.book().clone(), r.outputs.clone())
+}
+
+/// The same workloads on every path of `paths` (eager, a rung's launches run directly, a
+/// rung's graph replayed), at widths 0 and 3: the same tokens and every logit's bits.
+pub fn across_paths<D: QwenDevice>(
+    make: &dyn Fn() -> D,
+    paths: &[(CudaGraphs, DecodePath)],
+) -> Vec<(String, Result<String, String>)> {
+    let mut out = Vec::new();
+    for k in [0u32, 3] {
+        let runs: Vec<_> = paths
+            .iter()
+            .map(|&(g, p)| {
+                let before = super::rung_steps();
+                let w = super::with_path(g, p, || workload(make, k));
+                (w, super::rung_steps() - before)
+            })
+            .collect();
+        let ((base, base_out), _) = &runs[0];
+        for (&(g, p), ((book, outs), rung)) in paths.iter().zip(&runs).skip(1) {
+            let res = (|| {
+                ensure(
+                    outs == base_out,
+                    format!("tokens differ on {p:?} with graphs {}", g.as_str()),
+                )?;
+                let n = agree(&format!("{p:?}"), base, book)?;
+                ensure(n >= 40, format!("only {n} prefixes compared"))?;
+                ensure(
+                    p == DecodePath::Eager || *rung > 0,
+                    "no step ran a rung".into(),
+                )?;
+                Ok(format!("{n} prefixes, {rung} rung steps"))
+            })();
+            out.push((format!("width {k}: {:?} == {:?}", paths[0].1, p), res));
+        }
+    }
+    out
 }

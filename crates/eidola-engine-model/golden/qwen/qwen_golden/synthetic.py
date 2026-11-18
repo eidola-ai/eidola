@@ -115,6 +115,15 @@ CONFIG = {
 }
 
 
+def head_dim_256() -> None:
+    """The released attention geometry at the fixture's sizes: 256-wide heads, 12 query
+    heads over 2 KV heads (the released grouping of 6), a rotary width of 64 with the
+    released `mrope_section`. Everything else as the committed fixture."""
+    TEXT_CONFIG["head_dim"] = 256
+    TEXT_CONFIG["num_attention_heads"] = 12
+    TEXT_CONFIG["rope_parameters"]["mrope_section"] = [11, 11, 10]
+
+
 class Gen:
     def __init__(self, seed: int):
         self.rng = np.random.default_rng(seed)
