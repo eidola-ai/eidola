@@ -216,11 +216,17 @@ pub struct DnSeq {
     pub live_after: u32,
     pub write_after: [u32; SEQ_WRITES],
     pub writes: u32,
-    /// The run's first block among the launch's, for the blocked form
-    /// ([`DnChunkParams`]); the token recurrence ignores it.
+    /// The blocked form's ([`DnChunkParams`]; the token recurrence ignores them): the
+    /// run's first block among the launch's, the absolute position of its relative 0,
+    /// its slot's first row of the tail cache, and the first relative position whose
+    /// intermediates it writes there.
     pub tile: u32,
+    pub pos0: u32,
+    pub tail_row: u32,
+    pub keep_from: u32,
+    pub reserved: u32,
 }
-layout!(DnSeq, 88, { first: 48, writes: 80, tile: 84 });
+layout!(DnSeq, 104, { first: 48, writes: 80, tile: 84, keep_from: 96 });
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -261,6 +267,12 @@ pub struct DnChunkParams {
     /// The queries and keys of each block and key head, rounded to TF32.
     pub qr: u64,
     pub kr: u64,
+    /// The keys, and per value head the rows of `T`, write strengths and cumulative
+    /// decays (`[tiles][v_heads][16][20]`), for the state kernel to keep in the tail cache.
+    pub kraw: u64,
+    pub rec: u64,
+    /// The layer's tail cache (`[rows][chunk_entry_floats]`).
+    pub tail: u64,
     pub state_offset: u64,
     pub seq_count: u32,
     /// Blocks the scratch holds: the intra kernel's grid.
@@ -271,9 +283,21 @@ pub struct DnChunkParams {
     pub v_dim: u32,
     /// Positions a block, 1 to [`CHUNK_TILE`].
     pub chunk: u32,
-    pub reserved: u32,
+    /// Rows of a slot's tail ring.
+    pub ring: u32,
 }
-layout!(DnChunkParams, 144, { state_offset: 104, seq_count: 112, chunk: 136 });
+layout!(DnChunkParams, 168, { state_offset: 128, seq_count: 136, chunk: 160, ring: 164 });
+
+/// Floats of a block's `rec` scratch per value head: 16 rows of 20 (a row of `T`, the write
+/// strength, the cumulative decay, two pad floats).
+pub const CHUNK_REC_FLOATS: usize = 16 * 20;
+
+/// Floats of one position's entry in the blocked DeltaNet's tail cache, for one layer:
+/// per key head its key (`k_dim`), then per value head its value and `Δ` (`v_dim` each),
+/// its row of `T` (16), its write strength, its cumulative decay and two pad floats.
+pub fn chunk_entry_floats(k_heads: u32, v_heads: u32, k_dim: u32, v_dim: u32) -> usize {
+    (k_heads * k_dim + v_heads * (2 * v_dim + CHUNK_TILE + 4)) as usize
+}
 
 /// The rows of a block's tile: the longest block of the blocked DeltaNet.
 pub const CHUNK_TILE: u32 = 16;

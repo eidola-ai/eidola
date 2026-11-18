@@ -127,6 +127,8 @@ pub struct TargetPass {
     pub attn: AttnRows,
     /// Conv rows the staging uses.
     pub conv_rows: u32,
+    /// Blocks of the blocked DeltaNet the runs take.
+    pub tiles: u32,
 }
 
 impl TargetPass {
@@ -213,6 +215,8 @@ pub struct TargetShape {
     pub runs: usize,
     pub staged: usize,
     pub conv_rows: usize,
+    /// Blocks of the blocked DeltaNet the launch's scratch is numbered for.
+    pub tiles: usize,
     pub stage_conv: usize,
     pub stage_ab: usize,
     pub post_conv: usize,
@@ -304,6 +308,7 @@ impl Shape {
                 runs: t.seqs.len(),
                 staged: t.window.len(),
                 conv_rows: t.conv_rows as usize,
+                tiles: t.tiles as usize,
                 stage_conv: t.stage_conv.len(),
                 stage_ab: t.stage_ab.len(),
                 post_conv: t.post_conv.len(),
@@ -399,6 +404,7 @@ pub struct TargetAt {
     pub token_copies: ItemsAt,
     pub seqs: Arr,
     pub runs: usize,
+    pub tiles: usize,
     pub window: Arr,
     pub conv_rows: usize,
     pub stage_conv: ItemsAt,
@@ -507,6 +513,7 @@ impl Arena {
             token_copies: self.items(s.token_copies),
             seqs: self.arr(s.runs * SEQ_WORDS),
             runs: s.runs,
+            tiles: s.tiles,
             window: self.arr(s.staged),
             conv_rows: s.conv_rows,
             stage_conv: self.items(s.stage_conv),
@@ -663,6 +670,9 @@ fn target(words: &mut [u32], at: &TargetAt, t: &TargetPass, geo: &Geo, what: &st
     exact(words, at.seqs, &words_of(&t.seqs), what)?;
     if t.window.len() > at.window.len || t.conv_rows as usize > at.conv_rows {
         return Err(refuse(format!("{what}: staged positions past the shape")));
+    }
+    if t.tiles as usize > at.tiles {
+        return Err(refuse(format!("{what}: blocks past the shape")));
     }
     // Positions past the plan's stage from conv row 0: computed, never read.
     let mut window = t.window.clone();

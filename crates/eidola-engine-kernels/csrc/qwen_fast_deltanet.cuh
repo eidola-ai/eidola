@@ -130,31 +130,101 @@ DS_FN float ztree(const float* pr, const float* dj) {
   return (p[0] + p[1]) + (p[2] + p[3]);
 }
 
+// ---- the tail cache ----
+//
+// A position's intermediates, kept from the step that first computes it until
+// its block's state is stored: they are what a later step needs of it, so a
+// decode step computes only its new rows. Per layer and tail row, an entry of
+// `entry_floats` floats: per key head the position's key (`k_dim`), then per
+// value head a record of `rec_floats`: its value and `Δ` (`v_dim` each), its
+// row of `T` (16), its write strength, its cumulative decay `G` and two pad
+// floats. Every value is the bits the position's own computation produced,
+// and a row of each quantity reads only rows at or before it, so a row
+// computed beside cached rows is the row computed with the whole block.
+
+DS_FN uint32_t rec_floats(const QwDnChunkParams& p) { return 2 * p.v_dim + kTile + 4; }
+// Floats of a row of the `rec` scratch: its row of `T`, `β`, `G` and two pad floats.
+constexpr uint32_t kRec = kTile + 4;
+DS_FN uint32_t entry_floats(const QwDnChunkParams& p) {
+  return p.k_heads * kKey + p.v_heads * rec_floats(p);
+}
+// The entry of the run's relative position `rel`.
+DS_FN float* entry_at(const QwDnChunkParams& p, const QwDnSeq& s, uint32_t rel) {
+  const uint64_t row = s.tail_row + (static_cast<uint64_t>(s.pos0) + rel) % p.ring;
+  return p.tail + row * entry_floats(p);
+}
+// Value head `h`'s record in an entry.
+DS_FN float* rec_at(const QwDnChunkParams& p, float* entry, uint32_t h) {
+  return entry + p.k_heads * kKey + h * rec_floats(p);
+}
+// The staged index of relative position `rel` (at or past `out_from`).
+DS_FN uint64_t staged_at(const QwDnSeq& s, uint32_t rel) {
+  return static_cast<uint64_t>(s.first) + (rel - s.out_from);
+}
+// The block's cached rows: those before the run's `out_from`.
+DS_FN uint32_t cached_rows(const QwDnSeq& s, uint32_t from, uint32_t n) {
+  if (s.out_from <= from) return 0;
+  return s.out_from - from < n ? s.out_from - from : n;
+}
+
+// Keeps a new position's intermediates, but `Δ`, in the tail cache, for the state
+// CTA of value head `h` and the slice of `cols` columns from `vbase`: the value's
+// columns, and from the first slice the row of `T`, `β`, `G` and (the key
+// head's first value head) the key, from what the intra kernel left of block
+// `tile`'s row `r`. The state kernel writes them, after every intra CTA has read
+// the cache: a long run's cached and kept positions can share a ring row.
+DS_FN void keep_row(const QwDnChunkParams& p, const QwDnSeq& s, uint32_t tile, uint32_t from,
+                    uint32_t r, uint32_t h, uint32_t vbase, uint32_t cols, uint32_t t,
+                    uint32_t threads) {
+  float* entry = entry_at(p, s, from + r);
+  float* rec = rec_at(p, entry, h);
+  const float* v = p.v + (staged_at(s, from + r) * p.v_heads + h) * p.v_dim + vbase;
+  for (uint32_t c = t; c < cols; c += threads) rec[vbase + c] = v[c];
+  if (vbase != 0) return;
+  const float* rs = p.rec + (tile_head(p, tile, h) * kTile + r) * kRec;
+  for (uint32_t j = t; j < kTile + 2; j += threads) rec[2 * p.v_dim + j] = rs[j];
+  const uint32_t group = p.v_heads / p.k_heads;
+  if (h % group != 0) return;
+  const uint32_t kh = h / group;
+  const float* k = p.kraw + (tile_key(p, tile, kh) * kTile + r) * kKey;
+  for (uint32_t i = t; i < kKey; i += threads) entry[kh * kKey + i] = k[i];
+}
+
 // ---- the block's state-free parts (`eidola_qwen_fast_dn_intra`) ----
 //
 // Every row past the block's `n` positions is zero in what it writes (`W`, `U`,
-// `P`, the rounded queries and keys), and every loop over rows stops at `n`,
-// so a decode step's block of one or two positions costs that much.
+// `P`, the rounded queries and keys), every row before its first new one (a
+// cached row) zero in `W`, `U`, `P` and the queries, and every loop over rows
+// runs over the new ones: a decode step's block costs its new position.
+
+// The key and query rows are 129 floats apart, so the threads of a pair's dot,
+// each reading another row at one column, meet in distinct banks.
+constexpr uint32_t kQK = kKey + 1;
+// The most value heads a key head groups.
+constexpr uint32_t kMaxGroup = 4;
 
 struct QD_ALIGN32 IntraShared {
-  float q[kTile][kKey];
-  float k[kTile][kKey];
+  float q[kTile][kQK];
+  float k[kTile][kQK];
   float kk[kTile][kTile];
   float qk[kTile][kTile];
-  float a[kTile][kTile];
-  float t[kTile][kTile];
-  float tc[kTile][kTile];
-  float tb[kTile][kTile];
-  float beta[kTile];
-  float g[kTile];
-  float c[kTile];
+  float a[kMaxGroup][kTile][kTile];
+  float t[kMaxGroup][kTile][kTile];
+  float tc[kMaxGroup][kTile][kTile];
+  float tb[kMaxGroup][kTile][kTile];
+  float beta[kMaxGroup][kTile];
+  float g[kMaxGroup][kTile];
+  float gc[kMaxGroup][kTile];
+  float c[kMaxGroup][kTile];
   uint32_t seq;
   uint32_t found;
 };
 
 // CTA (`x`, key head `kh`): block `x` of the launch, its key head's queries and
-// keys (and their TF32 roundings into the scratch), then each of the key
-// head's value heads: `W` (rounded to TF32), `U`, `P` and the factors.
+// keys (and their TF32 roundings, and the keys, into the scratch), then all of
+// the key head's value heads at once: `W` (rounded to TF32), `U`, `P`, the
+// factors, and the rows of `T`, write strengths and cumulative decays the state
+// kernel keeps in the tail cache.
 template <class P>
 DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, const P& par,
                           IntraShared& sh) {
@@ -175,159 +245,214 @@ DS_FN void dn_intra_block(const QwDnChunkParams& p, uint32_t x, uint32_t kh, con
   const QwDnSeq& s = p.seqs[sh.seq];
   const uint32_t from = (x - s.tile) * p.chunk;
   const uint32_t n = s.count - from < p.chunk ? s.count - from : p.chunk;
-  const uint32_t pos0 = s.first + from;
+  const uint32_t lo = cached_rows(s, from, n);
   const uint32_t key_dim = p.k_heads * kKey;
   const uint32_t group = p.v_heads / p.k_heads;
+  const uint32_t tr = 2 * p.v_dim;  // a record's row of `T`
+  // The key head's queries and keys (a cached row's key from the cache), and each
+  // value head's write strengths and log decays (a cached row's cumulative decay and
+  // row of `T` from the cache).
   par.run([&](uint32_t t) {
     const uint64_t tk = tile_key(p, x, kh) * kTile * kKey;
     for (uint32_t e = t; e < kTile * kKey; e += kThreads) {
       const uint32_t r = e / kKey;
       const uint32_t i = e % kKey;
-      const uint64_t at = static_cast<uint64_t>(pos0 + r) * key_dim + kh * kKey + i;
-      const float q = r < n ? p.q[at] : 0.0f;
-      const float k = r < n ? p.k[at] : 0.0f;
+      float q = 0.0f;
+      float k = 0.0f;
+      if (r < lo) {
+        k = entry_at(p, s, from + r)[kh * kKey + i];
+      } else if (r < n) {
+        const uint64_t at = staged_at(s, from + r) * key_dim + kh * kKey + i;
+        q = p.q[at];
+        k = p.k[at];
+      }
       sh.q[r][i] = q;
       sh.k[r][i] = k;
       p.qr[tk + e] = tf32_rna(q);
       p.kr[tk + e] = tf32_rna(k);
+      p.kraw[tk + e] = k;
+    }
+    for (uint32_t e = t; e < group * kTile; e += kThreads) {
+      const uint32_t gi = e / kTile;
+      const uint32_t r = e % kTile;
+      const uint32_t h = kh * group + gi;
+      float beta = 0.0f;
+      float g = 0.0f;
+      if (r < lo) {
+        const float* rec = rec_at(p, entry_at(p, s, from + r), h);
+        beta = rec[tr + kTile];
+        g = rec[tr + kTile + 1];  // the cached row's cumulative decay
+      } else if (r < n) {
+        const uint64_t at = staged_at(s, from + r) * p.v_heads + h;
+        beta = p.beta[at];
+        g = p.g[at];
+      }
+      sh.beta[gi][r] = beta;
+      sh.g[gi][r] = g;
+    }
+    for (uint32_t e = t; e < group * lo * kTile; e += kThreads) {
+      const uint32_t gi = e / (lo * kTile);
+      const uint32_t r = e / kTile % lo;
+      const uint32_t j = e % kTile;
+      sh.t[gi][r][j] = rec_at(p, entry_at(p, s, from + r), kh * group + gi)[tr + j];
     }
   });
-  // The lower triangle's dots over the present rows, pair `e` = (r, j ≤ r) in
-  // row order.
+  // The new rows' dots, pair `e` = (r, j ≤ r) in row order; and each value head's
+  // cumulative log decay: the cached rows' as they were computed, then on from them.
   par.run([&](uint32_t t) {
-    for (uint32_t e = t; e < n * (n + 1) / 2; e += kThreads) {
+    for (uint32_t e = lo * (lo + 1) / 2 + t; e < n * (n + 1) / 2; e += kThreads) {
       uint32_t r = 0;
       while ((r + 1) * (r + 2) / 2 <= e) ++r;
       const uint32_t j = e - r * (r + 1) / 2;
       sh.kk[r][j] = dot128(sh.k[r], sh.k[j]);
       sh.qk[r][j] = dot128(sh.q[r], sh.k[j]);
     }
-  });
-  for (uint32_t gi = 0; gi < group; ++gi) {
-    const uint32_t h = kh * group + gi;
-    const uint64_t th = tile_head(p, x, h);
-    float* pm = p.pm + th * kTile * kTile;
-    float* fac = p.fac + th * kFac;
-    float* w = p.w + th * kTile * kKey;
-    float* u = p.u + th * kTile * p.v_dim;
-    par.run([&](uint32_t t) {
-      if (t < kTile) {
-        const uint64_t at = static_cast<uint64_t>(pos0 + t) * p.v_heads + h;
-        sh.beta[t] = t < n ? p.beta[at] : 0.0f;
-        sh.g[t] = t < n ? p.g[at] : 0.0f;
-      }
-    });
-    // The cumulative log decay, every thread its own copy (the same sums).
-    float gc[kTile];
-    {
-      float acc = sh.g[0];
-      gc[0] = acc;
-      for (uint32_t r = 1; r < kTile; ++r) {
-        acc = acc + sh.g[r];
-        gc[r] = acc;
+    if (t < group) {
+      float acc = 0.0f;
+      for (uint32_t r = 0; r < kTile; ++r) {
+        if (r < lo) {
+          acc = sh.g[t][r];
+        } else if (r == 0) {
+          acc = sh.g[t][0];
+        } else {
+          acc = acc + sh.g[t][r];
+        }
+        sh.gc[t][r] = acc;
       }
     }
-    par.run([&](uint32_t t) {
-      for (uint32_t e = t; e < kTile * kTile; e += kThreads) {
-        const uint32_t r = e / kTile;
-        const uint32_t j = e % kTile;
-        float a = 0.0f;
-        float pv = 0.0f;
-        if (j <= r && r < n) {
-          const float d = ds::exp32(gc[r] - gc[j]);
-          pv = sh.qk[r][j] * d;
-          if (j < r) a = (sh.beta[r] * sh.kk[r][j]) * d;
+  });
+  par.run([&](uint32_t t) {
+    for (uint32_t e = t; e < group * kTile * kTile; e += kThreads) {
+      const uint32_t gi = e / (kTile * kTile);
+      const uint32_t r = e / kTile % kTile;
+      const uint32_t j = e % kTile;
+      const float* gc = sh.gc[gi];
+      float a = 0.0f;
+      float pv = 0.0f;
+      if (j <= r && r >= lo && r < n) {
+        const float d = ds::exp32(gc[r] - gc[j]);
+        pv = sh.qk[r][j] * d;
+        if (j < r) a = (sh.beta[gi][r] * sh.kk[r][j]) * d;
+      }
+      sh.a[gi][r][j] = a;
+      p.pm[(tile_head(p, x, kh * group + gi) * kTile + r) * kTile + j] = pv;
+    }
+    for (uint32_t e = t; e < group * kTile; e += kThreads) {
+      const uint32_t gi = e / kTile;
+      const uint32_t r = e % kTile;
+      const float* gc = sh.gc[gi];
+      float* fac = p.fac + tile_head(p, x, kh * group + gi) * kFac;
+      const float eg = ds::exp32(gc[r]);
+      sh.c[gi][r] = sh.beta[gi][r] * eg;
+      fac[kFacG + r] = eg;
+      fac[kFacGL + r] = ds::exp32(gc[p.chunk - 1] - gc[r]);
+      if (r == 0) fac[kFacGamma] = ds::exp32(gc[p.chunk - 1]);
+    }
+  });
+  // T, a column a thread for every value head: column j reads only its own entries
+  // above (the cached rows' as they were computed).
+  par.run([&](uint32_t t) {
+    if (t < group * kTile) {
+      const uint32_t gi = t / kTile;
+      const uint32_t j = t % kTile;
+      for (uint32_t r = lo; r < kTile; ++r) {
+        float v = 0.0f;
+        if (r == j) {
+          v = 1.0f;
+        } else if (r > j && r < n) {
+          float acc = sh.a[gi][r][j];
+          for (uint32_t m = j + 1; m < r; ++m) acc = acc + sh.a[gi][r][m] * sh.t[gi][m][j];
+          v = -acc;
         }
-        sh.a[r][j] = a;
-        pm[e] = pv;
+        sh.t[gi][r][j] = v;
       }
-      if (t < kTile) {
-        const float eg = ds::exp32(gc[t]);
-        sh.c[t] = sh.beta[t] * eg;
-        fac[kFacG + t] = eg;
-        fac[kFacGL + t] = ds::exp32(gc[p.chunk - 1] - gc[t]);
-        if (t == 0) fac[kFacGamma] = ds::exp32(gc[p.chunk - 1]);
-      }
-    });
-    // T, a column a thread: column j reads only its own entries above.
-    par.run([&](uint32_t t) {
-      if (t < kTile) {
-        const uint32_t j = t;
-        for (uint32_t r = 0; r < kTile; ++r) {
-          float v = 0.0f;
-          if (r == j) {
-            v = 1.0f;
-          } else if (r > j && r < n) {
-            float acc = sh.a[r][j];
-            for (uint32_t m = j + 1; m < r; ++m) acc = acc + sh.a[r][m] * sh.t[m][j];
-            v = -acc;
-          }
-          sh.t[r][j] = v;
-        }
-      }
-    });
-    par.run([&](uint32_t t) {
-      for (uint32_t e = t; e < kTile * kTile; e += kThreads) {
-        const uint32_t r = e / kTile;
-        const uint32_t j = e % kTile;
-        const bool in = j <= r && r < n;
-        sh.tc[r][j] = in ? sh.t[r][j] * sh.c[j] : 0.0f;
-        sh.tb[r][j] = in ? sh.t[r][j] * sh.beta[j] : 0.0f;
-      }
-    });
-    // W and U a column a thread, the column's present rows in registers.
-    par.run([&](uint32_t t) {
-      for (uint32_t i = t; i < kKey; i += kThreads) {
-        float col[kTile];
-        for (uint32_t j = 0; j < kTile; ++j) col[j] = sh.k[j][i];
+    }
+  });
+  par.run([&](uint32_t t) {
+    for (uint32_t e = t; e < group * kTile * kTile; e += kThreads) {
+      const uint32_t gi = e / (kTile * kTile);
+      const uint32_t r = e / kTile % kTile;
+      const uint32_t j = e % kTile;
+      const bool in = j <= r && r >= lo && r < n;
+      sh.tc[gi][r][j] = in ? sh.t[gi][r][j] * sh.c[gi][j] : 0.0f;
+      sh.tb[gi][r][j] = in ? sh.t[gi][r][j] * sh.beta[gi][j] : 0.0f;
+      p.rec[(tile_head(p, x, kh * group + gi) * kTile + r) * kRec + j] = sh.t[gi][r][j];
+    }
+    for (uint32_t e = t; e < group * kTile; e += kThreads) {
+      const uint32_t gi = e / kTile;
+      const uint32_t r = e % kTile;
+      float* rs = p.rec + (tile_head(p, x, kh * group + gi) * kTile + r) * kRec;
+      rs[kTile] = sh.beta[gi][r];
+      rs[kTile + 1] = sh.gc[gi][r];
+    }
+  });
+  // W and U a column a thread, the column's rows in registers (the key column once for
+  // every value head).
+  par.run([&](uint32_t t) {
+    for (uint32_t i = t; i < kKey; i += kThreads) {
+      float col[kTile];
+      for (uint32_t j = 0; j < kTile; ++j) col[j] = sh.k[j][i];
+      for (uint32_t gi = 0; gi < group; ++gi) {
+        float* w = p.w + tile_head(p, x, kh * group + gi) * kTile * kKey;
         for (uint32_t r = 0; r < kTile; ++r) {
           float acc = 0.0f;
-          if (r < n) {
-            for (uint32_t j = 0; j <= r; ++j) acc = acc + sh.tc[r][j] * col[j];
+          if (r >= lo && r < n) {
+            for (uint32_t j = 0; j <= r; ++j) acc = acc + sh.tc[gi][r][j] * col[j];
           }
           w[r * kKey + i] = tf32_rna(acc);
         }
       }
-      for (uint32_t c = t; c < p.v_dim; c += kThreads) {
-        float col[kTile];
-        for (uint32_t j = 0; j < kTile; ++j) {
-          col[j] =
-              j < n ? p.v[(static_cast<uint64_t>(pos0 + j) * p.v_heads + h) * p.v_dim + c] : 0.0f;
+    }
+    for (uint32_t e = t; e < group * p.v_dim; e += kThreads) {
+      const uint32_t gi = e / p.v_dim;
+      const uint32_t c = e % p.v_dim;
+      const uint32_t h = kh * group + gi;
+      float* u = p.u + tile_head(p, x, h) * kTile * p.v_dim;
+      float col[kTile];
+      for (uint32_t j = 0; j < kTile; ++j) {
+        float v = 0.0f;
+        if (j < lo) {
+          v = rec_at(p, entry_at(p, s, from + j), h)[c];
+        } else if (j < n) {
+          v = p.v[(staged_at(s, from + j) * p.v_heads + h) * p.v_dim + c];
         }
-        for (uint32_t r = 0; r < kTile; ++r) {
-          float acc = 0.0f;
-          if (r < n) {
-            for (uint32_t j = 0; j <= r; ++j) acc = acc + sh.tb[r][j] * col[j];
-          }
-          u[r * p.v_dim + c] = acc;
-        }
+        col[j] = v;
       }
-    });
-  }
+      for (uint32_t r = 0; r < kTile; ++r) {
+        float acc = 0.0f;
+        if (r >= lo && r < n) {
+          for (uint32_t j = 0; j <= r; ++j) acc = acc + sh.tb[gi][r][j] * col[j];
+        }
+        u[r * p.v_dim + c] = acc;
+      }
+    }
+  });
 }
 
 // ---- the state kernel (`eidola_qwen_fast_dn_state`) ----
 //
-// A CTA owns one run, one value head and `kSlice` of its value columns (a warp
-// 16 of them; columns are independent in the recurrence), and keeps that slice
-// of the state in registers across the run's blocks, transposed (`Sᵀ`, value
-// rows by key columns), in the tensor core's accumulator layout. Per block,
-// on tensor cores (`mma.sync` m16n8k8, TF32): `Xᵀ = Sᵀ Wᵀ` and `Yᵀ = Sᵀ qᵀ`
-// (16 K-steps over the key dimension, `Sᵀ` read as the left operand straight
-// from its accumulator registers), then element by element `Δ = U − X`, `o =
+// A CTA owns one run, one value head and `kSlice` of its value columns (two warps
+// 16 of them, each warp half the key dimension; columns are independent in the
+// recurrence), and keeps that slice of the state in registers across the run's
+// blocks, transposed (`Sᵀ`, value rows by key columns), in the tensor core's
+// accumulator layout. Per block, on tensor cores (`mma.sync` m16n8k8, TF32):
+// `Xᵀ = Sᵀ Wᵀ` and `Yᵀ = Sᵀ qᵀ` as two sums of 8 K-steps, one a half of the key
+// dimension (`Sᵀ` read as the left operand straight from its accumulator
+// registers), added low half first; then element by element `Δ = U − X`, `o =
 // exp(G) · Y + Z` (`ztree`, over `Δ` staged in shared memory), and for a whole
-// block `Sᵀ ← Sᵀ · γ + Δ′ᵀ K` (each warp its 16 rows by 16 eight-column tiles,
-// two K-steps, from zero accumulators). A K-step's eight products pair `Sᵀ`'s
+// block `Sᵀ ← Sᵀ · γ + Δ′ᵀ K` (each warp its 16 rows by its half's eight
+// eight-column tiles, two K-steps, from zero accumulators). A K-step's eight products pair `Sᵀ`'s
 // (or `Δ′ᵀ`'s) columns `2t, 2t + 1` with the right operand's rows `2t, 2t + 1`,
 // which is how the accumulator layout hands them over; a product's column is
 // its right operand's column alone, so a position's results read only its own
 // rows of `W`, `q` and `U`.
 
 constexpr uint32_t kSlice = 64;     // value columns of a state CTA
+constexpr uint32_t kStateThreads = 256;  // a state CTA: two warps a 16 columns
 constexpr uint32_t kWP = kKey + 8;  // W's and the queries' row stride
 constexpr uint32_t kKP = kKey + 4;  // the keys' row stride
 constexpr uint32_t kUP = kSlice + 4;
-constexpr uint32_t kDP = kTile + 4; // a warp's Δ rows
+constexpr uint32_t kDP = kTile + 4; // a column group's Δ and Y rows
 
 struct QD_ALIGN32 StateShared {
   float w[kTile][kWP];
@@ -336,7 +461,9 @@ struct QD_ALIGN32 StateShared {
   float u[kTile][kUP];
   float pm[kTile][kTile];
   float fac[kFac];
-  float d[kThreads / 32][16][kDP];
+  // Per 16 columns `[v][r]`: the high key half's X, then Δ; its Y, then the sum.
+  float d[kSlice / 16][16][kDP];
+  float y[kSlice / 16][16][kDP];
 };
 
 // The stores due once `done` positions have run (`done` a block boundary: the
@@ -404,22 +531,37 @@ inline void dn_state_host(const QwDnChunkParams& p, uint32_t x, uint32_t h) {
     float y[kTile][kSlice];
     for (uint32_t r = 0; r < kTile; ++r)
       for (uint32_t c = 0; c < cols; ++c) {
-        float xa = 0.0f;
-        float ya = 0.0f;
+        // Each half of the key dimension its own sum, then the halves added.
+        float xh[2] = {0.0f, 0.0f};
+        float yh[2] = {0.0f, 0.0f};
         for (uint32_t ks = 0; ks < kKey / 8; ++ks) {
-          xa = xa + host_kstep(w + r * kKey + 8 * ks, 1, st + 8 * ks * kSlice + c, kSlice);
-          ya = ya + host_kstep(qr + r * kKey + 8 * ks, 1, st + 8 * ks * kSlice + c, kSlice);
+          const uint32_t half = ks / (kKey / 16);
+          xh[half] = xh[half] + host_kstep(w + r * kKey + 8 * ks, 1, st + 8 * ks * kSlice + c, kSlice);
+          yh[half] = yh[half] + host_kstep(qr + r * kKey + 8 * ks, 1, st + 8 * ks * kSlice + c, kSlice);
         }
-        d[r][c] = u[r * p.v_dim + vbase + c] - xa;
-        y[r][c] = ya;
+        d[r][c] = u[r * p.v_dim + vbase + c] - (xh[0] + xh[1]);
+        y[r][c] = yh[0] + yh[1];
       }
+    // A cached row's `Δ` as it was computed; a kept new row's into the tail cache.
+    const uint32_t lo = cached_rows(s, from, n);
+    for (uint32_t r = 0; r < n; ++r)
+      for (uint32_t c = 0; c < cols; ++c) {
+        float* rec = rec_at(p, entry_at(p, s, from + r), h);
+        if (r < lo) {
+          d[r][c] = rec[p.v_dim + vbase + c];
+        } else if (from + r >= s.keep_from) {
+          rec[p.v_dim + vbase + c] = d[r][c];
+        }
+      }
+    for (uint32_t r = lo; r < n; ++r)
+      if (from + r >= s.keep_from) keep_row(p, s, s.tile + b, from, r, h, vbase, cols, 0, 1);
     for (uint32_t r = 0; r < n; ++r) {
       if (from + r < s.out_from) continue;
       for (uint32_t c = 0; c < cols; ++c) {
         float dj[kTile];
         for (uint32_t j = 0; j < kTile; ++j) dj[j] = d[j][c];
         const float o = fac[kFacG + r] * y[r][c] + ztree(pm + r * kTile, dj);
-        const uint64_t pos = s.first + from + r;
+        const uint64_t pos = staged_at(s, from + r);
         p.out[(pos * p.v_heads + h) * p.v_dim + vbase + c] = ds::bf16_round(o);
       }
     }

@@ -33,8 +33,8 @@
 //! - `dn_chunk`: the fast profile's blocked DeltaNet at the same width, blocks of 16
 //!   (both kernels, and the intra kernel alone): prefills of 2,048 positions as one, two
 //!   and four runs, one of 10,240 and 64 of 1,760 (tokens a second a layer, and the
-//!   48 layers' time); one and 64 decode rows recomputing their block from its boundary
-//!   with 0, 7 and 15 of its positions before the new one;
+//!   48 layers' time); one and 64 decode rows of one new position each, with 0, 7 and 15
+//!   of its block's positions before it read from the tail cache;
 //! - `cipher`: the idle cipher over one 157 MB state image;
 //! - `host`: a 157 MB image to and from page-locked host memory.
 //!
@@ -350,8 +350,8 @@ fn main() {
 
     // The fast profile's blocked DeltaNet (`dn_chunk`, blocks of 16) on the same inputs,
     // the log decay of 0.99 a position: prefills of 2,048 positions as one, two and four
-    // runs, one of 10,240, 64 runs of 1,760; decode rows recomputing their block from its
-    // boundary with 0, 7 and 15 positions of it before the new one.
+    // runs, one of 10,240, 64 runs of 1,760; decode rows of one new position, reading from
+    // the tail cache 0, 7 and 15 positions of its block before it.
     let lg: Vec<u8> = (0..max_pos * vh as usize)
         .flat_map(|_| 0.99f32.ln().to_le_bytes())
         .collect();
@@ -370,6 +370,17 @@ fn main() {
     );
     let perk = max_tiles * kh as usize * 4 * CHUNK_QK_FLOATS;
     let (sq, sk) = (alloc(&fast, perk, &mut keep), alloc(&fast, perk, &mut keep));
+    let skraw = alloc(&fast, perk, &mut keep);
+    let srec = alloc(
+        &fast,
+        max_tiles * vh as usize * CHUNK_REC_FLOATS * 4,
+        &mut keep,
+    );
+    // A tail cache of 32 rows a sequence for 64 sequences: a decode row's earlier
+    // positions are read from it, its new one kept there, as in serving.
+    let ring = 32u32;
+    let entry = chunk_entry_floats(kh, vh, kd, vd);
+    let tail = alloc(&fast, 64 * ring as usize * entry * 4, &mut keep);
     // (rows, fold, outputs).
     for (rows, fold, outs) in [
         (1u32, 0u32, 2048u32),
@@ -385,13 +396,18 @@ fn main() {
         let mut tile = 0;
         let seqs: Vec<DnSeq> = (0..rows)
             .map(|r| {
+                let count = fold + outs;
                 let d = DnSeq {
                     src: states + u64::from(r) * state as u64,
-                    first: r * (fold + outs),
-                    count: fold + outs,
+                    first: r * outs,
+                    count,
                     out_from: fold,
-                    live_after: fold + outs + 1,
+                    live_after: count + 1,
                     tile,
+                    pos0: 0,
+                    tail_row: (r % 64) * ring,
+                    // The positions from the last boundary on are kept.
+                    keep_from: count / chunk * chunk,
                     ..DnSeq::default()
                 };
                 tile += (fold + outs).div_ceil(chunk);
@@ -428,6 +444,9 @@ fn main() {
             fac: sf,
             qr: sq,
             kr: sk,
+            kraw: skraw,
+            rec: srec,
+            tail,
             state_offset: 0,
             seq_count: rows,
             tiles: tile,
@@ -436,7 +455,7 @@ fn main() {
             k_dim: kd,
             v_dim: vd,
             chunk,
-            reserved: 0,
+            ring,
         };
         let n = if outs > 100 { 3 } else { it };
         // SAFETY: every position, state and scratch block the descriptors name is

@@ -379,13 +379,19 @@ pub fn recurrent_kv_block_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
 }
 
 /// Device bytes a recurrent model's executor keeps per seat: its live
-/// state image, its tail of `KV_BLOCK_SIZE − 1 + DRAFT_TOKENS` positions,
-/// and `DRAFT_TOKENS + 1` kept normed states. Saturates.
+/// state image, its tail of `KV_BLOCK_SIZE − 1 + DRAFT_TOKENS` positions
+/// (the raw inputs, and the fast profile's blocked DeltaNet's tail cache:
+/// [`HybridDims::chunk_tail_bytes_per_position`]), and `DRAFT_TOKENS + 1`
+/// kept normed states. Saturates.
 pub fn recurrent_seat_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
     let k = u64::from(sizing.draft_tokens);
-    let tail = u64::from(sizing.kv_block_size.max(1)) - 1 + k;
+    let tail = (u64::from(sizing.kv_block_size.max(1)) - 1 + k).max(1);
     dims.state_image_bytes()
-        .saturating_add(tail.saturating_mul(dims.tail_bytes_per_position()))
+        .saturating_add(
+            tail.saturating_mul(
+                dims.tail_bytes_per_position() + dims.chunk_tail_bytes_per_position(),
+            ),
+        )
         .saturating_add((k + 1).saturating_mul(dims.kept_row_bytes()))
 }
 

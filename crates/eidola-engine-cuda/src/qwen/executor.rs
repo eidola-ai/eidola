@@ -178,6 +178,11 @@ impl Dims {
         })
     }
 
+    /// Floats of a position's entry in the blocked DeltaNet's tail cache, a layer.
+    fn chunk_entry(&self) -> usize {
+        chunk_entry_floats(self.k_heads, self.v_heads, self.k_dim, self.v_dim)
+    }
+
     /// The widest K of an FP8 linear.
     fn k_max(&self) -> usize {
         [
@@ -269,6 +274,9 @@ pub struct QwenCudaExecutor<D: QwenDevice> {
     /// and the `a`, `b` rows (`2 · v_heads` f32).
     tails_conv: Alloc,
     tails_ab: Alloc,
+    /// The blocked DeltaNet's tail cache: per DeltaNet layer `[slot][ring]` entries of
+    /// a position's intermediates (8 bytes without blocks).
+    tails_dn: Alloc,
     tail_cap: u32,
     /// Kept normed states: per slot `[k + 1][hidden]` BF16.
     hiddens: Alloc,
@@ -403,6 +411,14 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let tail_rows = dn_layers * (slots_n + 1) * tail_cap.max(1) as usize;
         let tails_conv = Alloc::new(&dev, tail_rows * dims.conv_dim() as usize * 4)?;
         let tails_ab = Alloc::new(&dev, tail_rows * 2 * dims.v_heads as usize * 4)?;
+        let tails_dn = Alloc::new(
+            &dev,
+            if dev.block_deltanet() {
+                tail_rows * dims.chunk_entry() * 4
+            } else {
+                8
+            },
+        )?;
         let hiddens = Alloc::new(
             &dev,
             (slots_n + 1) * (k as usize + 1) * dims.hidden as usize * 2,
@@ -479,6 +495,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             live,
             tails_conv,
             tails_ab,
+            tails_dn,
             tail_cap,
             hiddens,
             spec,
@@ -548,10 +565,14 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let cap = self.tail_ring() as usize;
         let layer_rows = self.tail_layer_rows();
         let mut r = Vec::new();
-        for (arr, row) in [
+        let mut arrays = vec![
             (&self.tails_conv, self.dims.conv_dim() as usize * 4),
             (&self.tails_ab, 2 * self.dims.v_heads as usize * 4),
-        ] {
+        ];
+        if self.blocked() {
+            arrays.push((&self.tails_dn, self.dims.chunk_entry() * 4));
+        }
+        for (arr, row) in arrays {
             for l in 0..self.dn_layers() {
                 let at = (l * layer_rows + slot as usize * cap) * row;
                 r.push((arr.addr + at as u64, cap * row));
@@ -1053,9 +1074,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
     /// One target pass over `runs`: its DeltaNet sequences, staging and keeping copies,
     /// and attention rows, the runs' token rows consecutive from 0.
     fn target_pass(&self, runs: &[Run], kv: bool) -> TargetPass {
-        let bs = self.cfg.block_size;
         let rpi = self.rows_per_image();
-        let fast = self.dev.profile() == QwenProfile::Fast;
         let (blocked, chunk) = (self.blocked(), self.chunk());
         let mut tp = TargetPass::default();
         let (mut t, mut st, mut cv, mut tile) = (0u32, 0u32, 0u32, 0u32);
@@ -1086,6 +1105,27 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                     r.slot
                 );
             }
+            if blocked {
+                let (cvn, stn) = self.blocked_staging(r, &mut tp, t, st, cv, tile);
+                tile += (f + n).div_ceil(chunk);
+                for j in 0..n {
+                    let pos = r.start + j;
+                    if pos >= r.tail_from {
+                        let ti = self.tail_index(r.slot, pos);
+                        tp.post_conv
+                            .push(Item::new(buf::C_CONV, cv + 3 + j, buf::C_TAIL, ti));
+                        tp.post_ab
+                            .push(Item::new(buf::A_STAGED, st + j, buf::A_TAIL, ti));
+                    }
+                    tp.o_rows
+                        .push(Item::new(buf::O_STAGED, st + j, buf::O_ROWS, t + j));
+                }
+                self.attention_rows(r, &mut tp, t, kv);
+                t += n;
+                st = stn;
+                cv = cvn;
+                continue;
+            }
             let mut seq = DnSeq {
                 src: self.src_addr(r.src),
                 live: if r.live_store {
@@ -1101,9 +1141,6 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 tile,
                 ..DnSeq::default()
             };
-            if blocked {
-                tile += (f + n).div_ceil(chunk);
-            }
             for (j, &(len, b)) in r.writes.iter().enumerate() {
                 seq.write_after[j] = len - r.src_pos;
                 seq.write_dst[j] = self.state_addr(b);
@@ -1160,38 +1197,152 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 }
                 tp.o_rows
                     .push(Item::new(buf::O_STAGED, st + f + j, buf::O_ROWS, t + j));
-                tp.attn.rope.push(pos);
-                tp.attn.query.push(pos);
-                tp.attn.targets.push(if kv {
-                    self.wblk(r.slot, TARGET, pos) * bs + pos % bs
-                } else {
-                    NO_TARGET
-                });
-                if !fast {
-                    tp.attn.tables.extend(self.table_row(r.slot, TARGET));
-                }
             }
-            tp.tokens.extend_from_slice(&r.host);
-            tp.tokens.extend(r.lanes.iter().map(|_| PAD_TOKEN));
-            tp.token_copies.extend(
-                r.lanes
-                    .iter()
-                    .enumerate()
-                    .map(|(j, &lane)| Item::new(buf::T_LANES, lane, buf::T_DST, t + nh + n32(j))),
-            );
-            if fast && n > 0 {
-                tp.attn
-                    .requests
-                    .push(plan::request(t, n, r.start + n - 1, bs, &mut |j| {
-                        self.blk(r.slot, TARGET, j * bs)
-                    }));
-            }
+            self.attention_rows(r, &mut tp, t, kv);
             t += n;
             st += f + n;
             cv += 3 + f + n;
         }
         tp.conv_rows = cv;
+        tp.tiles = tile;
         tp
+    }
+
+    /// A run's token rows, draft copies and attention rows, its first token row `t`.
+    fn attention_rows(&self, r: &Run, tp: &mut TargetPass, t: u32, kv: bool) {
+        let bs = self.cfg.block_size;
+        let fast = self.dev.profile() == QwenProfile::Fast;
+        let (nh, n) = (r.n_host(), r.n());
+        for j in 0..n {
+            let pos = r.start + j;
+            tp.attn.rope.push(pos);
+            tp.attn.query.push(pos);
+            tp.attn.targets.push(if kv {
+                self.wblk(r.slot, TARGET, pos) * bs + pos % bs
+            } else {
+                NO_TARGET
+            });
+            if !fast {
+                tp.attn.tables.extend(self.table_row(r.slot, TARGET));
+            }
+        }
+        tp.tokens.extend_from_slice(&r.host);
+        tp.tokens.extend(r.lanes.iter().map(|_| PAD_TOKEN));
+        tp.token_copies.extend(
+            r.lanes
+                .iter()
+                .enumerate()
+                .map(|(j, &lane)| Item::new(buf::T_LANES, lane, buf::T_DST, t + nh + n32(j))),
+        );
+        if fast && n > 0 {
+            tp.attn
+                .requests
+                .push(plan::request(t, n, r.start + n - 1, bs, &mut |j| {
+                    self.blk(r.slot, TARGET, j * bs)
+                }));
+        }
+    }
+
+    /// The raw convolution input row of `r`'s slot at position `pos` before the run's new
+    /// positions (`pos < r.start`): from the source's history before its position, else
+    /// from the tail. `None` before the sequence's start.
+    fn raw_row_before(&self, r: &Run, pos: i64) -> (u32, u32) {
+        let src_pos = i64::from(r.src_pos);
+        if pos < src_pos {
+            // The history holds the three positions before the source's.
+            let j = u32::try_from(pos - (src_pos - 3)).expect("a history row");
+            self.hist_row(r.src, j)
+        } else {
+            let p = u32::try_from(pos).expect("a position");
+            (buf::C_TAIL, self.tail_index(r.slot, p))
+        }
+    }
+
+    /// The blocked DeltaNet's staging of run `r` (its first token row `t`, staged
+    /// position `st`, conv row `cv` and block `tile`): its sequence; the three raw rows
+    /// before its new positions, then the new rows, as conv rows; the new positions'
+    /// `a`/`b` rows; and the convolution histories its state writes and live store take.
+    /// The positions it keeps from earlier rows are read from the tail cache, not staged.
+    /// Returns the conv row and staged position after it.
+    fn blocked_staging(
+        &self,
+        r: &Run,
+        tp: &mut TargetPass,
+        t: u32,
+        st: u32,
+        cv: u32,
+        tile: u32,
+    ) -> (u32, u32) {
+        let rpi = self.rows_per_image();
+        let (f, nh, n) = (r.fold(), r.n_host(), r.n());
+        let mut seq = DnSeq {
+            src: self.src_addr(r.src),
+            live: if r.live_store {
+                self.live_addr(r.slot)
+            } else {
+                0
+            },
+            first: st,
+            count: f + n,
+            out_from: f,
+            live_after: if r.live_store { f + nh } else { f + n + 1 },
+            writes: n32(r.writes.len()),
+            tile,
+            pos0: r.src_pos,
+            tail_row: r.slot * self.tail_ring(),
+            keep_from: if r.tail_from == u32::MAX {
+                u32::MAX
+            } else {
+                r.tail_from - r.src_pos
+            },
+            ..DnSeq::default()
+        };
+        for (j, &(len, b)) in r.writes.iter().enumerate() {
+            seq.write_after[j] = len - r.src_pos;
+            seq.write_dst[j] = self.state_addr(b);
+        }
+        tp.seqs.push(seq);
+        tp.window.extend((0..n).map(|j| cv + j));
+        // Conv row `cv + i` holds position `start − 3 + i`.
+        let first = i64::from(r.start) - 3;
+        for j in 0..3u32 {
+            let (b, row) = self.raw_row_before(r, first + i64::from(j));
+            tp.stage_conv.push(Item::new(b, row, buf::C_CONV, cv + j));
+        }
+        for j in 0..n {
+            tp.stage_conv
+                .push(Item::new(buf::C_NEW, t + j, buf::C_CONV, cv + 3 + j));
+            tp.stage_ab
+                .push(Item::new(buf::A_NEW, t + j, buf::A_STAGED, st + j));
+        }
+        // The conv history after `len`: positions `len − 3 .. len`, staged from
+        // `start − 3` on and read where they are before.
+        let history = |len: u32, j: u32| -> (u32, u32) {
+            let pos = i64::from(len) - 3 + i64::from(j);
+            if pos >= first {
+                (
+                    buf::C_CONV,
+                    cv + u32::try_from(pos - first).expect("a staged row"),
+                )
+            } else {
+                self.raw_row_before(r, pos)
+            }
+        };
+        for &(len, b) in &r.writes {
+            for j in 0..3 {
+                let (sb, sr) = history(len, j);
+                tp.post_conv
+                    .push(Item::new(sb, sr, buf::C_STATES, b * rpi + j));
+            }
+        }
+        if r.live_store {
+            for j in 0..3 {
+                let (sb, sr) = history(r.host_end(), j);
+                tp.post_conv
+                    .push(Item::new(sb, sr, buf::C_LIVE, r.slot * rpi + j));
+            }
+        }
+        (cv + 3 + n, st + n)
     }
 
     /// The drafter's attention rows for rows at positions `s` of `slot`s, consecutive
@@ -1511,6 +1662,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         // A row: its folds, its host token and its drafts staged; the state writes, the
         // live image and every new position into the tail kept.
         let t = &mut s.target;
+        t.tiles = r * (fold + 1 + wu).div_ceil(self.chunk() as usize);
         t.staged = r * (fold + 1 + wu);
         t.conv_rows = 3 * r + t.staged;
         t.stage_conv = 3 * r + t.staged;
@@ -2031,6 +2183,9 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let t = &s.target;
         if t.staged > c.staged || t.conv_rows > c.conv_rows || t.attn.rows > c.rows {
             return bad("the target's rows");
+        }
+        if t.tiles > c.tiles {
+            return bad("the blocked DeltaNet's blocks");
         }
         if t.stage_conv.max(t.post_conv) > c.pad_conv || t.stage_ab.max(t.post_ab) > c.pad_ab {
             return bad("pad rows");

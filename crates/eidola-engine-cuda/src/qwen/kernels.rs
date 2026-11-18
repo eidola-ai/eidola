@@ -434,7 +434,8 @@ pub fn dn_rec_grid(p: &DnRecParams) -> Result<[u32; 3]> {
 fn dn_chunk_check(p: &DnChunkParams) -> Result<()> {
     ensure(
         [
-            p.seqs, p.q, p.k, p.v, p.beta, p.g, p.out, p.w, p.u, p.pm, p.fac, p.qr, p.kr,
+            p.seqs, p.q, p.k, p.v, p.beta, p.g, p.out, p.w, p.u, p.pm, p.fac, p.qr, p.kr, p.kraw,
+            p.rec, p.tail,
         ]
         .iter()
         .all(|&a| a != 0),
@@ -446,14 +447,14 @@ fn dn_chunk_check(p: &DnChunkParams) -> Result<()> {
         "dn chunk: value dim a multiple of 16, at most 128",
     )?;
     ensure(
-        p.k_heads > 0 && p.v_heads.is_multiple_of(p.k_heads),
-        "dn chunk: heads",
+        p.k_heads > 0 && p.v_heads.is_multiple_of(p.k_heads) && p.v_heads / p.k_heads <= 4,
+        "dn chunk: at most four value heads a key head",
     )?;
     ensure(
         p.chunk >= 1 && p.chunk <= CHUNK_TILE,
         "dn chunk: a block of 1 to 16 positions",
     )?;
-    ensure(p.reserved == 0, "dn chunk: reserved")?;
+    ensure(p.ring > 0, "dn chunk: a tail ring of at least one row")?;
     ensure(
         p.k_heads <= MAX_GRID_Y && p.v_heads <= MAX_GRID_Y,
         "dn chunk: heads",

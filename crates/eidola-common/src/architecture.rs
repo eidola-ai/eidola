@@ -346,12 +346,24 @@ impl HybridDims {
 
     /// One block's scratch of the fast profile's blocked DeltaNet (16
     /// positions at most), f32: per value head `W` (16 × key dim), `U` (16 ×
-    /// value dim), `P` (16 × 16) and 48 factors; per key head the block's
-    /// queries and keys rounded (16 × key dim each).
+    /// value dim), `P` (16 × 16), 48 factors and 16 rows of 20 for the tail
+    /// cache (a row of `T`, the write strength and the cumulative decay); per
+    /// key head the block's queries and keys rounded and its keys (16 × key
+    /// dim each).
     pub const fn chunk_tile_bytes(&self) -> u64 {
         let t = 16;
-        self.v_heads * (t * self.k_dim + t * self.v_dim + t * t + 48) * 4
-            + self.k_heads * 2 * t * self.k_dim * 4
+        self.v_heads * (t * self.k_dim + t * self.v_dim + t * t + 48 + t * 20) * 4
+            + self.k_heads * 3 * t * self.k_dim * 4
+    }
+
+    /// One position's entry in a seat's tail cache of the fast profile's
+    /// blocked DeltaNet, every DeltaNet layer: per key head the key, per value
+    /// head the value and its `Δ`, its row of `T` (16), its write strength, its
+    /// cumulative decay and two pad floats, f32.
+    pub const fn chunk_tail_bytes_per_position(&self) -> u64 {
+        self.deltanet_layers
+            * (self.k_heads * self.k_dim + self.v_heads * (2 * self.v_dim + 20))
+            * 4
     }
 
     /// One convolution input row of the staging, f32.

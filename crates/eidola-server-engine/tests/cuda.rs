@@ -1164,8 +1164,8 @@ fn the_nodes_qwen_pools_and_scratch_are_the_shared_counts() {
 
         // The pools, in the executor's order after its weights: the target's KV, with
         // drafting the drafter's KV and its taps, the states, then each seat's live
-        // image, tail (its convolution rows, then its decay and write rows) and kept
-        // states, the padding seat among them.
+        // image, tail (its convolution rows, then its decay and write rows, then the
+        // blocked DeltaNet's tail cache) and kept states, the padding seat among them.
         let blocks = u64::from(exec_config.num_blocks) + 1;
         let b = u64::from(s.kv_block_size);
         let mut want = vec![blocks * b * dims.kv_bytes_per_position()];
@@ -1181,7 +1181,7 @@ fn the_nodes_qwen_pools_and_scratch_are_the_shared_counts() {
                 .iter()
                 .position(|&(bytes, _)| bytes == want[0])
                 .expect("the target's pool");
-            let n = want.len() + 4;
+            let n = want.len() + 5;
             (
                 t.allocs[at + n - 1].1,
                 t.allocs[at..at + n].iter().map(|a| a.0).collect::<Vec<_>>(),

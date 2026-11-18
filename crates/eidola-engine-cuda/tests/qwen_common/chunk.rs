@@ -156,13 +156,15 @@ pub fn model(r: &HeadRun<'_>, s0: &[f32], chunk: usize) -> (Vec<f32>, Vec<Vec<f3
         let mut y = vec![vec![0.0f32; vd]; TILE];
         for row in 0..TILE {
             for col in 0..vd {
-                let (mut x, mut yy) = (0.0f32, 0.0f32);
+                // Each half of the key dimension its own sum, the low half's first.
+                let (mut x, mut yy) = ([0.0f32; 2], [0.0f32; 2]);
                 for ks_ in 0..KD / 8 {
-                    x += kstep(|k| w[row][k], |k| s[k * vd + col], 8 * ks_);
-                    yy += kstep(|k| qs[row][k], |k| s[k * vd + col], 8 * ks_);
+                    let half = ks_ / (KD / 16);
+                    x[half] += kstep(|k| w[row][k], |k| s[k * vd + col], 8 * ks_);
+                    yy[half] += kstep(|k| qs[row][k], |k| s[k * vd + col], 8 * ks_);
                 }
-                delta[row][col] = uu[row][col] - x;
-                y[row][col] = yy;
+                delta[row][col] = uu[row][col] - (x[0] + x[1]);
+                y[row][col] = yy[0] + yy[1];
             }
         }
         for row in 0..n {
@@ -334,15 +336,53 @@ impl HeadOwned {
     }
 }
 
-/// One run of a launch: staged positions `first .. first + count`, a source state (`None`:
-/// zero), outputs from `out_from`, and states stored after the given counts.
+/// A tail cache on a device: `ring` rows a slot of one layer's entries, for `slots` slots.
+pub struct Tail {
+    pub buf: Buf,
+    pub ring: usize,
+}
+
+impl Tail {
+    pub fn new<D: QwenDevice>(dev: &D, inp: &Inputs, slots: usize, ring: usize) -> Tail {
+        let entry = chunk_entry_floats(u(inp.k_heads), u(inp.v_heads), 128, u(inp.vd));
+        Tail {
+            buf: zeros(dev, slots * ring * entry * 4),
+            ring,
+        }
+    }
+}
+
+/// One run of a launch, as the executor lays one out: its relative 0 at absolute position
+/// `pos0` (a block boundary) from a source state (`None`: zero), its `cached` positions
+/// read from slot `slot`'s tail cache, its `new` positions staged at `first ..` (outputs
+/// there), states stored after the given relative counts, and the new positions from
+/// relative `keep_from` on kept in the tail cache.
 #[derive(Clone)]
 pub struct RunSpec {
     pub first: usize,
-    pub count: usize,
+    pub cached: usize,
+    pub new: usize,
     pub src: Option<Vec<f32>>,
-    pub out_from: usize,
     pub writes: Vec<usize>,
+    pub pos0: usize,
+    pub slot: usize,
+    pub keep_from: usize,
+}
+
+impl RunSpec {
+    /// A fresh run from position 0: no cached positions, nothing kept.
+    pub fn fresh(first: usize, new: usize, src: Option<Vec<f32>>, writes: Vec<usize>) -> Self {
+        RunSpec {
+            first,
+            cached: 0,
+            new,
+            src,
+            writes,
+            pos0: 0,
+            slot: 0,
+            keep_from: usize::MAX,
+        }
+    }
 }
 
 /// What one launch returns: every staged position's output row (zeros where none was
@@ -352,39 +392,55 @@ pub struct Launched {
     pub states: Vec<Vec<Vec<f32>>>,
 }
 
-/// One `dn_chunk` launch of `runs` over `inp` at block length `chunk`.
+/// One `dn_chunk` launch of `runs` over `inp` at block length `chunk`, over `tail`.
 pub fn launch<D: QwenDevice>(
     dev: &D,
     inp: &Inputs,
     runs: &[RunSpec],
     chunk: usize,
+    tail: &Tail,
 ) -> Result<Launched, String> {
-    let positions = inp.q.len() / (inp.k_heads * KD);
+    let positions = (inp.q.len() / (inp.k_heads * KD)).max(1);
     let sl = inp.state_len();
-    let (qb, kb, vb) = (buf(dev, &inp.q), buf(dev, &inp.k), buf(dev, &inp.v));
-    let (bb, gb) = (buf(dev, &inp.beta), buf(dev, &inp.g));
+    let pad = |x: &Vec<f32>| {
+        if x.is_empty() {
+            vec![0.0; 4]
+        } else {
+            x.clone()
+        }
+    };
+    let (qb, kb, vb) = (
+        buf(dev, &pad(&inp.q)),
+        buf(dev, &pad(&inp.k)),
+        buf(dev, &pad(&inp.v)),
+    );
+    let (bb, gb) = (buf(dev, &pad(&inp.beta)), buf(dev, &pad(&inp.g)));
     let ob = zeros(dev, positions * inp.v_heads * inp.vd * 4);
     let mut seqs = Vec::new();
     let mut keep: Vec<(Option<Buf>, Vec<Buf>)> = Vec::new();
     let mut tile = 0usize;
     for r in runs {
+        let count = r.cached + r.new;
         let src = r.src.as_ref().map(|s| buf(dev, s));
         let wb: Vec<Buf> = r.writes.iter().map(|_| zeros(dev, sl * 4)).collect();
         let mut d = DnSeq {
             src: src.as_ref().map_or(0, |b| b.addr),
             first: u(r.first),
-            count: u(r.count),
-            out_from: u(r.out_from),
-            live_after: u(r.count + 1),
+            count: u(count),
+            out_from: u(r.cached),
+            live_after: u(count + 1),
             writes: u(r.writes.len()),
             tile: u(tile),
+            pos0: u(r.pos0),
+            tail_row: u(r.slot * tail.ring),
+            keep_from: u32::try_from(r.keep_from).unwrap_or(u32::MAX),
             ..DnSeq::default()
         };
         for (w, (&at, b)) in r.writes.iter().zip(&wb).enumerate() {
             d.write_after[w] = u(at);
             d.write_dst[w] = b.addr;
         }
-        tile += r.count.div_ceil(chunk);
+        tile += count.div_ceil(chunk);
         seqs.push(d);
         keep.push((src, wb));
     }
@@ -398,7 +454,8 @@ pub fn launch<D: QwenDevice>(
         zeros(dev, n * ff * 4),
     );
     let nk = tile.max(1) * inp.k_heads * CHUNK_QK_FLOATS * 4;
-    let (qr, kr) = (zeros(dev, nk), zeros(dev, nk));
+    let (qr, kr, kraw) = (zeros(dev, nk), zeros(dev, nk), zeros(dev, nk));
+    let rec = zeros(dev, n * CHUNK_REC_FLOATS * 4);
     let p = DnChunkParams {
         seqs: sb.addr,
         q: qb.addr,
@@ -413,6 +470,9 @@ pub fn launch<D: QwenDevice>(
         fac: fac.addr,
         qr: qr.addr,
         kr: kr.addr,
+        kraw: kraw.addr,
+        rec: rec.addr,
+        tail: tail.buf.addr,
         state_offset: 0,
         seq_count: u(runs.len()),
         tiles: u(tile),
@@ -421,7 +481,7 @@ pub fn launch<D: QwenDevice>(
         k_dim: 128,
         v_dim: u(inp.vd),
         chunk: u(chunk),
-        reserved: 0,
+        ring: u(tail.ring),
     };
     // SAFETY: the buffers hold what the struct names.
     unsafe { dev.dn_chunk(&p) }.map_err(|e| e.to_string())?;
@@ -435,6 +495,59 @@ pub fn launch<D: QwenDevice>(
     })
 }
 
+/// One sequence served the way the executor serves it, over slot `slot` of a tail cache:
+/// its base (a boundary) and the state there, steps of new positions from the base's tail,
+/// each reading the positions since the base from the cache, keeping those from the
+/// boundary its committed positions reach, and storing the state there.
+pub struct Session<'a> {
+    pub inp: &'a Inputs,
+    pub chunk: usize,
+    pub slot: usize,
+    pub base: usize,
+    pub state: Option<Vec<f32>>,
+}
+
+impl Session<'_> {
+    /// Positions `start .. start + committed + drafts` (`start` at or past the base, the
+    /// cache holding `base .. start`): returns their outputs (`[n][v_heads][vd]`). The
+    /// first `committed` advance the base to the last boundary they reach.
+    pub fn step<D: QwenDevice>(
+        &mut self,
+        dev: &D,
+        tail: &Tail,
+        start: usize,
+        committed: usize,
+        drafts: usize,
+    ) -> Result<Vec<f32>, String> {
+        let end = start + committed + drafts;
+        let host_end = start + committed;
+        let new_base = host_end / self.chunk * self.chunk;
+        let mut staged = inp_shape(self.inp);
+        append(&mut staged, self.inp, start, end - start);
+        let writes = if new_base > self.base {
+            vec![new_base - self.base]
+        } else {
+            Vec::new()
+        };
+        let run = RunSpec {
+            first: 0,
+            cached: start - self.base,
+            new: end - start,
+            src: self.state.clone(),
+            writes: writes.clone(),
+            pos0: self.base,
+            slot: self.slot,
+            keep_from: new_base - self.base,
+        };
+        let r = launch(dev, &staged, &[run], self.chunk, tail)?;
+        if !writes.is_empty() {
+            self.state = Some(r.states[0][0].clone());
+            self.base = new_base;
+        }
+        let wide = self.inp.v_heads * self.inp.vd;
+        Ok(r.out[..(end - start) * wide].to_vec())
+    }
+}
 /// The model's outputs and whole-block states of a run (every head), laid out as a launch
 /// lays them: `[n][v_heads][vd]` and `[v_heads][128][vd]` per state.
 pub fn model_run(
@@ -500,6 +613,18 @@ const GEOMETRIES: [((usize, usize, usize), usize); 4] = [
 /// an output of that scale, but an output that cancels to a small value (`exp(G) · Y + Z`)
 /// is many of its own units from it. Returns the largest state deviation and the outputs'
 /// units apart (0, 1, 2 and more).
+/// Several fresh runs in one launch (from zero and from a state, storing at block
+/// boundaries, keeping their last block's positions in the tail cache), then each run
+/// continued by 7 positions in a second launch (its last boundary's state its source, its
+/// positions since read from the cache), against [`model`]: bit for bit when `exact` (the
+/// host form). Else (a GPU, whose tensor cores sum a K-step their own way, so its f32
+/// values differ from the host form's by a few f32 units of the products' magnitude)
+/// every stored state within `bound` of the model's relative to `1 + |x|`, and every
+/// output within one BF16 unit of its own plus `bound` of the largest output of its run:
+/// a difference at the products' scale crosses at most one BF16 rounding boundary of an
+/// output of that scale, but an output that cancels to a small value (`exp(G) · Y + Z`) is
+/// many of its own units from it. Returns the largest state deviation and the outputs'
+/// units apart (0, 1, 2 and more).
 pub fn against_model<D: QwenDevice>(
     dev: &D,
     seed: u64,
@@ -510,77 +635,117 @@ pub fn against_model<D: QwenDevice>(
     let mut worst_seen = 0.0f64;
     let mut ulps = [0usize; 3];
     let mut excess = 0.0f64;
+    let extra = 7usize;
     for (dims, chunk) in GEOMETRIES {
         let lens = [1usize, chunk, chunk + 1, 3 * chunk + 5, 70, 2];
-        let total: usize = lens.iter().sum();
+        let total: usize = lens.iter().map(|n| n + extra).sum();
         let inp = Inputs::new(&mut g, total, dims);
         let sl = inp.state_len();
+        let wide = inp.v_heads * inp.vd;
+        let what = format!("dn chunk {dims:?} at {chunk}");
+        let tail = Tail::new(dev, &inp, lens.len(), chunk + 3);
         let mut runs = Vec::new();
         let mut first = 0;
+        let mut firsts = Vec::new();
         for (i, &n) in lens.iter().enumerate() {
-            let src = (i % 2 == 1).then(|| (0..sl).map(|_| g.f32() * 0.3).collect());
+            let src: Option<Vec<f32>> =
+                (i % 2 == 1).then(|| (0..sl).map(|_| g.f32() * 0.3).collect());
             let whole = n / chunk;
-            // At most four stores a run (the kernel's), spread over its boundaries.
-            let mut writes: Vec<usize> = (0..=whole)
+            // At most four stores a run (the kernel's), the last boundary's among them.
+            let mut writes: Vec<usize> = (1..whole)
                 .filter(|b| b % 2 == i % 2)
                 .map(|b| b * chunk)
                 .collect();
             writes.reverse();
-            let mut writes: Vec<usize> =
-                writes.into_iter().step_by(1 + whole / 8).take(4).collect();
+            writes.truncate(3);
             writes.reverse();
+            if whole > 0 {
+                writes.push(whole * chunk);
+            }
             runs.push(RunSpec {
                 first,
-                count: n,
+                cached: 0,
+                new: n,
                 src,
-                out_from: if i % 3 == 2 { n / 2 } else { 0 },
                 writes,
+                pos0: 0,
+                slot: i,
+                keep_from: whole * chunk,
             });
-            first += n;
+            firsts.push(first);
+            first += n + extra;
         }
-        let got = launch(dev, &inp, &runs, chunk)?;
-        let what = format!("dn chunk {dims:?} at {chunk}");
-        let wide = inp.v_heads * inp.vd;
-        for (i, r) in runs.iter().enumerate() {
-            let (out, states) = model_run(&inp, r.first, r.count, r.src.as_deref(), chunk);
-            let gout = &got.out[(r.first + r.out_from) * wide..(r.first + r.count) * wide];
-            let wout = &out[r.out_from * wide..];
+        // The first launch reads every run's positions at its own offset.
+        let got = launch(dev, &inp, &runs, chunk, &tail)?;
+        let mut check_out = |gout: &[f32], wout: &[f32], what: &str| -> Result<(), String> {
             if exact {
-                same(&format!("{what}: run {i} outputs"), gout, wout)?;
-            } else {
-                let scale = wout.iter().fold(0.0f64, |m, &b| m.max(f64::from(b).abs()));
-                for (&a, &b) in gout.iter().zip(wout) {
-                    let d = (super::cases::ord16(eidola_engine_cuda::bf16::from_f32(a))
-                        - super::cases::ord16(eidola_engine_cuda::bf16::from_f32(b)))
-                    .unsigned_abs();
-                    ulps[(d as usize).min(2)] += 1;
-                    let unit = f64::from(b).abs() * f64::from(f32::EPSILON) * 65536.0;
-                    let off = (f64::from(a) - f64::from(b)).abs() - unit.max(f64::MIN_POSITIVE);
-                    excess = excess.max(off / scale.max(f64::MIN_POSITIVE));
-                }
+                return same(what, gout, wout);
             }
-            same(
-                &format!("{what}: run {i} positions before its outputs"),
-                &got.out[r.first * wide..(r.first + r.out_from) * wide],
-                &vec![0.0; r.out_from * wide],
+            let scale = wout.iter().fold(0.0f64, |m, &b| m.max(f64::from(b).abs()));
+            for (&a, &b) in gout.iter().zip(wout) {
+                let d = (super::cases::ord16(eidola_engine_cuda::bf16::from_f32(a))
+                    - super::cases::ord16(eidola_engine_cuda::bf16::from_f32(b)))
+                .unsigned_abs();
+                ulps[(d as usize).min(2)] += 1;
+                let unit = f64::from(b).abs() * f64::from(f32::EPSILON) * 65536.0;
+                let off = (f64::from(a) - f64::from(b)).abs() - unit.max(f64::MIN_POSITIVE);
+                excess = excess.max(off / scale.max(f64::MIN_POSITIVE));
+            }
+            Ok(())
+        };
+        let mut second = Vec::new();
+        let mut staged = inp_shape(&inp);
+        for (i, r) in runs.iter().enumerate() {
+            let n = r.new;
+            let (out, states) = model_run(&inp, r.first, n, r.src.as_deref(), chunk);
+            check_out(
+                &got.out[r.first * wide..(r.first + n) * wide],
+                &out,
+                &format!("{what}: run {i} outputs"),
             )?;
             for (w, &at) in r.writes.iter().enumerate() {
-                let want = if at == 0 {
-                    r.src.clone().unwrap_or_else(|| vec![0.0; sl])
-                } else {
-                    states[at / chunk - 1].clone()
-                };
-                if exact || at == 0 {
+                let want = &states[at / chunk - 1];
+                if exact {
                     same(
                         &format!("{what}: run {i} state after {at}"),
                         &got.states[i][w],
-                        &want,
+                        want,
                     )?;
                 } else {
-                    worst_seen = worst_seen.max(worst(&got.states[i][w], &want));
+                    worst_seen = worst_seen.max(worst(&got.states[i][w], want));
                 }
             }
+            // The continuation: from the last boundary's state, the cache holding the
+            // positions since.
+            let base = n / chunk * chunk;
+            let src = if base == 0 {
+                r.src.clone()
+            } else {
+                got.states[i].last().cloned()
+            };
+            let at = staged.q.len() / (inp.k_heads * KD);
+            append(&mut staged, &inp, r.first + n, extra);
+            second.push(RunSpec {
+                first: at,
+                cached: n - base,
+                new: extra,
+                src,
+                writes: Vec::new(),
+                pos0: base,
+                slot: i,
+                keep_from: usize::MAX,
+            });
         }
+        let got2 = launch(dev, &staged, &second, chunk, &tail)?;
+        for (i, (r, c)) in runs.iter().zip(&second).enumerate() {
+            let (out, _) = model_run(&inp, r.first, r.new + extra, r.src.as_deref(), chunk);
+            check_out(
+                &got2.out[c.first * wide..(c.first + extra) * wide],
+                &out[r.new * wide..],
+                &format!("{what}: run {i} continued from the cache"),
+            )?;
+        }
+        let _ = &firsts;
     }
     if worst_seen > bound || excess > bound {
         return Err(format!(
@@ -613,17 +778,13 @@ pub fn against_recurrence<D: QwenDevice>(
         let inp = Inputs::new(&mut g, n, dims);
         let sl = inp.state_len();
         let src: Vec<f32> = (0..sl).map(|_| g.f32() * 0.3).collect();
+        let tail = Tail::new(dev, &inp, 1, 1);
         let got = launch(
             dev,
             &inp,
-            &[RunSpec {
-                first: 0,
-                count: n,
-                src: Some(src.clone()),
-                out_from: 0,
-                writes: Vec::new(),
-            }],
+            &[RunSpec::fresh(0, n, Some(src.clone()), Vec::new())],
             chunk,
+            &tail,
         )?;
         let (vh, vd) = (inp.v_heads, inp.vd);
         let hs = KD * vd;
@@ -675,15 +836,17 @@ pub fn against_recurrence<D: QwenDevice>(
 }
 
 /// Reproducibility, bit for bit: one sequence of `len` positions run whole (its states
-/// stored at every boundary) against
+/// stored at every boundary) against the same sequence served as the executor serves it
+/// (`Session`: each step reading its block's earlier positions from the tail cache, so a
+/// block's row is computed with 1 to `chunk` of its positions present, the rest zeros in
+/// every operand)
 ///
-/// - every position decoded alone: a run from its block's boundary state folding the
-///   block's earlier positions (so a block's row is computed with 1 to `chunk` of its
-///   positions present, the rest zeros in every operand);
-/// - the sequence cut into chunks of 1, 3, 7, 16, 17, 64 and 65 positions, each chunk a
-///   launch resuming from the last boundary before it (folding to its start), storing the
-///   boundaries it reaches;
-/// - the whole run beside other runs in one launch, at another staged offset.
+/// - a position a step (decode);
+/// - in chunks of 1, 3, 7, 16, 17, 64 and 65 positions;
+/// - a committed position and three drafts a step, accepting none to all of them in turn
+///   (the rejected ones computed again, over their cache rows);
+///
+/// and the whole run beside other runs in one launch, at another offset and slot.
 pub fn invariant<D: QwenDevice>(dev: &D, seed: u64, len: usize) -> Result<String, String> {
     let mut g = Lcg(seed);
     let mut checked = 0usize;
@@ -692,7 +855,9 @@ pub fn invariant<D: QwenDevice>(dev: &D, seed: u64, len: usize) -> Result<String
         let sl = inp.state_len();
         let wide = inp.v_heads * inp.vd;
         let what = format!("{dims:?} at {chunk}");
+        let ring = chunk - 1 + 3;
         let bounds: Vec<usize> = (1..=len / chunk).map(|b| b * chunk).collect();
+        let none = Tail::new(dev, &inp, 1, 1);
         // The whole run, once per four of its boundaries (a run stores at most four
         // states): the same outputs every time, and every boundary's state.
         let mut states = Vec::new();
@@ -701,14 +866,9 @@ pub fn invariant<D: QwenDevice>(dev: &D, seed: u64, len: usize) -> Result<String
             let r = launch(
                 dev,
                 &inp,
-                &[RunSpec {
-                    first: 0,
-                    count: len,
-                    src: None,
-                    out_from: 0,
-                    writes: four.to_vec(),
-                }],
+                &[RunSpec::fresh(0, len, None, four.to_vec())],
                 chunk,
+                &none,
             )?;
             let out = r.out[..len * wide].to_vec();
             if full_out.is_empty() {
@@ -718,133 +878,86 @@ pub fn invariant<D: QwenDevice>(dev: &D, seed: u64, len: usize) -> Result<String
             }
             states.extend(r.states[0].iter().cloned());
         }
-        let state_at =
-            |pos: usize| -> Option<Vec<f32>> { (pos > 0).then(|| states[pos / chunk - 1].clone()) };
         let full_out = &full_out[..];
-        // Every position decoded from its boundary.
-        let mut runs = Vec::new();
-        let mut at = Vec::new();
-        let mut first = 0;
-        for t in 0..len {
-            let base = t / chunk * chunk;
-            let n = t - base + 1;
-            // Its own copy of the block's inputs, so every run has its own positions.
-            runs.push((base, n, first));
-            at.push(first + n - 1);
-            first += n;
-        }
-        let mut stacked = Inputs {
-            q: Vec::new(),
-            k: Vec::new(),
-            v: Vec::new(),
-            beta: Vec::new(),
-            g: Vec::new(),
-            ..inp_shape(&inp)
+        let check_state = |sess: &Session<'_>, at: &str| -> Result<(), String> {
+            if sess.base > 0 {
+                same(
+                    &format!("{what}: the state at {} {at}", sess.base),
+                    sess.state.as_deref().expect("a state"),
+                    &states[sess.base / chunk - 1],
+                )?;
+            }
+            Ok(())
         };
-        for &(base, n, _) in &runs {
-            append(&mut stacked, &inp, base, n);
-        }
-        let specs: Vec<RunSpec> = runs
-            .iter()
-            .map(|&(base, n, first)| RunSpec {
-                first,
-                count: n,
-                src: state_at(base),
-                out_from: n - 1,
-                writes: Vec::new(),
-            })
-            .collect();
-        let dec = launch(dev, &stacked, &specs, chunk)?;
-        for (t, &row) in at.iter().enumerate() {
-            same(
-                &format!("{what}: position {t} decoded from its boundary"),
-                &dec.out[row * wide..(row + 1) * wide],
-                &full_out[t * wide..(t + 1) * wide],
-            )?;
-            checked += 1;
-        }
-        // Chunked prefills.
+        // Decoded, and in chunks.
         for c in [1usize, 3, 7, 16, 17, 64, 65] {
+            let tail = Tail::new(dev, &inp, 1, ring);
+            let mut sess = Session {
+                inp: &inp,
+                chunk,
+                slot: 0,
+                base: 0,
+                state: None,
+            };
             let mut start = 0;
             while start < len {
-                let end = (start + c).min(len);
-                let base = start / chunk * chunk;
-                let writes: Vec<usize> = bounds
-                    .iter()
-                    .filter(|&&b| b > base && b <= end)
-                    .map(|&b| b - base)
-                    .take(4)
-                    .collect();
-                let r = launch(
-                    dev,
-                    &inp,
-                    &[RunSpec {
-                        first: base,
-                        count: end - base,
-                        src: state_at(base),
-                        out_from: start - base,
-                        writes: writes.clone(),
-                    }],
-                    chunk,
-                )?;
+                let n = c.min(len - start);
+                let out = sess.step(dev, &tail, start, n, 0)?;
                 same(
-                    &format!("{what}: positions {start}..{end} in chunks of {c}"),
-                    &r.out[start * wide..end * wide],
-                    &full_out[start * wide..end * wide],
+                    &format!("{what}: positions {start}..{} in steps of {c}", start + n),
+                    &out,
+                    &full_out[start * wide..(start + n) * wide],
                 )?;
-                for (w, &b) in writes.iter().enumerate() {
-                    same(
-                        &format!("{what}: the state at {} in chunks of {c}", base + b),
-                        &r.states[0][w],
-                        &states[(base + b) / chunk - 1],
-                    )?;
-                }
-                checked += end - start;
-                start = end;
+                check_state(&sess, &format!("in steps of {c}"))?;
+                checked += n;
+                start += n;
             }
         }
-        // Beside other runs, at another offset.
-        let mut crowd = Inputs {
-            q: Vec::new(),
-            k: Vec::new(),
-            v: Vec::new(),
-            beta: Vec::new(),
-            g: Vec::new(),
-            ..inp_shape(&inp)
-        };
+        // A committed position and three drafts a step.
+        {
+            let tail = Tail::new(dev, &inp, 1, ring);
+            let mut sess = Session {
+                inp: &inp,
+                chunk,
+                slot: 0,
+                base: 0,
+                state: None,
+            };
+            let (mut start, mut step) = (0usize, 0usize);
+            while start < len {
+                let drafts = 3.min(len - start - 1);
+                let out = sess.step(dev, &tail, start, 1, drafts)?;
+                same(
+                    &format!(
+                        "{what}: positions {start}..{} with drafts",
+                        start + 1 + drafts
+                    ),
+                    &out,
+                    &full_out[start * wide..(start + 1 + drafts) * wide],
+                )?;
+                check_state(&sess, "with drafts")?;
+                checked += 1 + drafts;
+                start += 1 + (step % 4).min(drafts);
+                step += 1;
+            }
+        }
+        // Beside other runs, at another offset and slot.
+        let mut crowd = inp_shape(&inp);
         let other = Inputs::new(&mut g, 23, dims);
         append(&mut crowd, &other, 0, 23);
         append(&mut crowd, &inp, 0, len);
         append(&mut crowd, &other, 0, 9);
         let src: Vec<f32> = (0..sl).map(|_| g.f32() * 0.3).collect();
-        let r = launch(
-            dev,
-            &crowd,
-            &[
-                RunSpec {
-                    first: 0,
-                    count: 23,
-                    src: Some(src.clone()),
-                    out_from: 0,
-                    writes: vec![],
-                },
-                RunSpec {
-                    first: 23,
-                    count: len,
-                    src: None,
-                    out_from: 0,
-                    writes: bounds.iter().copied().take(4).collect(),
-                },
-                RunSpec {
-                    first: 23 + len,
-                    count: 9,
-                    src: Some(src),
-                    out_from: 2,
-                    writes: vec![],
-                },
-            ],
-            chunk,
-        )?;
+        let tail = Tail::new(dev, &inp, 3, ring);
+        let mut runs = vec![
+            RunSpec::fresh(0, 23, Some(src.clone()), vec![]),
+            RunSpec::fresh(23, len, None, bounds.iter().copied().take(4).collect()),
+            RunSpec::fresh(23 + len, 9, Some(src), vec![]),
+        ];
+        for (i, r) in runs.iter_mut().enumerate() {
+            r.slot = i;
+        }
+        let r = launch(dev, &crowd, &runs, chunk, &tail)?;
         same(
             &format!("{what}: beside other runs"),
             &r.out[23 * wide..(23 + len) * wide],
@@ -889,8 +1002,8 @@ fn append(dst: &mut Inputs, src: &Inputs, from: usize, n: usize) {
 }
 
 /// The intra kernel's scratch after one launch over `runs` (`W`, `U`, `P`, the factors,
-/// the rounded queries and keys, in that order), for holding a device's bits to the host
-/// body's.
+/// the rounded queries and keys, the keys, the rows of `T`, write strengths and decays, in
+/// that order), for holding a device's bits to the host body's.
 pub fn intra_scratch<D: QwenDevice>(
     dev: &D,
     intra: &dyn Fn(&DnChunkParams) -> Result<(), String>,
@@ -910,6 +1023,7 @@ pub fn intra_scratch<D: QwenDevice>(
                 count: u(n),
                 live_after: u(n + 1),
                 tile: u(tile),
+                keep_from: u32::MAX,
                 ..DnSeq::default()
             });
             first += n;
@@ -919,6 +1033,7 @@ pub fn intra_scratch<D: QwenDevice>(
         let (bb, gb) = (buf(dev, &inp.beta), buf(dev, &inp.g));
         let ob = zeros(dev, 8);
         let sb = buf(dev, &seqs);
+        let tail = Tail::new(dev, &inp, 1, 1);
         let (fw, fu, fp, ff) = chunk_scratch_floats(u(inp.vd));
         let n = tile * inp.v_heads;
         let nk = tile * inp.k_heads;
@@ -929,6 +1044,8 @@ pub fn intra_scratch<D: QwenDevice>(
             n * ff,
             nk * CHUNK_QK_FLOATS,
             nk * CHUNK_QK_FLOATS,
+            nk * CHUNK_QK_FLOATS,
+            n * CHUNK_REC_FLOATS,
         ];
         let bufs: Vec<Buf> = lens6.iter().map(|&l| zeros(dev, l * 4)).collect();
         let p = DnChunkParams {
@@ -945,6 +1062,9 @@ pub fn intra_scratch<D: QwenDevice>(
             fac: bufs[3].addr,
             qr: bufs[4].addr,
             kr: bufs[5].addr,
+            kraw: bufs[6].addr,
+            rec: bufs[7].addr,
+            tail: tail.buf.addr,
             state_offset: 0,
             seq_count: u(lens.len()),
             tiles: u(tile),
@@ -953,7 +1073,7 @@ pub fn intra_scratch<D: QwenDevice>(
             k_dim: 128,
             v_dim: u(inp.vd),
             chunk: u(chunk),
-            reserved: 0,
+            ring: 1,
         };
         intra(&p)?;
         dev.synchronize().map_err(|e| e.to_string())?;

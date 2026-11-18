@@ -137,20 +137,31 @@ pub(super) struct Scratch {
     pub dn_fac: Alloc,
     pub dn_qr: Alloc,
     pub dn_kr: Alloc,
+    pub dn_kraw: Alloc,
+    pub dn_rec: Alloc,
     /// Every allocation above but the table, the sink and the zero rows: what the idle
     /// scrub zeroes besides the table.
     pub ranges: Vec<(u64, usize)>,
 }
 
-/// Bytes of the blocked DeltaNet's six scratch arrays (8 each without blocks).
-fn chunk_bytes(c: &Caps, d: &super::Dims, blocked: bool) -> [usize; 6] {
+/// Bytes of the blocked DeltaNet's eight scratch arrays (8 each without blocks).
+fn chunk_bytes(c: &Caps, d: &super::Dims, blocked: bool) -> [usize; 8] {
     if !blocked {
-        return [8; 6];
+        return [8; 8];
     }
     let (w, u, pm, fac) = chunk_scratch_floats(d.v_dim);
     let n = c.tiles.max(1) * d.v_heads as usize * 4;
     let nk = c.tiles.max(1) * d.k_heads as usize * 4 * CHUNK_QK_FLOATS;
-    [n * w, n * u, n * pm, n * fac, nk, nk]
+    [
+        n * w,
+        n * u,
+        n * pm,
+        n * fac,
+        nk,
+        nk,
+        nk,
+        n * CHUNK_REC_FLOATS,
+    ]
 }
 
 /// Bytes of the fast BF16 linears' f32 scratch: the head's rows of the vocabulary, the
@@ -320,6 +331,8 @@ fn build_scratch(
         dn_fac: a(cb[3])?,
         dn_qr: a(cb[4])?,
         dn_kr: a(cb[5])?,
+        dn_kraw: a(cb[6])?,
+        dn_rec: a(cb[7])?,
         caps: c,
         ranges,
     })
@@ -849,8 +862,10 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             log_decay: u32::from(self.blocked()),
         };
         if self.blocked() {
-            let tiles = super::chunk_tiles(at.staged(), at.runs, self.chunk());
+            let tiles = at.tiles;
             assert!(tiles <= s.caps.tiles, "the blocked DeltaNet's scratch");
+            let entry = self.dims.chunk_entry() * 4;
+            let tail = self.tails_dn.addr + (dn * self.tail_layer_rows() * entry) as u64;
             let ch = DnChunkParams {
                 seqs: self.tw(at.seqs),
                 q: s.dq.addr,
@@ -865,6 +880,9 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 fac: s.dn_fac.addr,
                 qr: s.dn_qr.addr,
                 kr: s.dn_kr.addr,
+                kraw: s.dn_kraw.addr,
+                rec: s.dn_rec.addr,
+                tail,
                 state_offset: (dn * self.layer_bytes() + 3 * cd * 4) as u64,
                 seq_count: n32(at.runs),
                 tiles: n32(tiles),
@@ -873,7 +891,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 k_dim: d.k_dim,
                 v_dim: d.v_dim,
                 chunk: self.chunk(),
-                reserved: 0,
+                ring: self.tail_ring(),
             };
             // SAFETY: as below; the scratch holds `tiles` blocks (asserted), and every run's
             // blocks are numbered within them by the pass.

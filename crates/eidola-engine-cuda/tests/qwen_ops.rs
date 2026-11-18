@@ -179,9 +179,10 @@ fn qwen_kernels_on_the_device() {
 /// a bound of its definition written out (the tensor cores sum a K-step their own way;
 /// the largest deviation recorded); its distance from the token recurrence (in BF16 units
 /// from the exact profile's, and from f64), recorded; and reproducibility bit for bit: a
-/// block's row the same with 1 to 16 of its positions present (decoded from the boundary,
-/// the later positions zeros in every operand, against prefilled with them real), the run
-/// cut into chunks of 1 to 65 positions, and beside other runs.
+/// block's row the same with 1 to 16 of its positions present (served as the executor
+/// serves it, the earlier ones from the tail cache and the later ones zeros in every
+/// operand, against prefilled with them real), the run in chunks of 1 to 65 positions,
+/// drafts accepted and rejected, and beside other runs.
 fn blocked_deltanet(fast: &CudaDevice) -> Vec<(&'static str, Result<String, String>)> {
     use qwen_common::chunk;
     let mut out = Vec::new();

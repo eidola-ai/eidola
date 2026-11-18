@@ -30,7 +30,8 @@
 #   kernel bit for bit its host body, the whole form within a bound of its
 #   definition, its distance from the token recurrence in
 #   $OUT/qwen_ops_blocked_deltanet_*.txt, and reproducible bit for bit: a
-#   block's rows with 1 to 16 of its positions present, chunks of 1 to 65,
+#   block's rows with 1 to 16 of its positions present (the earlier ones from
+#   the tail cache), chunks of 1 to 65, drafts accepted and rejected,
 #   beside other runs); then the exact profile on the
 #   device against the CPU reference executor, eagerly and replaying graphs
 #   (graphs keep it exact);

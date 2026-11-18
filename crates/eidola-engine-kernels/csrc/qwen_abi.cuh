@@ -256,9 +256,11 @@ QW_ABI_FIELD(QwDnPrepParams, log_decay, 108);
 // to `write_dst[i]`. The state of a layer is `[v_heads][k_dim][v_dim]` f32,
 // key dimension major (`DeltaNetState::recurrent`), at the address given plus
 // the layer's offset, which the launch's `state_offset` adds to every
-// address. `tile` is the run's first block among the launch's blocks for the
-// fast profile's blocked form (`QwDnChunkParams`); the token recurrence
-// ignores it.
+// address. The fast profile's blocked form (`QwDnChunkParams`) reads the
+// rest: `tile`, the run's first block among the launch's blocks; `pos0`, the
+// absolute position of the run's relative 0; `tail_row`, the run's slot's
+// first row of the tail cache; `keep_from`, the first relative position whose
+// intermediates the run writes there. The token recurrence ignores them.
 struct QwDnSeq {
   uint64_t src;
   uint64_t live;
@@ -270,11 +272,16 @@ struct QwDnSeq {
   uint32_t write_after[4];
   uint32_t writes;
   uint32_t tile;
+  uint32_t pos0;
+  uint32_t tail_row;
+  uint32_t keep_from;
+  uint32_t reserved;
 };
-QW_ABI_STRUCT(QwDnSeq, 88);
+QW_ABI_STRUCT(QwDnSeq, 104);
 QW_ABI_FIELD(QwDnSeq, first, 48);
 QW_ABI_FIELD(QwDnSeq, writes, 80);
 QW_ABI_FIELD(QwDnSeq, tile, 84);
+QW_ABI_FIELD(QwDnSeq, keep_from, 96);
 
 // `deltanet::recurrent_step` per value head and token, every sequence of
 // `seqs`; the output `o` (rounded to BF16, as f32) of every position at or
@@ -306,7 +313,11 @@ QW_ABI_FIELD(QwDnRecParams, seq_count, 64);
 // start. A run is `tiles(count) = ⌈count / chunk⌉` blocks, its first at the
 // sequence's `tile`; the launch's blocks are `0 .. tiles`, `tiles` the
 // scratch's capacity. A store (`live_after`, `write_after`) happens only at 0
-// or a whole number of blocks: the state exists at block boundaries only.
+// or a whole number of blocks: the state exists at block boundaries only. A
+// run's positions before `out_from` are cached: their intermediates (key,
+// value, write strength, cumulative decay, row of `T`, `Δ`) are read from the
+// tail cache, written there when they were new, and they produce no output;
+// its later positions are new, staged at `first ..`.
 // `g` is the per-position log decay (`QwDnPrepParams::log_decay`). Two
 // kernels: `eidola_qwen_fast_dn_intra` (grid `(tiles, k_heads)`) fills the
 // scratch with every block's state-free parts, and `eidola_qwen_fast_dn_state`
@@ -326,6 +337,9 @@ struct QwDnChunkParams {
   float* fac;               // [tiles, v_heads, 48]
   float* qr;                // [tiles, k_heads, 16, k_dim]: queries rounded to TF32
   float* kr;                // [tiles, k_heads, 16, k_dim]: keys rounded to TF32
+  float* kraw;              // [tiles, k_heads, 16, k_dim]: keys, for the tail cache
+  float* rec;               // [tiles, v_heads, 16, 20]: rows of `T`, `β`, `G`, for it
+  float* tail;              // the layer's tail cache: [rows][entry], `qwd::entry_floats`
   uint64_t state_offset;    // bytes added to every state address
   uint32_t seq_count;
   uint32_t tiles;
@@ -334,12 +348,13 @@ struct QwDnChunkParams {
   uint32_t k_dim;
   uint32_t v_dim;
   uint32_t chunk;           // positions a block, 1 to 16
-  uint32_t reserved;
+  uint32_t ring;            // rows of a slot's tail ring
 };
-QW_ABI_STRUCT(QwDnChunkParams, 144);
-QW_ABI_FIELD(QwDnChunkParams, state_offset, 104);
-QW_ABI_FIELD(QwDnChunkParams, seq_count, 112);
-QW_ABI_FIELD(QwDnChunkParams, chunk, 136);
+QW_ABI_STRUCT(QwDnChunkParams, 168);
+QW_ABI_FIELD(QwDnChunkParams, state_offset, 128);
+QW_ABI_FIELD(QwDnChunkParams, seq_count, 136);
+QW_ABI_FIELD(QwDnChunkParams, chunk, 160);
+QW_ABI_FIELD(QwDnChunkParams, ring, 164);
 
 // The DeltaNet's gated RMS norm per value head (`deltanet::gated_norm`):
 // `bf16(bf16(w · bf16(o · r)) · silu(z))`, `r = rsqrt(Σo² / v_dim + eps)`.
