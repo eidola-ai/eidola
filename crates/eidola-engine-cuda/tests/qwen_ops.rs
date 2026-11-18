@@ -5,7 +5,11 @@
 //! (the DeltaNet's stacked `a` and `b`) against the exact ones (deviation recorded, and
 //! bounded for the BF16 GEMM; a row's bits alone and in every batch asserted equal); every
 //! FP8 GEMM the fast profile routes rows to giving every row the same bits
-//! (`fast_fp8_configs_agree`); the small-N BF16 GEMM against the order it documents; and
+//! (`fast_fp8_configs_agree`); the small-N BF16 GEMM, both its forms, against the order it
+//! documents and against each other, and the dispatch past the tiled form's rows; the
+//! kernels arranged for speed (the norm, the gated norm, the widening) against their reference
+//! forms compiled for the host, and the quantiser against `quant_thread` over every BF16
+//! value under 96 block maxima (`quant_sweep`); and
 //! Qwen's sampler and chain acceptance (`qwen_sampling`) against the serving core's
 //! sampler, every probability's bits and every token (`qwen_sampler`, `qwen_accept`).
 //! Skipped, saying why, without a device or `EIDOLA_ENGINE_KERNELS_DIR`.
@@ -36,18 +40,38 @@ fn qwen_kernels_on_the_device() {
     }
     match qwen_common::library() {
         Some(lib) => {
-            let reference = qwen_common::quant_thread_reference(lib);
-            match cases::quant_forms(&exact, &reference, 12) {
-                Ok(()) => eprintln!("ok      quant forms"),
-                Err(e) => {
-                    eprintln!("FAILED  quant forms: {e}");
-                    failed.push("quant forms");
+            use eidola_engine_cuda::qwen::abi::{DnNormParams, NormParams, WidenParams};
+            let reference = qwen_common::quant_thread_reference(lib.clone());
+            let norm_ref =
+                qwen_common::host_body::<NormParams>(lib.clone(), "qwen_host_norm_reference");
+            let dn_norm_ref =
+                qwen_common::host_body::<DnNormParams>(lib.clone(), "qwen_host_dn_norm_reference");
+            let widen_ref = qwen_common::host_body::<WidenParams>(lib, "qwen_host_widen_reference");
+            for (name, outcome) in [
+                (
+                    "quant forms",
+                    cases::quant_forms(&exact, &reference, 12).map(|()| String::new()),
+                ),
+                ("quant sweep", cases::quant_sweep(&exact, &reference, 19)),
+                ("norm forms", cases::norm_forms(&exact, &norm_ref, 20)),
+                (
+                    "dn norm forms",
+                    cases::dn_norm_forms(&exact, &dn_norm_ref, 21),
+                ),
+                ("widen forms", cases::widen_forms(&exact, &widen_ref, 22)),
+            ] {
+                match outcome {
+                    Ok(report) => eprintln!("ok      {name} {report}"),
+                    Err(e) => {
+                        eprintln!("FAILED  {name}: {e}");
+                        failed.push(name);
+                    }
                 }
             }
         }
         None => {
-            eprintln!("FAILED  quant forms: no C++ compiler for the reference form");
-            failed.push("quant forms");
+            eprintln!("FAILED  reference forms: no C++ compiler for the reference forms");
+            failed.push("reference forms");
         }
     }
     match qwen_sampler(&exact, 17) {
@@ -109,14 +133,58 @@ fn qwen_kernels_on_the_device() {
         }
     }
     let small = cases::small_gemm_on(&fast);
-    match cases::small_gemm(&small, 14) {
-        Ok(report) => eprintln!("ok      fast small-N gemm: {report}"),
-        Err(e) => {
-            eprintln!("FAILED  fast small-N gemm: {e}");
-            failed.push("fast small-N gemm");
+    let small_form = small_gemm_form_on(&fast, false);
+    let tiled_form = small_gemm_form_on(&fast, true);
+    for (name, outcome) in [
+        ("fast small-N gemm", cases::small_gemm(&small, 14)),
+        (
+            "fast small-N gemm tiled",
+            cases::small_gemm(&tiled_form, 14),
+        ),
+        (
+            "fast small-N gemm forms",
+            cases::small_gemm_forms(&small_form, &tiled_form, 23),
+        ),
+        (
+            "fast small-N gemm dispatch",
+            cases::small_gemm_forms(&small_form, &small, 24),
+        ),
+    ] {
+        match outcome {
+            Ok(report) => eprintln!("ok      {name}: {report}"),
+            Err(e) => {
+                eprintln!("FAILED  {name}: {e}");
+                failed.push(name);
+            }
         }
     }
     assert!(failed.is_empty(), "{failed:?}");
+}
+
+/// [`cases::small_gemm`]'s runner on the small-N GEMM in the form named, whatever the
+/// row count (`CudaDevice::gemm_bf16_form`).
+fn small_gemm_form_on(fast: &CudaDevice, tiled: bool) -> impl cases::SmallGemmRun + '_ {
+    use eidola_engine_cuda::qwen::abi::LinearParams;
+    use qwen_common::{buf, read, zeros};
+    let u = |x: usize| u32::try_from(x).expect("small");
+    move |x, w, rows, first, n, k| {
+        let (xb, wb) = (buf(fast, x), buf(fast, w));
+        let out = zeros(fast, rows * n * 4);
+        let p = LinearParams {
+            x: xb.addr + (first * k * 2) as u64,
+            w: wb.addr,
+            out: out.addr,
+            rows: u(rows),
+            n: u(n),
+            k: u(k),
+            x_stride: u(k),
+            out_stride: u(n),
+            out_f32: 1,
+        };
+        // SAFETY: the buffers hold what the struct names.
+        unsafe { fast.gemm_bf16_form(&p, tiled) }.map_err(|e| e.to_string())?;
+        Ok(read::<CudaDevice, f32>(fast, &out, rows * n))
+    }
 }
 
 /// Every FP8 GEMM the fast profile can route a row to (`fp8_kind`: the swapped kernel

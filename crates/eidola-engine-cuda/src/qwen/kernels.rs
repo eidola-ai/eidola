@@ -189,7 +189,28 @@ pub fn norm_grid(p: &NormParams) -> Result<[u32; 3]> {
     }
     ensure(p.eps.is_finite() && p.eps > 0.0, "norm: epsilon")?;
     ensure(p.units <= 0x7fff_ffff, "norm: units")?;
-    rows_grid(p.units, p.rows)
+    if p.n > NORM_WARP_MAX {
+        return rows_grid(p.units, p.rows);
+    }
+    items_grid(
+        u64::from(p.units) * u64::from(p.rows),
+        NORM_ITEMS,
+        "norm: units",
+    )
+}
+
+/// Units a norm stages a warp each (`kNormWarpMax`), eight a CTA (`kNormItems`); wider
+/// units take a CTA each.
+pub const NORM_WARP_MAX: u32 = 1024;
+const NORM_ITEMS: u32 = 8;
+
+/// A grid of `items` a warp each, `per` a CTA, numbered row by row over x.
+fn items_grid(items: u64, per: u32, what: &str) -> Result<[u32; 3]> {
+    let x = u32::try_from(items.div_ceil(u64::from(per)))
+        .ok()
+        .filter(|&x| x <= MAX_GRID_X)
+        .ok_or_else(|| refuse(what))?;
+    Ok([x.max(1), 1, 1])
 }
 
 pub fn quant_grid(p: &QuantParams) -> Result<[u32; 3]> {
@@ -243,6 +264,16 @@ pub fn linear_grid(p: &LinearParams) -> Result<[u32; 3]> {
 /// Outputs (a warp each) and rows of a small-N GEMM CTA (`qwen_fast.cuh`).
 const SMALL_WARPS: u32 = 4;
 const SMALL_ROWS: u32 = 4;
+/// Rows and outputs a warp of the small-N GEMM's tiled form takes, and its warps a CTA
+/// (outputs side by side, the rows shared).
+const TILE_ROWS: u32 = 8;
+const TILE_OUTS: u32 = 4;
+const TILE_WARPS: u32 = 4;
+
+/// Rows from which the small-N GEMM runs its tiled form
+/// (`eidola_qwen_fast_gemm_bf16_tiled`). Both forms sum every (row, output) in one order,
+/// so the choice by row count leaves a row's bits its own.
+pub const SMALL_TILED_ROWS: u32 = 128;
 
 /// The fast profile's small-N BF16 GEMM (`eidola_qwen_fast_gemm_bf16`): f32 outputs,
 /// dense rows of 16-byte chunks; CTAs of four outputs by four rows.
@@ -264,6 +295,15 @@ pub fn small_gemm_grid(p: &LinearParams) -> Result<[u32; 3]> {
     let y = p.rows.div_ceil(SMALL_ROWS);
     ensure(y <= MAX_GRID_Y, "small gemm: rows")?;
     Ok([p.n.div_ceil(SMALL_WARPS), y.max(1), 1])
+}
+
+/// The small-N GEMM's tiled form (`eidola_qwen_fast_gemm_bf16_tiled`): what
+/// [`small_gemm_grid`] takes, over CTAs of sixteen outputs (four a warp) by eight rows.
+pub fn small_gemm_tiled_grid(p: &LinearParams) -> Result<[u32; 3]> {
+    small_gemm_grid(p)?;
+    let y = p.rows.div_ceil(TILE_ROWS);
+    ensure(y <= MAX_GRID_Y, "small gemm: rows")?;
+    Ok([p.n.div_ceil(TILE_OUTS * TILE_WARPS), y.max(1), 1])
 }
 
 pub fn gate_grid(p: &GateParams) -> Result<[u32; 3]> {
@@ -406,16 +446,24 @@ pub fn dn_norm_grid(p: &DnNormParams) -> Result<[u32; 3]> {
         p.eps.is_finite() && p.eps > 0.0 && p.reserved == 0,
         "dn norm: epsilon",
     )?;
-    rows_grid(p.v_heads, p.rows)
+    items_grid(
+        u64::from(p.v_heads) * u64::from(p.rows),
+        DN_NORM_ITEMS,
+        "dn norm: heads",
+    )
 }
 
+/// Heads the gated norm takes a CTA, a warp each (`kDnNormItems`).
+const DN_NORM_ITEMS: u32 = BLOCK_THREADS / 32;
+
+/// The widening: a thread eight consecutive elements of a row (`kWidenPer`).
 pub fn widen_grid(p: &WidenParams) -> Result<[u32; 3]> {
     ensure(p.x != 0 && p.out != 0, "widen: null")?;
     ensure(
         p.width > 0 && p.x_stride >= p.width && p.out_stride >= p.width,
         "widen: strides",
     )?;
-    rows_grid(p.width.div_ceil(ELEMENT), p.rows)
+    rows_grid(p.width.div_ceil(ELEMENT * 8), p.rows)
 }
 
 pub fn round_grid(p: &RoundParams) -> Result<[u32; 3]> {
@@ -562,7 +610,8 @@ mod tests {
 
     #[test]
     fn norm_grid_is_units_by_rows_and_refuses_what_its_body_cannot_run() {
-        assert_eq!(norm_grid(&norm()).unwrap(), [4, 3, 1]);
+        // Units up to 1,024 wide: a warp each, eight a CTA (12 units, 2 CTAs).
+        assert_eq!(norm_grid(&norm()).unwrap(), [2, 1, 1]);
         let rotated = NormParams {
             rotary: 64,
             rope_cos: 8,
@@ -570,7 +619,43 @@ mod tests {
             positions: 8,
             ..norm()
         };
-        assert_eq!(norm_grid(&rotated).unwrap(), [4, 3, 1]);
+        assert_eq!(norm_grid(&rotated).unwrap(), [2, 1, 1]);
+        assert_eq!(
+            norm_grid(&NormParams {
+                rows: 2048,
+                units: 24,
+                x_stride: 24 * 512,
+                out_stride: 24 * 256,
+                ..rotated
+            })
+            .unwrap(),
+            [6144, 1, 1]
+        );
+        // Wider units: a CTA each, units by rows.
+        let hidden = NormParams {
+            units: 1,
+            n: 5120,
+            x_stride: 5120,
+            out_stride: 5120,
+            ..norm()
+        };
+        assert_eq!(norm_grid(&hidden).unwrap(), [1, 3, 1]);
+        assert_eq!(
+            norm_grid(&NormParams {
+                n: NORM_WARP_MAX,
+                ..hidden
+            })
+            .unwrap(),
+            [1, 1, 1]
+        );
+        assert_eq!(
+            norm_grid(&NormParams {
+                n: NORM_WARP_MAX + 8,
+                ..hidden
+            })
+            .unwrap(),
+            [1, 3, 1]
+        );
         for bad in [
             NormParams {
                 x_stride: 1791,
@@ -612,6 +697,85 @@ mod tests {
         ] {
             assert!(norm_grid(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn gated_norm_widen_and_small_gemm_grids() {
+        let dn = DnNormParams {
+            o: 8,
+            z: 8,
+            weight: 8,
+            out: 8,
+            rows: 2048,
+            v_heads: 48,
+            v_dim: 128,
+            z_stride: 6144,
+            eps: 1e-6,
+            reserved: 0,
+        };
+        // A warp a (row, head), four a CTA.
+        assert_eq!(dn_norm_grid(&dn).unwrap(), [24_576, 1, 1]);
+        assert_eq!(
+            dn_norm_grid(&DnNormParams { rows: 1, ..dn }).unwrap(),
+            [12, 1, 1]
+        );
+        assert_eq!(
+            dn_norm_grid(&DnNormParams {
+                rows: 1,
+                v_heads: 6,
+                z_stride: 768,
+                ..dn
+            })
+            .unwrap(),
+            [2, 1, 1]
+        );
+        assert!(dn_norm_grid(&DnNormParams { v_dim: 129, ..dn }).is_err());
+        let w = WidenParams {
+            x: 8,
+            out: 8,
+            rows: 2048,
+            width: 10_240,
+            x_stride: 10_240,
+            out_stride: 10_240,
+        };
+        // Eight elements a thread, 2,048 a CTA.
+        assert_eq!(widen_grid(&w).unwrap(), [5, 2048, 1]);
+        assert_eq!(
+            widen_grid(&WidenParams {
+                rows: 3,
+                width: 48,
+                x_stride: 96,
+                out_stride: 48,
+                ..w
+            })
+            .unwrap(),
+            [1, 3, 1]
+        );
+        let ab = LinearParams {
+            x: 16,
+            w: 16,
+            out: 16,
+            rows: 2048,
+            n: 96,
+            k: 5120,
+            x_stride: 5120,
+            out_stride: 96,
+            out_f32: 1,
+        };
+        assert_eq!(small_gemm_grid(&ab).unwrap(), [24, 512, 1]);
+        // Sixteen outputs by eight rows a CTA.
+        assert_eq!(small_gemm_tiled_grid(&ab).unwrap(), [6, 256, 1]);
+        assert_eq!(
+            small_gemm_tiled_grid(&LinearParams {
+                rows: 129,
+                n: 16,
+                out_stride: 16,
+                ..ab
+            })
+            .unwrap(),
+            [1, 17, 1]
+        );
+        assert!(small_gemm_tiled_grid(&LinearParams { x: 8, ..ab }).is_err());
     }
 
     #[test]

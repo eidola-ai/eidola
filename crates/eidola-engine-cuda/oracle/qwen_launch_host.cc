@@ -1,7 +1,8 @@
 // The Qwen3.8 kernels' bodies (`eidola-engine-kernels`' `csrc/qwen_ops.cuh`
 // and the fast profile's `csrc/qwen_fast.cuh`, the C++ a GPU compiles) as a
 // host library: one function per launch, each repeating its kernel's entry
-// over the grid the Rust wrapper computed. Blocks
+// over the grid the Rust wrapper computed, and the reference forms of the
+// bodies arranged for speed over their own grids (`*_reference`). Blocks
 // and threads run in descending order and shared memory starts as garbage, so
 // a body that reads what another thread writes inside a phase, or reads
 // shared memory it never wrote, shows up. Dev-only: built by the crate's tests
@@ -37,35 +38,77 @@ void qwen_host_embed(const QwEmbedParams* p, uint32_t gx, uint32_t gy) {
       for (uint32_t t = qwk::kElementThreads; t-- > 0;) qwk::embed_thread(*p, x, y, t);
 }
 
+// `eidola_qwen_norm`'s entry: a unit wider than `kNormWarpMax` a CTA over the
+// grid's (units, rows); narrower ones a warp each, eight a CTA, numbered row
+// by row over the grid's x.
 void qwen_host_norm(const QwNormParams* p, uint32_t gx, uint32_t gy) {
   qwk::NormShared sh;
   for (uint32_t y = gy; y-- > 0;)
     for (uint32_t x = gx; x-- > 0;) {
       garbage(&sh);
-      qwk::norm_block(*p, y, x, kPar, sh);
+      if (p->n > qwk::kNormWarpMax) {
+        qwk::norm_item<qwk::kElementThreads>(*p, y, x, kPar, sh.ln[0], sh.row);
+        continue;
+      }
+      for (uint32_t w = qwk::kNormItems; w-- > 0;) {
+        const uint64_t item = static_cast<uint64_t>(x) * qwk::kNormItems + w;
+        if (item >= static_cast<uint64_t>(p->rows) * p->units) continue;
+        qwk::norm_item<qwk::kWarp>(*p, static_cast<uint32_t>(item / p->units),
+                                   static_cast<uint32_t>(item % p->units), qwk::WarpPar{},
+                                   sh.ln[w], sh.row + w * qwk::kNormWarpMax);
+      }
+    }
+}
+
+// The norm's reference form over its own grid: a CTA a (unit, row).
+void qwen_host_norm_reference(const QwNormParams* p, uint32_t gx, uint32_t gy) {
+  qwk::NormRefShared sh;
+  for (uint32_t y = gy; y-- > 0;)
+    for (uint32_t x = gx; x-- > 0;) {
+      garbage(&sh);
+      qwk::norm_reference_block(*p, y, x, kPar, sh);
     }
 }
 
 // `eidola_qwen_quant`'s entry: a warp per block and row (however the grid
 // groups rows into CTAs), its lanes' amaxes combined by the butterfly the
-// device's shuffles run, in the same operand order.
+// device's shuffles run.
 void qwen_host_quant(const QwQuantParams* p, uint32_t gx, uint32_t gy) {
   constexpr uint32_t kW = qwk::kWarp;
-  float v[kW][qwk::kQuantLane];
-  float m[kW];
+  qwk::QuantLane v[kW];
+  uint32_t m[kW];
   for (uint32_t y = gy * qwk::kQuantRows; y-- > 0;)
     for (uint32_t x = gx; x-- > 0;)
       for (uint32_t w = qwk::kQuantWarps; w-- > 0;) {
         uint32_t b;
         if (y >= p->rows || !qwk::quant_block_of(*p, x, w, &b)) continue;
-        for (uint32_t l = kW; l-- > 0;) m[l] = qwk::quant_lane_load(*p, y, b, l, v[l]);
+        for (uint32_t l = kW; l-- > 0;) {
+          v[l] = qwk::quant_lane_load(*p, y, b, l);
+          m[l] = qwk::quant_lane_amax(v[l]);
+        }
         for (uint32_t off = kW / 2; off > 0; off >>= 1) {
-          float next[kW];
-          for (uint32_t l = kW; l-- > 0;) next[l] = ds::max32(m[l], m[l ^ off]);
+          uint32_t next[kW];
+          for (uint32_t l = kW; l-- > 0;) next[l] = m[l] > m[l ^ off] ? m[l] : m[l ^ off];
           std::memcpy(m, next, sizeof m);
         }
         for (uint32_t l = kW; l-- > 0;) qwk::quant_lane_store(*p, y, b, l, v[l], m[l]);
       }
+}
+
+// `qwk::e4m3_code` against `ds::e4m3_encode` over every f32 bit pattern from
+// `first` to `last` inclusive: the number that differ, and the first of them
+// in `*at`.
+uint64_t qwen_host_e4m3_check(uint32_t first, uint32_t last, uint32_t* at) {
+  uint64_t bad = 0;
+  for (uint64_t b = first; b <= last; ++b) {
+    float x;
+    const uint32_t bits = static_cast<uint32_t>(b);
+    std::memcpy(&x, &bits, sizeof x);
+    if (qwk::e4m3_code(x) != ds::e4m3_encode(x)) {
+      if (bad++ == 0) *at = bits;
+    }
+  }
+  return bad;
 }
 
 // `eidola_qwen_fast_gemm_bf16`'s entry (the fast profile's small-N GEMM): a
@@ -87,6 +130,30 @@ void qwen_host_fast_gemm(const QwLinearParams* p, uint32_t gx, uint32_t gy) {
           std::memcpy(acc, next, sizeof acc);
         }
         qwf::small_gemm_store(*p, n, r0, rows, acc[0]);
+      }
+}
+
+// `eidola_qwen_fast_gemm_bf16_tiled`'s entry (the small-N GEMM's tiled form):
+// a warp per tile, each of its sums combined by the same butterfly.
+void qwen_host_fast_gemm_tiled(const QwLinearParams* p, uint32_t gx, uint32_t gy) {
+  constexpr uint32_t kW = qwf::kWarp;
+  constexpr uint32_t kT = qwf::kTileRows * qwf::kTileOuts;
+  std::vector<float> acc(kW * kT);
+  std::vector<float> next(kW * kT);
+  for (uint32_t y = gy; y-- > 0;)
+    for (uint32_t x = gx; x-- > 0;)
+      for (uint32_t w = qwf::kTileWarps; w-- > 0;) {
+        uint32_t n0, outs, r0, rows;
+        if (!qwf::tile_gemm_unit(*p, x, y, w, &n0, &outs, &r0, &rows)) continue;
+        for (uint32_t l = kW; l-- > 0;)
+          qwf::tile_gemm_lane(*p, n0, outs, r0, rows, l, &acc[l * kT]);
+        for (uint32_t off = kW / 2; off > 0; off >>= 1) {
+          for (uint32_t l = kW; l-- > 0;)
+            for (uint32_t i = 0; i < kT; ++i)
+              next[l * kT + i] = acc[l * kT + i] + acc[(l ^ off) * kT + i];
+          acc.swap(next);
+        }
+        qwf::tile_gemm_store(*p, n0, outs, r0, rows, &acc[0]);
       }
 }
 
@@ -218,16 +285,39 @@ void qwen_host_dn_rec(const QwDnRecParams* p, uint32_t gx, uint32_t gy) {
     }
 }
 
-void qwen_host_dn_norm(const QwDnNormParams* p, uint32_t gx, uint32_t gy) {
-  qwk::DnNormShared sh;
+// `eidola_qwen_dn_norm`'s entry: a warp a (row, head), four a CTA, numbered
+// row by row over the grid's x.
+void qwen_host_dn_norm(const QwDnNormParams* p, uint32_t gx, uint32_t) {
+  qwk::DnNormShared sh[qwk::kDnNormItems];
+  for (uint32_t x = gx; x-- > 0;) {
+    garbage(&sh);
+    for (uint32_t w = qwk::kDnNormItems; w-- > 0;) {
+      const uint64_t item = static_cast<uint64_t>(x) * qwk::kDnNormItems + w;
+      if (item >= static_cast<uint64_t>(p->rows) * p->v_heads) continue;
+      qwk::dn_norm_item(*p, static_cast<uint32_t>(item / p->v_heads),
+                        static_cast<uint32_t>(item % p->v_heads), qwk::WarpPar{}, sh[w]);
+    }
+  }
+}
+
+// The gated norm's reference form over its own grid: a CTA a (head, row).
+void qwen_host_dn_norm_reference(const QwDnNormParams* p, uint32_t gx, uint32_t gy) {
+  qwk::DnNormRefShared sh;
   for (uint32_t y = gy; y-- > 0;)
     for (uint32_t x = gx; x-- > 0;) {
       garbage(&sh);
-      qwk::dn_norm_block(*p, y, x, kParBlock, sh);
+      qwk::dn_norm_reference_block(*p, y, x, kParBlock, sh);
     }
 }
 
 void qwen_host_widen(const QwWidenParams* p, uint32_t gx, uint32_t gy) {
+  for (uint32_t y = gy; y-- > 0;)
+    for (uint32_t x = gx; x-- > 0;)
+      for (uint32_t t = qwk::kElementThreads; t-- > 0;) qwk::widen8_thread(*p, x, y, t);
+}
+
+// The widening's reference form over its own grid: an element a thread.
+void qwen_host_widen_reference(const QwWidenParams* p, uint32_t gx, uint32_t gy) {
   for (uint32_t y = gy; y-- > 0;)
     for (uint32_t x = gx; x-- > 0;)
       for (uint32_t t = qwk::kElementThreads; t-- > 0;) qwk::widen_thread(*p, x, y, t);
