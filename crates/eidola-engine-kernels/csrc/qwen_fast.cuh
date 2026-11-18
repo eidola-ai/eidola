@@ -128,4 +128,135 @@ QF_FN void small_gemm_store(const QwLinearParams& p, uint32_t n, uint32_t r0, ui
   }
 }
 
+// ---- the tiled form (`eidola_qwen_fast_gemm_bf16_tiled`) ----
+//
+// At prefill sizes the form above reads a weight row once per four rows and
+// each row once per output. The tiled form gives a warp `kTileRows` rows by
+// `kTileOuts` outputs (a CTA's four warps share its rows, so they read them
+// from L1): per chunk a lane loads each of its rows and each of its weight rows
+// once and makes every one of the tile's products from them. Every (row,
+// output) is summed exactly as above: lane `l` over its chunks `l, l + 32, …`,
+// each chunk's elements in turn, by fused multiply-adds from +0, then the same
+// butterfly. So a row's bits do not depend on which form ran, which is what
+// lets the executor choose by row count. On the device two rows' sums advance
+// in one paired fused multiply-add (`fma.rn.f32x2`: each half is rounded
+// once, as `fma32`).
+
+constexpr uint32_t kTileRows = 8;   // rows a warp of the tiled form takes
+constexpr uint32_t kTileOuts = 4;   // outputs a warp of the tiled form takes
+constexpr uint32_t kTileWarps = 4;  // warps a CTA: its outputs side by side, the rows shared
+static_assert(kTileRows % 2 == 0, "rows go in pairs");
+
+// The CTA (`bx`, `by`)'s outputs and rows for warp `w`, and their counts;
+// false past the outputs or rows.
+QF_FN bool tile_gemm_unit(const QwLinearParams& p, uint32_t bx, uint32_t by, uint32_t w,
+                          uint32_t* n0, uint32_t* outs, uint32_t* r0, uint32_t* rows) {
+  *n0 = (bx * kTileWarps + w) * kTileOuts;
+  *r0 = by * kTileRows;
+  if (*n0 >= p.n || *r0 >= p.rows) return false;
+  *outs = p.n - *n0 < kTileOuts ? p.n - *n0 : kTileOuts;
+  *rows = p.rows - *r0 < kTileRows ? p.rows - *r0 : kTileRows;
+  return true;
+}
+
+#if defined(__CUDA_ARCH__)
+// Two f32 values in one 64-bit register pair, and `fma.rn.f32x2`.
+__device__ __forceinline__ uint64_t pair32(float lo, float hi) {
+  uint64_t r;
+  asm("mov.b64 %0, {%1, %2};" : "=l"(r) : "f"(lo), "f"(hi));
+  return r;
+}
+__device__ __forceinline__ void unpair32(uint64_t v, float* lo, float* hi) {
+  asm("mov.b64 {%0, %1}, %2;" : "=f"(*lo), "=f"(*hi) : "l"(v));
+}
+__device__ __forceinline__ uint64_t fma2(uint64_t a, uint64_t b, uint64_t c) {
+  uint64_t r;
+  asm("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(r) : "l"(a), "l"(b), "l"(c));
+  return r;
+}
+#endif
+
+// Lane `l`'s partial sums of the tile: `acc[r · kTileOuts + o]` for row
+// `r0 + r` and output `n0 + o`. A row or output past the tile's counts reads
+// the first one instead and is never stored.
+QF_FN void tile_gemm_lane(const QwLinearParams& p, uint32_t n0, uint32_t outs, uint32_t r0,
+                          uint32_t rows, uint32_t l, float* acc) {
+  const uint32_t chunks = p.k / kSmallChunk;
+  // The tile's first row and weight row, and each one's offset from it.
+  const uint16_t* x0 = p.x + static_cast<uint64_t>(r0) * p.x_stride;
+  const uint16_t* w0 = p.w + static_cast<uint64_t>(n0) * p.k;
+  uint32_t xo[kTileRows];
+  uint32_t wo[kTileOuts];
+  for (uint32_t r = 0; r < kTileRows; ++r) xo[r] = r < rows ? r * p.x_stride : 0;
+  for (uint32_t o = 0; o < kTileOuts; ++o) wo[o] = o < outs ? o * p.k : 0;
+#if defined(__CUDA_ARCH__)
+  uint64_t a2[kTileRows / 2][kTileOuts];
+#pragma unroll
+  for (uint32_t r = 0; r < kTileRows / 2; ++r)
+#pragma unroll
+    for (uint32_t o = 0; o < kTileOuts; ++o) a2[r][o] = 0;
+  for (uint32_t c = l; c < chunks; c += kWarp) {
+    uint4 xv[kTileRows];
+    uint4 wv[kTileOuts];
+#pragma unroll
+    for (uint32_t r = 0; r < kTileRows; ++r) {
+      xv[r] = __ldg(reinterpret_cast<const uint4*>(x0 + xo[r] + c * kSmallChunk));
+    }
+#pragma unroll
+    for (uint32_t o = 0; o < kTileOuts; ++o) {
+      wv[o] = __ldg(reinterpret_cast<const uint4*>(w0 + wo[o] + c * kSmallChunk));
+    }
+#pragma unroll
+    for (uint32_t e = 0; e < kSmallChunk; ++e) {
+      // Element `e` of a 16-byte chunk: the low or high half of word `e / 2`.
+      auto half = [e](const uint4& u) {
+        const uint32_t word = e / 2 == 0 ? u.x : e / 2 == 1 ? u.y : e / 2 == 2 ? u.z : u.w;
+        return __uint_as_float(e % 2 == 0 ? word << 16 : word & 0xffff0000u);
+      };
+      float wf[kTileOuts];
+#pragma unroll
+      for (uint32_t o = 0; o < kTileOuts; ++o) wf[o] = half(wv[o]);
+#pragma unroll
+      for (uint32_t r = 0; r < kTileRows / 2; ++r) {
+        const uint64_t xp = pair32(half(xv[2 * r]), half(xv[2 * r + 1]));
+#pragma unroll
+        for (uint32_t o = 0; o < kTileOuts; ++o) {
+          a2[r][o] = fma2(xp, pair32(wf[o], wf[o]), a2[r][o]);
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (uint32_t r = 0; r < kTileRows / 2; ++r)
+#pragma unroll
+    for (uint32_t o = 0; o < kTileOuts; ++o) {
+      unpair32(a2[r][o], &acc[(2 * r) * kTileOuts + o], &acc[(2 * r + 1) * kTileOuts + o]);
+    }
+#else
+  for (uint32_t i = 0; i < kTileRows * kTileOuts; ++i) acc[i] = 0.0f;
+  for (uint32_t c = l; c < chunks; c += kWarp) {
+    for (uint32_t e = 0; e < kSmallChunk; ++e) {
+      for (uint32_t r = 0; r < kTileRows; ++r) {
+        const float xv = bf16_value(x0[xo[r] + c * kSmallChunk + e]);
+        for (uint32_t o = 0; o < kTileOuts; ++o) {
+          float& a = acc[r * kTileOuts + o];
+          a = fma32(xv, bf16_value(w0[wo[o] + c * kSmallChunk + e]), a);
+        }
+      }
+    }
+  }
+#endif
+}
+
+// Lane 0's stores of the tile's combined sums.
+QF_FN void tile_gemm_store(const QwLinearParams& p, uint32_t n0, uint32_t outs, uint32_t r0,
+                           uint32_t rows, const float* sum) {
+  for (uint32_t r = 0; r < rows; ++r) {
+    for (uint32_t o = 0; o < outs; ++o) {
+      static_cast<float*>(p.out)[static_cast<uint64_t>(r0 + r) * p.out_stride + n0 + o] =
+          sum[r * kTileOuts + o];
+    }
+  }
+}
+
 }  // namespace qwf

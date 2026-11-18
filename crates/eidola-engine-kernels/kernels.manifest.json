@@ -231,23 +231,23 @@
     },
     {
       "path": "csrc/qwen_fast.cu",
-      "sha256": "f30834ed9b905a0ff537fadf5ba405c2c7a4a5a2c594e33f93b2a004bfbc9d2a"
+      "sha256": "e03d3eed1b86d6a0d4d75517229bd10b4be4a80ee4458c6432c4af3911f1086f"
     },
     {
       "path": "csrc/qwen_fast.cuh",
-      "sha256": "daac371b419bee41ed2bc2600a8a057dc459f5deedb2dab17bf8b8e371d79387"
+      "sha256": "48edbaefd0825adbb9e0eff19a168330564dde74c289dca580c580aa9f36650d"
     },
     {
       "path": "csrc/qwen_ops.cu",
-      "sha256": "69d71a101d02624d4d3c46bd7301c28f5d4511275ba0a7eb1e6df6d4281f91d8"
+      "sha256": "a083eab3b57051d23bb7710266abb4da53acccf8ed3d988ecfba505c74c1eec8"
     },
     {
       "path": "csrc/qwen_ops.cuh",
-      "sha256": "58caf65d1085f55b3daf6f261794b0f7a35926427d63eabbb1b5836fa4b86398"
+      "sha256": "4f8a72668505db50f7ba642458dd270c3f84f59025c2deedb729de9da67eec67"
     },
     {
       "path": "csrc/qwen_ops_div.cu",
-      "sha256": "837a5b8b45641dc2f896f2fa1f8df89f83f1b15c6cbabffea3681ce9b27e5348"
+      "sha256": "bbc9bef69e9ac29eadce008d7956ed800cfb079d9653f7baca71d5a9807725a4"
     },
     {
       "path": "csrc/qwen_sampling.cu",
@@ -2884,8 +2884,8 @@
       "source": "csrc/qwen_fast.cu",
       "profile": "own",
       "file": "cubin/qwen_fast.sm_100a.cubin",
-      "sha256": "f43c2dbc43871d221c1ce5ff23a24bac390dad96d30a986ffba8b53bba5d907c",
-      "size": 56576,
+      "sha256": "329628a1dbb58c4b29fef4d8f39413c02f95033274b0a5b134022840948bfca7",
+      "size": 78888,
       "entries": [
         {
           "symbol": "eidola_qwen_fast_gate",
@@ -2896,11 +2896,17 @@
           "symbol": "eidola_qwen_fast_gemm_bf16",
           "demangled": "eidola_qwen_fast_gemm_bf16",
           "meta": "eidola_qwen_fast_gemm_bf16_meta"
+        },
+        {
+          "symbol": "eidola_qwen_fast_gemm_bf16_tiled",
+          "demangled": "eidola_qwen_fast_gemm_bf16_tiled",
+          "meta": "eidola_qwen_fast_gemm_bf16_tiled_meta"
         }
       ],
       "meta": [
         "eidola_qwen_fast_gate_meta",
-        "eidola_qwen_fast_gemm_bf16_meta"
+        "eidola_qwen_fast_gemm_bf16_meta",
+        "eidola_qwen_fast_gemm_bf16_tiled_meta"
       ],
       "mma_sass": {}
     },
@@ -2910,8 +2916,8 @@
       "source": "csrc/qwen_fast.cu",
       "profile": "own",
       "file": "cubin/qwen_fast.sm_100f.cubin",
-      "sha256": "7d2638d7f5a407fba3a096ff22a855a984c26196dbc7bf2f5433894becc9c7dd",
-      "size": 56576,
+      "sha256": "e399725dc113febbae0b50258bce41fdf417bc6eaf78c35123baededba89c833",
+      "size": 78888,
       "entries": [
         {
           "symbol": "eidola_qwen_fast_gate",
@@ -2922,11 +2928,17 @@
           "symbol": "eidola_qwen_fast_gemm_bf16",
           "demangled": "eidola_qwen_fast_gemm_bf16",
           "meta": "eidola_qwen_fast_gemm_bf16_meta"
+        },
+        {
+          "symbol": "eidola_qwen_fast_gemm_bf16_tiled",
+          "demangled": "eidola_qwen_fast_gemm_bf16_tiled",
+          "meta": "eidola_qwen_fast_gemm_bf16_tiled_meta"
         }
       ],
       "meta": [
         "eidola_qwen_fast_gate_meta",
-        "eidola_qwen_fast_gemm_bf16_meta"
+        "eidola_qwen_fast_gemm_bf16_meta",
+        "eidola_qwen_fast_gemm_bf16_tiled_meta"
       ],
       "mma_sass": {}
     },
@@ -2936,8 +2948,8 @@
       "source": "csrc/qwen_fast.cu",
       "profile": "own",
       "file": "cubin/qwen_fast.sm_103a.cubin",
-      "sha256": "fb6f0311f77347977e0947d63aab7baddf6538112729a54ddd9a2b9b52b25a38",
-      "size": 56576,
+      "sha256": "de67691af6eb32a99fa51d53e5eb5dfea451dabcfb301c38b1af8144d9a03db0",
+      "size": 78888,
       "entries": [
         {
           "symbol": "eidola_qwen_fast_gate",
@@ -2948,11 +2960,17 @@
           "symbol": "eidola_qwen_fast_gemm_bf16",
           "demangled": "eidola_qwen_fast_gemm_bf16",
           "meta": "eidola_qwen_fast_gemm_bf16_meta"
+        },
+        {
+          "symbol": "eidola_qwen_fast_gemm_bf16_tiled",
+          "demangled": "eidola_qwen_fast_gemm_bf16_tiled",
+          "meta": "eidola_qwen_fast_gemm_bf16_tiled_meta"
         }
       ],
       "meta": [
         "eidola_qwen_fast_gate_meta",
-        "eidola_qwen_fast_gemm_bf16_meta"
+        "eidola_qwen_fast_gemm_bf16_meta",
+        "eidola_qwen_fast_gemm_bf16_tiled_meta"
       ],
       "mma_sass": {}
     },
@@ -2962,8 +2980,8 @@
       "source": "csrc/qwen_ops.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops.sm_100a.cubin",
-      "sha256": "e9c246dd603ff1d7b86f53566eaf1a8db282a04d45b9ee2b15750b04cd88f703",
-      "size": 83264,
+      "sha256": "c86b5935f7c4bcce7bf7ffd7695bad8363f9a7800860cd194a3f9dc2f98a034d",
+      "size": 84904,
       "entries": [
         {
           "symbol": "eidola_qwen_copy_rows",
@@ -3024,8 +3042,8 @@
       "source": "csrc/qwen_ops.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops.sm_100f.cubin",
-      "sha256": "279c261af26b9562dac3d902127246739a730565f2d06e7f52f75ad49c7b976c",
-      "size": 83264,
+      "sha256": "3d032f4e7b7c3b0fe1ce409a089617fe6812f21fdcfb40be4c659a51395df8fe",
+      "size": 84904,
       "entries": [
         {
           "symbol": "eidola_qwen_copy_rows",
@@ -3086,8 +3104,8 @@
       "source": "csrc/qwen_ops.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops.sm_103a.cubin",
-      "sha256": "2b5c534b98dd18e1283d35703a4757e21b10e58184f4f3290d6776d9b933da14",
-      "size": 84416,
+      "sha256": "e4dcd393ccb82f5fa8321509471d1e60841def6ce3d8d51ec2c59103a902553b",
+      "size": 86056,
       "entries": [
         {
           "symbol": "eidola_qwen_copy_rows",
@@ -3148,8 +3166,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_100a.cubin",
-      "sha256": "2899d70c6c6982531d31d7794a22ef2b2567b76491c56f984b70ef320f752937",
-      "size": 212424,
+      "sha256": "0d5214f20cb96584b18dffa58fafee9cb0af64e6dd8c5b75f6eabd38860e5a15",
+      "size": 260680,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -3194,8 +3212,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1666,
-        "sass_fma": 416
+        "ptx_rounded": 2198,
+        "sass_fma": 496
       }
     },
     {
@@ -3204,8 +3222,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_100f.cubin",
-      "sha256": "e38e4ce07fe6bceeeac859b8f0c2bde90456a7642b4bd004b8169d5314e54c8c",
-      "size": 212424,
+      "sha256": "7056ab8a8d47bcdbaaaa6479712340291cf950c3c265b26bd780742ff50fc055",
+      "size": 260680,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -3250,8 +3268,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1666,
-        "sass_fma": 416
+        "ptx_rounded": 2198,
+        "sass_fma": 496
       }
     },
     {
@@ -3260,8 +3278,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_103a.cubin",
-      "sha256": "b7a2f10ef60964b859323f834eef3250a1c3586ea0c777ab7f3e6da4b423d93c",
-      "size": 266024,
+      "sha256": "374aeae7b72d2203b8d0708cd121d7ddbc383bb73f932c7567d7c3ebaf9a269e",
+      "size": 336944,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -3306,8 +3324,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1666,
-        "sass_fma": 416
+        "ptx_rounded": 2198,
+        "sass_fma": 496
       }
     },
     {
@@ -3811,8 +3829,8 @@
     {
       "name": "qwen_fast",
       "file": "fatbin/qwen_fast.fatbin",
-      "sha256": "8348f8da99434031108685d661e903c918a9d0dc485939e81173cde9b14810e0",
-      "size": 113384,
+      "sha256": "5d12bd17a40e331cc1d252fdab3659e58eed2e3f2a6d307d2a188e242136bdb0",
+      "size": 158008,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -3821,8 +3839,8 @@
     {
       "name": "qwen_ops",
       "file": "fatbin/qwen_ops.fatbin",
-      "sha256": "6dd500fd296ac1a87faf779b2f41e90cf5b2bb6c4bda396d78dba6cde17e99f4",
-      "size": 167912,
+      "sha256": "ababa4e7da9f032f0b59527b8286b67c0080d9dd190c8773eb21903593e47f81",
+      "size": 171192,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -3831,8 +3849,8 @@
     {
       "name": "qwen_ops_div",
       "file": "fatbin/qwen_ops_div.fatbin",
-      "sha256": "f45a4b374d06fadac498f173aa79acf88125c0cff509cc40c5cac9ada58a8e9d",
-      "size": 478680,
+      "sha256": "f74fa3afd22b7aa44e22f7539050baff471dd0d4819771f468d1ae889aa87e68",
+      "size": 597856,
       "archs": [
         "sm_100a",
         "sm_103a"

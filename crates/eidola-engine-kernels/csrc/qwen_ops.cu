@@ -39,7 +39,7 @@ EIDOLA_KERNEL_META(eidola_qwen_kv_write, qwk::kElementThreads, 1, 1, 0, 1, 1, 1,
 
 extern "C" __global__ void __launch_bounds__(qwk::kElementThreads)
     eidola_qwen_widen(const __grid_constant__ QwWidenParams p) {
-  qwk::widen_thread(p, blockIdx.x, blockIdx.y, threadIdx.x);
+  qwk::widen8_thread(p, blockIdx.x, blockIdx.y, threadIdx.x);
 }
 EIDOLA_KERNEL_META(eidola_qwen_widen, qwk::kElementThreads, 1, 1, 0, 1, 1, 1,
                    sizeof(QwWidenParams));

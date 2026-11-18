@@ -9,7 +9,8 @@
 //! with its operands swapped up to 64 rows (`cutlass_fp8_blockwise_swap`, [`fp8_kind`]); the BF16 linears
 //! (the head, the drafter's input projection) CUTLASS's BF16 GEMM into an f32 scratch the
 //! caller names, rounded to BF16 by `eidola_qwen_round`, and the DeltaNet's stacked `a`
-//! and `b` projections (`gemm_bf16`) our small-N kernel (`qwen_fast.cu`); the gates are
+//! and `b` projections (`gemm_bf16`) our small-N kernel (`qwen_fast.cu`, tiled from
+//! [`SMALL_TILED_ROWS`] rows); the gates are
 //! computed in f32 there too (`eidola_qwen_fast_gate`); and
 //! attention runs FA2 at head dimension 256 ([`super::attention`]). Both profiles load
 //! Qwen's sampler (`qwen_sampling`, [`super::sampler`]); the grouped row copy is
@@ -88,6 +89,7 @@ struct Fast {
     fp8_swap: [Gemm; 3],
     bf16: Gemm,
     small: Kernel,
+    small_tiled: Kernel,
     gate: Kernel,
     attention: QwenAttention,
     _modules: Vec<KernelModule>,
@@ -160,6 +162,11 @@ impl CudaDevice {
                     ],
                     bf16: Gemm::from_module(GemmKind::Bf16, &b)?,
                     small: bound::<LinearParams>(&q, FAST_IMAGE, "eidola_qwen_fast_gemm_bf16")?,
+                    small_tiled: bound::<LinearParams>(
+                        &q,
+                        FAST_IMAGE,
+                        "eidola_qwen_fast_gemm_bf16_tiled",
+                    )?,
                     gate: bound::<GateParams>(&q, FAST_IMAGE, "eidola_qwen_fast_gate")?,
                     attention: QwenAttention::from_module(a)?,
                     _modules: vec![f, sw, b, q],
@@ -294,6 +301,41 @@ impl CudaDevice {
         unsafe { f.bf16.launch(&self.gpu, &a) }
     }
 
+    /// The small-N BF16 GEMM of `p` in the form named (`tiled`: eight rows by four outputs
+    /// a warp; else four rows by one output), whatever its row count: the tests' and the
+    /// bench's. Both forms give every row the same bits.
+    ///
+    /// # Safety
+    ///
+    /// As [`QwenKernels::gemm_bf16`].
+    pub unsafe fn gemm_bf16_form(&self, p: &LinearParams, tiled: bool) -> Result<()> {
+        if p.rows == 0 {
+            return Ok(());
+        }
+        linear_grid(p)?;
+        let f = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the BF16 GEMM runs in the fast profile"))?;
+        if p.out_stride != p.n || p.out_f32 != 1 {
+            return Err(CudaError::new("the fast BF16 GEMM writes dense f32 rows"));
+        }
+        // SAFETY: the caller's.
+        unsafe { self.small_gemm(f, p, tiled) }
+    }
+
+    unsafe fn small_gemm(&self, f: &Fast, p: &LinearParams, tiled: bool) -> Result<()> {
+        if tiled {
+            let g = small_gemm_tiled_grid(p)?;
+            // SAFETY: the caller's.
+            unsafe { self.go(&f.small_tiled, p, g) }
+        } else {
+            let g = small_gemm_grid(p)?;
+            // SAFETY: the caller's.
+            unsafe { self.go(&f.small, p, g) }
+        }
+    }
+
     unsafe fn go<P: Copy>(&self, kernel: &Kernel, p: &P, grid: [u32; 3]) -> Result<()> {
         let mut v = *p;
         let mut args = [(&mut v as *mut P).cast::<c_void>()];
@@ -376,9 +418,8 @@ impl QwenKernels for CudaDevice {
         if p.out_stride != p.n || p.out_f32 != 1 {
             return Err(CudaError::new("the fast BF16 GEMM writes dense f32 rows"));
         }
-        let g = small_gemm_grid(p)?;
         // SAFETY: `rows` input rows, the weight, `rows · n` f32 outputs: the caller's.
-        unsafe { self.go(&f.small, p, g) }
+        unsafe { self.small_gemm(f, p, p.rows >= SMALL_TILED_ROWS) }
     }
     unsafe fn gate(&self, p: &GateParams) -> Result<()> {
         if p.rows == 0 {

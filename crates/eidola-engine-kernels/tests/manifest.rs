@@ -547,8 +547,8 @@ fn qwen_fa2_d256_is_the_mma_sync_path() {
 }
 
 /// The fast profile's own kernels: the `own` profile (contraction allowed: their bodies
-/// spell out the fused multiply-adds they mean), no tensor cores, exactly their two
-/// entries; the swapped FP8 GEMM's image exactly its three tile instances; and Qwen's
+/// spell out the fused multiply-adds they mean), no tensor cores, exactly their three
+/// entries (the gates and the small-N GEMM's two forms); the swapped FP8 GEMM's image exactly its three tile instances; and Qwen's
 /// sampler, in both profiles, the `own` profile (every f64 operation it means rounded is
 /// an explicit round-to-nearest intrinsic, as the shared sampler's), its four sample and
 /// three acceptance kernels.
@@ -560,7 +560,11 @@ fn qwen_fast_images_hold_their_entries() {
             (
                 "qwen_fast",
                 "own",
-                &["eidola_qwen_fast_gate", "eidola_qwen_fast_gemm_bf16"][..],
+                &[
+                    "eidola_qwen_fast_gate",
+                    "eidola_qwen_fast_gemm_bf16",
+                    "eidola_qwen_fast_gemm_bf16_tiled",
+                ][..],
             ),
             (
                 "cutlass_fp8_blockwise_swap",

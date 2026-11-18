@@ -8,9 +8,13 @@
 //!   weights, TFLOP/s; and `lin8_kind`, every fast GEMM forced (the swapped kernel at
 //!   each activation tile, and the unswapped one) at 1, 8, 64 and 2,048 rows;
 //! - `small_gemm`: the DeltaNet's stacked `a` and `b` projections (96 × 5,120) on the
-//!   small-N kernel and on CUTLASS's BF16 GEMM, at 1, 8, 64 and 2,048 rows;
-//! - `norm`, `quant`, `gate` (fast f32 and exact f64), `dn_prep`, `dn_norm`: one launch
-//!   at the released widths, at 1, 8, 64, 256 and 2,048 rows;
+//!   small-N kernel as dispatched (`small_n`), in each of its forms forced
+//!   (`small_n_rows`, `small_n_tiled`), and on CUTLASS's BF16 GEMM, at 1, 8, 64, 256 and
+//!   2,048 rows;
+//! - `norm` (the hidden norm with the residual add, and `q_rope`: the query heads' norm
+//!   with RoPE), `widen` (the DeltaNet's conv inputs, 10,240 wide), `quant` (over
+//!   activation-like values), `gate` (fast f32 and exact f64), `dn_prep`, `dn_norm`: one
+//!   launch at the released widths, at 1, 8, 64, 256 and 2,048 rows;
 //! - `head`: the BF16 head (248,320 × 5,120), fast;
 //! - `sample`: Qwen's sampler over the released vocabulary at 1, 8, 64 and 256 rows,
 //!   greedy, at temperature 1 alone, and with top-k 20 and top-p 0.95 (the conversation
@@ -67,6 +71,29 @@ fn fill(d: &CudaDevice, addr: u64, bytes: usize, seed: u64) {
         })
         .collect();
     // SAFETY: a fresh allocation of `bytes`.
+    unsafe { d.upload(addr, &v) }.unwrap_or_else(|e| fail(e));
+}
+
+/// `count` BF16 values at `addr` shaped like activations: about normal (a sum of four
+/// uniforms), one in a thousand twenty times larger. The quantiser's branch-free path
+/// covers such blocks; `fill`'s values, spread over a hundred binades, would send most of
+/// its blocks down the dividing path.
+fn fill_activations(d: &CudaDevice, addr: u64, count: usize, seed: u64) {
+    let mut s = seed;
+    let mut uniform = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let v: Vec<u8> = (0..count)
+        .flat_map(|i| {
+            let x = uniform() + uniform() + uniform() + uniform() - 2.0;
+            let x = if i % 1000 == 999 { 20.0 * x } else { x };
+            eidola_engine_cuda::bf16::from_f32(x).to_le_bytes()
+        })
+        .collect();
+    // SAFETY: an allocation of at least `2 · count` bytes.
     unsafe { d.upload(addr, &v) }.unwrap_or_else(|e| fail(e));
 }
 
@@ -377,8 +404,12 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
     unsafe { fast.upload(conv_w, &taps) }.unwrap_or_else(|e| fail(e));
     let codes = alloc(fast, rows_max * inter as usize, keep);
     let scales = alloc(fast, (inter as usize / 128) * rows_max * 4, keep);
+    let acts = alloc(fast, rows_max * inter as usize * 2, keep);
+    fill_activations(fast, acts, rows_max * inter as usize, 15);
     let ab_w = alloc(fast, 96 * hidden as usize * 2, keep);
     fill(fast, ab_w, 96 * hidden as usize * 2, 13);
+    let rope = alloc(fast, 4096 * 64 * 4, keep);
+    fill(fast, rope, 4096 * 64 * 4, 14);
     for rows in [1u32, 8, 64, 256, 2048] {
         let norm = NormParams {
             x,
@@ -399,9 +430,53 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
             unsafe { fast.norm(&norm) }.unwrap_or_else(|e| fail(e))
         });
         line("norm", "exact", rows, s);
+        // The query heads' norm with RoPE: 24 heads of 256 a row, beside their gates
+        // (unit stride 512), a warp a head.
+        let positions: Vec<u8> = (0..rows).flat_map(|r| (r % 4096).to_le_bytes()).collect();
+        let pos = alloc(fast, positions.len().max(8), keep);
+        // SAFETY: the positions array just made.
+        unsafe { fast.upload(pos, &positions) }.unwrap_or_else(|e| fail(e));
+        let qk = NormParams {
+            x,
+            add: 0,
+            weight: w,
+            out,
+            rope_cos: rope,
+            rope_sin: rope,
+            positions: pos,
+            rows,
+            units: 24,
+            n: 256,
+            x_stride: 24 * 512,
+            x_unit_stride: 512,
+            out_stride: 24 * 256,
+            out_unit_stride: 256,
+            rotary: 64,
+            eps: 1e-6,
+            ..NormParams::default()
+        };
+        // SAFETY: 2,048 rows of 12,288 BF16 values at `x`, of 6,144 at `out`; 4,096
+        // positions of 64 rotation values.
+        let s = time(fast, it, || {
+            unsafe { fast.norm(&qk) }.unwrap_or_else(|e| fail(e))
+        });
+        line("norm", "q_rope", rows, s);
+        let wid = WidenParams {
+            x,
+            out,
+            rows,
+            width: 10_240,
+            x_stride: 10_240,
+            out_stride: 10_240,
+        };
+        // SAFETY: 2,048 rows of 10,240 values at each.
+        let s = time(fast, it, || {
+            unsafe { fast.widen(&wid) }.unwrap_or_else(|e| fail(e))
+        });
+        line("widen", "conv_in", rows, s);
         for k in [hidden, inter] {
             let q = QuantParams {
-                x,
+                x: acts,
                 codes,
                 scales,
                 rows,
@@ -454,6 +529,13 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
             unsafe { fast.gemm_bf16(&ab) }.unwrap_or_else(|e| fail(e))
         });
         line("small_gemm", "small_n", rows, s);
+        for (form, tiled) in [("small_n_rows", false), ("small_n_tiled", true)] {
+            // SAFETY: as above.
+            let s = time(fast, it, || {
+                unsafe { fast.gemm_bf16_form(&ab, tiled) }.unwrap_or_else(|e| fail(e))
+            });
+            line("small_gemm", form, rows, s);
+        }
         // SAFETY: as above.
         let s = time(fast, it, || {
             unsafe { fast.gemm_bf16_cutlass(&ab) }.unwrap_or_else(|e| fail(e))
