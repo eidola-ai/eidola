@@ -739,7 +739,7 @@ mod counting {
     use eidola_engine_cuda::qwen::abi::*;
     use eidola_engine_cuda::qwen::attention::Fa2Args;
     use eidola_engine_cuda::qwen::device::{QwenDevice, QwenProfile};
-    use eidola_engine_cuda::qwen::kernels::{AcceptLaunch, CopyArgs, QwenKernels, SampleArgs};
+    use eidola_engine_cuda::qwen::kernels::{AcceptLaunch, QwenKernels, SampleArgs};
 
     impl<D: QwenKernels> QwenKernels for Counting<D> {
         unsafe fn embed(&self, p: &EmbedParams) -> Result<()> {
@@ -760,8 +760,8 @@ mod counting {
         unsafe fn gemm_bf16(&self, p: &LinearParams) -> Result<()> {
             unsafe { self.inner.gemm_bf16(p) }
         }
-        unsafe fn copy_rows(&self, a: &CopyArgs) -> Result<()> {
-            unsafe { self.inner.copy_rows(a) }
+        unsafe fn copy_rows(&self, p: &CopyParams) -> Result<()> {
+            unsafe { self.inner.copy_rows(p) }
         }
         unsafe fn sample(&self, a: &SampleArgs) -> Result<()> {
             unsafe { self.inner.sample(a) }
@@ -786,6 +786,9 @@ mod counting {
         }
         unsafe fn dn_rec(&self, p: &DnRecParams) -> Result<()> {
             unsafe { self.inner.dn_rec(p) }
+        }
+        unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()> {
+            unsafe { self.inner.dn_rec_short(p) }
         }
         unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()> {
             unsafe { self.inner.dn_norm(p) }
