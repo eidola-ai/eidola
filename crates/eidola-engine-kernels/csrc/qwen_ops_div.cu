@@ -18,7 +18,7 @@ __device__ __forceinline__ void norm_entry(const QwNormParams& p) {
   __shared__ qwk::NormShared sh;
   if (p.n > qwk::kNormWarpMax) {
     qwk::norm_item<qwk::kElementThreads, Fused>(p, blockIdx.y, blockIdx.x, ds::Par{}, sh.ln[0],
-                                                sh.row, sh.gm);
+                                                sh.row, sh.gm, sh.sc);
     return;
   }
   const uint32_t w = threadIdx.x / qwk::kWarp;
@@ -28,7 +28,8 @@ __device__ __forceinline__ void norm_entry(const QwNormParams& p) {
   qwk::norm_item<qwk::kWarp, Fused>(p, static_cast<uint32_t>(item / p.units),
                                     static_cast<uint32_t>(item % p.units), qwk::WarpPar{},
                                     sh.ln[w], sh.row + w * qwk::kNormWarpMax,
-                                    sh.gm + w * (qwk::kNormWarpMax / 4));
+                                    sh.gm + w * qwk::kNormWarpQuantWords,
+                                    sh.sc + w * (qwk::kNormWarpMax / QW_BLOCK));
 }
 
 extern "C" __global__ void __launch_bounds__(qwk::kElementThreads)
