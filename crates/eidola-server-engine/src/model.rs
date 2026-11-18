@@ -14,7 +14,8 @@
 //!
 //! The names are `eidola_common::weights_manifest`'s, the same for every architecture;
 //! which of them must be present is the served architecture's
-//! (`weights_manifest::required_files`): MiMo-V2.6 reads all three chat artifacts, while
+//! (`weights_manifest::required_files`): MiMo-V2.6 and Qwen3.8 read all three chat
+//! artifacts, while
 //! DeepSeek-V4.1 encodes its prompt with a compiled-in encoder and reads its EOS id from
 //! `config.json`, so it needs only the tokenizer (and reads `generation_config.json` when
 //! there is one). A covered file the node does not read is hashed all the same.
@@ -42,13 +43,15 @@
 //! is dequantised or copied to a device.
 //!
 //! The architecture is `config.json`'s `model_type`, read after the hash is checked:
-//! `deepseek_v41` is DeepSeek-V4.1-Flash, and anything else is read as MiMo-V2.6, whose
-//! configuration parser refuses what it is not.
+//! `deepseek_v41` is DeepSeek-V4.1-Flash, `qwen3_5` is Qwen3.8-27B, and anything else is
+//! read as MiMo-V2.6, whose configuration parser refuses what it is not.
 //!
 //! What is loaded depends on the executor: the CPU executor runs the reference model,
 //! built here (MiMo's dequantised to f32; DeepSeek's from the model crate's DeepSeek
 //! loader); the CUDA executor copies the checkpoint to the device as stored, from the
-//! same verified mapping ([`LoadedModel::store`]), so no reference model is built.
+//! same verified mapping ([`LoadedModel::store`]), so no reference model is built. Qwen3.8's
+//! reference model keeps its large weights in that mapping and decodes only its small
+//! ones, and both of its executors are built from it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -59,10 +62,12 @@ use eidola_common::weights_manifest;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine_chat::mimo::template::CHAT_TEMPLATE_FILE;
 use eidola_engine_chat::mimo::{ChatTemplate, MimoTokenizer};
+use eidola_engine_chat::qwen;
 use eidola_engine_chat::tokenizer::{CONFIG_FILE, GENERATION_CONFIG_FILE, TOKENIZER_FILE};
 use eidola_engine_chat::{ChatFormat, Tokenizer};
 use eidola_engine_model::deepseek::{DsConfig, DsLoadOptions, DsModel, DsWeights};
 use eidola_engine_model::mimo::{LoadOptions, ModelConfig, ModelWeights, ReferenceModel};
+use eidola_engine_model::qwen::{QwenConfig, QwenModel, QwenWeights};
 use eidola_engine_model::safetensors::{SEMANTIC_FILES, WeightSet};
 use sha2::{Digest, Sha256};
 
@@ -73,6 +78,9 @@ pub const CHAT_FILES: [&str; 3] = [TOKENIZER_FILE, CHAT_TEMPLATE_FILE, GENERATIO
 
 /// `config.json`'s `model_type` for DeepSeek-V4.1.
 pub const DEEPSEEK_V4_1_MODEL_TYPE: &str = "deepseek_v41";
+
+/// `config.json`'s `model_type` for Qwen3.8 (Transformers' `qwen3_5`).
+pub const QWEN3_8_MODEL_TYPE: &str = "qwen3_5";
 
 /// A tensor of DeepSeek-V4.1's Engram compressed-vocabulary map (one `int32` or `int64`
 /// per token id). The node derives the map from the tokenizer, as the reference does
@@ -190,6 +198,12 @@ pub enum Served {
         config: DsConfig,
         token_map: Option<Vec<u32>>,
         model: Option<Arc<DsModel>>,
+    },
+    /// Qwen3.8-27B, text only: the reference model over the verified mapping (its large
+    /// weights left there, as both executors read them) and the model's chat template.
+    Qwen {
+        model: Arc<QwenModel>,
+        template: qwen::ChatTemplate,
     },
 }
 
@@ -342,6 +356,39 @@ impl LoadedModel {
                     defaults,
                 )
             }
+            Architecture::Qwen38Dense27B => {
+                let config = eidola_engine_model::qwen::config_of(&store)
+                    .map_err(|e| ModelError(format!("config.json: {e}")))?;
+                let tokenizer = Tokenizer::for_format(
+                    ChatFormat::Qwen3_8,
+                    &chat[TOKENIZER_FILE],
+                    &chat[GENERATION_CONFIG_FILE],
+                )
+                .map_err(|e| ModelError(e.to_string()))?;
+                let template_source =
+                    String::from_utf8(chat.remove(CHAT_TEMPLATE_FILE).expect("required"))
+                        .map_err(|_| ModelError(format!("{CHAT_TEMPLATE_FILE} is not UTF-8")))?;
+                let template = qwen::ChatTemplate::from_source(template_source)
+                    .map_err(|e| ModelError(e.to_string()))?;
+                let defaults = GenerationDefaults::parse(&chat[GENERATION_CONFIG_FILE])?;
+                if tokenizer.vocab_size() > config.vocab_size {
+                    return Err(ModelError(format!(
+                        "the tokenizer defines {} ids but the model's head has only {} rows",
+                        tokenizer.vocab_size(),
+                        config.vocab_size
+                    )));
+                }
+                let weights = QwenWeights::load(store.clone(), config)
+                    .map_err(|e| ModelError(format!("cannot load the weights: {e}")))?;
+                (
+                    Served::Qwen {
+                        model: Arc::new(QwenModel::new(weights)),
+                        template,
+                    },
+                    tokenizer,
+                    defaults,
+                )
+            }
             _ => {
                 let config = eidola_engine_model::mimo::config_of(&store)
                     .map_err(|e| ModelError(format!("config.json: {e}")))?;
@@ -423,6 +470,7 @@ impl LoadedModel {
         match self.served {
             Served::Mimo { .. } => ChatFormat::MimoV2_6,
             Served::DeepSeek { .. } => ChatFormat::DeepSeekV4_1,
+            Served::Qwen { .. } => ChatFormat::Qwen3_8,
         }
     }
 
@@ -431,17 +479,20 @@ impl LoadedModel {
         let n = match &self.served {
             Served::Mimo { config, .. } => config.max_position_embeddings,
             Served::DeepSeek { config, .. } => config.max_positions.unwrap_or(usize::MAX),
+            Served::Qwen { model, .. } => model.config().max_position_embeddings,
         };
         u32::try_from(n).unwrap_or(u32::MAX)
     }
 
     /// The token ids the model may emit (the engine's `sampleable_vocab_size`): the
     /// tokenizer's ids, and for DeepSeek-V4.1 only those below its image token, which the
-    /// text model cannot embed (the ids from it on are the vision tower's).
+    /// text model cannot embed (the ids from it on are the vision tower's). Qwen3.8's
+    /// vision placeholders sit among its added tokens, so its whole vocabulary is
+    /// sampleable.
     pub fn sampleable_vocab_size(&self) -> u32 {
         let vocab = self.tokenizer.vocab_size() as u32;
         match &self.served {
-            Served::Mimo { .. } => vocab,
+            Served::Mimo { .. } | Served::Qwen { .. } => vocab,
             Served::DeepSeek { config, .. } => {
                 config.image_token_id.map_or(vocab, |i| i.min(vocab))
             }
@@ -457,6 +508,7 @@ impl LoadedModel {
         match &self.served {
             Served::Mimo { config, .. } => config,
             Served::DeepSeek { .. } => panic!("a DeepSeek-V4.1 model has no MiMo configuration"),
+            Served::Qwen { .. } => panic!("a Qwen3.8 model has no MiMo configuration"),
         }
     }
 
@@ -470,7 +522,7 @@ impl LoadedModel {
     pub fn reference(&self) -> Option<&Arc<ReferenceModel>> {
         match &self.served {
             Served::Mimo { reference, .. } => reference.as_ref(),
-            Served::DeepSeek { .. } => None,
+            Served::DeepSeek { .. } | Served::Qwen { .. } => None,
         }
     }
 
@@ -482,11 +534,21 @@ impl LoadedModel {
     ///
     /// # Panics
     ///
-    /// For another architecture (DeepSeek-V4.1's prompt encoder is compiled in).
+    /// For another architecture (DeepSeek-V4.1's prompt encoder is compiled in; Qwen3.8's
+    /// template is [`Served::Qwen`]'s).
     pub fn template(&self) -> &ChatTemplate {
         match &self.served {
             Served::Mimo { template, .. } => template,
             Served::DeepSeek { .. } => panic!("a DeepSeek-V4.1 model has no chat template"),
+            Served::Qwen { .. } => panic!("a Qwen3.8 model has no MiMo chat template"),
+        }
+    }
+
+    /// Qwen3.8's configuration (`config.json`'s text model, verified), when serving it.
+    pub fn qwen_config(&self) -> Option<&QwenConfig> {
+        match &self.served {
+            Served::Qwen { model, .. } => Some(model.config()),
+            _ => None,
         }
     }
 
@@ -502,6 +564,7 @@ fn architecture_of(config_json: &[u8]) -> Result<Architecture, ModelError> {
     Ok(
         match v.get("model_type").and_then(serde_json::Value::as_str) {
             Some(DEEPSEEK_V4_1_MODEL_TYPE) => Architecture::DeepSeekV41Flash,
+            Some(QWEN3_8_MODEL_TYPE) => Architecture::Qwen38Dense27B,
             _ => Architecture::MimoV26Flash,
         },
     )
@@ -753,6 +816,10 @@ mod tests {
         assert_eq!(
             architecture_of(br#"{"model_type": "deepseek_v41"}"#).unwrap(),
             Architecture::DeepSeekV41Flash
+        );
+        assert_eq!(
+            architecture_of(br#"{"model_type": "qwen3_5"}"#).unwrap(),
+            Architecture::Qwen38Dense27B
         );
         for other in [
             &br#"{"model_type": "mimo_v2"}"#[..],
