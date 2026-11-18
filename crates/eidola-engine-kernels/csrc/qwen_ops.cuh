@@ -229,30 +229,90 @@ struct NormLanes {
   float tail;
   float r;
 };
+// An FP8 quantisation block's scale, its reciprocal rounded once, and whether
+// every lane divides (a scale that is not a normal number): `quant_block_scale`.
+struct QuantScale {
+  float s;
+  float r;
+  bool divide;
+};
+
+// A fused quantisation's group maxima (a word of padding a block of 32) and
+// block scales, for a unit of `n` elements.
+constexpr uint32_t kNormQuantWords = kNormMax / 4 + kNormMax / QW_BLOCK;
+constexpr uint32_t kNormWarpQuantWords = kNormWarpMax / 4 + kNormWarpMax / QW_BLOCK;
+
 struct QW_ALIGN16 NormShared {
   uint16_t row[kNormMax];  // one CTA unit, or eight warp units of kNormWarpMax
   NormLanes ln[kNormItems];
+  // A fused quantisation's: one CTA unit's, or eight warp units' in turn.
+  uint32_t gm[kNormQuantWords];
+  QuantScale sc[kNormMax / QW_BLOCK];
 };
+
+// The fused quantisation of a unit's normed values staged in `buf`
+// (`norm_item` with `codes`; defined with the quantiser below).
+template <uint32_t T, class P>
+DS_FN void norm_quant(const QwNormParams& p, uint32_t row, const P& par, const uint16_t* buf,
+                      uint32_t* gm, QuantScale* sc);
 
 // Whether every unit of the launch moves in 16-byte vectors: whole vectors
 // per unit, every row and unit offset and every array aligned to them.
 DS_FN bool norm_vectors(const QwNormParams& p) {
   const uint32_t strides = p.n | p.x_stride | p.x_unit_stride | p.out_stride |
                            p.out_unit_stride | (p.add != nullptr ? p.add_stride : 0u);
-  return strides % 8 == 0 && aligned16(p.x, p.out, p.add, p.weight);
+  return strides % 8 == 0 && aligned16(p.x, p.out, p.add, p.weight) &&
+         aligned16(p.add_parts, p.add_parts, p.add_parts, p.add_parts);
+}
+
+// Element `i` of the residual add's input for `row`: the BF16 `add`, or (the
+// fused form) the split GEMM's partials added in split order and rounded once
+// (`add_parts`).
+template <bool Fused>
+DS_FN uint16_t norm_add_element(const QwNormParams& p, const uint16_t* add, uint32_t row,
+                                uint32_t i) {
+  if (!Fused || add != nullptr) return add[i];
+  const uint64_t at = static_cast<uint64_t>(row) * p.n + i;
+  const uint64_t step = static_cast<uint64_t>(p.add_part_rows) * p.n;
+  float acc = p.add_parts[at];
+  for (uint32_t s = 1; s < p.add_splits; ++s) acc = acc + p.add_parts[at + s * step];
+  return ds::bf16_store(ds::bf16_round(acc));
+}
+
+// Elements `8q .. 8q + 8` of the residual add's input, as `norm_add_element`.
+template <bool Fused>
+DS_FN Bf16x8 norm_add_vector(const QwNormParams& p, const uint16_t* add, uint32_t row,
+                             uint32_t q) {
+  if (!Fused || add != nullptr) return load8(add + 8 * q);
+  const uint64_t at = static_cast<uint64_t>(row) * p.n + 8 * q;
+  const uint64_t step = static_cast<uint64_t>(p.add_part_rows) * p.n;
+  F32x8 acc = load8f(p.add_parts + at);
+  for (uint32_t s = 1; s < p.add_splits; ++s) {
+    const F32x8 v = load8f(p.add_parts + at + s * step);
+    QW_UNROLL
+    for (uint32_t e = 0; e < 8; ++e) acc.f[e] = acc.f[e] + v.f[e];
+  }
+  Bf16x8 a;
+  QW_UNROLL
+  for (uint32_t e = 0; e < 8; ++e) set8(a, e, ds::bf16_store(ds::bf16_round(acc.f[e])));
+  return a;
 }
 
 // Unit `unit` of row `row` over `T` threads, staged in `buf` (at least `n`
 // values, 16-byte aligned).
-template <uint32_t T, class P>
+// `Fused`: the kernel of the fused forms (`eidola_qwen_norm_fused`), which reads
+// `add_parts` and `codes`; the plain kernel is compiled without them.
+template <uint32_t T, bool Fused, class P>
 DS_FN void norm_item(const QwNormParams& p, uint32_t row, uint32_t unit, const P& par,
-                     NormLanes& ln, uint16_t* buf) {
+                     NormLanes& ln, uint16_t* buf, uint32_t* gm, QuantScale* sc) {
   uint16_t* x = p.x + static_cast<uint64_t>(row) * p.x_stride +
                 static_cast<uint64_t>(unit) * p.x_unit_stride;
   uint16_t* out = p.out + static_cast<uint64_t>(row) * p.out_stride +
                   static_cast<uint64_t>(unit) * p.out_unit_stride;
   const uint16_t* add =
       p.add != nullptr ? p.add + static_cast<uint64_t>(row) * p.add_stride : nullptr;
+  const bool adding = add != nullptr || (Fused && p.add_parts != nullptr);
+  const bool quantise = Fused && p.codes != nullptr;
   const uint32_t n = p.n;
   const uint32_t nv = n / 8;
   const bool vec = norm_vectors(p);
@@ -266,17 +326,17 @@ DS_FN void norm_item(const QwNormParams& p, uint32_t row, uint32_t unit, const P
         for (uint32_t c = 0; c < kNormVecBatch; ++c) {
           if (t + (c0 + c) * T < nv) v[c] = load8(x + 8 * (t + (c0 + c) * T));
         }
-        if (add != nullptr) {
+        if (adding) {
           QW_UNROLL
           for (uint32_t c = 0; c < kNormVecBatch; ++c) {
-            if (t + (c0 + c) * T < nv) a[c] = load8(add + 8 * (t + (c0 + c) * T));
+            if (t + (c0 + c) * T < nv) a[c] = norm_add_vector<Fused>(p, add, row, t + (c0 + c) * T);
           }
         }
         QW_UNROLL
         for (uint32_t c = 0; c < kNormVecBatch; ++c) {
           const uint32_t q = t + (c0 + c) * T;
           if (q >= nv) continue;
-          if (add != nullptr) {
+          if (adding) {
             QW_UNROLL
             for (uint32_t e = 0; e < 8; ++e) {
               set8(v[c], e,
@@ -298,18 +358,18 @@ DS_FN void norm_item(const QwNormParams& p, uint32_t row, uint32_t unit, const P
         const uint32_t i = t + (c0 + c) * T;
         v[c] = i < n ? x[i] : uint16_t{0};
       }
-      if (add != nullptr) {
+      if (adding) {
         QW_UNROLL
         for (uint32_t c = 0; c < kNormBatch; ++c) {
           const uint32_t i = t + (c0 + c) * T;
-          a[c] = i < n ? add[i] : uint16_t{0};
+          a[c] = i < n ? norm_add_element<Fused>(p, add, row, i) : uint16_t{0};
         }
       }
       QW_UNROLL
       for (uint32_t c = 0; c < kNormBatch; ++c) {
         const uint32_t i = t + (c0 + c) * T;
         if (i >= n) continue;
-        if (add != nullptr) {
+        if (adding) {
           v[c] = ds::bf16_store(ds::bf16_round(ds::bf16_value(v[c]) + ds::bf16_value(a[c])));
           x[i] = v[c];
         }
@@ -367,6 +427,8 @@ DS_FN void norm_item(const QwNormParams& p, uint32_t row, uint32_t unit, const P
                  ds::bf16_store(ds::rms_element(ds::bf16_value(elem8(h, e)), r, w[c].f[e])));
           }
           store8(normed + 8 * q, h);
+          // A fused quantisation reads the normed values back from the staging.
+          if (quantise) store8(buf + 8 * q, h);
         }
       }
       return;
@@ -381,10 +443,17 @@ DS_FN void norm_item(const QwNormParams& p, uint32_t row, uint32_t unit, const P
       QW_UNROLL
       for (uint32_t c = 0; c < kNormBatch; ++c) {
         const uint32_t i = t + (c0 + c) * T;
-        if (i < n) normed[i] = ds::bf16_store(ds::rms_element(ds::bf16_value(buf[i]), r, w[c]));
+        if (i >= n) continue;
+        const uint16_t h = ds::bf16_store(ds::rms_element(ds::bf16_value(buf[i]), r, w[c]));
+        normed[i] = h;
+        if (quantise) buf[i] = h;
       }
     }
   });
+  if (quantise) {
+    norm_quant<T>(p, row, par, buf, gm, sc);
+    return;
+  }
   if (p.rotary == 0) return;
   const uint64_t at = static_cast<uint64_t>(p.positions[row]) * p.rotary;
   const uint32_t half = p.rotary / 2;
@@ -644,11 +713,19 @@ DS_FN uint32_t quant_lane_amax(const QuantLane& v) {
 // units past it, to be safe) the midpoints are E4M3's subnormal ones, and the
 // lane divides. A NaN `q` encodes to 0 either way. A block whose scale is 0,
 // infinite or subnormal divides throughout.
-DS_FN void quant_lane_store(const QwQuantParams& p, uint32_t row, uint32_t b, uint32_t l,
-                            const QuantLane& v, uint32_t amax) {
+//
+// Split in two so a caller can compute a block's scale once
+// (`quant_block_scale`) and each lane's codes from it (`quant_lane_word`).
+
+DS_FN QuantScale quant_block_scale(uint32_t amax) {
   const float s = ds::bf16_value(static_cast<uint16_t>(amax)) / 448.0f;
-  const float r = 1.0f / s;
-  bool divide = ds::f32_bits(s) - 0x00800000u >= 0x7f000000u;
+  return QuantScale{s, 1.0f / s, ds::f32_bits(s) - 0x00800000u >= 0x7f000000u};
+}
+
+DS_FN uint32_t quant_lane_word(const QuantLane& v, const QuantScale& sc) {
+  const float s = sc.s;
+  const float r = sc.r;
+  bool divide = sc.divide;
   uint32_t word = 0;
   for (uint32_t j = 0; j < kQuantLane; ++j) {
     const float q = ds::bf16_value(static_cast<uint16_t>(v.w[j / 2] >> (16 * (j % 2)))) * r;
@@ -663,6 +740,14 @@ DS_FN void quant_lane_store(const QwQuantParams& p, uint32_t row, uint32_t b, ui
       word |= e4m3_code(x / s) << (8 * j);
     }
   }
+  return word;
+}
+
+DS_FN void quant_lane_store(const QwQuantParams& p, uint32_t row, uint32_t b, uint32_t l,
+                            const QuantLane& v, uint32_t amax) {
+  const QuantScale sc = quant_block_scale(amax);
+  const float s = sc.s;
+  const uint32_t word = quant_lane_word(v, sc);
   uint8_t* codes = p.codes + static_cast<uint64_t>(row) * p.k + b * QW_BLOCK + l * kQuantLane;
 #if defined(__CUDACC__)
   *reinterpret_cast<uint32_t*>(codes) = word;
@@ -670,6 +755,56 @@ DS_FN void quant_lane_store(const QwQuantParams& p, uint32_t row, uint32_t b, ui
   std::memcpy(codes, &word, sizeof word);
 #endif
   if (l == 0) p.scales[static_cast<uint64_t>(b) * p.m_pad + row] = s;
+}
+
+// The fused quantisation (`norm_item` with `codes`): the unit's normed values,
+// staged in `buf`, quantised exactly as the warp form above quantises them
+// from memory. Group `g` of four elements is lane `g % 32` of block `g / 32`:
+// its amax bits into `gm`; then each block's amax, the integer maximum of its
+// 32 lanes' (the butterfly's maximum, in any order), and from it the block's
+// scale once (`quant_block_scale`), stored with the scales; then each group's
+// codes from that scale (`quant_lane_word`). A group's amax sits at `g + g /
+// 32` (a word of padding a block), so a block's 32 are read by its thread
+// without two blocks' threads meeting in one bank.
+static_assert(kNormWarpMax % QW_BLOCK == 0, "a warp unit's blocks are whole");
+static_assert(kQuantLane == 4, "the group maxima count groups of four");
+
+template <uint32_t T, class P>
+DS_FN void norm_quant(const QwNormParams& p, uint32_t row, const P& par, const uint16_t* buf,
+                      uint32_t* gm, QuantScale* sc) {
+  const uint32_t groups = p.n / kQuantLane;
+  const uint32_t blocks = p.n / QW_BLOCK;
+  auto lane = [&](uint32_t g) {
+    QuantLane v;
+    for (uint32_t j = 0; j < kQuantLane / 2; ++j) {
+      v.w[j] = static_cast<uint32_t>(buf[kQuantLane * g + 2 * j]) |
+               (static_cast<uint32_t>(buf[kQuantLane * g + 2 * j + 1]) << 16);
+    }
+    return v;
+  };
+  par.run([&](uint32_t t) {
+    for (uint32_t g = t; g < groups; g += T) gm[g + g / kWarp] = quant_lane_amax(lane(g));
+  });
+  par.run([&](uint32_t t) {
+    for (uint32_t b = t; b < blocks; b += T) {
+      const uint32_t* m = gm + b * (kWarp + 1);
+      uint32_t a = m[0];
+      for (uint32_t l = 1; l < kWarp; ++l) a = m[l] > a ? m[l] : a;
+      sc[b] = quant_block_scale(a);
+      p.scales[static_cast<uint64_t>(b) * p.m_pad + row] = sc[b].s;
+    }
+  });
+  par.run([&](uint32_t t) {
+    for (uint32_t g = t; g < groups; g += T) {
+      const uint32_t word = quant_lane_word(lane(g), sc[g / kWarp]);
+      uint8_t* codes = p.codes + static_cast<uint64_t>(row) * p.n + kQuantLane * g;
+#if defined(__CUDACC__)
+      *reinterpret_cast<uint32_t*>(codes) = word;
+#else
+      std::memcpy(codes, &word, sizeof word);
+#endif
+    }
+  });
 }
 
 // ---- the FP8 linear (`linear::fp8_block_dot`, `fp8_row_dot`) ----

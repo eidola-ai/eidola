@@ -13,12 +13,16 @@
 //!   sizes;
 //! - `small_gemm`: the DeltaNet's stacked `a` and `b` projections (96 × 5,120) on the
 //!   small-N kernel as dispatched (`small_n`), in each of its forms forced
-//!   (`small_n_rows`, `small_n_tiled`), and on CUTLASS's BF16 GEMM, at 1, 8, 64, 256 and
-//!   2,048 rows;
-//! - `norm` (the hidden norm with the residual add, and `q_rope`: the query heads' norm
+//!   (`small_n_rows`, `small_n_tiled`), and on CUTLASS's BF16 GEMM, at 1, 8, 16, 32, 64,
+//!   256 and 2,048 rows;
+//! - `norm` (the hidden norm with the residual add; its fused forms, `quant` (the normed
+//!   rows quantised in the same launch), `parts` (the residual add from a split GEMM's
+//!   three partials) and `parts_quant`, beside the launches each stands for
+//!   (`sum_then_norm`, `norm_then_quant`, `sum_norm_quant`); and `q_rope`: the query
+//!   heads' norm
 //!   with RoPE), `widen` (the DeltaNet's conv inputs, 10,240 wide), `quant` (over
 //!   activation-like values), `gate` (fast f32 and exact f64), `dn_prep`, `dn_norm`: one
-//!   launch at the released widths, at 1, 8, 64, 256 and 2,048 rows;
+//!   launch at the released widths, at 1, 8, 16, 32, 64, 256 and 2,048 rows;
 //! - `fa2`: one target layer's FA2 decode launch (and its merge) as a rung runs it, at
 //!   the released heads (24 query, 4 KV, 256 wide; pages of 256 positions): 1, 8, 16, 32
 //!   and 64 rows of one query (`decode`) and of four (`drafted`: a host token and three
@@ -55,7 +59,7 @@ use eidola_engine_cuda::qwen::QwenProfile;
 use eidola_engine_cuda::qwen::abi::*;
 use eidola_engine_cuda::qwen::cuda::{CudaDevice, FP8_KINDS};
 use eidola_engine_cuda::qwen::kernels::{
-    AcceptLaunch, MAX_SPLITS, QwenKernels, SampleArgs, fp8_splits,
+    AcceptLaunch, MAX_SPLITS, QwenKernels, SampleArgs, fp8_splits, split_sum_grid,
 };
 use eidola_engine_cuda::qwen::sampler::{accept_work_bytes, sample_work_bytes};
 use eidola_engine_cuda::sampler::SampleRow;
@@ -551,7 +555,14 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
     fill(fast, ab_w, 96 * hidden as usize * 2, 13);
     let rope = alloc(fast, 4096 * 64 * 4, keep);
     fill(fast, rope, 4096 * 64 * 4, 14);
-    for rows in [1u32, 8, 64, 256, 2048] {
+    // Three splits' partial sums of the hidden width (`o_proj`'s), small values.
+    let parts = alloc(fast, 3 * rows_max * hidden as usize * 4, keep);
+    let tiny: Vec<u8> = (0..3 * rows_max * hidden as usize)
+        .flat_map(|i| (((i % 13) as f32 - 6.0) * 1e-2).to_le_bytes())
+        .collect();
+    // SAFETY: the partials just made.
+    unsafe { fast.upload(parts, &tiny) }.unwrap_or_else(|e| fail(e));
+    for rows in [1u32, 8, 16, 32, 64, 256, 2048] {
         let norm = NormParams {
             x,
             add: y,
@@ -571,6 +582,75 @@ fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::An
             unsafe { fast.norm(&norm) }.unwrap_or_else(|e| fail(e))
         });
         line("norm", "exact", rows, s);
+        // Its fused forms: the residual add from three splits' partials, the normed rows
+        // quantised, and both; beside them the launches they stand for (the split sum
+        // is the bench's `lin8_kind` lines' difference; the quantiser is `quant`).
+        let m_pad = rows.next_multiple_of(4);
+        for (form, with_parts, quantise) in [
+            ("quant", false, true),
+            ("parts", true, false),
+            ("parts_quant", true, true),
+        ] {
+            let mut f = norm;
+            if with_parts {
+                f.add = 0;
+                f.add_parts = parts;
+                f.add_splits = 3;
+                f.add_part_rows = w32(rows_max);
+            }
+            if quantise {
+                f.codes = codes;
+                f.scales = scales;
+                f.m_pad = m_pad;
+            }
+            // SAFETY: as above; the partials hold three splits of 2,048 rows, the codes
+            // and scales 2,048 rows of the hidden width.
+            let s = time(fast, it, || {
+                unsafe { fast.norm(&f) }.unwrap_or_else(|e| fail(e))
+            });
+            line("norm", form, rows, s);
+        }
+        // The launches each fused form stands for, back to back: the split sum into a
+        // BF16 row then the norm adding it, the norm then the quantiser over its output,
+        // and all three. The program picks a form by these against the fused lines
+        // (`kernels::NORM_FUSED_PARTS_ROWS`, `NORM_FUSED_QUANT_ROWS`).
+        let sum = SplitSumParams {
+            parts,
+            out: y,
+            rows,
+            n: hidden,
+            splits: 3,
+            part_rows: w32(rows_max),
+            out_stride: hidden,
+            reserved: 0,
+        };
+        let sum_grid = split_sum_grid(&sum).unwrap_or_else(|e| fail(e));
+        let q = QuantParams {
+            x: out,
+            codes,
+            scales,
+            rows,
+            k: hidden,
+            x_stride: hidden,
+            m_pad,
+        };
+        for (form, with_sum, quantise) in [
+            ("sum_then_norm", true, false),
+            ("norm_then_quant", false, true),
+            ("sum_norm_quant", true, true),
+        ] {
+            // SAFETY: as above; the sum writes 2,048 rows of the hidden width at `y`.
+            let s = time(fast, it, || unsafe {
+                if with_sum {
+                    fast.split_sum(&sum, sum_grid).unwrap_or_else(|e| fail(e));
+                }
+                fast.norm(&norm).unwrap_or_else(|e| fail(e));
+                if quantise {
+                    fast.quant(&q).unwrap_or_else(|e| fail(e));
+                }
+            });
+            line("norm", form, rows, s);
+        }
         // The query heads' norm with RoPE: 24 heads of 256 a row, beside their gates
         // (unit stride 512), a warp a head.
         let positions: Vec<u8> = (0..rows).flat_map(|r| (r % 4096).to_le_bytes()).collect();

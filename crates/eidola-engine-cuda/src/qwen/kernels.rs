@@ -57,6 +57,11 @@ pub trait QwenKernels {
     /// an f32 scratch of `splits · m_pad · n` values for its partial sums, there (and on a
     /// host device planning as the fast profile does); the exact profile ignores it.
     unsafe fn lin8(&self, p: &Lin8Params, parts: Option<u64>) -> Result<()>;
+    /// A split shape's FP8 linear without its sum (fast profile): the [`fp8_splits`]
+    /// ranges' partial sums of `m_pad` rows into `parts` (`[splits][m_pad][n]` f32),
+    /// `p.out` unwritten, for a norm whose residual add reads them (`NormParams::
+    /// add_parts`). The sum the norm takes is the one [`QwenKernels::lin8`] would store.
+    unsafe fn lin8_parts(&self, p: &Lin8Params, parts: u64) -> Result<()>;
     /// The BF16 linear: exact (`linear_bf16_rows`) in the exact profile, the tensor-core
     /// form in the fast one for the large linears (the head and the drafter's input
     /// projection), which name an f32 scratch of `rows · n` values in `fast`; `None` for
@@ -179,6 +184,29 @@ pub fn norm_grid(p: &NormParams) -> Result<[u32; 3]> {
             "norm: a residual add over one unit",
         )?;
     }
+    if p.add_parts != 0 {
+        ensure(
+            p.add == 0
+                && p.units == 1
+                && p.add_splits >= 2
+                && p.add_part_rows >= p.rows
+                && p.add_parts.is_multiple_of(4),
+            "norm: a residual add of partial sums over one unit",
+        )?;
+    }
+    if p.codes != 0 {
+        ensure(
+            p.scales != 0
+                && p.units == 1
+                && p.rotary == 0
+                && p.n.is_multiple_of(BLOCK)
+                && p.m_pad >= p.rows
+                && p.codes.is_multiple_of(4)
+                && p.scales.is_multiple_of(4),
+            "norm: a fused quantisation of whole 128-blocks of one unrotated unit",
+        )?;
+    }
+    ensure(p.reserved == 0, "norm: reserved")?;
     if p.rotary > 0 {
         ensure(
             p.rope_cos != 0 && p.rope_sin != 0 && p.positions != 0,
@@ -199,6 +227,29 @@ pub fn norm_grid(p: &NormParams) -> Result<[u32; 3]> {
         NORM_ITEMS,
         "norm: units",
     )
+}
+
+/// Rows from which the program's residual norms add a split FP8 GEMM's partial sums
+/// themselves (`NormParams::add_parts`) rather than after `eidola_qwen_fast_split_sum`'s
+/// launch, and from which they quantise their output for the FP8 GEMM after them
+/// themselves (`NormParams::codes`) rather than before `eidola_qwen_quant`'s. Each form
+/// gives a row the same bits as the launches it stands for (`cases::norm_fused`,
+/// `fast_norm_split_residual`), so these are choices of speed alone, of a launch's row
+/// count. A fused norm is one CTA a row and does all of its row's extra work there, where
+/// the split sum and the quantiser spread a row over CTAs: at one decode row a B200
+/// measured the fused norm with both forms at about 15 µs a launch, against about 9 for
+/// the three launches it stood for. So both start at prefill sizes, where the launches
+/// they save are the costlier; the kernel bench's `norm` lines (`parts`, `quant`,
+/// `parts_quant` against `sum_then_norm`, `norm_then_quant`, `sum_norm_quant`) give
+/// each crossover.
+pub const NORM_FUSED_PARTS_ROWS: usize = 128;
+/// See [`NORM_FUSED_PARTS_ROWS`].
+pub const NORM_FUSED_QUANT_ROWS: usize = 128;
+
+/// Whether a norm takes its fused forms' kernel (`eidola_qwen_norm_fused`): a residual
+/// add from partial sums, or the normed rows quantised.
+pub fn norm_is_fused(p: &NormParams) -> bool {
+    p.add_parts != 0 || p.codes != 0
 }
 
 /// Units a norm stages a warp each (`kNormWarpMax`), eight a CTA (`kNormItems`); wider
