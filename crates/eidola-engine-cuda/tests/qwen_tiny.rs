@@ -1,8 +1,9 @@
 //! The Qwen3.8 CUDA executor in its exact profile on a GPU, held to the CPU reference
 //! executor step for step on the committed fixture through the real engine: the same
-//! scenarios as `tests/qwen_host.rs` (`qwen_common::scenarios`), eagerly and with decode
-//! steps replaying their captured graphs (the graphs keep the exact profile equal to the
-//! CPU executor). Skipped, saying why, without a device or `EIDOLA_ENGINE_KERNELS_DIR`.
+//! scenarios as `tests/qwen_host.rs` (`qwen_common::scenarios`: drafts accepted in every
+//! pattern and endings inside accepted drafts among them), eagerly and with decode steps
+//! replaying their captured graphs (the graphs keep the exact profile equal to the CPU
+//! executor). Skipped, saying why, without a device or `EIDOLA_ENGINE_KERNELS_DIR`.
 
 mod qwen_common;
 
@@ -31,6 +32,10 @@ fn qwen_tiny_scenarios_on_the_device() {
     eprintln!("ok      empty_tails");
     scenarios::alone_and_crowded(&make);
     eprintln!("ok      alone_and_crowded");
+    scenarios::draft_patterns(&make);
+    eprintln!("ok      draft_patterns");
+    scenarios::endings_inside_drafts(&make);
+    eprintln!("ok      endings_inside_drafts");
 }
 
 #[test]
@@ -48,6 +53,10 @@ fn qwen_tiny_scenarios_replaying_graphs() {
         eprintln!("ok      hits_and_pressure (graphs)");
         scenarios::alone_and_crowded(&make);
         eprintln!("ok      alone_and_crowded (graphs)");
+        scenarios::draft_patterns(&make);
+        eprintln!("ok      draft_patterns (graphs)");
+        scenarios::endings_inside_drafts(&make);
+        eprintln!("ok      endings_inside_drafts (graphs)");
     });
     qwen_common::with_fixture_256(|| {
         qwen_common::with_path(CudaGraphs::On, DecodePath::Replay, || {

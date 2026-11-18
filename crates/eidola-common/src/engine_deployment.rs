@@ -216,9 +216,8 @@ impl SupportedGpu {
     };
 
     /// The NVIDIA B200 (Blackwell, `sm_100a`): 183,359 MiB, about 179.1 GiB,
-    /// as its driver reports it in `nvidia-smi`'s listing (whole MiB, as the
-    /// B300's byte count also is). Not yet read from a node's
-    /// `/v1/engine/info` on one.
+    /// as its driver reports it on a node (whole MiB, as the B300's byte
+    /// count also is).
     pub const B200: SupportedGpu = SupportedGpu {
         name: "NVIDIA B200",
         memory_bytes: 183_359 << 20,
@@ -461,7 +460,12 @@ pub fn recurrent_table_words(sizing: &Sizing) -> u64 {
 /// Keys per chunk of FA2's split attention (`eidola-engine-cuda`'s
 /// `qwen::plan::SPLIT_KEYS`): a row's keys are reduced in chunks of this
 /// many positions, each a partial row.
-pub const RECURRENT_SPLIT_KEYS: u64 = 1024;
+pub const RECURRENT_SPLIT_KEYS: u64 = 512;
+
+/// Keys a forward row's partial rows are counted at for FA2's scratch
+/// (`qwen::plan::PARTIAL_KEYS`): a prefill whose rows need more partial
+/// rows runs its attention in passes.
+pub const RECURRENT_PARTIAL_KEYS: u64 = 1024;
 
 /// A recurrent model's step scratch in the fast profile (the executor's
 /// `capacities` and `program::alloc_scratch`, sized once at construction,
@@ -475,8 +479,10 @@ pub const RECURRENT_SPLIT_KEYS: u64 = 1024;
 /// - the DeltaNet's staging: max(`N + ST`, `Sk`) staged positions
 ///   ([`HybridDims::staged_position_bytes`]) and three more convolution rows a
 ///   seat;
-/// - FA2's partial rows: `R` rows times the chunks of [`RECURRENT_SPLIT_KEYS`]
-///   of `MAX_MODEL_LEN + k + 1` positions ([`HybridDims::partial_row_bytes`]):
+/// - FA2's partial rows: `R` rows times the `MAX_MODEL_LEN + k + 1` positions
+///   over [`RECURRENT_PARTIAL_KEYS`], or a decode rung's `S(k + 1)` rows times
+///   the chunks of [`RECURRENT_SPLIT_KEYS`], the more
+///   ([`HybridDims::partial_row_bytes`]):
 ///   about 12 bytes per row and position of the context at Qwen3.8's shape,
 ///   where the exact profile's scores, which this profile does not allocate,
 ///   take 96 a layer;
@@ -506,7 +512,9 @@ pub fn recurrent_step_scratch_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
     let head = s.max(s * k).max(64);
     let staged = n.saturating_add(s.saturating_mul(tail)).max(s * k);
     let conv_rows = 3 * s + staged;
-    let partial_rows = rows.saturating_mul(positions.div_ceil(RECURRENT_SPLIT_KEYS).max(1));
+    let partial_rows = rows
+        .saturating_mul(positions.div_ceil(RECURRENT_PARTIAL_KEYS).max(1))
+        .max((s * (k + 1)).saturating_mul(positions.div_ceil(RECURRENT_SPLIT_KEYS).max(1)));
     let head_tmp = (pad4(head) * v).max(r * h).max(r * dims.ab_rows()) * 4;
     let logit_rows = s.max(64) + s * k + head;
     let distributions = s + s * (k + 1) + (s * k).max(1) + s;
@@ -2305,7 +2313,8 @@ mod tests {
     };
 
     /// Qwen3.8-27B on one B200 at its whole 262,144-position context: 64
-    /// seats, steps of 2,048 tokens, three drafts, the cache on. The reserve
+    /// seats, steps of 2,048 tokens of prefill chunks of 256, three drafts,
+    /// the cache on. The reserve
     /// beside the KV budget is the fixed 4 GiB, 65 seats' state, the RoPE
     /// tables and the fast profile's step scratch; a 115 GiB budget then holds
     /// the state pool's 321 buffers and about 1,040,000 positions of KV. The
@@ -2321,14 +2330,14 @@ mod tests {
             max_model_len: 262_144,
             max_seqs: 64,
             max_batched_tokens: 2048,
-            max_prefill_chunk: 2048,
+            max_prefill_chunk: 256,
             draft_tokens: 3,
             max_requests: 64,
         };
         let reserve = cuda_device_reserve_bytes(shape, &sizing);
-        assert_eq!(reserve / 100_000_000, 346, "{reserve}");
+        assert_eq!(reserve / 100_000_000, 348, "{reserve}");
         let scratch = recurrent_step_scratch_bytes(&dims, &sizing);
-        assert_eq!(scratch / 100_000_000, 177, "{scratch}");
+        assert_eq!(scratch / 100_000_000, 178, "{scratch}");
         // Every covered file of the checkpoint is 30.88 GB; the pack holds its
         // other files too.
         let pack = 31_000_000_000;

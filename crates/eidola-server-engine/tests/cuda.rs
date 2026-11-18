@@ -739,7 +739,7 @@ mod counting {
     use eidola_engine_cuda::qwen::abi::*;
     use eidola_engine_cuda::qwen::attention::Fa2Args;
     use eidola_engine_cuda::qwen::device::{QwenDevice, QwenProfile};
-    use eidola_engine_cuda::qwen::kernels::{AcceptLaunch, CopyArgs, QwenKernels, SampleArgs};
+    use eidola_engine_cuda::qwen::kernels::{AcceptLaunch, QwenKernels, SampleArgs};
 
     impl<D: QwenKernels> QwenKernels for Counting<D> {
         unsafe fn embed(&self, p: &EmbedParams) -> Result<()> {
@@ -751,8 +751,11 @@ mod counting {
         unsafe fn quant(&self, p: &QuantParams) -> Result<()> {
             unsafe { self.inner.quant(p) }
         }
-        unsafe fn lin8(&self, p: &Lin8Params) -> Result<()> {
-            unsafe { self.inner.lin8(p) }
+        unsafe fn lin8(&self, p: &Lin8Params, parts: Option<u64>) -> Result<()> {
+            unsafe { self.inner.lin8(p, parts) }
+        }
+        unsafe fn lin8_parts(&self, p: &Lin8Params, parts: u64) -> Result<()> {
+            unsafe { self.inner.lin8_parts(p, parts) }
         }
         unsafe fn linear(&self, p: &LinearParams, fast: Option<u64>) -> Result<()> {
             unsafe { self.inner.linear(p, fast) }
@@ -760,8 +763,8 @@ mod counting {
         unsafe fn gemm_bf16(&self, p: &LinearParams) -> Result<()> {
             unsafe { self.inner.gemm_bf16(p) }
         }
-        unsafe fn copy_rows(&self, a: &CopyArgs) -> Result<()> {
-            unsafe { self.inner.copy_rows(a) }
+        unsafe fn copy_rows(&self, p: &CopyParams) -> Result<()> {
+            unsafe { self.inner.copy_rows(p) }
         }
         unsafe fn sample(&self, a: &SampleArgs) -> Result<()> {
             unsafe { self.inner.sample(a) }
@@ -786,6 +789,9 @@ mod counting {
         }
         unsafe fn dn_rec(&self, p: &DnRecParams) -> Result<()> {
             unsafe { self.inner.dn_rec(p) }
+        }
+        unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()> {
+            unsafe { self.inner.dn_rec_short(p) }
         }
         unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()> {
             unsafe { self.inner.dn_norm(p) }
@@ -841,6 +847,12 @@ mod counting {
             nonce: &KvNonce,
         ) -> Result<()> {
             unsafe { self.inner.cipher(addr, words, counter, key, nonce) }
+        }
+        unsafe fn cipher_ranges(
+            &self,
+            ranges: &[eidola_engine_cuda::qwen::device::CipherRange<'_>],
+        ) -> Result<()> {
+            unsafe { self.inner.cipher_ranges(ranges) }
         }
         fn alloc_host(&self, bytes: usize) -> Result<(*mut u8, Box<dyn std::any::Any>)> {
             self.inner.alloc_host(bytes)
@@ -1197,6 +1209,15 @@ fn the_nodes_qwen_pools_and_scratch_are_the_shared_counts() {
         eprintln!("k = {k}: step scratch {scratch} of the {bound} counted");
         assert!(scratch <= bound, "k = {k}: {scratch} > {bound}");
     }
+}
+
+/// The shared scratch rule counts FA2's partial rows at the executor's own chunks.
+#[test]
+fn the_shared_rule_counts_the_executors_attention_chunks() {
+    use eidola_common::engine_deployment::{RECURRENT_PARTIAL_KEYS, RECURRENT_SPLIT_KEYS};
+    use eidola_engine_cuda::qwen::plan::{PARTIAL_KEYS, SPLIT_KEYS};
+    assert_eq!(u64::from(SPLIT_KEYS), RECURRENT_SPLIT_KEYS);
+    assert_eq!(u64::from(PARTIAL_KEYS), RECURRENT_PARTIAL_KEYS);
 }
 
 // ---------------------------------------------------------------------------------------

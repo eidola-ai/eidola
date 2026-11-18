@@ -44,6 +44,20 @@ fn a_request_alone_and_beside_others_gives_the_same_tokens() {
     }
 }
 
+#[test]
+fn drafts_accepted_in_every_pattern_match_the_reference() {
+    if let Some(lib) = qwen_common::library() {
+        scenarios::draft_patterns(&|| qwen_common::host_device(lib.clone()));
+    }
+}
+
+#[test]
+fn endings_inside_accepted_drafts_match_the_reference() {
+    if let Some(lib) = qwen_common::library() {
+        scenarios::endings_inside_drafts(&|| qwen_common::host_device(lib.clone()));
+    }
+}
+
 /// Reproducibility between calls in the exact profile on the host-compiled kernels: the
 /// contract the fast profile is asserted against on a GPU (`tests/qwen_fast.rs`).
 #[test]
@@ -114,6 +128,8 @@ fn the_padded_rung_path_matches_the_reference() {
         scenarios::hits_and_pressure(&make);
         scenarios::alone_and_crowded(&make);
         scenarios::empty_tails(&make);
+        scenarios::draft_patterns(&make);
+        scenarios::endings_inside_drafts(&make);
     });
     let n = qwen_common::rung_steps() - before;
     eprintln!("{n} steps ran a rung");
@@ -160,7 +176,8 @@ fn the_rung_path_and_the_eager_path_agree() {
 
 /// The fast profile's plans on every path without a device, on the fixture with 256-wide
 /// heads: FA2's work lists built and packed for every step (prefill chunks, decode rows,
-/// the drafter's position pages, the rungs' reservations) and each launch checked,
+/// the drafter's position pages, the rungs' reservations, a long prompt's attention in
+/// several passes) and each launch checked,
 /// computing nothing. Its attention reads as zeros, so the logits are not the model's,
 /// but they are one function of the requests on the eager and rung paths alike, which
 /// must agree bit for bit.
@@ -176,8 +193,13 @@ fn fast_profile_plans_pack_on_every_path() {
         (CudaGraphs::Off, DecodePath::Direct),
     ];
     let mut failed = Vec::new();
-    let results =
+    let mut results =
         qwen_common::with_fixture_256(|| qwen_common::invariance::across_paths(&make, &paths));
+    // Past several 512-key chunks, a prefill attention in two passes.
+    results.push((
+        "long_context".to_string(),
+        qwen_common::with_fixture_256(|| qwen_common::invariance::long_context(&make)),
+    ));
     for (name, r) in results {
         match r {
             Ok(what) => eprintln!("ok      {name}: {what}"),
@@ -241,4 +263,112 @@ fn the_256_wide_fixture_runs_exact() {
             });
         }
     });
+}
+
+/// A drafting step runs the target once: every uniform decode step at draft width `k`
+/// launches the FP8 linears of one target forward (an undrafted decode step's count) and
+/// the drafter's, its layer's four (the attention's stacked projections and its output
+/// projection, the MLP's stacked gate and up and its down projection) at each of `k`
+/// depths and its stacked projections once more for the canonical rewrite; eagerly and on
+/// the padded rung path. Two target forwards would launch the target's linears twice.
+#[test]
+fn a_drafting_step_runs_the_target_once() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use eidola_engine::engine::{CacheScope, Engine};
+    use eidola_engine::executor::{Executor, ExecutorError, StepInput, StepOutput};
+    use eidola_engine::sampling::SamplingParams;
+    use eidola_engine::spec::ModelSpec;
+    use eidola_engine_cuda::qwen::{CudaGraphs, DecodePath, QwenCudaExecutor};
+    use qwen_common::pair::*;
+
+    type Counts = Arc<Mutex<HashMap<&'static str, u64>>>;
+    /// The FP8 linear launches of every uniform decode step, by its draft width.
+    struct PerStep<E> {
+        inner: E,
+        counts: Counts,
+        decode: Vec<(u32, u64)>,
+    }
+    impl<E: Executor> Executor for PerStep<E> {
+        fn spec(&self) -> &ModelSpec {
+            self.inner.spec()
+        }
+        fn execute(&mut self, step: &StepInput) -> Result<StepOutput, ExecutorError> {
+            let lin8 = |c: &Counts| c.lock().expect("counts").get("lin8").copied().unwrap_or(0);
+            let before = lin8(&self.counts);
+            let out = self.inner.execute(step)?;
+            let w = step.seqs.first().map_or(0, |e| e.num_drafts);
+            let uniform = !step.seqs.is_empty()
+                && step
+                    .seqs
+                    .iter()
+                    .all(|e| e.num_tokens == 1 && e.sample && e.num_drafts == w);
+            if uniform {
+                self.decode.push((w, lin8(&self.counts) - before));
+            }
+            Ok(out)
+        }
+    }
+
+    let Some(lib) = qwen_common::library() else {
+        return;
+    };
+    let run = |k: u32, path: DecodePath| -> Vec<(u32, u64)> {
+        let counts = Counts::default();
+        let dev = qwen_common::counting_device(lib.clone(), counts.clone());
+        let g = Geometry {
+            graphs: CudaGraphs::Off,
+            ..Geometry::plain(k)
+        };
+        let mut ex = QwenCudaExecutor::new(dev, &fixture(), cuda_config(&g)).expect("executor");
+        ex.set_decode_path(path).expect("path");
+        let rec = PerStep {
+            inner: ex,
+            counts,
+            decode: Vec::new(),
+        };
+        let mut eng = Engine::new(rec, sched(256, k > 0)).expect("config");
+        for id in 0..3u64 {
+            let prompt = TestRng(40 + id).tokens(9, VOCAB);
+            eng.submit(request(
+                id,
+                prompt,
+                SamplingParams::greedy(),
+                12,
+                CacheScope::Private,
+            ))
+            .expect("submit");
+        }
+        let mut now = 0;
+        while eng.unfinished() > 0 {
+            eng.step(now).expect("step");
+            now += 1;
+        }
+        let stats = eng.executor().inner.decode_stats();
+        assert!(
+            path == DecodePath::Eager || stats.direct > 0,
+            "{path:?} at width {k}: no step ran a rung"
+        );
+        eng.executor().decode.clone()
+    };
+    for path in [DecodePath::Eager, DecodePath::Direct] {
+        let plain = run(0, path);
+        let target = plain.first().expect("decode steps").1;
+        assert!(
+            plain.iter().all(|&(_, n)| n == target),
+            "{path:?}: undrafted decode steps launch {plain:?}"
+        );
+        for k in [1u32, 3] {
+            let steps = run(k, path);
+            let drafted: Vec<u64> = steps.iter().filter(|s| s.0 == k).map(|s| s.1).collect();
+            assert!(!drafted.is_empty(), "{path:?}: no decode step drafted {k}");
+            let want = target + 4 * u64::from(k) + 1;
+            assert!(
+                drafted.iter().all(|&n| n == want),
+                "{path:?} width {k}: FP8 linear launches {drafted:?}, one target forward \
+                 and the drafter's being {want} (the target alone {target})"
+            );
+        }
+    }
 }

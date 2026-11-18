@@ -11,16 +11,18 @@
 //! value from one table ([`super::plan`]):
 //!
 //! 1. Maintenance in order, then table updates; the rows checked and planned.
-//! 2. **Pass A**: the target over every row's host tokens, all rows in one forward. A
-//!    DeltaNet layer's recurrence starts each row from its source (the slot's live state,
-//!    or its base buffer), folds the kept positions between the source and the row's
-//!    `context_len` without output, runs the host tokens with output, stores every named
-//!    state write as the recurrence passes it, and stores the state after the host tokens
-//!    into the slot's live image.
-//! 3. The drafter over the host positions (with drafting), then the draft chain, depth by
-//!    depth over every drafting row, each depth's drafts drawn on the device.
-//! 4. **Pass B**: the target over the drafts, from the live image; nothing stored but the
-//!    drafts' KV in reserved positions and their inputs in the tail.
+//! 2. With drafting, the drafter at each drafting row's one host position `p` (the token
+//!    at `p` and the target's normed state at `p - 1`, which the slot kept or a tap holds:
+//!    both from earlier steps), then the draft chain, depth by depth over every drafting
+//!    row, each depth's drafts drawn on the device.
+//! 3. **The target, once**, over every row's host tokens followed by its drafts, all rows
+//!    in one forward. A DeltaNet layer's recurrence starts each row from its source (the
+//!    slot's live state, or its base buffer), folds the kept positions between the source
+//!    and the row's `context_len` without output, runs the host tokens and the drafts with
+//!    output, stores every named state write as the recurrence passes it and the state
+//!    after the host tokens into the slot's live image; the new positions' inputs join the
+//!    tail, and the drafts' KV goes into the positions reserved for them.
+//! 4. The drafter's KV over the host positions of rows that do not draft.
 //! 5. Plain rows drawn and chain acceptance on the device (the shared sampler, equal to
 //!    `eidola_engine::sampling` bit for bit given equal logits).
 //! 6. The drafter's canonical KV at every draft's position (a rejected draft's is
@@ -53,7 +55,7 @@ use eidola_engine_model::qwen::QwenModel;
 use eidola_engine_model::qwen::config::LayerKind;
 
 use super::abi::*;
-use super::device::{QwenDevice, QwenProfile};
+use super::device::{CipherRange, QwenDevice, QwenProfile};
 use super::plan::{
     self, AttnRows, DrafterPass, Fa2Geometry, Geo, Item, Layout, SAMPLE_WORDS, Shape, StepPlan,
     TargetPass, buf,
@@ -602,15 +604,17 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         Ok(())
     }
 
-    /// XORs a block's image with its keystream: each range from a fresh keystream block,
-    /// as `eidola_engine::kv_cipher` defines a block image.
-    fn crypt(
+    /// A block's image and its keystream, into `batch`: each range from a fresh keystream
+    /// block, as `eidola_engine::kv_cipher` defines a block image. The caller XORs the
+    /// batch ([`QwenDevice::cipher_ranges`]) before anything else touches the block.
+    fn crypt<'k>(
         &mut self,
         group: u32,
         b: u32,
-        key: &KvKey,
+        key: &'k KvKey,
         nonce: &KvNonce,
         encrypt: bool,
+        batch: &mut Vec<CipherRange<'k>>,
     ) -> Result<()> {
         let flag = if group == self.state_pool() {
             &mut self.state_encrypted[b as usize]
@@ -622,11 +626,30 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let mut counter = 0u32;
         for (addr, bytes) in self.block_ranges(group, b) {
             let words = u32of(bytes / 4, "cipher words")?;
-            // SAFETY: the block's range, whole words.
-            unsafe { self.dev.cipher(addr, words, counter, key, nonce)? };
+            batch.push(CipherRange {
+                addr,
+                words,
+                counter,
+                key,
+                nonce: *nonce,
+            });
             counter += words.div_ceil(16);
         }
         Ok(())
+    }
+
+    /// XORs every range of `batch` with its keystream in one launch, and empties it.
+    fn flush_crypts(
+        &self,
+        batch: &mut Vec<CipherRange<'_>>,
+        blocks: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
+        // SAFETY: each range is a piece of one block of a pool; the blocks are distinct
+        // (`blocks`), so the ranges do not overlap.
+        let r = unsafe { self.dev.cipher_ranges(batch) };
+        batch.clear();
+        blocks.clear();
+        r
     }
 
     fn reset_slot(&mut self, slot: Slot) -> Result<()> {
@@ -655,9 +678,23 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         unsafe { self.dev.upload(at, &(len + 1).to_le_bytes()) }
     }
 
+    /// The step's maintenance in its order. Consecutive encryptions and decryptions run
+    /// as one cipher launch over all their blocks' ranges, queued before the next other
+    /// operation (which may read or move those blocks) and before any block's second one.
     fn maintain(&mut self, step: &StepInput) -> Result<()> {
         let state = self.state_pool();
+        let mut batch: Vec<CipherRange<'_>> = Vec::new();
+        let mut blocks: Vec<(u32, u32)> = Vec::new();
         for m in &step.maintenance {
+            match *m {
+                Maintenance::Encrypt { group, block, .. }
+                | Maintenance::Decrypt { group, block, .. } => {
+                    if blocks.contains(&(group, block)) {
+                        self.flush_crypts(&mut batch, &mut blocks)?;
+                    }
+                }
+                _ => self.flush_crypts(&mut batch, &mut blocks)?,
+            }
             match *m {
                 Maintenance::SaveState { slot, len, buffer } => {
                     self.save_state(slot, len, buffer)?
@@ -691,7 +728,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                         .kv_keys
                         .get(key as usize)
                         .unwrap_or_else(|| panic!("maintenance names key {key}, not in the step"));
-                    self.crypt(group, block, key, &nonce, encrypt)?;
+                    self.crypt(group, block, key, &nonce, encrypt, &mut batch)?;
+                    blocks.push((group, block));
                 }
                 Maintenance::Demote { group, block, host } => {
                     let enc = if group == state {
@@ -754,7 +792,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 }
             }
         }
-        Ok(())
+        self.flush_crypts(&mut batch, &mut blocks)
     }
 }
 
@@ -771,37 +809,24 @@ enum Src {
     Buffer(u32),
 }
 
-/// Where a run's tokens come from.
-#[derive(Clone, Debug)]
-enum Toks {
-    /// Host ids.
-    Host(Vec<u32>),
-    /// Draft lanes, by lane index.
-    Lanes(Vec<u32>),
-}
-
-impl Toks {
-    fn len(&self) -> u32 {
-        match self {
-            Toks::Host(t) | Toks::Lanes(t) => n32(t.len()),
-        }
-    }
-}
-
-/// One run through the target (or, with no tokens, a fold alone).
+/// One run through the target (or, with no tokens, a fold alone): its host tokens, then
+/// its drafts.
 #[derive(Clone, Debug)]
 struct Run {
     slot: Slot,
     /// The first new position.
     start: u32,
-    toks: Toks,
+    /// Host ids.
+    host: Vec<u32>,
+    /// The drafts after them, by lane index.
+    lanes: Vec<u32>,
     src: Src,
     /// The position the source stands at: the kept positions `src_pos .. start` are
     /// folded from the tail first.
     src_pos: u32,
-    /// State writes `(len, buffer)`, ascending.
+    /// State writes `(len, buffer)`, ascending, at most the host tokens' end.
     writes: Vec<(u32, u32)>,
-    /// Store the state after the run's tokens into the slot's live image.
+    /// Store the state after the host tokens into the slot's live image.
     live_store: bool,
     /// New positions at or past this join the tail.
     tail_from: u32,
@@ -811,11 +836,14 @@ impl Run {
     fn fold(&self) -> u32 {
         self.start - self.src_pos
     }
-    fn n(&self) -> u32 {
-        self.toks.len()
+    fn n_host(&self) -> u32 {
+        n32(self.host.len())
     }
-    fn end(&self) -> u32 {
-        self.start + self.n()
+    fn n(&self) -> u32 {
+        n32(self.host.len() + self.lanes.len())
+    }
+    fn host_end(&self) -> u32 {
+        self.start + self.n_host()
     }
 }
 
@@ -847,10 +875,12 @@ impl Row {
 /// Where a step's rows sit in its plan, for reading the results.
 #[derive(Clone, Debug, Default)]
 struct Placed {
-    /// Per row: its head row in pass A, its drafting index, its first pass-B row.
-    head_a: Vec<Option<u32>>,
+    /// Per row: its last host row's head row, its drafting index, its first draft's
+    /// index among the head's draft rows (which follow the `hosts` host rows).
+    head: Vec<Option<u32>>,
     drafting: Vec<Option<u32>>,
-    row_b: Vec<u32>,
+    first_draft: Vec<u32>,
+    hosts: u32,
     /// Per row: its index among the plain draws.
     plain: Vec<Option<u32>>,
 }
@@ -1037,7 +1067,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let mut tp = TargetPass::default();
         let (mut t, mut st, mut cv) = (0u32, 0u32, 0u32);
         for r in runs {
-            let (f, n) = (r.fold(), r.n());
+            let (f, nh, n) = (r.fold(), r.n_host(), r.n());
             assert!(
                 r.writes.len() <= SEQ_WRITES,
                 "more state writes in one row than the kernel takes"
@@ -1052,7 +1082,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 first: st,
                 count: f + n,
                 out_from: f,
-                live_after: if r.live_store { f + n } else { f + n + 1 },
+                live_after: if r.live_store { f + nh } else { f + n + 1 },
                 writes: n32(r.writes.len()),
                 ..DnSeq::default()
             };
@@ -1095,7 +1125,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 for j in 0..3 {
                     tp.post_conv.push(Item::new(
                         buf::C_CONV,
-                        hist(r.end()) + j,
+                        hist(r.host_end()) + j,
                         buf::C_LIVE,
                         r.slot * rpi + j,
                     ));
@@ -1123,18 +1153,18 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                     tp.attn.tables.extend(self.table_row(r.slot, TARGET));
                 }
             }
-            match &r.toks {
-                Toks::Host(h) => tp.tokens.extend_from_slice(h),
-                Toks::Lanes(l) => tp.token_copies.extend(
-                    l.iter()
-                        .enumerate()
-                        .map(|(j, &lane)| Item::new(buf::T_LANES, lane, buf::T_DST, t + n32(j))),
-                ),
-            }
+            tp.tokens.extend_from_slice(&r.host);
+            tp.tokens.extend(r.lanes.iter().map(|_| PAD_TOKEN));
+            tp.token_copies.extend(
+                r.lanes
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &lane)| Item::new(buf::T_LANES, lane, buf::T_DST, t + nh + n32(j))),
+            );
             if fast && n > 0 {
                 tp.attn
                     .requests
-                    .push(plan::request(t, n, r.end() - 1, bs, &mut |j| {
+                    .push(plan::request(t, n, r.start + n - 1, bs, &mut |j| {
                         self.blk(r.slot, TARGET, j * bs)
                     }));
             }
@@ -1197,29 +1227,6 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             width,
             ..StepPlan::default()
         };
-        let runs_a: Vec<Run> = rows.iter().map(|r| r.run.clone()).collect();
-        p.a = self.target_pass(&runs_a, true);
-        let mut t_first = Vec::with_capacity(rows.len());
-        let mut t = 0;
-        for r in rows {
-            t_first.push(t);
-            t += n32(r.toks.len());
-        }
-        // Pass A's head: every sampled row's last host position.
-        for (i, r) in rows.iter().enumerate() {
-            if r.sample {
-                pl.head_a.push(Some(n32(p.head_a.len())));
-                p.head_a.push(Item::new(
-                    buf::H_A,
-                    t_first[i] + n32(r.toks.len()) - 1,
-                    buf::H_DST,
-                    n32(p.head_a.len()),
-                ));
-            } else {
-                pl.head_a.push(None);
-            }
-        }
-        let ha = n32(p.head_a.len());
         let draft_rows: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].k > 0).collect();
         let dn = n32(draft_rows.len());
         p.drafting = dn;
@@ -1227,42 +1234,45 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         for (d, &i) in draft_rows.iter().enumerate() {
             pl.drafting[i] = Some(n32(d));
         }
-        if drafting_exec {
-            // The drafter over the host positions.
+        // The target's rows: each row's host tokens, then its drafts from their lanes.
+        let mut t_first = Vec::with_capacity(rows.len());
+        let mut t = 0;
+        let runs: Vec<Run> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                t_first.push(t);
+                let mut run = r.run.clone();
+                if let Some(d) = pl.drafting[i] {
+                    run.lanes = (0..r.k).map(|j| j * dn + d).collect();
+                }
+                t += run.n();
+                run
+            })
+            .collect();
+        // The target's normed row of row `i`'s position `q` (a host position or a draft's).
+        let normed =
+            |i: usize, q: u32| -> (u32, u32) { (buf::H_NORMED, t_first[i] + q - rows[i].c) };
+        if drafting_exec && dn > 0 {
+            // The drafter at each drafting row's one host position `p`: the token at `p`
+            // and the target's normed state at `p - 1`, both from earlier steps.
             let mut pass = DrafterPass::default();
             let mut at = Vec::new();
-            let mut at_p = vec![0u32; rows.len()];
-            for (i, r) in rows.iter().enumerate() {
-                for s in r.c.max(1)..=r.p() {
-                    let m = n32(at.len());
-                    pass.token_copies.push(Item::new(
-                        buf::T_HOST,
-                        t_first[i] + s - r.c,
-                        buf::T_DST,
-                        m,
-                    ));
-                    let (hb, hr) = if s == r.c {
-                        r.hidden_before.expect("a hidden state before the row")
-                    } else {
-                        (buf::H_A, t_first[i] + s - r.c - 1)
-                    };
-                    pass.hidden_copies.push(Item::new(hb, hr, buf::H_DST, m));
-                    if s == r.p() {
-                        at_p[i] = m;
-                    }
-                    at.push((r.slot, s));
-                }
+            for (d, &i) in draft_rows.iter().enumerate() {
+                let r = &rows[i];
+                let m = n32(d);
+                pass.token_copies
+                    .push(Item::new(buf::T_HOST, t_first[i], buf::T_DST, m));
+                let (hb, hr) = r.hidden_before.expect("a hidden state before the row");
+                pass.hidden_copies.push(Item::new(hb, hr, buf::H_DST, m));
+                pass.head.push(Item::new(buf::H_DRAFT, m, buf::H_DST, m));
+                pass.draws.push(SampleRow::new(&r.params, r.p() + 1, m));
+                at.push((r.slot, r.p()));
             }
             pass.attn = self.drafter_attn(&at);
-            for (d, &i) in draft_rows.iter().enumerate() {
-                pass.head
-                    .push(Item::new(buf::H_DRAFT, at_p[i], buf::H_DST, n32(d)));
-                pass.draws
-                    .push(SampleRow::new(&rows[i].params, rows[i].p() + 1, n32(d)));
-            }
-            p.drafter.push(pass);
+            p.lead.push(pass);
             // The chain: depth `j` drafts from the previous depth's normed rows.
-            let mut prev: Vec<u32> = draft_rows.iter().map(|&i| at_p[i]).collect();
+            let mut prev: Vec<u32> = (0..dn).collect();
             for j in 1..width {
                 let mut pass = DrafterPass::default();
                 let mut at = Vec::new();
@@ -1292,40 +1302,66 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                         .push(SampleRow::new(&r.params, r.p() + 1 + j, row));
                 }
                 prev = now;
-                p.drafter.push(pass);
+                p.lead.push(pass);
             }
         }
-        // Pass B: the drafts, from the live images.
-        if dn > 0 {
-            let runs_b: Vec<Run> = draft_rows
-                .iter()
-                .enumerate()
-                .map(|(d, &i)| {
-                    let r = &rows[i];
-                    Run {
-                        slot: r.slot,
-                        start: r.e(),
-                        toks: Toks::Lanes((0..r.k).map(|j| j * dn + n32(d)).collect()),
-                        src: Src::Live(r.slot),
-                        src_pos: r.e(),
-                        writes: Vec::new(),
-                        live_store: false,
-                        tail_from: r.new_base.1,
-                    }
-                })
-                .collect();
-            let b = self.target_pass(&runs_b, true);
-            let mut tb = 0;
-            pl.row_b = vec![0; rows.len()];
-            for &i in &draft_rows {
-                pl.row_b[i] = tb;
-                for j in 0..rows[i].k {
-                    p.head_b
-                        .push(Item::new(buf::H_B, tb + j, buf::H_DST, tb + j));
-                }
-                tb += rows[i].k;
+        p.target = self.target_pass(&runs, true);
+        // The head: every sampled row's last host row, then every draft's row.
+        pl.head = vec![None; rows.len()];
+        for (i, r) in rows.iter().enumerate() {
+            if r.sample {
+                pl.head[i] = Some(n32(p.head.len()));
+                let (hb, hr) = normed(i, r.p());
+                p.head
+                    .push(Item::new(hb, hr, buf::H_DST, n32(p.head.len())));
             }
-            p.b = Some(b);
+        }
+        let hosts = n32(p.head.len());
+        pl.hosts = hosts;
+        pl.first_draft = vec![0; rows.len()];
+        let mut nd = 0;
+        for &i in &draft_rows {
+            let r = &rows[i];
+            pl.first_draft[i] = nd;
+            for j in 0..r.k {
+                let (hb, hr) = normed(i, r.e() + j);
+                p.head.push(Item::new(hb, hr, buf::H_DST, hosts + nd + j));
+            }
+            nd += r.k;
+        }
+        if drafting_exec {
+            // The drafter's KV at the host positions of rows that do not draft: from the
+            // target's normed rows of this step past the row's first position.
+            let mut pass = DrafterPass {
+                kv_only: true,
+                ..DrafterPass::default()
+            };
+            let mut at = Vec::new();
+            for (i, r) in rows.iter().enumerate() {
+                if r.k > 0 {
+                    continue;
+                }
+                for s in r.c.max(1)..=r.p() {
+                    let m = n32(at.len());
+                    pass.token_copies.push(Item::new(
+                        buf::T_HOST,
+                        t_first[i] + s - r.c,
+                        buf::T_DST,
+                        m,
+                    ));
+                    let (hb, hr) = if s == r.c {
+                        r.hidden_before.expect("a hidden state before the row")
+                    } else {
+                        normed(i, s - 1)
+                    };
+                    pass.hidden_copies.push(Item::new(hb, hr, buf::H_DST, m));
+                    at.push((r.slot, s));
+                }
+            }
+            if !at.is_empty() {
+                pass.attn = self.drafter_attn(&at);
+                p.trail = Some(pass);
+            }
         }
         // Draws, target distributions, acceptance.
         pl.plain = vec![None; rows.len()];
@@ -1335,7 +1371,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 p.plain.push(SampleRow::new(
                     &r.params,
                     r.p() + 1,
-                    pl.head_a[i].expect("a sampled row's head row"),
+                    pl.head[i].expect("a sampled row's head row"),
                 ));
             }
         }
@@ -1345,24 +1381,19 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             p.targets.push(SampleRow::new(
                 &r.params,
                 r.p() + 1,
-                pl.head_a[i].expect("a drafting row samples"),
+                pl.head[i].expect("a drafting row samples"),
             ));
             for j in 0..r.k {
-                p.targets
-                    .push(SampleRow::new(&r.params, r.p() + 1, ha + pl.row_b[i] + j));
+                p.targets.push(SampleRow::new(
+                    &r.params,
+                    r.p() + 1,
+                    hosts + pl.first_draft[i] + j,
+                ));
             }
             p.accept
                 .push((SampleRow::new(&r.params, r.p() + 1, 0), first, r.k));
         }
         if drafting_exec {
-            let normed = |i: usize, q: u32| -> (u32, u32) {
-                let r = &rows[i];
-                if q <= r.p() {
-                    (buf::H_A, t_first[i] + q - r.c)
-                } else {
-                    (buf::H_B, pl.row_b[i] + q - r.e())
-                }
-            };
             // The canonical rewrite at every draft's position.
             if dn > 0 {
                 let mut pass = DrafterPass {
@@ -1429,7 +1460,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             run: Run {
                 slot,
                 start: k,
-                toks: Toks::Host(vec![PAD_TOKEN]),
+                host: vec![PAD_TOKEN],
+                lanes: Vec::new(),
                 src: Src::Zero,
                 src_pos: k,
                 writes: Vec::new(),
@@ -1456,21 +1488,24 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             StateStrategy::Lagging => self.tail_cap as usize,
         };
         let writes = ((fold + 1) / bs + 1).min(SEQ_WRITES);
-        s.a.staged = r * (1 + fold);
-        s.a.conv_rows = 3 * r + s.a.staged;
-        s.a.stage_conv = 3 * r + s.a.staged;
-        s.a.stage_ab = s.a.staged;
-        s.a.post_conv = 3 * writes * r + 3 * r + r;
-        s.a.post_ab = r;
+        let wu = w as usize;
+        // A row: its folds, its host token and its drafts staged; the state writes, the
+        // live image and every new position into the tail kept.
+        let t = &mut s.target;
+        t.staged = r * (fold + 1 + wu);
+        t.conv_rows = 3 * r + t.staged;
+        t.stage_conv = 3 * r + t.staged;
+        t.stage_ab = t.staged;
+        t.post_conv = 3 * writes * r + 3 * r + r * (1 + wu);
+        t.post_ab = r * (1 + wu);
         if drafting_exec {
-            let wu = w as usize;
             s.keep = r * (wu + 1) + r * ((wu + 1) / bs + 1);
         }
         if geo.fast {
             let len = self.cfg.max_model_len + self.cfg.draft_tokens + 1;
             let blocks = self.spec.max_blocks_per_seq();
             let caps = |queries: u32, g: &Fa2Geometry, pages: u32| {
-                PassCaps::with_max_tile(
+                PassCaps::with_split_keys(
                     Reduction::Split,
                     rows,
                     queries,
@@ -1479,14 +1514,18 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                     pages,
                     len,
                     super::attention::MAX_TILE,
+                    plan::SPLIT_KEYS,
                 )
             };
-            s.a.attn.fa2 = Some(caps(1, &geo.target, blocks)?);
-            for d in &mut s.drafter {
-                d.attn.fa2 = Some(caps(1, &geo.drafter, len)?);
-            }
-            if let Some(b) = &mut s.b {
-                b.attn.fa2 = Some(caps(w, &geo.target, blocks)?);
+            s.target.attn.fa2 = vec![plan::Fa2Pass {
+                caps: caps(1 + w, &geo.target, blocks)?,
+                out_row: 0,
+            }];
+            for d in &mut s.lead {
+                d.attn.fa2 = vec![plan::Fa2Pass {
+                    caps: caps(1, &geo.drafter, len)?,
+                    out_row: 0,
+                }];
             }
         }
         Ok(s)
@@ -1543,7 +1582,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             run: Run {
                 slot: e.slot,
                 start: e.context_len,
-                toks: Toks::Host(toks.clone()),
+                host: toks.clone(),
+                lanes: Vec::new(),
                 src: Src::Zero,
                 src_pos: 0,
                 writes: writes.iter().map(|w| (w.len, w.buffer)).collect(),
@@ -1819,9 +1859,9 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 let mut rows_l = Vec::new();
                 for j in 0..produced.len() {
                     let lr = if j == 0 {
-                        placed.head_a[i].expect("a sampled row") as usize
+                        placed.head[i].expect("a sampled row") as usize
                     } else {
-                        layout.head_a.items + (placed.row_b[i] as usize) + j - 1
+                        (placed.hosts + placed.first_draft[i]) as usize + j - 1
                     };
                     let mut v = vec![0f32; vocab];
                     let at = self.scratch.logits_t.addr + (lr * vocab * 4) as u64;
@@ -1975,22 +2015,15 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
     fn check_rung_fits(&self, s: &Shape) -> Result<()> {
         let c = &self.scratch.caps;
         let bad = |what: &str| Err(CudaError::new(format!("rung past the scratch: {what}")));
-        let a = &s.a;
-        if a.staged > c.staged || a.conv_rows > c.conv_rows {
-            return bad("staged positions");
+        let t = &s.target;
+        if t.staged > c.staged || t.conv_rows > c.conv_rows || t.attn.rows > c.rows {
+            return bad("the target's rows");
         }
-        if a.stage_conv.max(a.post_conv) > c.pad_conv || a.stage_ab.max(a.post_ab) > c.pad_ab {
+        if t.stage_conv.max(t.post_conv) > c.pad_conv || t.stage_ab.max(t.post_ab) > c.pad_ab {
             return bad("pad rows");
         }
-        if let Some(b) = &s.b
-            && (b.staged > c.staged
-                || b.stage_conv.max(b.post_conv) > c.pad_conv
-                || b.stage_ab.max(b.post_ab) > c.pad_ab)
-        {
-            return bad("pass B");
-        }
-        if s.keep > c.pad_h {
-            return bad("kept rows");
+        if s.keep.max(s.head) > c.pad_h || s.head > c.head {
+            return bad("kept or head rows");
         }
         Ok(())
     }
@@ -2015,7 +2048,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let run = Run {
             slot,
             start: len,
-            toks: Toks::Host(Vec::new()),
+            host: Vec::new(),
+            lanes: Vec::new(),
             src,
             src_pos,
             writes: vec![(len, buffer)],
@@ -2023,14 +2057,14 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             tail_from: u32::MAX,
         };
         let p = StepPlan {
-            a: self.target_pass(std::slice::from_ref(&run), false),
+            target: self.target_pass(std::slice::from_ref(&run), false),
             ..StepPlan::default()
         };
         let geo = self.geo();
         let layout = Layout::new(&Shape::of(&p, &geo)?);
         let words = plan::pack(&p, &layout, &geo)?;
         self.upload_table(&words, false)?;
-        self.fold_program(&layout.a)?;
+        self.fold_program(&layout.target)?;
         self.dev.synchronize()?;
         self.set_tag(buffer, len)
     }
@@ -2160,8 +2194,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         }
         self.slots[slot as usize].base = Some((NULL_STATE, 0));
         let c = self.scratch.caps;
-        // Pieces of at most the head's rows of pass A: the logits are the vocabulary a row.
-        let piece = c.rows_a.min(c.logits_t - c.rows_b).max(1);
+        // Pieces of at most one head launch's rows: the logits are the vocabulary a row.
+        let piece = c.rows.min(c.head).min(c.logits_t).max(1);
         let vocab = self.dims.vocab as usize;
         let geo = self.geo();
         let mut logits = Vec::with_capacity(tokens.len());
@@ -2171,7 +2205,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             let run = Run {
                 slot,
                 start,
-                toks: Toks::Host(chunk.to_vec()),
+                host: chunk.to_vec(),
+                lanes: Vec::new(),
                 src: if start == 0 {
                     Src::Zero
                 } else {
@@ -2183,9 +2218,9 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 tail_from: u32::MAX,
             };
             let p = StepPlan {
-                a: self.target_pass(std::slice::from_ref(&run), true),
-                head_a: (0..m)
-                    .map(|j| Item::new(buf::H_A, j, buf::H_DST, j))
+                target: self.target_pass(std::slice::from_ref(&run), true),
+                head: (0..m)
+                    .map(|j| Item::new(buf::H_NORMED, j, buf::H_DST, j))
                     .collect(),
                 ..StepPlan::default()
             };
@@ -2219,38 +2254,39 @@ fn lcm(a: usize, b: usize) -> usize {
     a / x * b
 }
 
-/// What the scratch is sized for: the largest bucket's rows and tokens, every slot's
-/// drafts, and any decode rung's padded lists.
+/// What the scratch is sized for: the largest bucket's rows and tokens (drafts among
+/// them), every slot's drafts, and any decode rung's padded lists.
 fn capacities(cfg: &QwenCudaExecutorConfig, tail_cap: u32) -> Caps {
     let r = cfg.buckets.iter().map(|b| b.max_seqs).max().unwrap_or(1) as usize;
     let t = cfg.buckets.iter().map(|b| b.max_tokens).max().unwrap_or(1) as usize;
     let k = cfg.draft_tokens as usize;
     let tc = tail_cap as usize;
     let bs = cfg.block_size as usize;
-    let rows = t.max(r * k);
-    let staged = (t + r * tc).max(r * k);
+    // The target's rows: a step's host tokens and drafts, which its bucket bounds.
+    let rows = t.max(r * (k + 1));
+    let staged = (t + r * tc).max(r * (k + 1 + tc));
     let positions = cfg.max_model_len + cfg.draft_tokens + 1;
     Caps {
         rows,
-        rows_a: t,
-        rows_b: (r * k).max(1),
         staged,
         conv_rows: 3 * r + staged,
         drafter: rows,
-        head: r.max(r * k).max(64),
-        logits_t: r.max(64) + r * k,
+        head: (r * (k + 1)).max(64),
+        logits_t: (r * (k + 1)).max(64),
+        logits_d: r,
         drafting: r,
         depth: k,
         plain: r,
         targets: r * (k + 1),
-        pad_conv: 3 * r + r * (1 + tc) + 3 * SEQ_WRITES * r + 4 * r,
-        pad_ab: r * (1 + tc) + r,
+        pad_conv: 3 * r + staged + 3 * SEQ_WRITES * r + 3 * r + r * (k + 1),
+        pad_ab: staged + r * (k + 1),
         pad_o: r.max(r * k),
         pad_h: r * (k + 1) + r * ((k + 1) / bs.max(1) + 1) + r * k + r,
         pad_t: r * k + r,
         table: 64,
         readback: 1 + r + r * (k + 1) + r,
         score_stride: positions as usize,
-        partial_rows: plan::partial_rows(n32(rows), positions) as usize,
+        // A rung's rows: every sequence's host token and drafts.
+        partial_rows: plan::partial_rows(n32(rows), n32(r * (k + 1)), positions) as usize,
     }
 }

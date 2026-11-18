@@ -334,4 +334,4 @@ Measured on an Apple M4 Max in the dev profile (the crate builds at `opt-level =
 - The drafter's row layout and its canonical rewrite at accepted positions in the same step.
 - The boundary taps.
 
-It may keep the state differently (a live state per slot instead of folding the tail each row), but the images it stores and the logits it produces must be these.
+It may keep the state differently (a live state per slot instead of folding the tail each row), and order the work differently (the CUDA executor draws the drafts first, from the kept states and taps, and runs the target once over each row's host token and drafts, which computes the rows steps 2 and 5 compute), but the images it stores, the drafts it draws and the logits it produces must be these.

@@ -70,8 +70,19 @@ pub struct NormParams {
     pub out_unit_stride: u32,
     pub rotary: u32,
     pub eps: f32,
+    /// A split FP8 GEMM's partial sums as the residual add's input (fast profile), in
+    /// place of `add`: `add_splits` arrays of `add_part_rows` rows of `n` f32.
+    pub add_parts: u64,
+    /// The normed rows quantised as `eidola_qwen_quant` would (`[rows, n]` codes, f32
+    /// scales `[n / 128][m_pad]`), or 0.
+    pub codes: u64,
+    pub scales: u64,
+    pub add_splits: u32,
+    pub add_part_rows: u32,
+    pub m_pad: u32,
+    pub reserved: u32,
 }
-layout!(NormParams, 96, { positions: 48, rows: 56, rotary: 88, eps: 92 });
+layout!(NormParams, 136, { positions: 48, rows: 56, rotary: 88, eps: 92, add_parts: 96, add_splits: 120, m_pad: 128 });
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -280,3 +291,54 @@ pub struct RoundParams {
     pub reserved: u32,
 }
 layout!(RoundParams, 40, { out_f32: 32 });
+
+/// The fast profile's split FP8 GEMM's sum (`eidola_qwen_fast_split_sum`): `out[r][n] =
+/// bf16(((parts[0][r][n] + parts[1][r][n]) + …) + parts[splits - 1][r][n])`, each split's
+/// array `part_rows` rows of `n` f32 values.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitSumParams {
+    pub parts: u64,
+    pub out: u64,
+    pub rows: u32,
+    pub n: u32,
+    pub splits: u32,
+    pub part_rows: u32,
+    pub out_stride: u32,
+    pub reserved: u32,
+}
+layout!(SplitSumParams, 40, { splits: 24, out_stride: 32 });
+
+/// Groups one [`CopyParams`] launch carries.
+pub const COPY_GROUPS: usize = 3;
+/// Buffers of one [`CopyGroup`].
+pub const COPY_BUFFERS: usize = 8;
+/// Status bit: a copy item's buffer or row out of range.
+pub const STATUS_BAD_INDEX: u32 = 4;
+
+/// One group of row copies: a table of buffers of `width`-word rows and `items` copies
+/// (device arrays of `items` words: source buffer and row, destination buffer and row).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyGroup {
+    pub buf: [u64; COPY_BUFFERS],
+    pub rows: [u64; COPY_BUFFERS],
+    pub src_buf: u64,
+    pub src_row: u64,
+    pub dst_buf: u64,
+    pub dst_row: u64,
+    pub width: u32,
+    pub items: u32,
+}
+layout!(CopyGroup, 168, { src_buf: 128, width: 160 });
+
+/// Row copies of up to [`COPY_GROUPS`] groups in one launch (`eidola_qwen_copy_rows`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyParams {
+    pub group: [CopyGroup; COPY_GROUPS],
+    pub status: u64,
+    pub groups: u32,
+    pub reserved: u32,
+}
+layout!(CopyParams, 520, { status: 504, groups: 512 });

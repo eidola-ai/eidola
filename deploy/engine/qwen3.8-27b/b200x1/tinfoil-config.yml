@@ -18,10 +18,11 @@
 # modelwrap schema 1 pack of the repo below, which has not been built. Until
 # it is, this deployment is not pinned and the gateway's build refuses it.
 #
-# The sizing is the whole 262,144-position context at 64 seats and steps of
-# 2,048 tokens, decode graphs on: what one B200 holds beside the weights and
-# the CUDA executor's reserve, the state pool growing with the seats
-# (eidola-common's `qwen_fits_one_b200_at_its_whole_context`).
+# The sizing is the whole 262,144-position context at 64 seats, steps of
+# 2,048 tokens of prefill chunks of 256 (the serving chunk), decode graphs on:
+# what one B200 holds beside the weights and the CUDA executor's reserve, the
+# state pool growing with the seats (eidola-common's
+# `qwen_fits_one_b200_at_its_whole_context`).
 cvm-version: 0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f
 cpus: 24
 memory: 196608
@@ -35,7 +36,7 @@ models:
 
 containers:
   - name: "eidola-server-engine"
-    image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:da8bed767da86538a44edf41f6616a72451cbf8b06c7bc388894f183ef7aad77"
+    image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:116eac9f2c20df313006f9c21a9940bcf5a406c76a99a5c72ea8d0d955b6b13d"
     runtime: nvidia
     models: ["weights"]
     gpus: all
@@ -57,7 +58,7 @@ containers:
       - EIDOLA_ENGINE_MAX_MODEL_LEN: "262144"
       - EIDOLA_ENGINE_MAX_SEQS: "64"
       - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "2048"
-      - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "2048"
+      - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "256"
       - EIDOLA_ENGINE_DRAFT_TOKENS: "3"
       - EIDOLA_ENGINE_MAX_REQUESTS: "64"
       - EIDOLA_ENGINE_PREFIX_CACHE: "true"

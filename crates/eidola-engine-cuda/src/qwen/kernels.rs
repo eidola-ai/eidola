@@ -15,15 +15,15 @@ use eidola_engine::sampling::Stream;
 
 use super::abi::*;
 use super::attention::Fa2Args;
-pub use crate::mimo::engine_ops::{COPY_BUFFERS, CopyArgs, STATUS_BAD_INDEX, copy_grid};
 pub use crate::sampler::AcceptLaunch;
 use crate::{CudaError, Result};
 
-/// One `eidola_sample` launch over device rows (`crate::sampler`): for each of
-/// `num_rows` sample rows at `rows` (`SampleRow`s), the processed distribution over the
-/// first `n` logits of its logit row into `probs[r · n ..]` (f64) and, with `draw`, a
-/// token drawn from it with that stream into `tokens[r]` (a greedy row takes the
-/// argmax). Non-finite logits raise `STATUS_NON_FINITE` in `status`.
+/// One sample launch over device rows (`super::sampler`): for each of `num_rows` sample
+/// rows at `rows` (`SampleRow`s), the processed distribution over the first `n` logits of
+/// its logit row into `probs[r · n ..]` (f64) and, with `draw`, a token drawn from it with
+/// that stream into `tokens[r]` (a greedy row takes the argmax), through a work area of
+/// `super::sampler::sample_work_bytes(num_rows)` bytes at `work`. Non-finite logits raise
+/// `STATUS_NON_FINITE` in `status`.
 #[derive(Clone, Copy, Debug)]
 pub struct SampleArgs {
     pub logits: u64,
@@ -35,6 +35,7 @@ pub struct SampleArgs {
     pub probs: u64,
     pub tokens: u64,
     pub status: u64,
+    pub work: u64,
 }
 
 /// The kernel families of the forward.
@@ -52,8 +53,15 @@ pub trait QwenKernels {
     unsafe fn norm(&self, p: &NormParams) -> Result<()>;
     unsafe fn quant(&self, p: &QuantParams) -> Result<()>;
     /// The FP8 linear: exact (`lin8_rows`) in the exact profile, the tensor-core form in
-    /// the fast one.
-    unsafe fn lin8(&self, p: &Lin8Params) -> Result<()>;
+    /// the fast one. A shape the fast profile splits ([`fp8_splits`] above 1) needs `parts`,
+    /// an f32 scratch of `splits · m_pad · n` values for its partial sums, there (and on a
+    /// host device planning as the fast profile does); the exact profile ignores it.
+    unsafe fn lin8(&self, p: &Lin8Params, parts: Option<u64>) -> Result<()>;
+    /// A split shape's FP8 linear without its sum (fast profile): the [`fp8_splits`]
+    /// ranges' partial sums of `m_pad` rows into `parts` (`[splits][m_pad][n]` f32),
+    /// `p.out` unwritten, for a norm whose residual add reads them (`NormParams::
+    /// add_parts`). The sum the norm takes is the one [`QwenKernels::lin8`] would store.
+    unsafe fn lin8_parts(&self, p: &Lin8Params, parts: u64) -> Result<()>;
     /// The BF16 linear: exact (`linear_bf16_rows`) in the exact profile, the tensor-core
     /// form in the fast one for the large linears (the head and the drafter's input
     /// projection), which name an f32 scratch of `rows · n` values in `fast`; `None` for
@@ -71,16 +79,22 @@ pub trait QwenKernels {
     unsafe fn attention(&self, p: &AttnParams) -> Result<()>;
     unsafe fn dn_prep(&self, p: &DnPrepParams) -> Result<()>;
     unsafe fn dn_rec(&self, p: &DnRecParams) -> Result<()>;
+    /// The recurrence's short form (`eidola_qwen_dn_rec_short`): the same bits as
+    /// [`Self::dn_rec`] over the same grid, faster when every run is a few positions
+    /// (at most about [`DN_SHORT_RUN`]: a decode step, a draft check).
+    unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()>;
     unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()>;
     unsafe fn widen(&self, p: &WidenParams) -> Result<()>;
     unsafe fn round(&self, p: &RoundParams) -> Result<()>;
-    /// Row copies between up to [`COPY_BUFFERS`] buffers (`eidola_copy_rows`): every
-    /// buffer and row index bounded, an item out of range copying nothing and raising
-    /// [`STATUS_BAD_INDEX`].
-    unsafe fn copy_rows(&self, a: &CopyArgs) -> Result<()>;
+    /// Row copies of up to [`COPY_GROUPS`] groups, each between up to [`COPY_BUFFERS`]
+    /// buffers (`eidola_qwen_copy_rows`): every buffer and row index bounded, an item out
+    /// of range copying nothing and raising [`STATUS_BAD_INDEX`], an item onto its own
+    /// row copying nothing.
+    unsafe fn copy_rows(&self, p: &CopyParams) -> Result<()>;
     /// The device sampler ([`SampleArgs`]).
     unsafe fn sample(&self, a: &SampleArgs) -> Result<()>;
-    /// Chain acceptance (`eidola_chain_accept`).
+    /// Chain acceptance (`super::sampler::QwenSampler::accept`), its `scratch` a work
+    /// area of `super::sampler::accept_work_bytes(num_rows)` bytes.
     unsafe fn accept(&self, a: &AcceptLaunch) -> Result<()>;
     /// One FA2 head-dim-256 pass and its merge (the fast profile's attention).
     unsafe fn fa2(&self, a: &Fa2Args) -> Result<()>;
@@ -107,6 +121,41 @@ const BLOCK_THREADS: u32 = 128;
 const LIN_ROWS: u32 = 8;
 /// 128-wide blocks a CTA of the quantiser takes, a warp each (`kQuantWarps`).
 const QUANT_WARPS: u32 = BLOCK_THREADS / 32;
+/// Rows a quantiser CTA covers at prefill sizes (`kQuantRows`).
+const QUANT_ROWS: u32 = 4;
+/// CTAs the quantiser has at [`QUANT_ROWS`] rows a CTA from which it takes that many;
+/// below, a CTA a row, so a decode-size launch spreads over as many CTAs as it has rows.
+const QUANT_GROUPED_CTAS: u32 = 1024;
+
+/// The driver's grid limit in x.
+const MAX_GRID_X: u32 = 0x7fff_ffff;
+
+/// Positions a run of the recurrence's short form stages at once (`kDnChunk`): a launch
+/// whose runs average at most this many takes the short form.
+pub const DN_SHORT_RUN: usize = 8;
+
+/// The grouped row copy's grid: a block an item, the groups' items in order. Checks
+/// the groups' count, each non-empty group's width and arrays, and the status word.
+pub fn copy_grid(p: &CopyParams) -> Result<[u32; 3]> {
+    ensure(p.groups as usize <= COPY_GROUPS, "copy: groups")?;
+    ensure(p.status != 0, "copy: no status word")?;
+    let mut items = 0u32;
+    for g in &p.group[..p.groups as usize] {
+        if g.items == 0 {
+            continue;
+        }
+        ensure(g.width > 0, "copy: rows of no words")?;
+        ensure(
+            g.src_buf != 0 && g.src_row != 0 && g.dst_buf != 0 && g.dst_row != 0,
+            "copy: null item arrays",
+        )?;
+        items = items
+            .checked_add(g.items)
+            .filter(|&n| n <= MAX_GRID_X)
+            .ok_or_else(|| refuse("copy: items past the grid"))?;
+    }
+    Ok([items, 1, 1])
+}
 
 pub fn embed_grid(p: &EmbedParams) -> Result<[u32; 3]> {
     ensure(
@@ -135,6 +184,29 @@ pub fn norm_grid(p: &NormParams) -> Result<[u32; 3]> {
             "norm: a residual add over one unit",
         )?;
     }
+    if p.add_parts != 0 {
+        ensure(
+            p.add == 0
+                && p.units == 1
+                && p.add_splits >= 2
+                && p.add_part_rows >= p.rows
+                && p.add_parts.is_multiple_of(4),
+            "norm: a residual add of partial sums over one unit",
+        )?;
+    }
+    if p.codes != 0 {
+        ensure(
+            p.scales != 0
+                && p.units == 1
+                && p.rotary == 0
+                && p.n.is_multiple_of(BLOCK)
+                && p.m_pad >= p.rows
+                && p.codes.is_multiple_of(4)
+                && p.scales.is_multiple_of(4),
+            "norm: a fused quantisation of whole 128-blocks of one unrotated unit",
+        )?;
+    }
+    ensure(p.reserved == 0, "norm: reserved")?;
     if p.rotary > 0 {
         ensure(
             p.rope_cos != 0 && p.rope_sin != 0 && p.positions != 0,
@@ -147,7 +219,51 @@ pub fn norm_grid(p: &NormParams) -> Result<[u32; 3]> {
     }
     ensure(p.eps.is_finite() && p.eps > 0.0, "norm: epsilon")?;
     ensure(p.units <= 0x7fff_ffff, "norm: units")?;
-    rows_grid(p.units, p.rows)
+    if p.n > NORM_WARP_MAX {
+        return rows_grid(p.units, p.rows);
+    }
+    items_grid(
+        u64::from(p.units) * u64::from(p.rows),
+        NORM_ITEMS,
+        "norm: units",
+    )
+}
+
+/// Rows from which the program's residual norms add a split FP8 GEMM's partial sums
+/// themselves (`NormParams::add_parts`) rather than after `eidola_qwen_fast_split_sum`'s
+/// launch, and from which they quantise their output for the FP8 GEMM after them
+/// themselves (`NormParams::codes`) rather than before `eidola_qwen_quant`'s. Each form
+/// gives a row the same bits as the launches it stands for (`cases::norm_fused`,
+/// `fast_norm_split_residual`), so these are choices of speed alone, of a launch's row
+/// count. A fused norm is one CTA a row and does all of its row's extra work there, where
+/// the split sum and the quantiser spread a row over CTAs: at one decode row a B200
+/// measured the fused norm with both forms at about 15 µs a launch, against about 9 for
+/// the three launches it stood for. So both start at prefill sizes, where the launches
+/// they save are the costlier; the kernel bench's `norm` lines (`parts`, `quant`,
+/// `parts_quant` against `sum_then_norm`, `norm_then_quant`, `sum_norm_quant`) give
+/// each crossover.
+pub const NORM_FUSED_PARTS_ROWS: usize = 128;
+/// See [`NORM_FUSED_PARTS_ROWS`].
+pub const NORM_FUSED_QUANT_ROWS: usize = 128;
+
+/// Whether a norm takes its fused forms' kernel (`eidola_qwen_norm_fused`): a residual
+/// add from partial sums, or the normed rows quantised.
+pub fn norm_is_fused(p: &NormParams) -> bool {
+    p.add_parts != 0 || p.codes != 0
+}
+
+/// Units a norm stages a warp each (`kNormWarpMax`), eight a CTA (`kNormItems`); wider
+/// units take a CTA each.
+pub const NORM_WARP_MAX: u32 = 1024;
+const NORM_ITEMS: u32 = 8;
+
+/// A grid of `items` a warp each, `per` a CTA, numbered row by row over x.
+fn items_grid(items: u64, per: u32, what: &str) -> Result<[u32; 3]> {
+    let x = u32::try_from(items.div_ceil(u64::from(per)))
+        .ok()
+        .filter(|&x| x <= MAX_GRID_X)
+        .ok_or_else(|| refuse(what))?;
+    Ok([x.max(1), 1, 1])
 }
 
 pub fn quant_grid(p: &QuantParams) -> Result<[u32; 3]> {
@@ -161,7 +277,15 @@ pub fn quant_grid(p: &QuantParams) -> Result<[u32; 3]> {
         p.x.is_multiple_of(8) && p.x_stride.is_multiple_of(4) && p.codes.is_multiple_of(4),
         "quant: a lane's 8-byte load and 4-byte store aligned",
     )?;
-    rows_grid((p.k / BLOCK).div_ceil(QUANT_WARPS), p.rows)
+    let cols = (p.k / BLOCK).div_ceil(QUANT_WARPS);
+    let grouped = p.rows.div_ceil(QUANT_ROWS);
+    // The kernel reads its rows a CTA as ⌈rows / y⌉: 1 here, at most QUANT_ROWS there.
+    let y = if cols.saturating_mul(grouped) >= QUANT_GROUPED_CTAS {
+        grouped
+    } else {
+        p.rows
+    };
+    rows_grid(cols, y)
 }
 
 pub fn lin8_grid(p: &Lin8Params) -> Result<[u32; 3]> {
@@ -190,6 +314,51 @@ pub fn linear_grid(p: &LinearParams) -> Result<[u32; 3]> {
     Ok([p.n.div_ceil(BLOCK_THREADS), y.max(1), 1])
 }
 
+/// Outputs (a warp each) and rows of a small-N GEMM CTA (`qwen_fast.cuh`).
+const SMALL_WARPS: u32 = 4;
+const SMALL_ROWS: u32 = 4;
+/// Rows and outputs a warp of the small-N GEMM's tiled form takes, and its warps a CTA
+/// (outputs side by side, the rows shared).
+const TILE_ROWS: u32 = 8;
+const TILE_OUTS: u32 = 4;
+const TILE_WARPS: u32 = 4;
+
+/// Rows from which the small-N GEMM runs its tiled form
+/// (`eidola_qwen_fast_gemm_bf16_tiled`). Both forms sum every (row, output) in one order,
+/// so the choice by row count leaves a row's bits its own.
+pub const SMALL_TILED_ROWS: u32 = 128;
+
+/// The fast profile's small-N BF16 GEMM (`eidola_qwen_fast_gemm_bf16`): f32 outputs,
+/// dense rows of 16-byte chunks; CTAs of four outputs by four rows.
+pub fn small_gemm_grid(p: &LinearParams) -> Result<[u32; 3]> {
+    ensure(p.x != 0 && p.w != 0 && p.out != 0, "small gemm: null")?;
+    ensure(p.n > 0 && p.k > 0, "small gemm: empty")?;
+    ensure(
+        p.out_f32 == 1 && p.out_stride >= p.n,
+        "small gemm: f32 rows",
+    )?;
+    ensure(
+        p.k.is_multiple_of(8)
+            && p.x_stride.is_multiple_of(8)
+            && p.x_stride >= p.k
+            && p.x.is_multiple_of(16)
+            && p.w.is_multiple_of(16),
+        "small gemm: rows of whole 16-byte chunks, aligned",
+    )?;
+    let y = p.rows.div_ceil(SMALL_ROWS);
+    ensure(y <= MAX_GRID_Y, "small gemm: rows")?;
+    Ok([p.n.div_ceil(SMALL_WARPS), y.max(1), 1])
+}
+
+/// The small-N GEMM's tiled form (`eidola_qwen_fast_gemm_bf16_tiled`): what
+/// [`small_gemm_grid`] takes, over CTAs of sixteen outputs (four a warp) by eight rows.
+pub fn small_gemm_tiled_grid(p: &LinearParams) -> Result<[u32; 3]> {
+    small_gemm_grid(p)?;
+    let y = p.rows.div_ceil(TILE_ROWS);
+    ensure(y <= MAX_GRID_Y, "small gemm: rows")?;
+    Ok([p.n.div_ceil(TILE_OUTS * TILE_WARPS), y.max(1), 1])
+}
+
 pub fn gate_grid(p: &GateParams) -> Result<[u32; 3]> {
     ensure(p.a != 0 && p.g != 0 && p.out != 0, "gate: null")?;
     ensure(
@@ -204,6 +373,12 @@ pub fn gate_grid(p: &GateParams) -> Result<[u32; 3]> {
         "gate: strides",
     )?;
     rows_grid(p.width.div_ceil(ELEMENT), p.rows)
+}
+
+/// The fast profile's gates (`eidola_qwen_fast_gate`): 256 threads of 8 elements.
+pub fn fast_gate_grid(p: &GateParams) -> Result<[u32; 3]> {
+    gate_grid(p)?;
+    rows_grid(p.width.div_ceil(ELEMENT * 8), p.rows)
 }
 
 pub fn kv_write_grid(p: &KvWriteParams) -> Result<[u32; 3]> {
@@ -317,19 +492,31 @@ pub fn dn_norm_grid(p: &DnNormParams) -> Result<[u32; 3]> {
         "dn norm: widths",
     )?;
     ensure(
+        p.v_dim <= BLOCK_THREADS,
+        "dn norm: value dim at most 128 (a thread per staged value)",
+    )?;
+    ensure(
         p.eps.is_finite() && p.eps > 0.0 && p.reserved == 0,
         "dn norm: epsilon",
     )?;
-    rows_grid(p.v_heads, p.rows)
+    items_grid(
+        u64::from(p.v_heads) * u64::from(p.rows),
+        DN_NORM_ITEMS,
+        "dn norm: heads",
+    )
 }
 
+/// Heads the gated norm takes a CTA, a warp each (`kDnNormItems`).
+const DN_NORM_ITEMS: u32 = BLOCK_THREADS / 32;
+
+/// The widening: a thread eight consecutive elements of a row (`kWidenPer`).
 pub fn widen_grid(p: &WidenParams) -> Result<[u32; 3]> {
     ensure(p.x != 0 && p.out != 0, "widen: null")?;
     ensure(
         p.width > 0 && p.x_stride >= p.width && p.out_stride >= p.width,
         "widen: strides",
     )?;
-    rows_grid(p.width.div_ceil(ELEMENT), p.rows)
+    rows_grid(p.width.div_ceil(ELEMENT * 8), p.rows)
 }
 
 pub fn round_grid(p: &RoundParams) -> Result<[u32; 3]> {
@@ -342,9 +529,117 @@ pub fn round_grid(p: &RoundParams) -> Result<[u32; 3]> {
     rows_grid(p.width.div_ceil(ELEMENT), p.rows)
 }
 
+/// CTAs a split FP8 GEMM may fill at one tile row: the SM count of a B200 and a B300.
+/// A constant, not the device's count, so a shape's split is the same on every device.
+pub const SPLIT_CTAS: u32 = 148;
+/// The most ranges a GEMM's K is split into, which bounds the partial sums' traffic at
+/// prefill sizes (every row count runs the same split).
+pub const MAX_SPLITS: u32 = 4;
+/// The fewest 128-wide K blocks a range holds.
+pub const MIN_SPLIT_BLOCKS: u32 = 8;
+
+/// The ranges of K the fast profile's FP8 GEMM of `n` outputs over `k` runs in, a
+/// function of the shape alone: the most, up to [`MAX_SPLITS`], that divide K's 128-wide
+/// blocks into ranges of at least [`MIN_SPLIT_BLOCKS`] and keep the 128-output tiles of
+/// all ranges within [`SPLIT_CTAS`]; 1 (no split) when none does. On the released model:
+/// 3 for `o_proj` and the DeltaNet's `out_proj` (`5,120 × 6,144`, 120 CTAs), 2 for
+/// `down_proj` (`5,120 × 17,408`, 80 CTAs: 136 blocks have no third), and 1 for every
+/// wider GEMM, whose tiles already fill the device. Every row of such a shape, at any row
+/// count, is summed range by range and the ranges added in order
+/// (`eidola_qwen_fast_split_sum`), so a row's bits do not depend on its batch.
+pub fn fp8_splits(n: u32, k: u32) -> u32 {
+    let tiles = n.div_ceil(BLOCK);
+    let blocks = k / BLOCK;
+    (2..=MAX_SPLITS)
+        .rev()
+        .find(|&s| {
+            blocks.is_multiple_of(s)
+                && blocks / s >= MIN_SPLIT_BLOCKS
+                && tiles.saturating_mul(s) <= SPLIT_CTAS
+        })
+        .unwrap_or(1)
+}
+
+/// f32 values a split FP8 GEMM's partial sums take a row: `splits · n`, or 0 for a shape
+/// that does not split. At most `SPLIT_CTAS · 128` by [`fp8_splits`]'s rule.
+pub fn split_width(n: u32, k: u32) -> usize {
+    match fp8_splits(n, k) {
+        1 => 0,
+        s => s as usize * n as usize,
+    }
+}
+
+/// Outputs a thread of `eidola_qwen_fast_split_sum` adds (`kSumChunk`), and its CTA.
+const SUM_CHUNK: u32 = 4;
+const SUM_THREADS: u32 = 256;
+
+pub fn split_sum_grid(p: &SplitSumParams) -> Result<[u32; 3]> {
+    ensure(p.parts != 0 && p.out != 0, "split sum: null")?;
+    ensure(
+        p.n > 0 && p.splits > 1 && p.part_rows >= p.rows && p.out_stride >= p.n,
+        "split sum: shape",
+    )?;
+    ensure(p.reserved == 0, "split sum: reserved")?;
+    rows_grid(p.n.div_ceil(SUM_CHUNK * SUM_THREADS), p.rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_are_fixed_by_the_shape() {
+        // The released model: o_proj and out_proj, down_proj, and the wide GEMMs.
+        assert_eq!(fp8_splits(5120, 6144), 3);
+        assert_eq!(fp8_splits(5120, 17408), 2);
+        for (n, k) in [(16384, 5120), (14336, 5120), (34816, 5120), (12288, 5120)] {
+            assert_eq!(fp8_splits(n, k), 1, "{n} x {k}");
+            assert_eq!(split_width(n, k), 0);
+        }
+        assert_eq!(split_width(5120, 6144), 15360);
+        // The drafter's stacked keys and values alone: 16 tiles, 40 blocks.
+        assert_eq!(fp8_splits(2048, 5120), 4);
+        // Too few blocks for two ranges of eight.
+        assert_eq!(fp8_splits(256, 1024 + 896), 1);
+        assert_eq!(fp8_splits(256, 2048), 2);
+        // Every split fits the CTAs and holds whole ranges.
+        for n in (128..20_000).step_by(128) {
+            for k in (128..20_000).step_by(128) {
+                let s = fp8_splits(n, k);
+                assert!(s <= MAX_SPLITS && (k / 128).is_multiple_of(s));
+                if s > 1 {
+                    assert!(n.div_ceil(128) * s <= SPLIT_CTAS && k / 128 / s >= MIN_SPLIT_BLOCKS);
+                    assert!(split_width(n, k) <= (SPLIT_CTAS * 128) as usize);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_sum_grid_covers_rows_and_refuses_one_split() {
+        let p = SplitSumParams {
+            parts: 16,
+            out: 16,
+            rows: 3,
+            n: 5120,
+            splits: 3,
+            part_rows: 4,
+            out_stride: 5120,
+            reserved: 0,
+        };
+        assert_eq!(split_sum_grid(&p).unwrap(), [5, 3, 1]);
+        for bad in [
+            SplitSumParams { splits: 1, ..p },
+            SplitSumParams { part_rows: 2, ..p },
+            SplitSumParams {
+                out_stride: 100,
+                ..p
+            },
+            SplitSumParams { parts: 0, ..p },
+        ] {
+            assert!(split_sum_grid(&bad).is_err(), "{bad:?}");
+        }
+    }
 
     fn lin8() -> Lin8Params {
         Lin8Params {
@@ -397,8 +692,52 @@ mod tests {
             x_stride: 5120,
             m_pad: 4,
         };
+        // Decode sizes: a CTA a row.
         assert_eq!(quant_grid(&q).unwrap(), [10, 3, 1]);
         assert_eq!(quant_grid(&QuantParams { k: 640, ..q }).unwrap(), [2, 3, 1]);
+        assert_eq!(
+            quant_grid(&QuantParams {
+                rows: 256,
+                m_pad: 256,
+                ..q
+            })
+            .unwrap(),
+            [10, 256, 1]
+        );
+        // Prefill sizes: four rows a CTA, once that still leaves 1,024 CTAs.
+        let big = QuantParams {
+            rows: 2047,
+            m_pad: 2048,
+            ..q
+        };
+        assert_eq!(quant_grid(&big).unwrap(), [10, 512, 1]);
+        assert_eq!(
+            quant_grid(&QuantParams {
+                k: 17_408,
+                x_stride: 17_408,
+                ..big
+            })
+            .unwrap(),
+            [34, 512, 1]
+        );
+        assert_eq!(
+            quant_grid(&QuantParams {
+                rows: 409,
+                m_pad: 412,
+                ..q
+            })
+            .unwrap(),
+            [10, 103, 1]
+        );
+        assert_eq!(
+            quant_grid(&QuantParams {
+                rows: 408,
+                m_pad: 408,
+                ..q
+            })
+            .unwrap(),
+            [10, 408, 1]
+        );
         for bad in [
             QuantParams { k: 100, ..q },
             QuantParams { x: 260, ..q },
@@ -432,7 +771,8 @@ mod tests {
 
     #[test]
     fn norm_grid_is_units_by_rows_and_refuses_what_its_body_cannot_run() {
-        assert_eq!(norm_grid(&norm()).unwrap(), [4, 3, 1]);
+        // Units up to 1,024 wide: a warp each, eight a CTA (12 units, 2 CTAs).
+        assert_eq!(norm_grid(&norm()).unwrap(), [2, 1, 1]);
         let rotated = NormParams {
             rotary: 64,
             rope_cos: 8,
@@ -440,7 +780,43 @@ mod tests {
             positions: 8,
             ..norm()
         };
-        assert_eq!(norm_grid(&rotated).unwrap(), [4, 3, 1]);
+        assert_eq!(norm_grid(&rotated).unwrap(), [2, 1, 1]);
+        assert_eq!(
+            norm_grid(&NormParams {
+                rows: 2048,
+                units: 24,
+                x_stride: 24 * 512,
+                out_stride: 24 * 256,
+                ..rotated
+            })
+            .unwrap(),
+            [6144, 1, 1]
+        );
+        // Wider units: a CTA each, units by rows.
+        let hidden = NormParams {
+            units: 1,
+            n: 5120,
+            x_stride: 5120,
+            out_stride: 5120,
+            ..norm()
+        };
+        assert_eq!(norm_grid(&hidden).unwrap(), [1, 3, 1]);
+        assert_eq!(
+            norm_grid(&NormParams {
+                n: NORM_WARP_MAX,
+                ..hidden
+            })
+            .unwrap(),
+            [1, 1, 1]
+        );
+        assert_eq!(
+            norm_grid(&NormParams {
+                n: NORM_WARP_MAX + 8,
+                ..hidden
+            })
+            .unwrap(),
+            [1, 3, 1]
+        );
         for bad in [
             NormParams {
                 x_stride: 1791,
@@ -482,6 +858,85 @@ mod tests {
         ] {
             assert!(norm_grid(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn gated_norm_widen_and_small_gemm_grids() {
+        let dn = DnNormParams {
+            o: 8,
+            z: 8,
+            weight: 8,
+            out: 8,
+            rows: 2048,
+            v_heads: 48,
+            v_dim: 128,
+            z_stride: 6144,
+            eps: 1e-6,
+            reserved: 0,
+        };
+        // A warp a (row, head), four a CTA.
+        assert_eq!(dn_norm_grid(&dn).unwrap(), [24_576, 1, 1]);
+        assert_eq!(
+            dn_norm_grid(&DnNormParams { rows: 1, ..dn }).unwrap(),
+            [12, 1, 1]
+        );
+        assert_eq!(
+            dn_norm_grid(&DnNormParams {
+                rows: 1,
+                v_heads: 6,
+                z_stride: 768,
+                ..dn
+            })
+            .unwrap(),
+            [2, 1, 1]
+        );
+        assert!(dn_norm_grid(&DnNormParams { v_dim: 129, ..dn }).is_err());
+        let w = WidenParams {
+            x: 8,
+            out: 8,
+            rows: 2048,
+            width: 10_240,
+            x_stride: 10_240,
+            out_stride: 10_240,
+        };
+        // Eight elements a thread, 2,048 a CTA.
+        assert_eq!(widen_grid(&w).unwrap(), [5, 2048, 1]);
+        assert_eq!(
+            widen_grid(&WidenParams {
+                rows: 3,
+                width: 48,
+                x_stride: 96,
+                out_stride: 48,
+                ..w
+            })
+            .unwrap(),
+            [1, 3, 1]
+        );
+        let ab = LinearParams {
+            x: 16,
+            w: 16,
+            out: 16,
+            rows: 2048,
+            n: 96,
+            k: 5120,
+            x_stride: 5120,
+            out_stride: 96,
+            out_f32: 1,
+        };
+        assert_eq!(small_gemm_grid(&ab).unwrap(), [24, 512, 1]);
+        // Sixteen outputs by eight rows a CTA.
+        assert_eq!(small_gemm_tiled_grid(&ab).unwrap(), [6, 256, 1]);
+        assert_eq!(
+            small_gemm_tiled_grid(&LinearParams {
+                rows: 129,
+                n: 16,
+                out_stride: 16,
+                ..ab
+            })
+            .unwrap(),
+            [1, 17, 1]
+        );
+        assert!(small_gemm_tiled_grid(&LinearParams { x: 8, ..ab }).is_err());
     }
 
     #[test]

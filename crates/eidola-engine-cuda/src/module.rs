@@ -347,14 +347,20 @@ mod tests {
         assert!(check_entry(ops, "rmsnorm", Some("eidola_rmsnorm_bf16")).is_err());
         assert!(check_entry(ops, "rmsnorm", None).is_err());
         assert!(check_entry(rms, "engine_ops", Some("eidola_embed")).is_err());
-        // Each GEMM kind binds its own image only: both share a Params size,
-        // so the size check alone would not tell them apart.
-        use crate::mimo::gemm::GemmKind;
-        let kinds = [GemmKind::Fp8Blockwise, GemmKind::Bf16];
+        // Each GEMM kind binds its own image and entry only: all share a
+        // Params size, so the size check alone would not tell them apart.
+        use crate::mimo::gemm::{GemmKind, SwapTile};
+        let kinds = [
+            GemmKind::Fp8Blockwise,
+            GemmKind::Bf16,
+            GemmKind::Fp8Swap(SwapTile::T16),
+            GemmKind::Fp8Swap(SwapTile::T32),
+            GemmKind::Fp8Swap(SwapTile::T64),
+        ];
         for kind in kinds {
             let (image, entry) = kind.kernel();
             check_entry(cubin(image), image, Some(entry)).unwrap();
-            for other in kinds.iter().filter(|&&k| k != kind) {
+            for other in kinds.iter().filter(|&&k| k.kernel().0 != image) {
                 assert!(check_entry(cubin(other.kernel().0), image, Some(entry)).is_err());
             }
         }

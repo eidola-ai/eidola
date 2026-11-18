@@ -34,6 +34,9 @@ pub enum TmaSwizzle {
     B32,
     B64,
     B128,
+    /// 128-byte swizzle over 32-byte atoms (CuTe's choice for f32 tiles of a 32-wide
+    /// column-major output, the swapped split GEMM's).
+    B128Atom32,
 }
 
 /// One `cuTensorMapEncodeTiled` call (no interleave, element strides 1,
@@ -83,6 +86,7 @@ impl TmaSpec {
             TmaSwizzle::B32 => sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B,
             TmaSwizzle::B64 => sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
             TmaSwizzle::B128 => sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            TmaSwizzle::B128Atom32 => sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B,
         };
         let elem_strides = vec![1u32; rank];
         let mut map = sys::CUtensorMap { opaque: [0; 16] };

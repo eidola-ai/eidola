@@ -145,7 +145,12 @@ fn mma(manifest: &Manifest, name: &str, arch: &str, family: &str) -> u64 {
 fn sass_uses_the_intended_tensor_core_path() {
     let manifest = Manifest::embedded();
     for arch in ["sm_100a", "sm_103a", "sm_100f"] {
-        for gemm in ["cutlass_fp8_blockwise_gemm", "deepgemm_fp8_fp4_grouped"] {
+        for gemm in [
+            "cutlass_fp8_blockwise_gemm",
+            "cutlass_fp8_blockwise_swap",
+            "cutlass_fp8_blockwise_split",
+            "deepgemm_fp8_fp4_grouped",
+        ] {
             assert!(mma(manifest, gemm, arch, "UTCQMMA") > 0, "{gemm} {arch}");
             assert_eq!(mma(manifest, gemm, arch, "HMMA"), 0, "{gemm} {arch}");
         }
@@ -167,6 +172,8 @@ fn sass_uses_the_intended_tensor_core_path() {
             "engine_ops",
             "engine_ops_reference",
             "kv_cipher",
+            "qwen_fast",
+            "qwen_sampling",
         ] {
             let cubin = manifest.cubin(own, arch).expect("cubin");
             assert!(cubin.mma_sass.is_empty(), "{own} {arch}");
@@ -330,9 +337,9 @@ fn entries_and_meta_records() {
     }
 }
 
-/// Sampling comes only from our own kernel (`sampling.cu`), which reproduces
-/// the serving core's sampling semantics bit for bit (see AGENTS.md): no
-/// upstream sampling entry is in the set.
+/// Sampling comes only from our own kernels (`sampling.cu`, and Qwen's
+/// `qwen_sampling.cu`), which reproduce the serving core's sampling semantics bit
+/// for bit (see AGENTS.md): no upstream sampling entry is in the set.
 #[test]
 fn no_third_party_sampling_kernels() {
     let manifest = Manifest::embedded();
@@ -472,6 +479,7 @@ fn qwen_kernels_fuse_nothing() {
             "qwen_ops",
             false,
             &[
+                "eidola_qwen_copy_rows",
                 "eidola_qwen_embed",
                 "eidola_qwen_kv_write",
                 "eidola_qwen_lin8",
@@ -489,10 +497,15 @@ fn qwen_kernels_fuse_nothing() {
                 "eidola_qwen_dn_prep",
                 "eidola_qwen_gate",
                 "eidola_qwen_norm",
+                "eidola_qwen_norm_fused",
                 "eidola_qwen_quant",
             ],
         ),
-        ("qwen_deltanet", false, &["eidola_qwen_dn_rec"]),
+        (
+            "qwen_deltanet",
+            false,
+            &["eidola_qwen_dn_rec", "eidola_qwen_dn_rec_short"],
+        ),
     ];
     for arch in ["sm_100a", "sm_103a", "sm_100f"] {
         for (name, divides, entries) in images {
@@ -532,5 +545,72 @@ fn qwen_fa2_d256_is_the_mma_sync_path() {
             ],
             "{arch}"
         );
+    }
+}
+
+/// The fast profile's own kernels: the `own` profile (contraction allowed: their bodies
+/// spell out the fused multiply-adds they mean), no tensor cores, exactly their four
+/// entries (the gates, the small-N GEMM's two forms and the split FP8 GEMM's sum); the
+/// swapped FP8 GEMM's image exactly its three tile instances, and the split one its four
+/// (the three swapped tiles and the unswapped); and Qwen's
+/// sampler, in both profiles, the `own` profile (every f64 operation it means rounded is
+/// an explicit round-to-nearest intrinsic, as the shared sampler's), its four sample and
+/// three acceptance kernels.
+#[test]
+fn qwen_fast_images_hold_their_entries() {
+    let manifest = Manifest::embedded();
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        for (name, profile, entries) in [
+            (
+                "qwen_fast",
+                "own",
+                &[
+                    "eidola_qwen_fast_gate",
+                    "eidola_qwen_fast_gemm_bf16",
+                    "eidola_qwen_fast_gemm_bf16_tiled",
+                    "eidola_qwen_fast_split_sum",
+                ][..],
+            ),
+            (
+                "cutlass_fp8_blockwise_split",
+                "cutlass",
+                &[
+                    "eidola_cutlass_fp8_blockwise_split128_f32",
+                    "eidola_cutlass_fp8_blockwise_split16_f32",
+                    "eidola_cutlass_fp8_blockwise_split32_f32",
+                    "eidola_cutlass_fp8_blockwise_split64_f32",
+                ][..],
+            ),
+            (
+                "cutlass_fp8_blockwise_swap",
+                "cutlass",
+                &[
+                    "eidola_cutlass_fp8_blockwise_swap16_bf16",
+                    "eidola_cutlass_fp8_blockwise_swap32_bf16",
+                    "eidola_cutlass_fp8_blockwise_swap64_bf16",
+                ][..],
+            ),
+            (
+                "qwen_sampling",
+                "own",
+                &[
+                    "eidola_qwen_accept_decide",
+                    "eidola_qwen_accept_finish",
+                    "eidola_qwen_accept_sums",
+                    "eidola_qwen_sample_exp",
+                    "eidola_qwen_sample_norm",
+                    "eidola_qwen_sample_pick",
+                    "eidola_qwen_sample_top",
+                ][..],
+            ),
+        ] {
+            let cubin = manifest
+                .cubin(name, arch)
+                .unwrap_or_else(|| panic!("no cubin {name} {arch}"));
+            assert_eq!(cubin.profile, profile, "{name}");
+            let mut symbols: Vec<&str> = cubin.entries.iter().map(|e| e.symbol.as_str()).collect();
+            symbols.sort_unstable();
+            assert_eq!(symbols, entries, "{name} {arch}");
+        }
     }
 }

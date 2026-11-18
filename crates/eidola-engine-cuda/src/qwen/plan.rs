@@ -1,17 +1,19 @@
 //! A step as data: what every launch of the step program ([`super::program`]) reads,
 //! laid out in one table of 32-bit words that one host-to-device copy fills.
 //!
-//! The executor describes a step as a [`StepPlan`]: per forward its rows, the DeltaNet
+//! The executor describes a step as a [`StepPlan`]: the drafter's passes that draw the
+//! drafts, the one target forward over every row's host tokens and drafts (its DeltaNet
 //! sequences, the row copies that stage and keep the recurrent state's inputs, the
-//! attention rows (and, in the fast profile, FA2 requests), the head's rows, the sample
-//! rows and chain acceptance, and the copies that keep the drafter's states. Every count
-//! the launches take is a [`Shape`]; [`Layout::new`] places every array at an offset that
-//! is a function of the shape alone, and [`pack`] writes a plan into it. An eager step's
-//! shape is its plan's own ([`Shape::of`]); a graph rung's is fixed, and a plan is packed
-//! into it only if each of its variable lists fits, the rest padded with inert entries
-//! (a copy of a pad row onto itself, a fully padded attention request). So a captured
-//! launch sequence, which fixed the shape and the table's addresses, serves every step
-//! of its rung with new table contents.
+//! attention rows and, in the fast profile, FA2 requests), the head's rows, the drafter
+//! over the host positions of rows that do not draft, the sample rows and chain
+//! acceptance, the canonical rewrite, and the copies that keep the drafter's states. Every
+//! count the launches take is a [`Shape`]; [`Layout::new`] places every array at an
+//! offset that is a function of the shape alone, and [`pack`] writes a plan into it. An
+//! eager step's shape is its plan's own ([`Shape::of`]); a graph rung's is fixed, and a
+//! plan is packed into it only if each of its variable lists fits, the rest padded with
+//! inert entries (a copy of a pad row onto itself, a fully padded attention request). So
+//! a captured launch sequence, which fixed the shape and the table's addresses, serves
+//! every step of its rung with new table contents.
 //!
 //! Nothing here touches a device: the layouts, the padding and the refusals are tested
 //! on the host.
@@ -19,7 +21,7 @@
 use eidola_engine::spec::NULL_BLOCK;
 
 use super::abi::DnSeq;
-use crate::mimo::attention::{AttnRequest, HostPlan, PassCaps, Reduction, SPLIT_KEYS};
+use crate::mimo::attention::{AttnRequest, HostPlan, PassCaps, Reduction};
 use crate::sampler::SampleRow;
 use crate::{CudaError, Result, narrow};
 
@@ -48,17 +50,17 @@ pub mod buf {
     pub const O_ROWS: u32 = 1;
     pub const O_PAD: u32 = 2;
     /// Rows of `hidden` BF16 (`hidden / 2` words): the slots' kept normed states, the
-    /// drafter's taps, pass A's and pass B's normed rows, the drafter's normed rows, the
-    /// launch's destination (the drafter's input, or the head's), the pad rows.
+    /// drafter's taps, the target's normed rows, the drafter's normed rows, the launch's
+    /// destination (the drafter's input, or the head's), the pad rows.
     pub const H_KEPT: u32 = 0;
     pub const H_TAPS: u32 = 1;
-    pub const H_A: u32 = 2;
-    pub const H_B: u32 = 3;
-    pub const H_DRAFT: u32 = 4;
-    pub const H_DST: u32 = 5;
-    pub const H_PAD: u32 = 6;
-    /// One-word rows (token ids): pass A's tokens (in the table), the draft lanes, the
-    /// launch's destination token array, the pad rows.
+    pub const H_NORMED: u32 = 2;
+    pub const H_DRAFT: u32 = 3;
+    pub const H_DST: u32 = 4;
+    pub const H_PAD: u32 = 5;
+    /// One-word rows (token ids): the target's tokens (in the table: host ids, and the
+    /// drafts once their copies have run), the draft lanes, the launch's destination token
+    /// array, the pad rows.
     pub const T_HOST: u32 = 0;
     pub const T_LANES: u32 = 1;
     pub const T_DST: u32 = 2;
@@ -104,9 +106,9 @@ pub struct AttnRows {
 /// One forward through the target's layers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TargetPass {
-    /// Host token ids (pass A); empty when `token_copies` gather them on the device.
+    /// Token ids by row: each run's host ids, then a placeholder per draft.
     pub tokens: Vec<u32>,
-    /// One-word copies filling the token array (pass B: the drafts from their lanes).
+    /// One-word copies of the drafts from their lanes over the placeholders.
     pub token_copies: Vec<Item>,
     /// The DeltaNet sequences, one a run.
     pub seqs: Vec<DnSeq>,
@@ -154,15 +156,18 @@ pub struct DrafterPass {
 /// A step's whole plan.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StepPlan {
-    pub a: TargetPass,
-    /// Pass A's normed rows into the head's input, the head's logits at the front of
-    /// the target logits.
-    pub head_a: Vec<Item>,
-    /// The drafter's pass over the host positions, then one a chain depth.
-    pub drafter: Vec<DrafterPass>,
-    pub b: Option<TargetPass>,
-    /// Every row of pass B through the head, after pass A's.
-    pub head_b: Vec<Item>,
+    /// The drafter at each drafting row's host position, then one pass a chain depth,
+    /// each drawing a depth's drafts into the lanes: before the target, whose input the
+    /// drafts are.
+    pub lead: Vec<DrafterPass>,
+    /// The target over every row's host tokens and, after them, its drafts.
+    pub target: TargetPass,
+    /// The target's normed rows into the head's input: every sampled row's last host
+    /// row, then every draft's row.
+    pub head: Vec<Item>,
+    /// The drafter over the host positions of rows that do not draft, which may read
+    /// the target's normed rows of this step.
+    pub trail: Option<DrafterPass>,
     /// Rows without drafts, drawn from the target logits (tokens into the read-back).
     pub plain: Vec<SampleRow>,
     /// Drafting rows' target distributions (rows `p ..= p + k` of each, consecutive).
@@ -183,6 +188,28 @@ pub struct StepPlan {
 
 // ---- shapes ----
 
+/// Qwen3.8's FA2 split: every query's keys are reduced in chunks of this many absolute
+/// positions (from each group's first key), each chunk a work item of its own and the
+/// chunks merged in order, so a row at key `p` merges chunks `0 ..= p / SPLIT_KEYS`
+/// whether it is decoded or prefilled. At a decode step a row's attention is then as many
+/// CTAs as it has chunks, each walking at most `SPLIT_KEYS` keys (MiMo's plan splits at
+/// 1,024). A multiple of the 64-key tile.
+pub const SPLIT_KEYS: u32 = 512;
+
+/// Keys a forward row's partial rows are counted at for FA2's scratch: the scratch holds
+/// one partial row per this many positions of every forward row, or a decode rung's rows
+/// at [`SPLIT_KEYS`], whichever is more ([`partial_rows`]). A prefill pass whose rows need
+/// more (long positions at the shorter chunk) is cut into passes that fit.
+pub const PARTIAL_KEYS: u32 = 1024;
+
+/// One FA2 launch of an attention: its reservation, and the first query row its merge
+/// writes (0 for a pass that is its attention's only one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fa2Pass {
+    pub caps: PassCaps,
+    pub out_row: u32,
+}
+
 /// An FA2 launch's geometry: query heads per KV head, the page size, and the partial
 /// rows the scratch holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,16 +220,17 @@ pub struct Fa2Geometry {
 }
 
 /// What every launch of one attention takes as counts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttnShape {
     pub rows: usize,
     /// The exact kernel's block-table width (0 in the fast profile).
     pub table_width: usize,
-    /// The FA2 pass's reservation (fast profile).
-    pub fa2: Option<PassCaps>,
+    /// The FA2 passes' reservations (fast profile): one for a decode rung, as many as
+    /// the partial rows need for an eager step.
+    pub fa2: Vec<Fa2Pass>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetShape {
     pub token_copies: usize,
     pub runs: usize,
@@ -215,7 +243,7 @@ pub struct TargetShape {
     pub attn: AttnShape,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DrafterShape {
     pub kv_only: bool,
     pub attn: AttnShape,
@@ -226,11 +254,10 @@ pub struct DrafterShape {
 /// Every count of a step's launches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shape {
-    pub a: TargetShape,
-    pub head_a: usize,
-    pub drafter: Vec<DrafterShape>,
-    pub b: Option<TargetShape>,
-    pub head_b: usize,
+    pub lead: Vec<DrafterShape>,
+    pub target: TargetShape,
+    pub head: usize,
+    pub trail: Option<DrafterShape>,
     pub plain: usize,
     pub targets: usize,
     pub accept: usize,
@@ -249,34 +276,36 @@ pub struct Geo {
     pub drafter: Fa2Geometry,
 }
 
-/// The FA2 plan of `requests`, one pass.
+/// The FA2 plan of `requests` at [`SPLIT_KEYS`], in passes whose partial rows fit the
+/// scratch.
 pub fn fa2_plan(requests: &[AttnRequest], g: &Fa2Geometry) -> Result<HostPlan> {
-    let plan = HostPlan::with_max_tile(
+    HostPlan::with_split_keys(
         requests,
         g.group_size,
         g.page_size,
         Reduction::Split,
         g.partial_rows,
         super::attention::MAX_TILE,
-    )?;
-    if plan.passes().len() != 1 {
-        return Err(CudaError::new(format!(
-            "attention: {} passes; the partial rows hold one",
-            plan.passes().len()
-        )));
-    }
-    Ok(plan)
+        SPLIT_KEYS,
+    )
 }
 
-/// An eager launch's reservation: exactly its plan's own.
-fn own_caps(plan: &HostPlan) -> Result<PassCaps> {
-    let p = &plan.passes()[0];
-    let shape = p.shape(plan)?;
-    Ok(PassCaps {
-        shape,
-        work_items: shape.grid,
-        pages: narrow(p.indices.len(), "pages")?,
-    })
+/// An eager attention's reservations: exactly its plan's own passes.
+fn own_passes(plan: &HostPlan) -> Result<Vec<Fa2Pass>> {
+    plan.passes()
+        .iter()
+        .map(|p| {
+            let shape = p.shape(plan)?;
+            Ok(Fa2Pass {
+                caps: PassCaps {
+                    shape,
+                    work_items: shape.grid,
+                    pages: narrow(p.indices.len(), "pages")?,
+                },
+                out_row: p.q_rows.start,
+            })
+        })
+        .collect()
 }
 
 fn attn_shape(a: &AttnRows, geo: &Geo, g: &Fa2Geometry) -> Result<AttnShape> {
@@ -284,9 +313,9 @@ fn attn_shape(a: &AttnRows, geo: &Geo, g: &Fa2Geometry) -> Result<AttnShape> {
         rows: a.rope.len(),
         table_width: if geo.fast { 0 } else { geo.table_width },
         fa2: if geo.fast && !a.requests.is_empty() {
-            Some(own_caps(&fa2_plan(&a.requests, g)?)?)
+            own_passes(&fa2_plan(&a.requests, g)?)?
         } else {
-            None
+            Vec::new()
         },
     })
 }
@@ -311,7 +340,7 @@ impl Shape {
             let mut attn = attn_shape(&d.attn, geo, &geo.drafter)?;
             if d.kv_only {
                 // Only the KV write: no attention reads.
-                attn.fa2 = None;
+                attn.fa2 = Vec::new();
                 attn.table_width = 0;
             }
             Ok(DrafterShape {
@@ -322,11 +351,10 @@ impl Shape {
             })
         };
         Ok(Shape {
-            a: target(&p.a)?,
-            head_a: p.head_a.len(),
-            drafter: p.drafter.iter().map(drafter).collect::<Result<_>>()?,
-            b: p.b.as_ref().map(target).transpose()?,
-            head_b: p.head_b.len(),
+            lead: p.lead.iter().map(drafter).collect::<Result<_>>()?,
+            target: target(&p.target)?,
+            head: p.head.len(),
+            trail: p.trail.as_ref().map(drafter).transpose()?,
             plain: p.plain.len(),
             targets: p.targets.len(),
             accept: p.accept.len(),
@@ -337,9 +365,9 @@ impl Shape {
         })
     }
 
-    /// Target logit rows: pass A's head rows, then pass B's.
+    /// Target logit rows: the head's.
     pub fn target_logits(&self) -> usize {
-        self.head_a + self.head_b
+        self.head
     }
 }
 
@@ -362,10 +390,12 @@ pub struct ItemsAt {
     pub items: usize,
 }
 
-/// One FA2 pass's arrays (a `PaddedPass`'s), and its reservation.
+/// One FA2 pass's arrays (a `PaddedPass`'s), its reservation, and the first query row
+/// its merge writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fa2At {
     pub caps: PassCaps,
+    pub out_row: u32,
     pub q_indptr: Arr,
     pub indices: Arr,
     pub indptr: Arr,
@@ -379,7 +409,7 @@ pub struct Fa2At {
     pub counts: Arr,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttnAt {
     pub rows: usize,
     pub rope: Arr,
@@ -387,10 +417,10 @@ pub struct AttnAt {
     pub targets: Arr,
     pub tables: Arr,
     pub table_width: usize,
-    pub fa2: Option<Fa2At>,
+    pub fa2: Vec<Fa2At>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetAt {
     pub tokens: Arr,
     pub token_copies: ItemsAt,
@@ -415,7 +445,7 @@ impl TargetAt {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DrafterAt {
     pub token_copies: ItemsAt,
     pub hidden_copies: ItemsAt,
@@ -433,11 +463,10 @@ pub const SEQ_WORDS: usize = std::mem::size_of::<DnSeq>() / 4;
 /// Every array of a step's table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
-    pub a: TargetAt,
-    pub head_a: ItemsAt,
-    pub drafter: Vec<DrafterAt>,
-    pub b: Option<TargetAt>,
-    pub head_b: ItemsAt,
+    pub lead: Vec<DrafterAt>,
+    pub target: TargetAt,
+    pub head: ItemsAt,
+    pub trail: Option<DrafterAt>,
     pub plain: Arr,
     pub targets: Arr,
     /// Acceptance: sample rows, target rows, draft rows (`d`), draft counts.
@@ -482,27 +511,32 @@ impl Arena {
             targets: self.arr(s.rows),
             tables: self.arr(s.rows * s.table_width),
             table_width: s.table_width,
-            fa2: s.fa2.map(|caps| Fa2At {
-                caps,
-                q_indptr: self.arr(caps.request_words()),
-                indptr: self.arr(caps.request_words()),
-                last_page_len: self.arr(caps.request_words() - 1),
-                o_indptr: self.arr(caps.request_words()),
-                merge_indptr: self.arr(caps.merge_words()),
-                request_indices: self.arr(caps.work_items as usize),
-                qo_tile_indices: self.arr(caps.work_items as usize),
-                kv_tile_indices: self.arr(caps.work_items as usize),
-                counts: self.arr(2),
-                indices: self.arr(caps.pages as usize),
-            }),
+            fa2: s
+                .fa2
+                .iter()
+                .map(|&Fa2Pass { caps, out_row }| Fa2At {
+                    caps,
+                    out_row,
+                    q_indptr: self.arr(caps.request_words()),
+                    indptr: self.arr(caps.request_words()),
+                    last_page_len: self.arr(caps.request_words() - 1),
+                    o_indptr: self.arr(caps.request_words()),
+                    merge_indptr: self.arr(caps.merge_words()),
+                    request_indices: self.arr(caps.work_items as usize),
+                    qo_tile_indices: self.arr(caps.work_items as usize),
+                    kv_tile_indices: self.arr(caps.work_items as usize),
+                    counts: self.arr(2),
+                    indices: self.arr(caps.pages as usize),
+                })
+                .collect(),
         }
     }
 
-    fn target(&mut self, s: &TargetShape, host_tokens: bool) -> TargetAt {
+    fn target(&mut self, s: &TargetShape) -> TargetAt {
         let t = s.attn.rows;
         TargetAt {
             tokens: self.arr(t),
-            token_copies: self.items(if host_tokens { 0 } else { s.token_copies }),
+            token_copies: self.items(s.token_copies),
             seqs: self.arr(s.runs * SEQ_WORDS),
             runs: s.runs,
             window: self.arr(s.staged),
@@ -533,11 +567,10 @@ impl Layout {
     /// Every array at an offset that is a function of `s` alone.
     pub fn new(s: &Shape) -> Layout {
         let mut m = Arena(0);
-        let a = m.target(&s.a, true);
-        let head_a = m.items(s.head_a);
-        let drafter = s.drafter.iter().map(|d| m.drafter(d, d.draws)).collect();
-        let b = s.b.as_ref().map(|b| m.target(b, false));
-        let head_b = m.items(s.head_b);
+        let lead = s.lead.iter().map(|d| m.drafter(d, d.draws)).collect();
+        let target = m.target(&s.target);
+        let head = m.items(s.head);
+        let trail = s.trail.as_ref().map(|d| m.drafter(d, d.draws));
         let plain = m.arr(s.plain * SAMPLE_WORDS);
         let targets = m.arr(s.targets * SAMPLE_WORDS);
         let accept_rows = m.arr(s.accept * SAMPLE_WORDS);
@@ -547,11 +580,10 @@ impl Layout {
         let rewrite = s.rewrite.as_ref().map(|r| m.drafter(r, 0));
         let keep = m.items(s.keep);
         Layout {
-            a,
-            head_a,
-            drafter,
-            b,
-            head_b,
+            lead,
+            target,
+            head,
+            trail,
             plain,
             targets,
             accept_rows,
@@ -638,8 +670,24 @@ fn attn(words: &mut [u32], at: &AttnAt, a: &AttnRows, g: &Fa2Geometry, what: &st
     if at.table_width > 0 {
         exact(words, at.tables, &a.tables, what)?;
     }
-    if let Some(f) = &at.fa2 {
-        let p = fa2_plan(&a.requests, g)?.padded(&f.caps)?;
+    if at.fa2.is_empty() {
+        return Ok(());
+    }
+    let plan = fa2_plan(&a.requests, g)?;
+    if plan.passes().len() != at.fa2.len() {
+        return Err(refuse(format!(
+            "{what}: {} attention passes in a shape of {}",
+            plan.passes().len(),
+            at.fa2.len()
+        )));
+    }
+    for (i, f) in at.fa2.iter().enumerate() {
+        let p = plan.padded_pass(i, &f.caps)?;
+        if p.out_row != f.out_row {
+            return Err(refuse(format!(
+                "{what}: attention pass {i} starts elsewhere"
+            )));
+        }
         exact(words, f.q_indptr, &p.q_indptr, what)?;
         exact(words, f.indptr, &p.indptr, what)?;
         exact(words, f.last_page_len, &p.last_page_len, what)?;
@@ -655,9 +703,8 @@ fn attn(words: &mut [u32], at: &AttnAt, a: &AttnRows, g: &Fa2Geometry, what: &st
 }
 
 fn target(words: &mut [u32], at: &TargetAt, t: &TargetPass, geo: &Geo, what: &str) -> Result<()> {
-    if at.token_copies.items == 0 {
-        exact(words, at.tokens, &t.tokens, what)?;
-    } else if t.token_copies.len() != at.token_copies.items {
+    exact(words, at.tokens, &t.tokens, what)?;
+    if t.token_copies.len() != at.token_copies.items {
         return Err(refuse(format!("{what}: token copies")));
     }
     items(words, &at.token_copies, &t.token_copies, buf::T_PAD, what)?;
@@ -706,26 +753,25 @@ fn drafter(
 pub fn pack(p: &StepPlan, layout: &Layout, geo: &Geo) -> Result<Vec<u32>> {
     let mut w = vec![0u32; layout.words];
     let words = &mut w;
-    if p.drafter.len() != layout.drafter.len()
-        || p.b.is_some() != layout.b.is_some()
+    if p.lead.len() != layout.lead.len()
+        || p.trail.is_some() != layout.trail.is_some()
         || p.rewrite.is_some() != layout.rewrite.is_some()
         || p.drafting != layout.drafting
         || p.width != layout.width
     {
         return Err(refuse("the plan's passes are not the shape's".into()));
     }
-    target(words, &layout.a, &p.a, geo, "pass A")?;
-    if p.head_a.len() != layout.head_a.items || p.head_b.len() != layout.head_b.items {
-        return Err(refuse("head rows".into()));
-    }
-    items(words, &layout.head_a, &p.head_a, buf::H_PAD, "head A")?;
-    for (d, at) in p.drafter.iter().zip(&layout.drafter) {
+    for (d, at) in p.lead.iter().zip(&layout.lead) {
         drafter(words, at, d, geo, "drafter")?;
     }
-    if let (Some(b), Some(at)) = (&p.b, &layout.b) {
-        target(words, at, b, geo, "pass B")?;
+    target(words, &layout.target, &p.target, geo, "target")?;
+    if p.head.len() != layout.head.items {
+        return Err(refuse("head rows".into()));
     }
-    items(words, &layout.head_b, &p.head_b, buf::H_PAD, "head B")?;
+    items(words, &layout.head, &p.head, buf::H_PAD, "head")?;
+    if let (Some(d), Some(at)) = (&p.trail, &layout.trail) {
+        drafter(words, at, d, geo, "trailing drafter")?;
+    }
     exact(words, layout.plain, &words_of(&p.plain), "plain rows")?;
     exact(words, layout.targets, &words_of(&p.targets), "target rows")?;
     let rows: Vec<SampleRow> = p.accept.iter().map(|a| a.0).collect();
@@ -780,9 +826,13 @@ pub fn pad_page(pad_block: u32, page_size: u32, block_size: u32) -> u32 {
 /// `NULL_BLOCK` as a table word.
 pub const NULL: u32 = NULL_BLOCK;
 
-/// The partial rows FA2's scratch needs for `rows` query rows reaching `positions`.
-pub fn partial_rows(rows: u32, positions: u32) -> u32 {
-    rows.saturating_mul(positions.div_ceil(SPLIT_KEYS).max(1))
+/// The partial rows FA2's scratch holds for forwards of `rows` query rows and decode
+/// rungs of `decode_rows`, every row reaching `positions`: a forward row's at one per
+/// [`PARTIAL_KEYS`] positions or a rung row's at one per [`SPLIT_KEYS`], the more of the
+/// two. A rung's attention is one pass; an eager forward's takes as many as its rows need.
+pub fn partial_rows(rows: u32, decode_rows: u32, positions: u32) -> u32 {
+    rows.saturating_mul(positions.div_ceil(PARTIAL_KEYS).max(1))
+        .max(decode_rows.saturating_mul(positions.div_ceil(SPLIT_KEYS).max(1)))
 }
 
 #[cfg(test)]
@@ -836,26 +886,32 @@ mod tests {
         for fast in [false, true] {
             let g = geo(fast);
             let mut p = StepPlan {
-                a: row_pass(3, 5, fast),
+                target: row_pass(3, 5, fast),
                 ..StepPlan::default()
             };
             let s = Shape::of(&p, &g).expect("shape");
             let l = Layout::new(&s);
             let one = pack(&p, &l, &g).expect("pack");
-            p.a.tokens = vec![1, 2, 3];
-            p.a.stage_conv.truncate(2);
-            p.a.window.truncate(4);
+            p.target.tokens = vec![1, 2, 3];
+            p.target.stage_conv.truncate(2);
+            p.target.window.truncate(4);
             let two = pack(&p, &l, &g).expect("pack");
             assert_eq!(Layout::new(&s), l);
             assert_eq!(one.len(), two.len());
             // The truncated lists are padded: inert self-copies, window rows at 0.
-            let at = l.a.stage_conv;
+            let at = l.target.stage_conv;
             assert_eq!(two[at.src_buf.at + 3], buf::C_PAD);
             assert_eq!(two[at.src_row.at + 3], 3);
             assert_eq!(two[at.dst_row.at + 3], 3);
-            assert_eq!(two[l.a.window.at + 4], 0);
+            assert_eq!(two[l.target.window.at + 4], 0);
             // Every array of an even word, inside the table.
-            for a in [l.a.seqs, l.a.window, l.a.tokens, l.a.attn.rope, l.plain] {
+            for a in [
+                l.target.seqs,
+                l.target.window,
+                l.target.tokens,
+                l.target.attn.rope,
+                l.plain,
+            ] {
                 assert!(a.at.is_multiple_of(2) && a.at + a.len <= l.words);
             }
         }
@@ -865,29 +921,69 @@ mod tests {
     fn a_plan_past_its_shape_is_refused() {
         let g = geo(false);
         let p = StepPlan {
-            a: row_pass(3, 5, false),
+            target: row_pass(3, 5, false),
             ..StepPlan::default()
         };
         let l = Layout::new(&Shape::of(&p, &g).expect("shape"));
         let mut more = p.clone();
-        more.a.stage_conv.push(Item::default());
+        more.target.stage_conv.push(Item::default());
         assert!(pack(&more, &l, &g).is_err());
         let mut longer = p.clone();
-        longer.a.window.push(0);
+        longer.target.window.push(0);
         assert!(pack(&longer, &l, &g).is_err());
         let mut fewer = p.clone();
-        fewer.a.tokens.pop();
+        fewer.target.tokens.pop();
         assert!(pack(&fewer, &l, &g).is_err());
         let mut drafting = p;
-        drafting.drafter.push(DrafterPass::default());
+        drafting.lead.push(DrafterPass::default());
         assert!(pack(&drafting, &l, &g).is_err());
+    }
+
+    #[test]
+    fn drafts_join_the_host_tokens_in_one_target_pass() {
+        // Two drafting rows of three drafts each: one run each of four positions, the
+        // host id first, the drafts copied from their lanes over the placeholders.
+        let g = geo(false);
+        let mut p = StepPlan {
+            target: row_pass(8, 8, false),
+            width: 3,
+            drafting: 2,
+            ..StepPlan::default()
+        };
+        p.target.tokens = vec![7, 0, 0, 0, 9, 0, 0, 0];
+        for (d, first) in [(0u32, 0u32), (1, 4)] {
+            for j in 0..3 {
+                p.target.token_copies.push(Item::new(
+                    buf::T_LANES,
+                    j * 2 + d,
+                    buf::T_DST,
+                    first + 1 + j,
+                ));
+            }
+        }
+        let l = Layout::new(&Shape::of(&p, &g).expect("shape"));
+        let w = pack(&p, &l, &g).expect("pack");
+        let at = l.target.tokens;
+        assert_eq!(&w[at.at..at.at + 8], &[7, 0, 0, 0, 9, 0, 0, 0]);
+        let c = l.target.token_copies;
+        assert_eq!(c.items, 6);
+        assert_eq!(
+            w[c.src_row.at + 4],
+            3,
+            "the second row's second draft's lane"
+        );
+        assert_eq!(w[c.dst_row.at + 4], 6);
+        // A draft without its copy is refused.
+        let mut short = p;
+        short.target.token_copies.pop();
+        assert!(pack(&short, &l, &g).is_err());
     }
 
     #[test]
     fn fa2_requests_pack_into_a_rungs_reservation() {
         let g = geo(true);
-        // A rung of 4 decode rows reaching key 2,100 (three chunks of 1,024).
-        let caps = PassCaps::with_max_tile(
+        // A rung of 4 decode rows reaching key 2,200 (five chunks of 512).
+        let caps = PassCaps::with_split_keys(
             Reduction::Split,
             4,
             1,
@@ -896,29 +992,78 @@ mod tests {
             600,
             2200,
             super::super::attention::MAX_TILE,
+            SPLIT_KEYS,
         )
         .expect("caps");
         let mut p = StepPlan {
-            a: row_pass(4, 4, true),
+            target: row_pass(4, 4, true),
             ..StepPlan::default()
         };
-        p.a.attn.requests = (0..4)
+        p.target.attn.requests = (0..4)
             .map(|r| request(r, 1, 100 + 600 * r, 4, &mut |j| j + 1))
             .collect();
         let mut s = Shape::of(&p, &g).expect("shape");
-        s.a.attn.fa2 = Some(caps);
+        s.target.attn.fa2 = vec![Fa2Pass { caps, out_row: 0 }];
         let l = Layout::new(&s);
         let w = pack(&p, &l, &g).expect("pack");
-        let f = l.a.attn.fa2.expect("fa2");
-        // Work items: one per row and chunk (1 + 1 + 2 + 2), walked by the fixed grid.
-        assert_eq!(w[f.counts.at], 6);
+        let f = l.target.attn.fa2[0];
+        // Work items: one per row and chunk of 512 (keys 101, 701, 1,301 and 1,901: 1 + 2
+        // + 3 + 4), walked by the fixed grid.
+        assert_eq!(w[f.counts.at], 10);
         assert_eq!(w[f.counts.at + 1], SPLIT_KEYS);
         assert_eq!(caps.shape.grid, caps.work_items.min(148));
         // Rows past the reservation's pages (600 a row) are refused.
-        p.a.attn.requests = (0..4)
+        p.target.attn.requests = (0..4)
             .map(|r| request(r, 1, 2403, 4, &mut |j| j + 1))
             .collect();
         assert!(pack(&p, &l, &g).is_err());
+    }
+
+    /// An eager attention whose partial rows outgrow the scratch runs in passes, each
+    /// packed into its own reservation and merging its own rows; every row's chunks are
+    /// `0 ..= key / SPLIT_KEYS` whichever pass it lands in, as at a decode step.
+    #[test]
+    fn eager_attention_takes_the_passes_its_partials_need() {
+        let mut g = geo(true);
+        // 128 prefill rows at keys 2,000 .. 2,128: 4 or 5 chunks a row, about 540 partial
+        // rows against a scratch of 200.
+        g.target.partial_rows = 200;
+        let mut p = StepPlan {
+            target: row_pass(128, 128, true),
+            ..StepPlan::default()
+        };
+        p.target.attn.requests = vec![request(0, 128, 2127, 4, &mut |j| j + 1)];
+        p.target.attn.rope = (2000..2128).collect();
+        p.target.attn.query = (2000..2128).collect();
+        let s = Shape::of(&p, &g).expect("shape");
+        let passes = &s.target.attn.fa2;
+        assert!(passes.len() >= 3, "{} passes", passes.len());
+        assert_eq!(passes[0].out_row, 0);
+        assert!(passes.windows(2).all(|w| w[0].out_row < w[1].out_row));
+        assert!(passes.iter().all(|f| f.caps.shape.partial_rows <= 200));
+        let l = Layout::new(&s);
+        let w = pack(&p, &l, &g).expect("pack");
+        // Every query row's chunks across the passes: its key over 512, plus one.
+        let mut chunks_of_rows = Vec::new();
+        for f in &l.target.attn.fa2 {
+            let items = w[f.counts.at] as usize;
+            assert_eq!(w[f.counts.at + 1], SPLIT_KEYS);
+            let rows = f.caps.shape.merge_rows as usize;
+            let merge = &w[f.merge_indptr.at..f.merge_indptr.at + rows + 1];
+            for r in 0..rows {
+                chunks_of_rows.push(merge[r + 1] - merge[r]);
+            }
+            assert!(items > 0);
+        }
+        let want: Vec<u32> = (2000..2128u32).map(|k| k / SPLIT_KEYS + 1).collect();
+        assert_eq!(chunks_of_rows, want);
+        // A shape of another pass count is refused.
+        let mut fewer = s.clone();
+        fewer.target.attn.fa2.pop();
+        assert!(pack(&p, &Layout::new(&fewer), &g).is_err());
+        // The scratch sized as the executor sizes it holds a decode rung in one pass.
+        assert!(partial_rows(2048, 256, 32_769) >= 256 * 32_769u32.div_ceil(SPLIT_KEYS));
+        assert!(partial_rows(2048, 256, 32_769) >= 2048 * 32_769u32.div_ceil(PARTIAL_KEYS));
     }
 
     #[test]

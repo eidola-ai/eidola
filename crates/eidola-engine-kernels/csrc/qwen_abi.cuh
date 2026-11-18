@@ -60,6 +60,17 @@ QW_ABI_FIELD(QwEmbedParams, out_stride, 44);
 // position (`attention::apply_rope`: `bf16(bf16(x·cos) + bf16(rot(x)·sin))`,
 // pairs `(j, j + rotary / 2)`) from the host's BF16-valued tables
 // `[positions][rotary]`.
+//
+// Two forms the fast profile's decode path takes (one unit per row, no
+// rotation, the unit whole 128-wide blocks for the second):
+//
+// - With `add_parts` in place of `add`, the residual add's input is a split
+//   FP8 GEMM's partial sums, `add_splits` arrays of `add_part_rows` rows of `n`
+//   f32: each element their sum in split order from the first, rounded once to
+//   BF16, as `eidola_qwen_fast_split_sum` stores it.
+// - With `codes`, the normed rows are also quantised as `eidola_qwen_quant`
+//   quantises them (`linear::act_quant`): codes `[rows, n]`, scales
+//   `[n / 128][m_pad]`.
 struct QwNormParams {
   uint16_t* x;                 // [rows, x_stride]; unit u at u · x_unit_stride
   const uint16_t* add;         // [rows, add_stride] or null
@@ -78,8 +89,18 @@ struct QwNormParams {
   uint32_t out_unit_stride;
   uint32_t rotary;
   float eps;
+  const float* add_parts;  // [add_splits][add_part_rows][n] or null
+  uint8_t* codes;          // [rows, n] or null
+  float* scales;           // [n / 128][m_pad] with `codes`
+  uint32_t add_splits;
+  uint32_t add_part_rows;
+  uint32_t m_pad;
+  uint32_t reserved;
 };
-QW_ABI_STRUCT(QwNormParams, 96);
+QW_ABI_STRUCT(QwNormParams, 136);
+QW_ABI_FIELD(QwNormParams, add_parts, 96);
+QW_ABI_FIELD(QwNormParams, add_splits, 120);
+QW_ABI_FIELD(QwNormParams, m_pad, 128);
 QW_ABI_FIELD(QwNormParams, positions, 48);
 QW_ABI_FIELD(QwNormParams, rows, 56);
 QW_ABI_FIELD(QwNormParams, rotary, 88);
@@ -341,3 +362,57 @@ struct QwRoundParams {
 };
 QW_ABI_STRUCT(QwRoundParams, 40);
 QW_ABI_FIELD(QwRoundParams, out_f32, 32);
+
+// The fast profile's split FP8 GEMM, its partial sums added
+// (`eidola_qwen_fast_split_sum`): `out[r][n] = bf16(((p[0][r][n] + p[1][r][n])
+// + …) + p[splits - 1][r][n])`, the splits in order from the first, each
+// split's array `part_rows` rows of `n` f32 values, rounded once to the
+// nearest BF16 (ties to even; a NaN as the one quiet NaN).
+struct QwSplitSumParams {
+  const float* parts;  // [splits][part_rows][n]
+  uint16_t* out;       // [rows, out_stride] BF16
+  uint32_t rows;
+  uint32_t n;
+  uint32_t splits;
+  uint32_t part_rows;
+  uint32_t out_stride;
+  uint32_t reserved;
+};
+QW_ABI_STRUCT(QwSplitSumParams, 40);
+QW_ABI_FIELD(QwSplitSumParams, splits, 24);
+QW_ABI_FIELD(QwSplitSumParams, out_stride, 32);
+
+// Row copies of 32-bit words (`eidola_qwen_copy_rows`): up to
+// `QW_COPY_GROUPS` groups in one launch, each a table of up to
+// `QW_COPY_BUFFERS` buffers of `width`-word rows and `items` copies (source
+// buffer and row, destination buffer and row: device data). An item whose
+// buffer or row is out of range copies nothing and raises
+// `QW_STATUS_BAD_INDEX`; an item copying a row onto itself (the padding of a
+// rung's lists) copies nothing.
+constexpr uint32_t QW_COPY_GROUPS = 3;
+constexpr uint32_t QW_COPY_BUFFERS = 8;
+constexpr uint32_t QW_STATUS_BAD_INDEX = 4u;
+
+struct QwCopyGroup {
+  uint32_t* buf[QW_COPY_BUFFERS];
+  uint64_t rows[QW_COPY_BUFFERS];  // rows each buffer holds
+  const uint32_t* src_buf;         // [items]
+  const uint32_t* src_row;
+  const uint32_t* dst_buf;
+  const uint32_t* dst_row;
+  uint32_t width;  // words a row
+  uint32_t items;
+};
+QW_ABI_STRUCT(QwCopyGroup, 168);
+QW_ABI_FIELD(QwCopyGroup, src_buf, 128);
+QW_ABI_FIELD(QwCopyGroup, width, 160);
+
+struct QwCopyParams {
+  QwCopyGroup group[QW_COPY_GROUPS];
+  uint32_t* status;
+  uint32_t groups;
+  uint32_t reserved;
+};
+QW_ABI_STRUCT(QwCopyParams, 520);
+QW_ABI_FIELD(QwCopyParams, status, 504);
+QW_ABI_FIELD(QwCopyParams, groups, 512);

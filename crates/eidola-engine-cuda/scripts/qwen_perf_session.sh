@@ -9,7 +9,8 @@
 #   DRY_RUN=1 qwen_perf_session.sh      print every command, run none
 #
 #   steps: facts setup build kernels_build kernels perf_host perf_tiny
-#          perf_fast serve_b serve_b_mtp serve_c serve_c_mtp summary
+#          perf_fast perf_kernels serve_b serve_b_mtp serve_c serve_c_mtp
+#          summary
 #   named only: serve_b_eager serve_profile
 #
 # - `perf_host`: every kernel body compiled for this host against the model
@@ -19,13 +20,33 @@
 # - `perf_tiny`: every kernel on the device against the model crate, the
 #   quantiser's kernel against its reference form, the fast linears and BF16
 #   GEMM against the exact ones (a row's bits alone and in batches, asserted;
-#   deviation in $OUT/qwen_ops_fast_*.txt); then the exact profile on the
+#   deviation in $OUT/qwen_ops_fast_*.txt), every FP8 GEMM the fast profile
+#   routes rows to (the swapped kernel's three tiles and the unswapped one,
+#   and the split instances at the split shapes) giving each row the same
+#   bits, the split's ranges and sum in their order, a stack's parts against
+#   each part alone, the norm's fused partials and quantisation against the
+#   GEMM's sum, the norm and the quantiser, the small-N BF16 GEMM against its
+#   order and
+#   the f32 gates against the exact ones (asserted within two BF16 units;
+#   histogram in $OUT/qwen_ops_fast_gates.txt); then the exact profile on the
 #   device against the CPU reference executor, eagerly and replaying graphs
 #   (graphs keep it exact);
 # - `perf_fast`: both profiles' reproducibility between calls, asserted,
-#   eagerly and replaying graphs, and the same workloads on every path (eager,
+#   eagerly and replaying graphs (a 1,800-position prompt among them, past
+#   several FA2 chunks and prefilled in two attention passes), and the same
+#   workloads on every path (eager,
 #   a rung run directly, its graph replayed) equal in tokens and logits bits;
 #   the fast profile's deviation recorded in $OUT/qwen_fast_deviation.txt;
+# - `perf_kernels`: the kernel bench (`examples/qwen_kernel_bench.rs`) as JSON
+#   lines in $OUT/qwen_kernel_bench.jsonl: every FP8 GEMM form at 1 to 2,048
+#   rows at the stacked shapes (a split shape's split and unsplit forms side
+#   by side), a target layer's FA2 decode launch at 1 to 64 rows and 1,024 to
+#   12,288 keys split at 256, 512 and 1,024, the small-N and CUTLASS `a`/`b`
+#   projection,
+#   the norm, quantiser, gates, DeltaNet preparation and gated norm at 1, 8, 64
+#   and 2,048 rows, the recurrence, the cipher and the host copies;
+# - the serving steps prefill in chunks of 256 positions, the bench's default
+#   (`qwen::SERVING_PREFILL_CHUNK`, the chunk Qwen3.8 is served at);
 # - `serve_b`, `serve_b_mtp`: workload B (1,024 in, 256 out, greedy) at
 #   concurrency 1, 8, 32, 64 and 128, without drafts and with three, graphs
 #   on: $OUT/serve_b*.jsonl;
@@ -55,6 +76,17 @@ export CHECKPOINT PROMPTS
 perf_host() { device_tests qwen_kernels_host qwen_host; }
 perf_tiny() { device_tests qwen_ops qwen_tiny; }
 perf_fast() { device_tests qwen_fast; }
+
+perf_kernels() {
+    if [ -n "$DRY_RUN" ]; then
+        (cd "$REPO" && x cargo run --release --locked -p eidola-engine-cuda --example qwen_kernel_bench -- "$KERNELS")
+        return 0
+    fi
+    (cd "$REPO" && cargo run --release --locked -p eidola-engine-cuda --example qwen_kernel_bench -- \
+        "$KERNELS") | tee "$OUT/qwen_kernel_bench.txt"
+    grep '^{' "$OUT/qwen_kernel_bench.txt" > "$OUT/qwen_kernel_bench.jsonl" ||
+        die "the bench printed no measurement"
+}
 
 # serve <name> <workload> <draft> <graphs> [concurrency]
 serve() {
@@ -92,5 +124,5 @@ serve_profile() {
     done
 }
 
-main "facts setup build kernels_build kernels perf_host perf_tiny perf_fast serve_b serve_b_mtp serve_c serve_c_mtp summary" \
+main "facts setup build kernels_build kernels perf_host perf_tiny perf_fast perf_kernels serve_b serve_b_mtp serve_c serve_c_mtp summary" \
     "serve_b_eager serve_profile" "$@"

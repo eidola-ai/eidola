@@ -92,6 +92,19 @@ fn host_launch(lib: Arc<libloading::Library>) -> Box<eidola_engine_cuda::qwen::h
     })
 }
 
+/// A [`HostDevice`] whose launches run the compiled bodies, counting the launches of each
+/// family into `counts`.
+pub fn counting_device(
+    lib: Arc<libloading::Library>,
+    counts: Arc<std::sync::Mutex<std::collections::HashMap<&'static str, u64>>>,
+) -> HostDevice {
+    let run = host_launch(lib);
+    HostDevice::new(Box::new(move |family, params, gx, gy| {
+        *counts.lock().expect("counts").entry(family).or_default() += 1;
+        run(family, params, gx, gy);
+    }))
+}
+
 /// The quantiser's reference form (`quant_thread`) compiled for the host, over host
 /// buffers: `(params, grid x, grid y)`, the grid a thread per 128-wide block.
 pub fn quant_thread_reference(
@@ -110,6 +123,100 @@ pub fn quant_thread_reference(
                 gy,
             );
         }
+    }
+}
+
+/// A body compiled for the host, by its symbol (`qwen_host_*`), over host buffers:
+/// `(params, grid x, grid y)`. The reference forms of the kernels arranged for speed
+/// (`qwen_host_norm_reference`, `qwen_host_dn_norm_reference`,
+/// `qwen_host_widen_reference`) run over their own grids: a CTA a (unit, row), a CTA a
+/// (head, row), and an element a thread.
+pub fn host_body<P>(lib: Arc<libloading::Library>, symbol: &'static str) -> impl Fn(&P, u32, u32) {
+    move |p, gx, gy| {
+        let name = format!("{symbol}\0");
+        // SAFETY: every `qwen_host_*` launch symbol takes its family's parameter struct
+        // and the grid; the caller's addresses are host buffers holding what it names.
+        unsafe {
+            let f: libloading::Symbol<HostFn> = lib.get(name.as_bytes()).expect("a host body");
+            f((p as *const P).cast(), gx, gy);
+        }
+    }
+}
+
+/// `qwk::e4m3_code` against `ds::e4m3_encode` over every f32 bit pattern, in eight
+/// ranges at once: the patterns that differ (none, or the first of each range's).
+pub fn e4m3_code_mismatches(lib: &libloading::Library) -> Vec<(u64, u32)> {
+    type Check = unsafe extern "C" fn(u32, u32, *mut u32) -> u64;
+    // SAFETY: `qwen_host_e4m3_check` has this signature and touches nothing but `at`.
+    let check: libloading::Symbol<Check> =
+        unsafe { lib.get(b"qwen_host_e4m3_check\0") }.expect("the encoder check");
+    let check = *check;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = (0..8u64)
+            .map(|i| {
+                s.spawn(move || {
+                    let first = u32::try_from(i << 29).expect("a 32-bit pattern");
+                    let last = u32::try_from(((i + 1) << 29) - 1).expect("a 32-bit pattern");
+                    let mut at = 0u32;
+                    // SAFETY: as above; `at` is this thread's own.
+                    let bad = unsafe { check(first, last, &mut at) };
+                    (bad, at)
+                })
+            })
+            .collect();
+        parts
+            .into_iter()
+            .map(|h| h.join().expect("a check thread"))
+            .filter(|&(bad, _)| bad > 0)
+            .collect()
+    })
+}
+
+/// The fast profile's small-N GEMM body compiled for the host (`qwen_host_fast_gemm`),
+/// over host buffers: a [`cases::small_gemm`] runner.
+pub fn small_gemm_host(lib: Arc<libloading::Library>) -> impl cases::SmallGemmRun {
+    small_gemm_host_form(lib, false)
+}
+
+/// The small-N GEMM's tiled form compiled for the host (`qwen_host_fast_gemm_tiled`):
+/// a [`cases::small_gemm`] runner.
+pub fn small_gemm_tiled_host(lib: Arc<libloading::Library>) -> impl cases::SmallGemmRun {
+    small_gemm_host_form(lib, true)
+}
+
+fn small_gemm_host_form(lib: Arc<libloading::Library>, tiled: bool) -> impl cases::SmallGemmRun {
+    move |x, w, rows, first, n, k| {
+        let mut out = vec![0.0f32; rows * n];
+        let p = eidola_engine_cuda::qwen::abi::LinearParams {
+            x: x[first * k..].as_ptr() as u64,
+            w: w.as_ptr() as u64,
+            out: out.as_mut_ptr() as u64,
+            rows: u32::try_from(rows).expect("rows"),
+            n: u32::try_from(n).expect("n"),
+            k: u32::try_from(k).expect("k"),
+            x_stride: u32::try_from(k).expect("k"),
+            out_stride: u32::try_from(n).expect("n"),
+            out_f32: 1,
+        };
+        use eidola_engine_cuda::qwen::kernels::{small_gemm_grid, small_gemm_tiled_grid};
+        let (grid, symbol): (_, &[u8]) = if tiled {
+            (small_gemm_tiled_grid(&p), b"qwen_host_fast_gemm_tiled\0")
+        } else {
+            (small_gemm_grid(&p), b"qwen_host_fast_gemm\0")
+        };
+        let [gx, gy, _] = grid.map_err(|e| e.to_string())?;
+        // SAFETY: `qwen_host_fast_gemm` and `qwen_host_fast_gemm_tiled` take a
+        // `QwLinearParams` and the grid; the addresses are the host vectors above, alive for
+        // the call.
+        unsafe {
+            let f: libloading::Symbol<HostFn> = lib.get(symbol).expect("the small-N GEMM body");
+            f(
+                (&p as *const eidola_engine_cuda::qwen::abi::LinearParams).cast(),
+                gx,
+                gy,
+            );
+        }
+        Ok(out)
     }
 }
 

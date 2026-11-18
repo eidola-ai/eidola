@@ -103,9 +103,26 @@ pub struct Run<D: QwenDevice> {
 
 impl<D: QwenDevice> Run<D> {
     pub fn new(dev: D, k: u32, chunk: u32) -> Self {
+        Self::with_config(dev, k, chunk, cuda_config(&Geometry::plain(k)))
+    }
+
+    /// [`Run::new`] for sequences up to 2,048 positions: past several of FA2's 512-key
+    /// chunks, and with prefill chunks whose attention outgrows the partial rows of one
+    /// pass.
+    pub fn long(dev: D, chunk: u32) -> Self {
+        let mut c = cuda_config(&Geometry::plain(0));
+        c.max_model_len = 2048;
+        Self::with_config(dev, 0, chunk, c)
+    }
+
+    fn with_config(
+        dev: D,
+        k: u32,
+        chunk: u32,
+        cfg: eidola_engine_cuda::qwen::QwenCudaExecutorConfig,
+    ) -> Self {
         let model = fixture();
-        let mut ex =
-            QwenCudaExecutor::new(dev, &model, cuda_config(&Geometry::plain(k))).expect("executor");
+        let mut ex = QwenCudaExecutor::new(dev, &model, cfg).expect("executor");
         super::apply_path(&mut ex);
         let rec = Recorder {
             inner: ex,
@@ -321,7 +338,133 @@ pub fn all<D: QwenDevice>(make: &dyn Fn() -> D) -> Vec<(&'static str, Result<Str
         Ok(format!("{total} prefixes over widths 1 to 3"))
     })();
     out.push(("draft_widths", res));
+    out.push(("drafting", drafting(make, &prompt, &crowd)));
+    out.push(("long_context", long_context(make)));
     out
+}
+
+/// A prompt of 1,800 positions (four of FA2's 512-key chunks at its end), prefilled in
+/// chunks of 256 (whose last full chunk's attention takes two passes of the partial rows)
+/// and of 100 (one pass each), then decoded: the same tokens and logits bits; and decoded
+/// positions against the same positions prefilled.
+pub fn long_context<D: QwenDevice>(make: &dyn Fn() -> D) -> Result<String, String> {
+    let g = SamplingParams::greedy();
+    let prompt = TestRng(9191).tokens(1800, VOCAB);
+    let run = |chunk: u32, p: Vec<u32>, max: u32| {
+        let mut r = Run::long(make(), chunk);
+        r.submit(1, p, g, max, CacheScope::Private);
+        r.run();
+        r
+    };
+    let wide = run(256, prompt.clone(), 6);
+    let narrow = run(100, prompt.clone(), 6);
+    ensure(
+        wide.outputs[&1] == narrow.outputs[&1],
+        "tokens differ between prefill chunks of 256 and 100".into(),
+    )?;
+    let mut n = agree("chunks of 256 and 100", wide.book(), narrow.book())?;
+    ensure(n >= 6, format!("only {n} prefixes compared"))?;
+    let mut p = prompt;
+    p.extend_from_slice(&wide.outputs[&1][..3]);
+    let prefilled = run(256, p, 1);
+    let m = agree("decoded and prefilled", wide.book(), prefilled.book())?;
+    ensure(
+        m == 1,
+        format!("decoded and prefilled: {m} prefixes compared"),
+    )?;
+    n += m;
+    Ok(format!("{n} prefixes past 1,800 positions"))
+}
+
+/// With drafting on (width 3): a greedy and a seeded sampled request each alone, beside
+/// traffic arriving at varied steps and prefilled in chunks, and a second turn resumed
+/// from a snapshot against the same turn computed fresh: the same tokens and logits bits.
+/// A sampled row's tokens at a fixed width are a function of its prefix and seed alone,
+/// since its drafts and their draws are.
+fn drafting<D: QwenDevice>(
+    make: &dyn Fn() -> D,
+    prompt: &[u32],
+    crowd: &[Vec<u32>],
+) -> Result<String, String> {
+    let k = 3;
+    let sampled = SamplingParams::random(1.0, 777).expect("params");
+    let other = TestRng(4343).tokens(14, VOCAB);
+    let reqs = [
+        (1u64, prompt.to_vec(), SamplingParams::greedy()),
+        (2, other, sampled),
+    ];
+    let alone: Vec<Run<D>> = reqs
+        .iter()
+        .map(|(id, p, s)| {
+            let mut r = Run::new(make(), k, 256);
+            r.submit(*id, p.clone(), *s, 12, keyed(1));
+            r.run();
+            r
+        })
+        .collect();
+    let mut total = 0;
+    for chunk in [3u32, 5] {
+        let mut r = Run::new(make(), k, chunk);
+        for (i, c) in crowd.iter().enumerate() {
+            let id = 10 + u64::try_from(i).expect("small");
+            r.submit(
+                id,
+                c.clone(),
+                super::pair::params(id),
+                6 + u32::try_from(i).expect("small"),
+                keyed(2),
+            );
+            if i == 1 {
+                let (id, p, s) = &reqs[0];
+                r.submit(*id, p.clone(), *s, 12, keyed(1));
+            }
+            if i == 3 {
+                let (id, p, s) = &reqs[1];
+                r.submit(*id, p.clone(), *s, 12, keyed(3));
+            }
+            for e in r.eng.step(r.now).expect("step") {
+                r.outputs.entry(e.id).or_default().extend(&e.tokens);
+            }
+            r.now += 1;
+        }
+        r.run();
+        for (a, (id, _, _)) in alone.iter().zip(&reqs) {
+            ensure(
+                r.outputs[id] == a.outputs[id],
+                format!("request {id}: tokens differ beside traffic at chunk {chunk}"),
+            )?;
+            total += agree(
+                &format!("request {id} at chunk {chunk}"),
+                a.book(),
+                r.book(),
+            )?;
+        }
+    }
+    ensure(total >= 40, format!("only {total} prefixes compared"))?;
+    // A second turn of the sampled request, from its snapshot and fresh.
+    let (id, p, s) = &reqs[1];
+    let mut turn = p.clone();
+    turn.extend_from_slice(&alone[1].outputs[id]);
+    turn.extend(TestRng(78).tokens(5, VOCAB));
+    let mut hit = Run::new(make(), k, 256);
+    hit.submit(*id, p.clone(), *s, 12, keyed(1));
+    hit.run();
+    hit.submit(5, turn.clone(), *s, 10, keyed(1));
+    hit.run();
+    let cached = hit.cached[&5];
+    ensure(cached > 0, "the second turn did not hit a snapshot".into())?;
+    let mut fresh = Run::new(make(), k, 256);
+    fresh.submit(5, turn, *s, 10, CacheScope::Private);
+    fresh.run();
+    ensure(
+        hit.outputs[&5] == fresh.outputs[&5],
+        "sampled tokens differ after a hit".into(),
+    )?;
+    let n = agree("hit and fresh", hit.book(), fresh.book())?;
+    ensure(n >= 10, format!("only {n} prefixes compared after the hit"))?;
+    Ok(format!(
+        "{total} prefixes beside traffic, {n} after a hit of {cached} positions"
+    ))
 }
 
 /// The logits of a fixed set of greedy requests (prompts of 5 to 40 tokens, 12 tokens
