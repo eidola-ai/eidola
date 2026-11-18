@@ -261,10 +261,10 @@ fn the_256_wide_fixture_runs_exact() {
 
 /// A drafting step runs the target once: every uniform decode step at draft width `k`
 /// launches the FP8 linears of one target forward (an undrafted decode step's count) and
-/// the drafter's, its layer's seven (the attention's four projections and the MLP's
-/// three) at each of `k` depths and its K and V projections for the canonical rewrite;
-/// eagerly and on the padded rung path. Two target forwards would launch the target's
-/// linears twice.
+/// the drafter's, its layer's four (the attention's stacked projections and its output
+/// projection, the MLP's stacked gate and up and its down projection) at each of `k`
+/// depths and its stacked projections once more for the canonical rewrite; eagerly and on
+/// the padded rung path. Two target forwards would launch the target's linears twice.
 #[test]
 fn a_drafting_step_runs_the_target_once() {
     use std::collections::HashMap;
@@ -357,7 +357,7 @@ fn a_drafting_step_runs_the_target_once() {
             let steps = run(k, path);
             let drafted: Vec<u64> = steps.iter().filter(|s| s.0 == k).map(|s| s.1).collect();
             assert!(!drafted.is_empty(), "{path:?}: no decode step drafted {k}");
-            let want = target + 7 * u64::from(k) + 2;
+            let want = target + 4 * u64::from(k) + 1;
             assert!(
                 drafted.iter().all(|&n| n == want),
                 "{path:?} width {k}: FP8 linear launches {drafted:?}, one target forward \

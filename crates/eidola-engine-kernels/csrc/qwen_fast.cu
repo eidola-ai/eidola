@@ -1,7 +1,8 @@
 // Qwen3.8's fast-profile kernels of our own: the small-N BF16 GEMM
 // (`qwen_fast.cuh`, whose body the host check runs too: it spells out every
-// fused multiply-add it means, `qwf::fma32`) and the element-wise gates in
-// f32. Built in the `own` profile (contraction allowed).
+// fused multiply-add it means, `qwf::fma32`), the element-wise gates in f32,
+// and the sum of the split FP8 GEMM's partials. Built in the `own` profile
+// (contraction allowed).
 
 #include "eidola_kernel.cuh"
 #include "qwen_fast.cuh"
@@ -141,3 +142,61 @@ extern "C" __global__ void __launch_bounds__(kGateThreads)
   }
 }
 EIDOLA_KERNEL_META(eidola_qwen_fast_gate, kGateThreads, 1, 1, 0, 1, 1, 1, sizeof(QwGateParams));
+
+// ---- the split FP8 GEMM's sum (`eidola_qwen_fast_split_sum`) ----
+//
+// `cutlass_fp8_blockwise_split` leaves each split of K its own f32 partial
+// sums; this adds them for each output in split order, from the first
+// split's value, and rounds the sum once as `gate_round` does. A thread takes
+// 4 consecutive outputs of a row (16-byte loads of each split's values and an
+// 8-byte store when `n`, the strides and the arrays allow; element by element
+// otherwise). An output is a function of its own partials alone.
+
+namespace {
+
+constexpr uint32_t kSumThreads = 256;
+constexpr uint32_t kSumChunk = 4;
+
+__device__ __forceinline__ uint16_t split_sum_one(const QwSplitSumParams& p, uint64_t at) {
+  const uint64_t step = static_cast<uint64_t>(p.part_rows) * p.n;
+  float acc = p.parts[at];
+  for (uint32_t s = 1; s < p.splits; ++s) acc = __fadd_rn(acc, p.parts[at + s * step]);
+  return gate_store(gate_round(acc));
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(kSumThreads)
+    eidola_qwen_fast_split_sum(const __grid_constant__ QwSplitSumParams p) {
+  const uint32_t row = blockIdx.y;
+  const uint32_t i0 = (blockIdx.x * kSumThreads + threadIdx.x) * kSumChunk;
+  if (row >= p.rows || i0 >= p.n) return;
+  const uint64_t at = static_cast<uint64_t>(row) * p.n + i0;
+  uint16_t* out = p.out + static_cast<uint64_t>(row) * p.out_stride + i0;
+  const bool vec = ((p.n | p.out_stride) % kSumChunk == 0) &&
+                   reinterpret_cast<uint64_t>(p.parts) % 16 == 0 &&
+                   reinterpret_cast<uint64_t>(p.out) % 8 == 0;
+  if (vec) {
+    const uint64_t step = static_cast<uint64_t>(p.part_rows) * p.n;
+    float4 acc = *reinterpret_cast<const float4*>(p.parts + at);
+    for (uint32_t s = 1; s < p.splits; ++s) {
+      const float4 v = *reinterpret_cast<const float4*>(p.parts + at + s * step);
+      acc.x = __fadd_rn(acc.x, v.x);
+      acc.y = __fadd_rn(acc.y, v.y);
+      acc.z = __fadd_rn(acc.z, v.z);
+      acc.w = __fadd_rn(acc.w, v.w);
+    }
+    const uint32_t lo = static_cast<uint32_t>(gate_store(gate_round(acc.x))) |
+                        (static_cast<uint32_t>(gate_store(gate_round(acc.y))) << 16);
+    const uint32_t hi = static_cast<uint32_t>(gate_store(gate_round(acc.z))) |
+                        (static_cast<uint32_t>(gate_store(gate_round(acc.w))) << 16);
+    *reinterpret_cast<uint2*>(out) = make_uint2(lo, hi);
+    return;
+  }
+#pragma unroll
+  for (uint32_t e = 0; e < kSumChunk; ++e) {
+    if (i0 + e < p.n) out[e] = split_sum_one(p, at + e);
+  }
+}
+EIDOLA_KERNEL_META(eidola_qwen_fast_split_sum, kSumThreads, 1, 1, 0, 1, 1, 1,
+                   sizeof(QwSplitSumParams));

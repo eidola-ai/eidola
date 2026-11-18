@@ -200,6 +200,12 @@ pub struct Shape {
     pub recurrent: Option<HybridDims>,
 }
 
+/// f32 values a row of a recurrent model's split FP8 GEMMs' partial sums takes at
+/// most (`eidola-engine-cuda`'s `qwen::kernels::split_width`): a GEMM splits K into
+/// `s` ranges only while its `s` ranges' 128-output tiles fit 148 CTAs, so `s · n`
+/// is at most 148 · 128.
+pub const SPLIT_PARTIAL_FLOATS: u64 = 148 * 128;
+
 /// The dimensions of a dense hybrid of Gated DeltaNet and gated
 /// full-attention layers with one MTP layer (Qwen3.8's), as the CUDA
 /// executor (`eidola-engine-cuda`'s `QwenCudaExecutor`) lays its memory out
@@ -308,7 +314,8 @@ impl HybridDims {
 
     /// The step program's scratch per row of its widest forward (the
     /// executor's `program::alloc_scratch`): the residual stream and its
-    /// three working rows; the quantised input and its scales; the MLP's
+    /// three working rows; the quantised input and its scales; the split FP8
+    /// GEMMs' partial sums ([`SPLIT_PARTIAL_FLOATS`], a bound); the MLP's
     /// gate, up and gated rows; the DeltaNet's projections, gated norm,
     /// widened inputs, decay and write rows and output rows; the attention's
     /// gated query, K, V, normed query and key, output and gated output; and
@@ -321,6 +328,7 @@ impl HybridDims {
         4 * h * 2
             + k
             + k / 128 * 4
+            + SPLIT_PARTIAL_FLOATS * 4
             + 3 * self.intermediate * 2
             + cd * 2
             + vd * 2

@@ -92,9 +92,16 @@ impl QwenKernels for HostDevice {
         }
         self.run("quant", p, quant_grid(p))
     }
-    unsafe fn lin8(&self, p: &Lin8Params) -> Result<()> {
+    unsafe fn lin8(&self, p: &Lin8Params, parts: Option<u64>) -> Result<()> {
         if p.rows == 0 {
             return Ok(());
+        }
+        // The fast profile's split shapes need their partials' scratch: planning as that
+        // profile does refuses a launch without it, as the GPU would.
+        if self.profile == QwenProfile::Fast && fp8_splits(p.n, p.k) > 1 && parts.is_none() {
+            return Err(CudaError::new(
+                "a split FP8 GEMM needs the partial sums' scratch",
+            ));
         }
         self.run("lin8", p, lin8_grid(p))
     }

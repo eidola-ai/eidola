@@ -21,8 +21,10 @@
 #   quantiser's kernel against its reference form, the fast linears and BF16
 #   GEMM against the exact ones (a row's bits alone and in batches, asserted;
 #   deviation in $OUT/qwen_ops_fast_*.txt), every FP8 GEMM the fast profile
-#   routes rows to (the swapped kernel's three tiles and the unswapped one)
-#   giving each row the same bits, the small-N BF16 GEMM against its order and
+#   routes rows to (the swapped kernel's three tiles and the unswapped one,
+#   and the split instances at the split shapes) giving each row the same
+#   bits, the split's ranges and sum in their order, a stack's parts against
+#   each part alone, the small-N BF16 GEMM against its order and
 #   the f32 gates against the exact ones (asserted within two BF16 units;
 #   histogram in $OUT/qwen_ops_fast_gates.txt); then the exact profile on the
 #   device against the CPU reference executor, eagerly and replaying graphs
@@ -33,7 +35,8 @@
 #   the fast profile's deviation recorded in $OUT/qwen_fast_deviation.txt;
 # - `perf_kernels`: the kernel bench (`examples/qwen_kernel_bench.rs`) as JSON
 #   lines in $OUT/qwen_kernel_bench.jsonl: every FP8 GEMM form at 1 to 2,048
-#   rows at the released shapes, the small-N and CUTLASS `a`/`b` projection,
+#   rows at the stacked shapes (a split shape's split and unsplit forms side
+#   by side), the small-N and CUTLASS `a`/`b` projection,
 #   the norm, quantiser, gates, DeltaNet preparation and gated norm at 1, 8, 64
 #   and 2,048 rows, the recurrence, the cipher and the host copies;
 # - `serve_b`, `serve_b_mtp`: workload B (1,024 in, 256 out, greedy) at

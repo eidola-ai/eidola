@@ -114,6 +114,10 @@
       "sha256": "0d0b0a25f98192d772de6e56da1e25366882604006f8eb6a0dcde595932efc5c"
     },
     {
+      "path": "csrc/cutlass_fp8_blockwise_split.cu",
+      "sha256": "b597daaeca95c2588e79be92de854b348f260e53b9d7b709fbbaa6dc0c98e14a"
+    },
+    {
       "path": "csrc/cutlass_fp8_blockwise_swap.cu",
       "sha256": "8ccc3cc792db34757e00fc43a0777782aba6c9fdc8fff44aa7243beb96d339c8"
     },
@@ -215,7 +219,7 @@
     },
     {
       "path": "csrc/kernels.json",
-      "sha256": "46877d02121f2cd5906e3b609d415942ea415445c6149ab03fffcfa697284bab"
+      "sha256": "4aa0efac8077f0179648bd29b021ffc5bff908d1b1436559386bec138373fe7d"
     },
     {
       "path": "csrc/kv_cipher.cu",
@@ -223,7 +227,7 @@
     },
     {
       "path": "csrc/qwen_abi.cuh",
-      "sha256": "7e49764728e082d2126776550f7fc227e2a4b2deb84df0c281d9db61c91bd5a7"
+      "sha256": "ef88a73791c0cec0963987c4d9214e4a94e6562b46f7b78b7d0123fe437df284"
     },
     {
       "path": "csrc/qwen_deltanet.cu",
@@ -231,7 +235,7 @@
     },
     {
       "path": "csrc/qwen_fast.cu",
-      "sha256": "e03d3eed1b86d6a0d4d75517229bd10b4be4a80ee4458c6432c4af3911f1086f"
+      "sha256": "255ba572bf86c31018f9c52b9f7a38f5edccf6cbb126bb32fec74de0830b08ee"
     },
     {
       "path": "csrc/qwen_fast.cuh",
@@ -425,6 +429,132 @@
         "UTCATOMSWS": 3,
         "UTCBAR": 2,
         "UTCQMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_fp8_blockwise_split",
+      "arch": "sm_100a",
+      "source": "csrc/cutlass_fp8_blockwise_split.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_fp8_blockwise_split.sm_100a.cubin",
+      "sha256": "3e8372d4a7c7f11699289c822b67afae9de6653f61d1c2419ec9521355b41552",
+      "size": 351376,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split128_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split128_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split128_f32_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split16_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split16_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split16_f32_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split32_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split32_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split32_f32_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split64_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split64_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split64_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_fp8_blockwise_split128_f32_meta",
+        "eidola_cutlass_fp8_blockwise_split16_f32_meta",
+        "eidola_cutlass_fp8_blockwise_split32_f32_meta",
+        "eidola_cutlass_fp8_blockwise_split64_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 12,
+        "UTCBAR": 8,
+        "UTCQMMA": 16
+      }
+    },
+    {
+      "name": "cutlass_fp8_blockwise_split",
+      "arch": "sm_100f",
+      "source": "csrc/cutlass_fp8_blockwise_split.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_fp8_blockwise_split.sm_100f.cubin",
+      "sha256": "1826345ff143b26568644c99b1354dc5a40b2afc935e76a33f885576d5d2d4c8",
+      "size": 351376,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split128_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split128_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split128_f32_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split16_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split16_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split16_f32_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split32_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split32_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split32_f32_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split64_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split64_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split64_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_fp8_blockwise_split128_f32_meta",
+        "eidola_cutlass_fp8_blockwise_split16_f32_meta",
+        "eidola_cutlass_fp8_blockwise_split32_f32_meta",
+        "eidola_cutlass_fp8_blockwise_split64_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 12,
+        "UTCBAR": 8,
+        "UTCQMMA": 16
+      }
+    },
+    {
+      "name": "cutlass_fp8_blockwise_split",
+      "arch": "sm_103a",
+      "source": "csrc/cutlass_fp8_blockwise_split.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_fp8_blockwise_split.sm_103a.cubin",
+      "sha256": "80c56431d0bb684ed2053b9f386af62205943416219f789b6cea75ef3d3d810f",
+      "size": 351376,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split128_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split128_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split128_f32_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split16_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split16_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split16_f32_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split32_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split32_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split32_f32_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_split64_f32",
+          "demangled": "eidola_cutlass_fp8_blockwise_split64_f32",
+          "meta": "eidola_cutlass_fp8_blockwise_split64_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_fp8_blockwise_split128_f32_meta",
+        "eidola_cutlass_fp8_blockwise_split16_f32_meta",
+        "eidola_cutlass_fp8_blockwise_split32_f32_meta",
+        "eidola_cutlass_fp8_blockwise_split64_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 12,
+        "UTCBAR": 8,
+        "UTCQMMA": 16
       }
     },
     {
@@ -2884,8 +3014,8 @@
       "source": "csrc/qwen_fast.cu",
       "profile": "own",
       "file": "cubin/qwen_fast.sm_100a.cubin",
-      "sha256": "329628a1dbb58c4b29fef4d8f39413c02f95033274b0a5b134022840948bfca7",
-      "size": 78888,
+      "sha256": "0297f2e06bb3a85c88266e1ae2609c49f5ed690f2628d7c7e92516f179a8565f",
+      "size": 108352,
       "entries": [
         {
           "symbol": "eidola_qwen_fast_gate",
@@ -2901,12 +3031,18 @@
           "symbol": "eidola_qwen_fast_gemm_bf16_tiled",
           "demangled": "eidola_qwen_fast_gemm_bf16_tiled",
           "meta": "eidola_qwen_fast_gemm_bf16_tiled_meta"
+        },
+        {
+          "symbol": "eidola_qwen_fast_split_sum",
+          "demangled": "eidola_qwen_fast_split_sum",
+          "meta": "eidola_qwen_fast_split_sum_meta"
         }
       ],
       "meta": [
         "eidola_qwen_fast_gate_meta",
         "eidola_qwen_fast_gemm_bf16_meta",
-        "eidola_qwen_fast_gemm_bf16_tiled_meta"
+        "eidola_qwen_fast_gemm_bf16_tiled_meta",
+        "eidola_qwen_fast_split_sum_meta"
       ],
       "mma_sass": {}
     },
@@ -2916,8 +3052,8 @@
       "source": "csrc/qwen_fast.cu",
       "profile": "own",
       "file": "cubin/qwen_fast.sm_100f.cubin",
-      "sha256": "e399725dc113febbae0b50258bce41fdf417bc6eaf78c35123baededba89c833",
-      "size": 78888,
+      "sha256": "c25a5a4fc7662cfcbfea9a0353a62fe91a84267104e54809ee196176096bb29a",
+      "size": 108352,
       "entries": [
         {
           "symbol": "eidola_qwen_fast_gate",
@@ -2933,12 +3069,18 @@
           "symbol": "eidola_qwen_fast_gemm_bf16_tiled",
           "demangled": "eidola_qwen_fast_gemm_bf16_tiled",
           "meta": "eidola_qwen_fast_gemm_bf16_tiled_meta"
+        },
+        {
+          "symbol": "eidola_qwen_fast_split_sum",
+          "demangled": "eidola_qwen_fast_split_sum",
+          "meta": "eidola_qwen_fast_split_sum_meta"
         }
       ],
       "meta": [
         "eidola_qwen_fast_gate_meta",
         "eidola_qwen_fast_gemm_bf16_meta",
-        "eidola_qwen_fast_gemm_bf16_tiled_meta"
+        "eidola_qwen_fast_gemm_bf16_tiled_meta",
+        "eidola_qwen_fast_split_sum_meta"
       ],
       "mma_sass": {}
     },
@@ -2948,8 +3090,8 @@
       "source": "csrc/qwen_fast.cu",
       "profile": "own",
       "file": "cubin/qwen_fast.sm_103a.cubin",
-      "sha256": "de67691af6eb32a99fa51d53e5eb5dfea451dabcfb301c38b1af8144d9a03db0",
-      "size": 78888,
+      "sha256": "f15b58e81533ba88168e03f4aee10d26d69cb80d4341b73d5233a7c3a642fc1e",
+      "size": 108352,
       "entries": [
         {
           "symbol": "eidola_qwen_fast_gate",
@@ -2965,12 +3107,18 @@
           "symbol": "eidola_qwen_fast_gemm_bf16_tiled",
           "demangled": "eidola_qwen_fast_gemm_bf16_tiled",
           "meta": "eidola_qwen_fast_gemm_bf16_tiled_meta"
+        },
+        {
+          "symbol": "eidola_qwen_fast_split_sum",
+          "demangled": "eidola_qwen_fast_split_sum",
+          "meta": "eidola_qwen_fast_split_sum_meta"
         }
       ],
       "meta": [
         "eidola_qwen_fast_gate_meta",
         "eidola_qwen_fast_gemm_bf16_meta",
-        "eidola_qwen_fast_gemm_bf16_tiled_meta"
+        "eidola_qwen_fast_gemm_bf16_tiled_meta",
+        "eidola_qwen_fast_split_sum_meta"
       ],
       "mma_sass": {}
     },
@@ -3657,6 +3805,16 @@
       ]
     },
     {
+      "name": "cutlass_fp8_blockwise_split",
+      "file": "fatbin/cutlass_fp8_blockwise_split.fatbin",
+      "sha256": "7062be19c432659753a802fd0ac29b8cc8ce9923e3bd2f1c57e44c15b2c53ddd",
+      "size": 702984,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
       "name": "cutlass_fp8_blockwise_swap",
       "file": "fatbin/cutlass_fp8_blockwise_swap.fatbin",
       "sha256": "59f6920c97d86d702db7338a6315a2eb0057dfd78064331fcf6ad40a17afc12c",
@@ -3829,8 +3987,8 @@
     {
       "name": "qwen_fast",
       "file": "fatbin/qwen_fast.fatbin",
-      "sha256": "5d12bd17a40e331cc1d252fdab3659e58eed2e3f2a6d307d2a188e242136bdb0",
-      "size": 158008,
+      "sha256": "ee3649cf9ca8e3ca80587bedb2bd4e159ec03a61b2fecaff93e8182eec3e7b73",
+      "size": 216936,
       "archs": [
         "sm_100a",
         "sm_103a"

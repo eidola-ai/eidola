@@ -55,7 +55,7 @@ use eidola_engine_model::qwen::QwenModel;
 use eidola_engine_model::qwen::config::LayerKind;
 
 use super::abi::*;
-use super::device::{QwenDevice, QwenProfile};
+use super::device::{CipherRange, QwenDevice, QwenProfile};
 use super::plan::{
     self, AttnRows, DrafterPass, Fa2Geometry, Geo, Item, Layout, SAMPLE_WORDS, Shape, StepPlan,
     TargetPass, buf,
@@ -604,15 +604,17 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         Ok(())
     }
 
-    /// XORs a block's image with its keystream: each range from a fresh keystream block,
-    /// as `eidola_engine::kv_cipher` defines a block image.
-    fn crypt(
+    /// A block's image and its keystream, into `batch`: each range from a fresh keystream
+    /// block, as `eidola_engine::kv_cipher` defines a block image. The caller XORs the
+    /// batch ([`QwenDevice::cipher_ranges`]) before anything else touches the block.
+    fn crypt<'k>(
         &mut self,
         group: u32,
         b: u32,
-        key: &KvKey,
+        key: &'k KvKey,
         nonce: &KvNonce,
         encrypt: bool,
+        batch: &mut Vec<CipherRange<'k>>,
     ) -> Result<()> {
         let flag = if group == self.state_pool() {
             &mut self.state_encrypted[b as usize]
@@ -624,11 +626,30 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let mut counter = 0u32;
         for (addr, bytes) in self.block_ranges(group, b) {
             let words = u32of(bytes / 4, "cipher words")?;
-            // SAFETY: the block's range, whole words.
-            unsafe { self.dev.cipher(addr, words, counter, key, nonce)? };
+            batch.push(CipherRange {
+                addr,
+                words,
+                counter,
+                key,
+                nonce: *nonce,
+            });
             counter += words.div_ceil(16);
         }
         Ok(())
+    }
+
+    /// XORs every range of `batch` with its keystream in one launch, and empties it.
+    fn flush_crypts(
+        &self,
+        batch: &mut Vec<CipherRange<'_>>,
+        blocks: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
+        // SAFETY: each range is a piece of one block of a pool; the blocks are distinct
+        // (`blocks`), so the ranges do not overlap.
+        let r = unsafe { self.dev.cipher_ranges(batch) };
+        batch.clear();
+        blocks.clear();
+        r
     }
 
     fn reset_slot(&mut self, slot: Slot) -> Result<()> {
@@ -657,9 +678,23 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         unsafe { self.dev.upload(at, &(len + 1).to_le_bytes()) }
     }
 
+    /// The step's maintenance in its order. Consecutive encryptions and decryptions run
+    /// as one cipher launch over all their blocks' ranges, queued before the next other
+    /// operation (which may read or move those blocks) and before any block's second one.
     fn maintain(&mut self, step: &StepInput) -> Result<()> {
         let state = self.state_pool();
+        let mut batch: Vec<CipherRange<'_>> = Vec::new();
+        let mut blocks: Vec<(u32, u32)> = Vec::new();
         for m in &step.maintenance {
+            match *m {
+                Maintenance::Encrypt { group, block, .. }
+                | Maintenance::Decrypt { group, block, .. } => {
+                    if blocks.contains(&(group, block)) {
+                        self.flush_crypts(&mut batch, &mut blocks)?;
+                    }
+                }
+                _ => self.flush_crypts(&mut batch, &mut blocks)?,
+            }
             match *m {
                 Maintenance::SaveState { slot, len, buffer } => {
                     self.save_state(slot, len, buffer)?
@@ -693,7 +728,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                         .kv_keys
                         .get(key as usize)
                         .unwrap_or_else(|| panic!("maintenance names key {key}, not in the step"));
-                    self.crypt(group, block, key, &nonce, encrypt)?;
+                    self.crypt(group, block, key, &nonce, encrypt, &mut batch)?;
+                    blocks.push((group, block));
                 }
                 Maintenance::Demote { group, block, host } => {
                     let enc = if group == state {
@@ -756,7 +792,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 }
             }
         }
-        Ok(())
+        self.flush_crypts(&mut batch, &mut blocks)
     }
 }
 

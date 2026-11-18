@@ -6,7 +6,8 @@
 // this crate; see REUSE.toml).
 //
 // What it checks: it includes the kernels crate's own CUTLASS translation units
-// (csrc/cutlass_fp8_blockwise_gemm.cu, csrc/cutlass_bf16_gemm.cu), so its types
+// (csrc/cutlass_fp8_blockwise_gemm.cu, csrc/cutlass_bf16_gemm.cu,
+// csrc/cutlass_fp8_blockwise_swap.cu, csrc/cutlass_fp8_blockwise_split.cu), so its types
 // are exactly the AOT kernels' types, and for a list of problem shapes and
 // fixed fake device addresses runs CUTLASS's own host path
 // (`GemmKernel::to_underlying_arguments`, `get_grid_shape`, `can_implement`,
@@ -59,6 +60,7 @@ CUresult oracle_encode(CUtensorMap* map, CUtensorMapDataType dtype, cuuint32_t r
 #include "cutlass_bf16_gemm.cu"
 #include "cutlass_fp8_blockwise_gemm.cu"
 #include "cutlass_fp8_blockwise_swap.cu"
+#include "cutlass_fp8_blockwise_split.cu"
 
 #undef cuTensorMapEncodeTiled
 
@@ -156,7 +158,7 @@ static void build_into(unsigned char* storage, unsigned char fill, unsigned char
 
 template <class Kernel>
 static void emit(const char* name, int m, int n, int k, double alpha,
-                 typename Kernel::Arguments const& args) {
+                 typename Kernel::Arguments const& args, int splits = 1) {
   using Params = typename Kernel::Params;
   const size_t ws = Kernel::get_workspace_size(args);
   const bool ok = Kernel::can_implement(args);
@@ -171,12 +173,13 @@ static void emit(const char* name, int m, int n, int k, double alpha,
   for (size_t i = 0; i < sizeof(Params); ++i) mask += (s1[i] == s2[i] && s1[i] == s3[i]) ? '1' : '0';
   const dim3 grid = Kernel::get_grid_shape(params);
   const char* base = reinterpret_cast<const char*>(&params);
-  printf("{\"kernel\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"alpha\":%.17g,\"can_implement\":%s,"
+  printf("{\"kernel\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"splits\":%d,\"alpha\":%.17g,"
+         "\"can_implement\":%s,"
          "\"workspace\":%zu,\"grid\":[%u,%u,%u],\"params_bytes\":%zu,"
          "\"offsets\":{\"problem_shape\":%td,\"mainloop\":%td,\"epilogue\":%td,\"scheduler\":%td,"
          "\"hw_info\":%td,\"sizeof_mainloop\":%zu,\"sizeof_epilogue\":%zu,\"sizeof_scheduler\":%zu},"
          "\"params\":\"%s\",\"defined\":\"%s\",\"driver\":%s,\"encodes\":%s}\n",
-         name, m, n, k, alpha, ok ? "true" : "false", ws, grid.x, grid.y, grid.z, sizeof(params),
+         name, m, n, k, splits, alpha, ok ? "true" : "false", ws, grid.x, grid.y, grid.z, sizeof(params),
          reinterpret_cast<const char*>(&params.problem_shape) - base,
          reinterpret_cast<const char*>(&params.mainloop) - base,
          reinterpret_cast<const char*>(&params.epilogue) - base,
@@ -265,6 +268,47 @@ static void bf16(int m, int n, int k, float alpha) {
   emit<K>("bf16", m, n, k, alpha, args);
 }
 
+// The split FP8 GEMM (`cutlass_fp8_blockwise_split`), recorded in the
+// executor's terms as `fp8_swap` is: `m` activation rows at kA (scales at
+// kSFA), the weight `[n, k]` at kB (scales at kSFB), f32 partials at kD.
+// CUTLASS's problem is one batch per split of K: K is `k / splits`, L is
+// `splits`, each batch's A and B start `k / splits` elements further along
+// the same rows (row stride `k`), its scales `k / (128 · splits)` blocks
+// further on, and its output is the next `[m, n]` array.
+template <class K, class ScaleConfig, bool Swapped>
+static void fp8_split(const char* name, int m, int n, int k, int splits) {
+  using StrideA = typename K::StrideA;
+  using StrideB = typename K::StrideB;
+  using StrideD = typename K::StrideD;
+  using StrideC = typename K::StrideC;
+  using EA = typename K::ElementA;
+  using EB = typename K::ElementB;
+  using ED = typename K::ElementD;
+  const int ks = k / splits;
+  // CUTLASS's own (M, N): the weight's rows first when swapped.
+  const int cm = Swapped ? n : m, cn = Swapped ? m : n;
+  auto sa = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(cm, ks, splits));
+  auto sb = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(cn, ks, splits));
+  cute::get<0>(sa) = k;
+  cute::get<2>(sa) = ks;
+  cute::get<0>(sb) = k;
+  cute::get<2>(sb) = ks;
+  auto sd = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(cm, cn, splits));
+  auto sc = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(cm, cn, splits));
+  auto lsfa = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(cm, cn, ks, splits));
+  auto lsfb = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(cm, cn, ks, splits));
+  const uint64_t a = Swapped ? kB : kA, b = Swapped ? kA : kB;
+  const uint64_t sfa = Swapped ? kSFB : kSFA, sfb = Swapped ? kSFA : kSFB;
+  typename K::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {cm, cn, ks, splits},
+      {reinterpret_cast<EA*>(a), sa, reinterpret_cast<EB*>(b), sb, reinterpret_cast<float*>(sfa),
+       lsfa, reinterpret_cast<float*>(sfb), lsfb},
+      {{}, nullptr, sc, reinterpret_cast<ED*>(kD), sd},
+      hw()};
+  emit<K>(name, m, n, k, 1.0, args, splits);
+}
+
 int main() {
 #if !defined(EIDOLA_ORACLE_NO_DRIVER)
   if (cuInit(0) != CUDA_SUCCESS) {
@@ -300,6 +344,23 @@ int main() {
     for (auto [m, n, k] : std::vector<std::tuple<int, int, int>>{
              {64, 17408, 5120}, {36, 5120, 17408}, {64, 256, 128}, {48, 12288, 5120}})
       fp8_swap<EidolaFp8Swap64, SC>("fp8_swap64", m, n, k);
+  }
+  {
+    using SC = eidola_fp8_blockwise_split::SwapScaleConfig;
+    using WC = eidola_fp8_blockwise_split::WideScaleConfig;
+    for (auto [m, n, k, s] : std::vector<std::tuple<int, int, int, int>>{
+             {4, 5120, 6144, 3}, {16, 5120, 17408, 2}, {1, 2048, 5120, 4}, {8, 256, 1024, 1}})
+      fp8_split<EidolaFp8Split16, SC, true>("fp8_split16", m, n, k, s);
+    for (auto [m, n, k, s] : std::vector<std::tuple<int, int, int, int>>{
+             {32, 5120, 6144, 3}, {20, 5120, 17408, 2}})
+      fp8_split<EidolaFp8Split32, SC, true>("fp8_split32", m, n, k, s);
+    for (auto [m, n, k, s] : std::vector<std::tuple<int, int, int, int>>{
+             {64, 5120, 6144, 3}, {36, 5120, 17408, 2}, {48, 2048, 5120, 4}})
+      fp8_split<EidolaFp8Split64, SC, true>("fp8_split64", m, n, k, s);
+    for (auto [m, n, k, s] : std::vector<std::tuple<int, int, int, int>>{
+             {68, 5120, 6144, 3}, {2048, 5120, 17408, 2}, {300, 2048, 5120, 4}, {3, 256, 512, 2},
+             {128, 1024, 640, 5}})
+      fp8_split<EidolaFp8SplitWide, WC, false>("fp8_split128", m, n, k, s);
   }
   return 0;
 }
