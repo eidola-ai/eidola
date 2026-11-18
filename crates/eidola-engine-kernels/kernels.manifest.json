@@ -231,11 +231,11 @@
     },
     {
       "path": "csrc/qwen_ops.cuh",
-      "sha256": "ee4e1e73f2ab6d30e13a3dd022c15c9ea7c7fabcd1bc1a6bec03541514ab9047"
+      "sha256": "ca67bbd1e5a2d9cc71b3bed64f8b959554feaf5621da7fe3c4406fa5622f096c"
     },
     {
       "path": "csrc/qwen_ops_div.cu",
-      "sha256": "e0679c74e0eb88f459e0b451d0f81b14182fa7d567739ba69f5757276729c9ce"
+      "sha256": "0fe90a73e9d54d124d295a8af9f1e97aad227c16a14a7abc1ca851c379387134"
     },
     {
       "path": "csrc/rmsnorm.cu",
@@ -2910,8 +2910,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_100a.cubin",
-      "sha256": "07973ac26bb5f8947a99d6d0a25bcc97f9398b6d47a0917be135c74dbf4ddb65",
-      "size": 157648,
+      "sha256": "094903705b5c6af03ca6506ede9209f1bdd4924f2d78eb7df194da5d8792592e",
+      "size": 159888,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -2956,8 +2956,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1524,
-        "sass_fma": 307
+        "ptx_rounded": 1468,
+        "sass_fma": 317
       }
     },
     {
@@ -2966,8 +2966,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_100f.cubin",
-      "sha256": "65fe814ff97eb3f28edbd9e2b67af62e456504789dfcc747c8463e47ddb37308",
-      "size": 157648,
+      "sha256": "29b2b3241a84570fd9c47ab82d3cd89eec64e45639d3f351c4172855e0547f03",
+      "size": 159888,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -3012,8 +3012,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1524,
-        "sass_fma": 307
+        "ptx_rounded": 1468,
+        "sass_fma": 317
       }
     },
     {
@@ -3022,8 +3022,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_103a.cubin",
-      "sha256": "5467577b56ad9cf9c070b81c0ab7ded9dd1180521518c1c824461a4792b6a298",
-      "size": 201392,
+      "sha256": "b03760ecf16d5d2b6aa0c9a27800d3a71cd65f0b9b079a90788d3751002e7ccc",
+      "size": 203632,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -3068,8 +3068,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1524,
-        "sass_fma": 307
+        "ptx_rounded": 1468,
+        "sass_fma": 317
       }
     },
     {
@@ -3405,8 +3405,8 @@
     {
       "name": "qwen_ops_div",
       "file": "fatbin/qwen_ops_div.fatbin",
-      "sha256": "3e8dd9e5c5a88a3263059535442ae661e14952d48c9d9eb32a23b8bda7640f9a",
-      "size": 359272,
+      "sha256": "80dc5444758277b3abfb5f2d232a6c20a8aea20afbe6b54c925297723e8bf8df",
+      "size": 363752,
       "archs": [
         "sm_100a",
         "sm_103a"

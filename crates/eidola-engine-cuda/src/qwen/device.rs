@@ -21,7 +21,7 @@ pub enum QwenProfile {
     /// mode.
     #[default]
     Exact,
-    /// The FP8 and large BF16 linears on tensor cores (CUTLASS) and attention by FA2: the
+    /// The FP8 and BF16 linears on tensor cores (CUTLASS) and attention by FA2: the
     /// serving mode, within a measured bound of [`QwenProfile::Exact`] and invariant to
     /// the batch, the chunking and the cache.
     Fast,

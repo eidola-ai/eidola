@@ -57,8 +57,14 @@ pub trait QwenKernels {
     /// The BF16 linear: exact (`linear_bf16_rows`) in the exact profile, the tensor-core
     /// form in the fast one for the large linears (the head and the drafter's input
     /// projection), which name an f32 scratch of `rows · n` values in `fast`; `None` for
-    /// the DeltaNet's small projections, exact in both profiles.
+    /// the exact form in both profiles.
     unsafe fn linear(&self, p: &LinearParams, fast: Option<u64>) -> Result<()>;
+    /// The fast profile's BF16 GEMM alone (CUTLASS's, the large linears' tensor-core
+    /// form): `p.rows × p.n` f32 values into `p.out`, dense (`x_stride = k`,
+    /// `out_stride = n`, `out_f32 = 1`), unrounded; the caller rounds what it reads
+    /// (`eidola_qwen_round`). An exact-profile GPU refuses it; the host device computes the
+    /// exact linear's values (already BF16, which a rounding leaves as they are).
+    unsafe fn gemm_bf16(&self, p: &LinearParams) -> Result<()>;
     unsafe fn gate(&self, p: &GateParams) -> Result<()>;
     unsafe fn kv_write(&self, p: &KvWriteParams) -> Result<()>;
     /// The exact attention core (`attend`).
@@ -99,6 +105,8 @@ fn rows_grid(x: u32, rows: u32) -> Result<[u32; 3]> {
 const ELEMENT: u32 = 256;
 const BLOCK_THREADS: u32 = 128;
 const LIN_ROWS: u32 = 8;
+/// 128-wide blocks a CTA of the quantiser takes, a warp each (`kQuantWarps`).
+const QUANT_WARPS: u32 = BLOCK_THREADS / 32;
 
 pub fn embed_grid(p: &EmbedParams) -> Result<[u32; 3]> {
     ensure(
@@ -112,6 +120,7 @@ pub fn embed_grid(p: &EmbedParams) -> Result<[u32; 3]> {
 pub fn norm_grid(p: &NormParams) -> Result<[u32; 3]> {
     ensure(p.x != 0 && p.weight != 0 && p.out != 0, "norm: null")?;
     ensure(p.n > 0 && p.units > 0, "norm: empty unit")?;
+    ensure(p.n <= NORM_MAX, "norm: a unit past the staged width")?;
     ensure(
         p.x_stride >= (p.units - 1) * p.x_unit_stride + p.n,
         "norm: input stride",
@@ -148,7 +157,11 @@ pub fn quant_grid(p: &QuantParams) -> Result<[u32; 3]> {
         "quant: whole 128-blocks",
     )?;
     ensure(p.x_stride >= p.k && p.m_pad >= p.rows, "quant: strides")?;
-    rows_grid((p.k / BLOCK).div_ceil(BLOCK_THREADS), p.rows)
+    ensure(
+        p.x.is_multiple_of(8) && p.x_stride.is_multiple_of(4) && p.codes.is_multiple_of(4),
+        "quant: a lane's 8-byte load and 4-byte store aligned",
+    )?;
+    rows_grid((p.k / BLOCK).div_ceil(QUANT_WARPS), p.rows)
 }
 
 pub fn lin8_grid(p: &Lin8Params) -> Result<[u32; 3]> {
@@ -373,6 +386,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quant_grid_is_a_warp_per_block_and_refuses_unaligned_lanes() {
+        let q = QuantParams {
+            x: 256,
+            codes: 256,
+            scales: 256,
+            rows: 3,
+            k: 5120,
+            x_stride: 5120,
+            m_pad: 4,
+        };
+        assert_eq!(quant_grid(&q).unwrap(), [10, 3, 1]);
+        assert_eq!(quant_grid(&QuantParams { k: 640, ..q }).unwrap(), [2, 3, 1]);
+        for bad in [
+            QuantParams { k: 100, ..q },
+            QuantParams { x: 260, ..q },
+            QuantParams {
+                x_stride: 5122,
+                ..q
+            },
+            QuantParams { codes: 258, ..q },
+            QuantParams { m_pad: 2, ..q },
+        ] {
+            assert!(quant_grid(&bad).is_err(), "{bad:?}");
+        }
+    }
+
     fn norm() -> NormParams {
         NormParams {
             x: 8,
@@ -432,6 +472,13 @@ mod tests {
                 ..rotated
             },
             NormParams { eps: 0.0, ..norm() },
+            NormParams {
+                n: NORM_MAX + 16,
+                units: 1,
+                x_stride: NORM_MAX + 16,
+                out_stride: NORM_MAX + 16,
+                ..norm()
+            },
         ] {
             assert!(norm_grid(&bad).is_err(), "{bad:?}");
         }

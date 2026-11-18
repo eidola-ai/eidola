@@ -295,6 +295,9 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         if !c.hidden_size.is_multiple_of(128) || !c.intermediate_size.is_multiple_of(128) {
             return Err(CudaError::new("widths must be whole 128-blocks"));
         }
+        if c.hidden_size > NORM_MAX as usize {
+            return Err(CudaError::new("hidden size past the norm's staged width"));
+        }
         let dims = Dims {
             hidden: u32of(c.hidden_size, "hidden")?,
             inter: u32of(c.intermediate_size, "intermediate")?,

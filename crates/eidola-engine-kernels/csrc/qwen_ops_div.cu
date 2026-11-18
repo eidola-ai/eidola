@@ -16,9 +16,20 @@ extern "C" __global__ void __launch_bounds__(qwk::kElementThreads)
 }
 EIDOLA_KERNEL_META(eidola_qwen_norm, qwk::kElementThreads, 1, 1, 0, 1, 1, 1, sizeof(QwNormParams));
 
+// The warp form (`qwen_ops.cuh`): a warp per block, its lanes' amaxes
+// combined by a butterfly of shuffles.
 extern "C" __global__ void __launch_bounds__(qwk::kBlockThreads)
     eidola_qwen_quant(const __grid_constant__ QwQuantParams p) {
-  qwk::quant_thread(p, blockIdx.x, blockIdx.y, threadIdx.x);
+  const uint32_t l = threadIdx.x % qwk::kWarp;
+  uint32_t b;
+  // Uniform across the warp: the block is the warp's.
+  if (!qwk::quant_block_of(p, blockIdx.x, blockIdx.y, threadIdx.x / qwk::kWarp, &b)) return;
+  float v[qwk::kQuantLane];
+  float m = qwk::quant_lane_load(p, blockIdx.y, b, l, v);
+  for (uint32_t off = qwk::kWarp / 2; off > 0; off >>= 1) {
+    m = ds::max32(m, __shfl_xor_sync(0xffffffffu, m, off));
+  }
+  qwk::quant_lane_store(p, blockIdx.y, b, l, v, m);
 }
 EIDOLA_KERNEL_META(eidola_qwen_quant, qwk::kBlockThreads, 1, 1, 0, 1, 1, 1, sizeof(QwQuantParams));
 

@@ -104,6 +104,17 @@ impl QwenKernels for HostDevice {
         }
         self.run("linear", p, linear_grid(p))
     }
+    unsafe fn gemm_bf16(&self, p: &LinearParams) -> Result<()> {
+        if p.rows == 0 {
+            return Ok(());
+        }
+        if p.x_stride != p.k || p.out_stride != p.n || p.out_f32 != 1 {
+            return Err(CudaError::new(
+                "the fast BF16 GEMM reads and writes dense rows, to f32",
+            ));
+        }
+        self.run("linear", p, linear_grid(p))
+    }
     unsafe fn gate(&self, p: &GateParams) -> Result<()> {
         if p.rows == 0 {
             return Ok(());

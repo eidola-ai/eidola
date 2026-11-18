@@ -6,8 +6,9 @@
 //! profile the FP8 linears run CUTLASS's blockwise tcgen05 GEMM
 //! (`cutlass_fp8_blockwise_gemm`, the same image MiMo's executor runs: f32 scales per
 //! 1×128 of the activations and 128×128 of the weights, exactly the kernels' layouts),
-//! and the large BF16 linears (the head, the drafter's input projection) CUTLASS's BF16
-//! GEMM into an f32 scratch the caller names, rounded to BF16 by `eidola_qwen_round`; and
+//! and the BF16 linears (the head, the drafter's input projection, the DeltaNet's stacked
+//! `a` and `b` projections) CUTLASS's BF16 GEMM into an f32 scratch the caller names,
+//! rounded to BF16 by `eidola_qwen_round`; and
 //! attention runs FA2 at head dimension 256 ([`super::attention`]). Both profiles load the
 //! shared sampler (`sampling`) and the row copy (`engine_ops`'s `eidola_copy_rows`). Graphs
 //! are captured on the device's one stream ([`QwenDevice::capture`]).
@@ -143,6 +144,26 @@ impl CudaDevice {
         Ok(())
     }
 
+    /// The CUTLASS BF16 GEMM of `p`'s rows and weight into `d` (`rows · n` f32), checked.
+    fn bf16_args(p: &LinearParams, d: u64) -> Result<GemmArgs> {
+        if p.x_stride != p.k {
+            return Err(CudaError::new("the fast BF16 linear reads dense rows"));
+        }
+        let a = GemmArgs {
+            m: p.rows,
+            n: p.n,
+            k: p.k,
+            a: p.x,
+            b: p.w,
+            d,
+            sfa: 0,
+            sfb: 0,
+            alpha: 1.0,
+        };
+        GemmKind::Bf16.check(&a)?;
+        Ok(a)
+    }
+
     /// Launches `kernel` with `p` by value over `grid`.
     ///
     /// # Safety
@@ -215,21 +236,7 @@ impl QwenKernels for CudaDevice {
         let g = linear_grid(p)?;
         match (&self.fast, fast) {
             (Some(f), Some(tmp)) => {
-                if p.x_stride != p.k {
-                    return Err(CudaError::new("the fast BF16 linear reads dense rows"));
-                }
-                let a = GemmArgs {
-                    m: p.rows,
-                    n: p.n,
-                    k: p.k,
-                    a: p.x,
-                    b: p.w,
-                    d: tmp,
-                    sfa: 0,
-                    sfb: 0,
-                    alpha: 1.0,
-                };
-                GemmKind::Bf16.check(&a)?;
+                let a = Self::bf16_args(p, tmp)?;
                 let r = RoundParams {
                     x: tmp,
                     out: p.out,
@@ -250,6 +257,22 @@ impl QwenKernels for CudaDevice {
             }
             _ => unsafe { self.go(&self.k.linear, p, g) },
         }
+    }
+    unsafe fn gemm_bf16(&self, p: &LinearParams) -> Result<()> {
+        if p.rows == 0 {
+            return Ok(());
+        }
+        linear_grid(p)?;
+        let f = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| CudaError::new("the BF16 GEMM runs in the fast profile"))?;
+        if p.out_stride != p.n || p.out_f32 != 1 {
+            return Err(CudaError::new("the fast BF16 GEMM writes dense f32 rows"));
+        }
+        let a = Self::bf16_args(p, p.out)?;
+        // SAFETY: `rows` input rows, the weight, `rows · n` f32 outputs: the caller's.
+        unsafe { f.bf16.launch(&self.gpu, &a) }
     }
     unsafe fn gate(&self, p: &GateParams) -> Result<()> {
         if p.rows == 0 {

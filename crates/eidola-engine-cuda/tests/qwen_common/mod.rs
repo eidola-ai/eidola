@@ -92,6 +92,27 @@ fn host_launch(lib: Arc<libloading::Library>) -> Box<eidola_engine_cuda::qwen::h
     })
 }
 
+/// The quantiser's reference form (`quant_thread`) compiled for the host, over host
+/// buffers: `(params, grid x, grid y)`, the grid a thread per 128-wide block.
+pub fn quant_thread_reference(
+    lib: Arc<libloading::Library>,
+) -> impl Fn(&eidola_engine_cuda::qwen::abi::QuantParams, u32, u32) {
+    move |p, gx, gy| {
+        // SAFETY: `qwen_host_quant_thread` takes a `QwQuantParams` and the grid; the
+        // caller's addresses are host buffers holding what the struct names.
+        unsafe {
+            let f: libloading::Symbol<HostFn> = lib
+                .get(b"qwen_host_quant_thread\0")
+                .expect("the reference quantiser");
+            f(
+                (p as *const eidola_engine_cuda::qwen::abi::QuantParams).cast(),
+                gx,
+                gy,
+            );
+        }
+    }
+}
+
 /// A [`HostDevice`] planning as the fast profile: the compiled bodies, and FA2's launches
 /// checked and computing nothing.
 pub fn planning_fast(lib: Arc<libloading::Library>) -> HostDevice {

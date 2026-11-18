@@ -12,11 +12,16 @@
 #          perf_fast serve_b serve_b_mtp serve_c serve_c_mtp summary
 #   named only: serve_b_eager serve_profile
 #
-# - `perf_host`: the executor on this host's compiled kernel bodies against the
-#   CPU reference executor, eagerly and on the padded rung path; the fast
-#   profile's plans packed on every path;
-# - `perf_tiny`: the exact profile on the device against the CPU reference
-#   executor, eagerly and replaying graphs (graphs keep it exact);
+# - `perf_host`: every kernel body compiled for this host against the model
+#   crate (the quantiser's warp form against its reference form too), and the
+#   executor on those bodies against the CPU reference executor, eagerly and on
+#   the padded rung path; the fast profile's plans packed on every path;
+# - `perf_tiny`: every kernel on the device against the model crate, the
+#   quantiser's kernel against its reference form, the fast linears and BF16
+#   GEMM against the exact ones (a row's bits alone and in batches, asserted;
+#   deviation in $OUT/qwen_ops_fast_*.txt); then the exact profile on the
+#   device against the CPU reference executor, eagerly and replaying graphs
+#   (graphs keep it exact);
 # - `perf_fast`: both profiles' reproducibility between calls, asserted,
 #   eagerly and replaying graphs, and the same workloads on every path (eager,
 #   a rung run directly, its graph replayed) equal in tokens and logits bits;
@@ -47,8 +52,8 @@ CHECKPOINT="${CHECKPOINT:-$WORK/checkpoint}"
 PROMPTS="${PROMPTS:-}"
 export CHECKPOINT PROMPTS
 
-perf_host() { device_tests qwen_host; }
-perf_tiny() { device_tests qwen_tiny; }
+perf_host() { device_tests qwen_kernels_host qwen_host; }
+perf_tiny() { device_tests qwen_ops qwen_tiny; }
 perf_fast() { device_tests qwen_fast; }
 
 # serve <name> <workload> <draft> <graphs> [concurrency]

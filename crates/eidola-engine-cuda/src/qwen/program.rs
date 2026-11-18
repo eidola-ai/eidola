@@ -19,7 +19,7 @@ use super::super::attention::{Fa2Args, HEAD_DIM, PARTIAL_BYTES_PER_HEAD};
 use super::super::device::QwenDevice;
 use super::super::kernels::{AcceptLaunch, COPY_BUFFERS, CopyArgs, SampleArgs};
 use super::super::plan::{AttnAt, DrafterAt, Fa2At, ItemsAt, Layout, SAMPLE_WORDS, TargetAt};
-use super::super::weights::{AttentionW, LayerW, MixerW};
+use super::super::weights::{AttentionW, DeltaNetW, LayerW, MixerW, ab_rows};
 use super::{Alloc, DRAFTER, QwenCudaExecutor, TARGET};
 use crate::mimo::attention::{AttnLayer, Partials, PlanView};
 use crate::{CudaError, Result};
@@ -129,10 +129,14 @@ pub(super) struct Scratch {
     pub pad_t: Alloc,
 }
 
-/// Bytes of the fast BF16 linears' f32 scratch: the head's rows of the vocabulary, or the
-/// drafter's input projection's rows of the hidden size.
+/// Bytes of the fast BF16 linears' f32 scratch: the head's rows of the vocabulary, the
+/// drafter's input projection's rows of the hidden size, or a forward's rows of the
+/// DeltaNet's stacked `a` and `b` projections.
 fn head_tmp(c: &Caps, d: &super::Dims) -> usize {
-    (pad4(c.head) * d.vocab as usize).max(pad4(c.drafter) * d.hidden as usize) * 4
+    (pad4(c.head) * d.vocab as usize)
+        .max(pad4(c.drafter) * d.hidden as usize)
+        .max(pad4(c.rows.max(c.drafter)) * ab_rows(d.v_heads) as usize)
+        * 4
 }
 
 /// `rows` rounded up to the quantiser's and the fast GEMM's 4.
@@ -683,6 +687,47 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         unsafe { self.dev.linear(&p, fast) }
     }
 
+    /// The DeltaNet's `a` and `b` projections of `rows` rows. Exact: each by the exact
+    /// linear to BF16 (`aa`, `bb`), widened into `ab_new` by [`Self::deltanet`]. Fast: the
+    /// stacked weight by the BF16 GEMM into the f32 scratch, then its first `2 · v_heads`
+    /// columns rounded to BF16 values straight into `ab_new` (`a`'s then `b`'s, the
+    /// widening's layout).
+    fn ab_projections(&self, x: u64, rows: usize, w: &DeltaNetW) -> Result<()> {
+        let s = &self.scratch;
+        let d = &self.dims;
+        if self.dev.profile() == super::QwenProfile::Exact {
+            self.linear(x, rows, w.a, d.v_heads, d.hidden, s.aa.addr, false)?;
+            return self.linear(x, rows, w.b, d.v_heads, d.hidden, s.bb.addr, false);
+        }
+        let g = LinearParams {
+            x,
+            w: w.ab,
+            out: s.head_tmp.addr,
+            rows: n32(rows),
+            n: w.ab_n,
+            k: d.hidden,
+            x_stride: d.hidden,
+            out_stride: w.ab_n,
+            out_f32: 1,
+        };
+        let r = RoundParams {
+            x: s.head_tmp.addr,
+            out: s.ab_new.addr,
+            rows: n32(rows),
+            width: 2 * d.v_heads,
+            x_stride: w.ab_n,
+            out_stride: 2 * d.v_heads,
+            out_f32: 1,
+            reserved: 0,
+        };
+        // SAFETY: `rows` rows of `x`; the f32 scratch holds `rows · ab_n` (`head_tmp`),
+        // `ab_new` `rows · 2 · v_heads`.
+        unsafe {
+            self.dev.gemm_bf16(&g)?;
+            self.dev.round(&r)
+        }
+    }
+
     fn widen(
         &self,
         x: u64,
@@ -753,15 +798,17 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 t,
                 d.conv_dim(),
             )?;
-            self.widen(s.aa.addr, d.v_heads, s.ab_new.addr, two, t, d.v_heads)?;
-            self.widen(
-                s.bb.addr,
-                d.v_heads,
-                s.ab_new.addr + (vh * 4) as u64,
-                two,
-                t,
-                d.v_heads,
-            )?;
+            if self.dev.profile() == super::QwenProfile::Exact {
+                self.widen(s.aa.addr, d.v_heads, s.ab_new.addr, two, t, d.v_heads)?;
+                self.widen(
+                    s.bb.addr,
+                    d.v_heads,
+                    s.ab_new.addr + (vh * 4) as u64,
+                    two,
+                    t,
+                    d.v_heads,
+                )?;
+            }
         }
         self.copies(&at.stage_conv, cd, &self.conv_bufs(dn))?;
         self.copies(&at.stage_ab, 2 * vh, &self.ab_bufs(dn))?;
@@ -849,8 +896,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 MixerW::DeltaNet(w) => {
                     self.lin8(s.x.addr, t, &w.qkv, s.mixed.addr)?;
                     self.lin8(s.x.addr, t, &w.z, s.z.addr)?;
-                    self.linear(s.x.addr, t, w.a, d.v_heads, d.hidden, s.aa.addr, false)?;
-                    self.linear(s.x.addr, t, w.b, d.v_heads, d.hidden, s.bb.addr, false)?;
+                    self.ab_projections(s.x.addr, t, w)?;
                     self.deltanet(at, dn, w, true)?;
                     let p = DnNormParams {
                         o: s.o_rows.addr,
