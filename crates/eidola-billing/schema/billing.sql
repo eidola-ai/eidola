@@ -131,7 +131,7 @@ CREATE TABLE billing_event (
     generation BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0),
     completed_generation BIGINT NOT NULL DEFAULT 0 CHECK (
         completed_generation >= 0 AND completed_generation <= generation),
-    report JSONB,
+    report JSONB CHECK (report IS NULL OR kind = 'billing.account.reconcile'),
     attempts INTEGER NOT NULL DEFAULT 0,
     completed_at TIMESTAMPTZ,
     last_error TEXT,
@@ -139,6 +139,54 @@ CREATE TABLE billing_event (
     received_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX idx_billing_event_pending ON billing_event(next_attempt_at,received_at,id) WHERE completed_at IS NULL;
+
+COMMENT ON TABLE billing_event IS
+    'The durable billing work inbox: verified Stripe webhook notifications, '
+    'account repair requests and local refund/closure resumptions. A row holds '
+    'identities and scheduling state only. No Stripe object content is stored: '
+    'the receiver accepts only thin events, which carry none, and keeps their '
+    'event ID, type and related object ID; workers read current facts from '
+    'Stripe.';
+COMMENT ON COLUMN billing_event.id IS
+    'A Stripe event ID for a webhook notification, or a local key: '
+    'billing.reconcile:<account>, local:refund:<operation> or '
+    'local:close:<account>. A redelivered event naming another kind or object '
+    'is refused.';
+COMMENT ON COLUMN billing_event.kind IS
+    'A Stripe thin event type exactly as received (v1.*), or a local job kind: '
+    'billing.account.reconcile, billing.refund.resume or billing.close.resume. '
+    'The two namespaces never meet.';
+COMMENT ON COLUMN billing_event.object_id IS
+    'For a Stripe event, its related object''s ID (a checkout session, invoice, '
+    'charge, refund or dispute); for a local job, the account or operation UUID.';
+COMMENT ON COLUMN billing_event.protocol_version IS
+    'The ingress envelope version the row was produced under. An executor '
+    'leaves a row of another version pending for review.';
+COMMENT ON COLUMN billing_event.generation IS
+    'The number of requests accepted for this row. A repeated repair request '
+    'or closure wakeup advances it, so one arriving during a run stays pending.';
+COMMENT ON COLUMN billing_event.completed_generation IS
+    'The latest generation a worker completed.';
+COMMENT ON COLUMN billing_event.report IS
+    'Only for billing.account.reconcile rows: the result of the repair that '
+    'completed completed_generation, as counts of purchases, refunds and '
+    'disputes observed plus review items (a provider object ID and a fixed '
+    'reason). Returned by the account repair status endpoint. NULL for every '
+    'other kind.';
+COMMENT ON COLUMN billing_event.attempts IS
+    'Failed attempts since the last completion; sets the retry backoff.';
+COMMENT ON COLUMN billing_event.completed_at IS
+    'When the current generation completed; NULL while work is pending.';
+COMMENT ON COLUMN billing_event.last_error IS
+    'The latest failure as a fixed category (such as requires_review, '
+    'provider_unavailable or unsupported_kind), never a provider message or '
+    'response body. Returned by the account repair status endpoint.';
+COMMENT ON COLUMN billing_event.next_attempt_at IS
+    'When a worker may next claim the row.';
+COMMENT ON COLUMN billing_event.received_at IS
+    'When the row was first inserted, by the database clock: the age of '
+    'pending work for monitoring, and a scheduling tie-break. Not a Stripe '
+    'timestamp; a repeated request does not move it.';
 
 -- Purchase-level allocation replaces pools which accidentally merged prices.
 -- This signature is also called by record_credential_issuance.

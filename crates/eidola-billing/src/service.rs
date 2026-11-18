@@ -20,24 +20,26 @@ use crate::stripe::{RefundSnapshot, ReviewItem, StripeClient};
 /// expires, absence from a list is not permission to create another refund.
 const SAFE_RESUBMIT_WINDOW: Duration = Duration::from_secs(23 * 60 * 60);
 
-/// Stripe notifications that trigger the same authoritative reconciliation.
-/// Internal operation jobs deliberately do not appear in this public allowlist.
+/// Stripe thin event types that trigger the same authoritative reconciliation,
+/// spelled exactly as Stripe sends them and as the inbox stores them. Stripe's
+/// `v1.` namespace never meets the inbox's own `billing.` job kinds, which
+/// deliberately do not appear in this public allowlist.
 pub const BILLING_EVENT_TYPES: &[&str] = &[
-    "checkout.session.completed",
-    "checkout.session.async_payment_succeeded",
-    "checkout.session.async_payment_failed",
-    "invoice.paid",
-    "invoice.payment_succeeded",
-    "charge.refunded",
-    "charge.succeeded",
-    "refund.created",
-    "refund.updated",
-    "refund.failed",
-    "charge.dispute.created",
-    "charge.dispute.updated",
-    "charge.dispute.closed",
-    "charge.dispute.funds_withdrawn",
-    "charge.dispute.funds_reinstated",
+    "v1.checkout.session.completed",
+    "v1.checkout.session.async_payment_succeeded",
+    "v1.checkout.session.async_payment_failed",
+    "v1.invoice.paid",
+    "v1.invoice.payment_succeeded",
+    "v1.charge.refunded",
+    "v1.charge.succeeded",
+    "v1.refund.created",
+    "v1.refund.updated",
+    "v1.refund.failed",
+    "v1.charge.dispute.created",
+    "v1.charge.dispute.updated",
+    "v1.charge.dispute.closed",
+    "v1.charge.dispute.funds_withdrawn",
+    "v1.charge.dispute.funds_reinstated",
 ];
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -626,23 +628,24 @@ fn terminal_refund(state: &str) -> bool {
     )
 }
 
-/// The webhook entry point can use this exact allowlist before enqueuing.
+/// The kind of provider object a thin event's related object is, which is the
+/// object the worker reads. The webhook entry point uses the same allowlist.
 pub fn event_object_kind(kind: &str) -> Option<&'static str> {
     if !BILLING_EVENT_TYPES.contains(&kind) {
         return None;
     }
     match kind {
-        "checkout.session.completed"
-        | "checkout.session.async_payment_succeeded"
-        | "checkout.session.async_payment_failed" => Some("checkout.session"),
-        "invoice.paid" | "invoice.payment_succeeded" => Some("invoice"),
-        "charge.refunded" | "charge.succeeded" => Some("charge"),
-        "refund.created" | "refund.updated" | "refund.failed" => Some("refund"),
-        "charge.dispute.created"
-        | "charge.dispute.updated"
-        | "charge.dispute.closed"
-        | "charge.dispute.funds_withdrawn"
-        | "charge.dispute.funds_reinstated" => Some("dispute"),
+        "v1.checkout.session.completed"
+        | "v1.checkout.session.async_payment_succeeded"
+        | "v1.checkout.session.async_payment_failed" => Some("checkout.session"),
+        "v1.invoice.paid" | "v1.invoice.payment_succeeded" => Some("invoice"),
+        "v1.charge.refunded" | "v1.charge.succeeded" => Some("charge"),
+        "v1.refund.created" | "v1.refund.updated" | "v1.refund.failed" => Some("refund"),
+        "v1.charge.dispute.created"
+        | "v1.charge.dispute.updated"
+        | "v1.charge.dispute.closed"
+        | "v1.charge.dispute.funds_withdrawn"
+        | "v1.charge.dispute.funds_reinstated" => Some("dispute"),
         _ => None,
     }
 }
@@ -687,10 +690,32 @@ mod tests {
 
     #[test]
     fn every_cash_event_reaches_reconciliation_without_an_inferred_effect() {
-        assert_eq!(event_object_kind("refund.failed"), Some("refund"));
-        assert_eq!(event_object_kind("charge.refunded"), Some("charge"));
-        assert_eq!(event_object_kind("charge.dispute.closed"), Some("dispute"));
-        assert_eq!(event_object_kind("charge.succeeded"), Some("charge"));
-        assert_eq!(event_object_kind("customer.updated"), None);
+        assert_eq!(event_object_kind("v1.refund.failed"), Some("refund"));
+        assert_eq!(event_object_kind("v1.charge.refunded"), Some("charge"));
+        assert_eq!(
+            event_object_kind("v1.charge.dispute.closed"),
+            Some("dispute")
+        );
+        assert_eq!(event_object_kind("v1.charge.succeeded"), Some("charge"));
+        assert_eq!(event_object_kind("v1.customer.updated"), None);
+        // Snapshot spellings are not accepted kinds.
+        assert_eq!(event_object_kind("refund.failed"), None);
+        assert_eq!(event_object_kind("charge.refunded"), None);
+    }
+
+    #[test]
+    fn stripe_event_kinds_never_collide_with_local_job_kinds() {
+        for kind in BILLING_EVENT_TYPES {
+            assert!(kind.starts_with("v1."), "{kind}");
+            assert!(event_object_kind(kind).is_some(), "{kind}");
+        }
+        for local in [
+            "billing.refund.resume",
+            "billing.close.resume",
+            "billing.account.reconcile",
+        ] {
+            assert!(!BILLING_EVENT_TYPES.contains(&local));
+            assert_eq!(event_object_kind(local), None);
+        }
     }
 }

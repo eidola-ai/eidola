@@ -23,7 +23,29 @@ eidola-billing serve-webhooks --bind 0.0.0.0:8080
 eidola-billing work --batch-size 32 --retry-interval-secs 5
 ```
 
-The receiver needs the database settings above and `STRIPE_WEBHOOK_SECRET`. It does **not** need `STRIPE_API_KEY`, and does not execute reconciliation or start workers. Direct Stripe webhooks to `POST /v1/webhooks/stripe` on this stable deployment. It serves plain HTTP behind the deployment's HTTPS termination, including a Tinfoil shim if desired. `GET /healthz` checks database connectivity and the ingress protocol. The receiver limits request bodies to 2 MiB, authenticates the exact raw bytes with at most five minutes of clock skew in either direction, and stores only the supported event's ID, type, and object ID. Keep the host clock synchronized. It acknowledges a supported event only after the database commits it; a failed write returns a non-success response for Stripe to retry. Unsupported event types are acknowledged without storing them, including events whose objects have no ID.
+The receiver needs the database settings above and `STRIPE_WEBHOOK_SECRET`. It does **not** need `STRIPE_API_KEY`, and does not execute reconciliation or start workers. Direct Stripe webhooks to `POST /v1/webhooks/stripe` on this stable deployment. It serves plain HTTP behind the deployment's HTTPS termination, including a Tinfoil shim if desired. `GET /healthz` checks database connectivity and the ingress protocol. The receiver limits request bodies to 2 MiB, authenticates the exact raw bytes with at most five minutes of clock skew in either direction, and stores only the supported event's ID, type, and related object's ID. Keep the host clock synchronized. It acknowledges a supported event only after the database commits it; a failed write returns a non-success response for Stripe to retry. Unsupported event types are acknowledged without storing them, including events that name no related object.
+
+The receiver accepts only Stripe's *thin* events, which carry an event's ID, type and related object's ID but none of that object's contents, so no customer email or billing detail reaches it. It refuses a snapshot event with 400. In Stripe's dashboard, create the endpoint's event destination with the **Thin** payload and select these events:
+
+```text
+v1.checkout.session.completed
+v1.checkout.session.async_payment_succeeded
+v1.checkout.session.async_payment_failed
+v1.invoice.paid
+v1.invoice.payment_succeeded
+v1.charge.succeeded
+v1.charge.refunded
+v1.refund.created
+v1.refund.updated
+v1.refund.failed
+v1.charge.dispute.created
+v1.charge.dispute.updated
+v1.charge.dispute.closed
+v1.charge.dispute.funds_withdrawn
+v1.charge.dispute.funds_reinstated
+```
+
+`STRIPE_WEBHOOK_SECRET` is that destination's signing secret (`whsec_…`); every destination has its own. Retire any snapshot destination pointed at this endpoint: its deliveries are refused, and they fail visibly in Stripe's delivery log rather than being processed. The list is `BILLING_EVENT_TYPES` in the shared billing crate, which `compose.yaml`'s stripe-cli forwards for local development.
 
 The worker needs the database settings and `STRIPE_API_KEY`, but no webhook secret. It opens no HTTP listener. Its timer retries pending database work, including webhook observations, account repair requests, and interrupted refunds/closures; it never periodically scans Stripe accounts. Each process handles one batch at a time. Scale worker containers for parallel accounts. Database locks coordinate duplicate deliveries, multiple workers, and direct support commands; durable operation identities and Stripe idempotency remain necessary when a process loses a provider response.
 

@@ -154,10 +154,37 @@ fn signature_at(body: &[u8], secret: &str, timestamp: u64) -> String {
     )
 }
 
+/// A thin event notification in the shape Stripe documents. Every member
+/// other than the event, type and related object IDs must be dropped.
 fn event(id: &str, kind: &str, object_id: &str) -> Vec<u8> {
-    serde_json::to_vec(&json!({"id":id,"type":kind,"data":{"object":{
-        "id":object_id,"amount":500,"customer_email":"never persist this"
-    }}}))
+    serde_json::to_vec(&json!({
+        "id": id,
+        "object": "v2.core.event",
+        "type": kind,
+        "created": "2026-01-01T00:00:00.000Z",
+        "livemode": false,
+        "context": null,
+        "reason": {"type": "request", "request": {
+            "id": "req_never_persist_this",
+            "idempotency_key": "never persist this"
+        }},
+        "related_object": {
+            "id": object_id,
+            "type": "refund",
+            "url": format!("/v1/never_persist_this/{object_id}")
+        },
+        "snapshot_event": "evt_never_persist_this"
+    }))
+    .unwrap()
+}
+
+/// A snapshot event, which carries the related object's contents.
+fn snapshot_event(id: &str, kind: &str, object_id: &str) -> Vec<u8> {
+    serde_json::to_vec(
+        &json!({"id":id,"object":"event","type":kind,"data":{"object":{
+            "id":object_id,"amount":500,"customer_email":"never persist this"
+        }}}),
+    )
     .unwrap()
 }
 
@@ -167,7 +194,7 @@ async fn receiver_acknowledges_committed_identities_and_rejects_conflicting_dupl
     let db = TestDb::new().await;
     // No provider client or Stripe API credentials enter receiver construction.
     let receiver = Receiver::start(db.pool.clone()).await;
-    let body = event("evt_durable", "refund.created", "re_durable");
+    let body = event("evt_durable", "v1.refund.created", "re_durable");
     for _ in 0..2 {
         assert_eq!(
             receiver
@@ -186,7 +213,7 @@ async fn receiver_acknowledges_committed_identities_and_rejects_conflicting_dupl
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<_, String>(0), "evt_durable");
-        assert_eq!(rows[0].get::<_, String>(1), "refund.created");
+        assert_eq!(rows[0].get::<_, String>(1), "v1.refund.created");
         assert_eq!(rows[0].get::<_, String>(2), "re_durable");
         assert!(rows[0].get::<_, bool>(3));
         let stored: serde_json::Value = client
@@ -194,10 +221,17 @@ async fn receiver_acknowledges_committed_identities_and_rejects_conflicting_dupl
             .await
             .unwrap()
             .get(0);
-        assert!(!stored.to_string().contains("never persist this"));
-        assert!(!stored.to_string().contains("customer_email"));
+        let stored = stored.to_string();
+        for dropped in [
+            "never persist this",
+            "never_persist_this",
+            "req_",
+            "2026-01-01",
+        ] {
+            assert!(!stored.contains(dropped), "{dropped}");
+        }
     }
-    let conflicting = event("evt_durable", "refund.created", "re_changed");
+    let conflicting = event("evt_durable", "v1.refund.created", "re_changed");
     assert_eq!(
         receiver
             .post(conflicting.clone(), signature(&conflicting, SECRET))
@@ -223,7 +257,7 @@ async fn receiver_never_acknowledges_an_observation_it_failed_to_persist() {
         )
         .await
         .unwrap();
-    let body = event("evt_failed", "charge.dispute.created", "dp_failed");
+    let body = event("evt_failed", "v1.charge.dispute.created", "dp_failed");
     let response = receiver.post(body.clone(), signature(&body, SECRET)).await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(
@@ -242,7 +276,7 @@ async fn receiver_never_acknowledges_an_observation_it_failed_to_persist() {
 async fn receiver_checks_signatures_identifiers_and_body_size_before_inserting() {
     let db = TestDb::new().await;
     let receiver = Receiver::start(db.pool.clone()).await;
-    let valid = event("evt_forged", "charge.dispute.created", "dp_forged");
+    let valid = event("evt_forged", "v1.charge.dispute.created", "dp_forged");
     assert_eq!(
         receiver
             .post(valid.clone(), signature(&valid, "whsec_wrong"))
@@ -250,7 +284,7 @@ async fn receiver_checks_signatures_identifiers_and_body_size_before_inserting()
             .status(),
         StatusCode::BAD_REQUEST
     );
-    let malformed = event("evt_bad", "refund.created", "../refunds/re_other");
+    let malformed = event("evt_bad", "v1.refund.created", "../refunds/re_other");
     assert_eq!(
         receiver
             .post(malformed.clone(), signature(&malformed, SECRET))
@@ -258,6 +292,25 @@ async fn receiver_checks_signatures_identifiers_and_body_size_before_inserting()
             .status(),
         StatusCode::BAD_REQUEST
     );
+    // A snapshot event is authentic but refused, whether or not its type has
+    // a thin counterpart this receiver supports.
+    for snapshot in [
+        snapshot_event("evt_snapshot", "refund.created", "re_snapshot"),
+        snapshot_event("evt_snapshot", "v1.refund.created", "re_snapshot"),
+        snapshot_event("evt_snapshot", "customer.updated", "cus_snapshot"),
+    ] {
+        let response = receiver
+            .post(snapshot.clone(), signature(&snapshot, SECRET))
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !response
+                .text()
+                .await
+                .unwrap()
+                .contains("never persist this")
+        );
+    }
     let oversized = vec![b' '; 2 * 1024 * 1024 + 1];
     assert_eq!(
         receiver
@@ -266,7 +319,7 @@ async fn receiver_checks_signatures_identifiers_and_body_size_before_inserting()
             .status(),
         StatusCode::PAYLOAD_TOO_LARGE
     );
-    let ignored = event("evt_ignored", "customer.updated", "cus_ignored");
+    let ignored = event("evt_ignored", "v1.customer.updated", "cus_ignored");
     assert_eq!(
         receiver
             .post(ignored.clone(), signature(&ignored, SECRET))
@@ -293,28 +346,33 @@ async fn receiver_checks_signatures_identifiers_and_body_size_before_inserting()
 async fn receiver_ignores_unsupported_no_id_events_but_requires_ids_for_supported_events() {
     let db = TestDb::new().await;
     let receiver = Receiver::start(db.pool.clone()).await;
-    let upcoming = serde_json::to_vec(&json!({
-        "id":"evt_upcoming", "type":"invoice.upcoming",
-        "data":{"object":{"object":"invoice", "customer":"cus_test"}}
+    // Some thin event types have no related object.
+    let no_meter = serde_json::to_vec(&json!({
+        "id":"evt_no_meter", "object":"v2.core.event",
+        "type":"v1.billing.meter.no_meter_found", "related_object":null
     }))
     .unwrap();
     assert_eq!(
         receiver
-            .post(upcoming.clone(), signature(&upcoming, "whsec_wrong"))
+            .post(no_meter.clone(), signature(&no_meter, "whsec_wrong"))
             .await
             .status(),
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
         receiver
-            .post(upcoming.clone(), signature(&upcoming, SECRET))
+            .post(no_meter.clone(), signature(&no_meter, SECRET))
             .await
             .status(),
         StatusCode::OK
     );
     for invalid in [
-        json!({"id":"evt_paid", "type":"invoice.paid", "data":{"object":{"object":"invoice"}}}),
-        json!({"type":"invoice.paid", "data":{"object":{"id":"in_paid"}}}),
+        json!({"id":"evt_paid", "object":"v2.core.event", "type":"v1.invoice.paid",
+            "related_object":null}),
+        json!({"id":"evt_paid", "object":"v2.core.event", "type":"v1.invoice.paid",
+            "related_object":{"type":"invoice"}}),
+        json!({"object":"v2.core.event", "type":"v1.invoice.paid",
+            "related_object":{"id":"in_paid"}}),
     ] {
         let body = serde_json::to_vec(&invalid).unwrap();
         assert_eq!(
@@ -359,7 +417,7 @@ async fn receiver_allows_bounded_clock_skew_but_rejects_ancient_and_far_future_s
     ] {
         let body = event(
             &format!("evt_{name}"),
-            "refund.created",
+            "v1.refund.created",
             &format!("re_{name}"),
         );
         assert_eq!(
@@ -398,7 +456,7 @@ async fn receiver_accepts_rotating_signatures_and_reports_incompatible_ingress()
         .batch_execute("UPDATE billing_protocol SET execution_version=999")
         .await
         .unwrap();
-    let body = event("evt_rotation", "refund.created", "re_rotation");
+    let body = event("evt_rotation", "v1.refund.created", "re_rotation");
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

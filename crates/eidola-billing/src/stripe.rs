@@ -36,9 +36,9 @@ use crate::{BillingError as ServerError, error::parse_error_summary, tls_config}
 /// [`InvoiceLine`], [`InvoicePayment`], [`StripeCharge`], [`StripePaymentIntent`],
 /// [`StripeRefund`] and [`StripeDispute`] (including their status enums).
 /// Unknown financial states fail closed rather than guessing their cash effect.
-/// This header pins **only what this client reads**: webhook payloads are
-/// rendered at the version configured on the endpoint in Stripe's dashboard.
-/// The receiver's event/object identity envelope is versioned separately.
+/// This header pins **only what this client reads**. The receiver accepts
+/// Stripe's thin event notifications, which are unversioned and carry only
+/// identities; its event/object identity envelope is versioned separately.
 pub const STRIPE_API_VERSION: &str = "2025-03-31.basil";
 
 /// Minimal Stripe subscription representation.

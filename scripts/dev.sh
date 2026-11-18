@@ -18,7 +18,8 @@
 #     postgres serving only TLS, and applies schema.sql (idempotent — pass through
 #     `just db-reset` if you want a clean DB)
 #   - if STRIPE_API_KEY is set, captures the Stripe webhook secret and starts
-#     the billing receiver/worker and stripe-cli forwarding to that receiver
+#     the billing receiver/worker and stripe-cli forwarding thin events to that
+#     receiver
 #   - starts everything detached and prints next-step instructions
 #
 # Stop with `just down`.
@@ -157,7 +158,7 @@ cat <<EOF
 EOF
 [ "$MODE" = "container" ] && echo "    gateway  : http://localhost:8080  (in docker)"
 [ -n "$STRIPE_WEBHOOK_SECRET" ] && echo "    billing  : http://localhost:8081 (receiver); worker runs separately"
-[ -n "$STRIPE_WEBHOOK_SECRET" ] && echo "    stripe-cli: forwarding to http://billing-receiver:8080/v1/webhooks/stripe"
+[ -n "$STRIPE_WEBHOOK_SECRET" ] && echo "    stripe-cli: forwarding thin events to http://billing-receiver:8080/v1/webhooks/stripe"
 echo ""
 
 if [ "$MODE" = "host" ]; then

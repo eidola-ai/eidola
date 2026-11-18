@@ -686,7 +686,7 @@ async fn inbox_claims_exclude_other_connections_and_recheck_stale_candidates() {
     let f = fixture().await;
     let other = Store::new(f.pool.clone());
     f.store
-        .enqueue_event("evt_claim", "refund.updated", "re_claim")
+        .enqueue_event("evt_claim", "v1.refund.updated", "re_claim")
         .await
         .unwrap();
     let selected = other.pending_events(32).await.unwrap();
@@ -695,6 +695,26 @@ async fn inbox_claims_exclude_other_connections_and_recheck_stale_candidates() {
     claim.complete(None).await.unwrap();
     assert!(other.claim_event(&selected[0].id).await.unwrap().is_none());
     assert!(other.pending_events(32).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn only_an_account_repair_row_can_hold_a_report() {
+    let f = fixture().await;
+    let report = eidola_billing::service::ReconcileReport::default();
+    f.store
+        .enqueue_event("evt_report", "v1.refund.updated", "re_report")
+        .await
+        .unwrap();
+    let claim = f.store.claim_event("evt_report").await.unwrap().unwrap();
+    assert!(claim.complete(Some(&report)).await.is_err());
+    f.store.request_reconciliation(f.account).await.unwrap();
+    let id = format!("billing.reconcile:{}", f.account);
+    let claim = f.store.claim_event(&id).await.unwrap().unwrap();
+    claim.complete(Some(&report)).await.unwrap();
+    let status = f.store.reconciliation_status(f.account).await.unwrap();
+    assert_eq!(status.completed_generation, 1);
+    assert!(status.report.is_some());
 }
 
 #[tokio::test]
@@ -835,7 +855,7 @@ async fn a_hot_repair_returns_to_the_back_of_due_work_after_each_generation() {
     let id = format!("billing.reconcile:{}", f.account);
     let first = f.store.claim_event(&id).await.unwrap().unwrap();
     f.store
-        .enqueue_event("evt_waiting", "refund.updated", "re_waiting")
+        .enqueue_event("evt_waiting", "v1.refund.updated", "re_waiting")
         .await
         .unwrap();
     f.store.request_reconciliation(f.account).await.unwrap();

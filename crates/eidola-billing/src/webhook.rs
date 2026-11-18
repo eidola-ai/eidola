@@ -1,5 +1,7 @@
 //! Stripe ingress authenticates raw bytes and retains only event identities.
-//! Provider payloads are observations, never ledger mutation instructions.
+//! It accepts Stripe's thin event notifications, which name an event and its
+//! related object without carrying that object's contents. A notification is
+//! a wakeup, never a ledger mutation instruction.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -82,25 +84,25 @@ fn verify_signature_at(
     }
 }
 
+/// The `object` member of a thin event notification. A snapshot event names
+/// `event` here instead, and carries the related object's contents.
+const THIN_EVENT_OBJECT: &str = "v2.core.event";
+
 #[derive(serde::Deserialize)]
-struct EventType {
+struct Envelope {
+    object: Option<String>,
     #[serde(rename = "type")]
     kind: String,
 }
 
 #[derive(serde::Deserialize)]
-struct StripeEvent {
+struct ThinEvent {
     id: String,
-    data: EventData,
+    related_object: Option<RelatedObject>,
 }
 
 #[derive(serde::Deserialize)]
-struct EventData {
-    object: EventObject,
-}
-
-#[derive(serde::Deserialize)]
-struct EventObject {
+struct RelatedObject {
     id: String,
 }
 
@@ -114,7 +116,8 @@ fn event_type_label(kind: &str) -> &'static str {
         .unwrap_or("other")
 }
 
-/// The only fields persisted from a verified Stripe event.
+/// The only fields persisted from a verified Stripe event: its ID, its type
+/// exactly as Stripe names it, and its related object's ID.
 #[derive(Debug, PartialEq, Eq)]
 pub struct WebhookEvent {
     pub id: String,
@@ -122,24 +125,30 @@ pub struct WebhookEvent {
     pub object_id: String,
 }
 
-/// Parse a previously authenticated payload. Unsupported types are ignored.
-/// The caller must verify the signature against these exact bytes first.
+/// Parse a previously authenticated thin event notification. A snapshot
+/// event is refused; unsupported thin event types are ignored. The caller
+/// must verify the signature against these exact bytes first.
 pub fn parse_event(body: &[u8]) -> Result<Option<WebhookEvent>, &'static str> {
-    // Unsupported events need not have the object shape our billing events do.
-    // For example, invoice.upcoming can describe an invoice without an ID.
-    let event_type: EventType =
-        serde_json::from_slice(body).map_err(|_| "invalid webhook event")?;
-    if event_type_label(&event_type.kind) == "other" {
+    let envelope: Envelope = serde_json::from_slice(body).map_err(|_| "invalid webhook event")?;
+    if envelope.object.as_deref() != Some(THIN_EVENT_OBJECT) {
+        return Err("only thin events are accepted");
+    }
+    // Unsupported types need not name a related object: some thin event
+    // types, such as v1.billing.meter.no_meter_found, have none.
+    if event_type_label(&envelope.kind) == "other" {
         return Ok(None);
     }
-    let event: StripeEvent = serde_json::from_slice(body).map_err(|_| "invalid webhook event")?;
-    if !valid_object_id(&event.id) || !valid_object_id(&event.data.object.id) {
+    let event: ThinEvent = serde_json::from_slice(body).map_err(|_| "invalid webhook event")?;
+    let related = event
+        .related_object
+        .ok_or("webhook event has no related object")?;
+    if !valid_object_id(&event.id) || !valid_object_id(&related.id) {
         return Err("invalid webhook object identifier");
     }
     Ok(Some(WebhookEvent {
         id: event.id,
-        kind: event_type.kind,
-        object_id: event.data.object.id,
+        kind: envelope.kind,
+        object_id: related.id,
     }))
 }
 
@@ -363,28 +372,99 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unsupported_events_are_ignored_without_requiring_a_billing_object_id() {
-        let body = br#"{"id":"evt_upcoming","type":"invoice.upcoming","data":{"object":{"object":"invoice","customer":"cus_test"}}}"#;
-        assert_eq!(parse_event(body), Ok(None));
+    fn thin(value: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&value).unwrap()
     }
 
     #[test]
-    fn supported_events_still_require_valid_event_and_object_ids() {
+    fn a_thin_notification_keeps_only_its_event_type_and_related_object_ids() {
+        // The shape of Stripe's documented v1.charge.dispute.created payload.
+        let body = thin(serde_json::json!({
+            "context": null,
+            "created": "2025-01-01T00:00:00.000Z",
+            "id": "evt_65TKLQpAv1Sm67uODUs16TKLJo0qSQNzPlJ0NZGpF32MVk",
+            "object": "v2.core.event",
+            "reason": {"type": "request", "request": {
+                "id": "req_yK7ktaG8CO3xK5",
+                "idempotency_key": "672c7b35-f590-4946-bdcf-1206bcd52530"
+            }},
+            "related_object": {
+                "id": "du_1MtJUT2eZvKYlo2CNaw2HvEv",
+                "type": "dispute",
+                "url": "/v1/charges/ch_3MmlLrLkdIwHu7ix0snN0B15/dispute"
+            },
+            "type": "v1.charge.dispute.created",
+            "snapshot_event": "evt_1SAxTSNX9ddFk9bgxDuoHH3A",
+            "livemode": true
+        }));
+        assert_eq!(
+            parse_event(&body),
+            Ok(Some(WebhookEvent {
+                id: "evt_65TKLQpAv1Sm67uODUs16TKLJo0qSQNzPlJ0NZGpF32MVk".into(),
+                kind: "v1.charge.dispute.created".into(),
+                object_id: "du_1MtJUT2eZvKYlo2CNaw2HvEv".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn snapshot_events_are_refused_whatever_their_type() {
         for body in [
-            serde_json::json!({"type":"invoice.paid","data":{"object":{"id":"in_test"}}}),
-            serde_json::json!({"id":"evt_test","type":"invoice.paid","data":{"object":{}}}),
-            serde_json::json!({"id":"evt/test","type":"invoice.paid","data":{"object":{"id":"in_test"}}}),
-            serde_json::json!({"id":"evt_test","type":"invoice.paid","data":{"object":{"id":"in/test"}}}),
+            serde_json::json!({"id":"evt_test","object":"event","type":"invoice.paid",
+                "data":{"object":{"id":"in_test","customer_email":"never accept this"}}}),
+            serde_json::json!({"id":"evt_test","object":"event","type":"v1.invoice.paid",
+                "related_object":{"id":"in_test"}}),
+            serde_json::json!({"id":"evt_test","object":"event","type":"customer.updated",
+                "data":{"object":{"id":"cus_test"}}}),
+            serde_json::json!({"id":"evt_test","type":"v1.invoice.paid",
+                "related_object":{"id":"in_test"}}),
+            serde_json::json!({"id":"evt_test","object":null,"type":"v1.invoice.paid",
+                "related_object":{"id":"in_test"}}),
         ] {
-            assert!(parse_event(&serde_json::to_vec(&body).unwrap()).is_err());
+            assert_eq!(
+                parse_event(&thin(body)),
+                Err("only thin events are accepted")
+            );
         }
-        let body = br#"{"id":"evt_test","type":"invoice.paid","data":{"object":{"id":"in_test"}}}"#;
+    }
+
+    #[test]
+    fn unsupported_thin_events_are_ignored_without_requiring_a_related_object() {
+        for body in [
+            serde_json::json!({"id":"evt_meter","object":"v2.core.event",
+                "type":"v1.billing.meter.no_meter_found","related_object":null}),
+            serde_json::json!({"id":"evt_meter","object":"v2.core.event",
+                "type":"v1.billing.meter.no_meter_found"}),
+            serde_json::json!({"id":"evt_customer","object":"v2.core.event",
+                "type":"v1.customer.updated","related_object":{"id":"cus_test"}}),
+        ] {
+            assert_eq!(parse_event(&thin(body)), Ok(None));
+        }
+    }
+
+    #[test]
+    fn supported_events_still_require_valid_event_and_related_object_ids() {
+        for body in [
+            serde_json::json!({"object":"v2.core.event","type":"v1.invoice.paid",
+                "related_object":{"id":"in_test"}}),
+            serde_json::json!({"id":"evt_test","object":"v2.core.event","type":"v1.invoice.paid"}),
+            serde_json::json!({"id":"evt_test","object":"v2.core.event","type":"v1.invoice.paid",
+                "related_object":null}),
+            serde_json::json!({"id":"evt_test","object":"v2.core.event","type":"v1.invoice.paid",
+                "related_object":{}}),
+            serde_json::json!({"id":"evt/test","object":"v2.core.event","type":"v1.invoice.paid",
+                "related_object":{"id":"in_test"}}),
+            serde_json::json!({"id":"evt_test","object":"v2.core.event","type":"v1.invoice.paid",
+                "related_object":{"id":"in/test"}}),
+        ] {
+            assert!(parse_event(&thin(body)).is_err());
+        }
+        let body = br#"{"id":"evt_test","object":"v2.core.event","type":"v1.invoice.paid","related_object":{"id":"in_test","type":"invoice","url":"/v1/invoices/in_test"}}"#;
         assert_eq!(
             parse_event(body),
             Ok(Some(WebhookEvent {
                 id: "evt_test".into(),
-                kind: "invoice.paid".into(),
+                kind: "v1.invoice.paid".into(),
                 object_id: "in_test".into(),
             }))
         );
@@ -393,15 +473,17 @@ mod tests {
     #[test]
     fn every_financial_event_is_an_observation() {
         for kind in [
-            "refund.created",
-            "refund.updated",
-            "refund.failed",
-            "checkout.session.async_payment_succeeded",
-            "charge.dispute.updated",
-            "charge.dispute.funds_reinstated",
+            "v1.refund.created",
+            "v1.refund.updated",
+            "v1.refund.failed",
+            "v1.checkout.session.async_payment_succeeded",
+            "v1.charge.dispute.updated",
+            "v1.charge.dispute.funds_reinstated",
         ] {
             assert_ne!(event_type_label(kind), "other");
         }
+        // A snapshot type's name is not a thin type's.
+        assert_eq!(event_type_label("refund.created"), "other");
         assert_eq!(event_type_label("unexpected_customer_input"), "other");
     }
 

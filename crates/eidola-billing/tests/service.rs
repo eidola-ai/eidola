@@ -113,6 +113,9 @@ async fn serve(State(state): State<Arc<Mutex<Provider>>>, request: Request) -> R
             json!({"id":format!("pi_{n}"),"customer":"cus_1","latest_charge":format!("ch_{n}"),
                 "status":"succeeded","currency":"usd","amount_received":1000})
         }
+        ("GET", path) if path.starts_with("/charges/ch_") => {
+            json!({"id":path.strip_prefix("/charges/").unwrap(),"customer":"cus_1"})
+        }
         _ => return (StatusCode::NOT_FOUND, Json(json!({"error":{"type":"invalid_request_error"}}))).into_response(),
     };
         (result, response_gate)
@@ -732,6 +735,56 @@ async fn separate_workers_do_not_duplicate_a_claim_and_a_later_repair_is_not_los
 
 #[tokio::test]
 #[ignore = "requires isolated BILLING_TEST_DATABASE_URL"]
+async fn a_thin_event_reconciles_its_related_objects_account_and_a_snapshot_kind_does_not() {
+    let f = Fixture::new().await;
+    let before = f.provider.lock().unwrap().snapshot_reads;
+    assert!(
+        f.service
+            .store()
+            .enqueue_event("evt_thin", "v1.charge.succeeded", "ch_1")
+            .await
+            .unwrap()
+    );
+    // The snapshot spelling of the same type is not a kind this worker runs.
+    assert!(
+        f.service
+            .store()
+            .enqueue_event("evt_snapshot", "charge.succeeded", "ch_1")
+            .await
+            .unwrap()
+    );
+    let result = f.service.drain_events(32).await.unwrap();
+    assert_eq!((result.completed, result.failed, result.review), (1, 1, 1));
+    // The related charge named the linked customer, whose account was read.
+    assert_eq!(f.provider.lock().unwrap().snapshot_reads, before + 1);
+    let rows = f
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query(
+            "SELECT id,completed_at IS NOT NULL,last_error,report IS NULL FROM billing_event ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "evt_snapshot");
+    assert!(!rows[0].get::<_, bool>(1));
+    assert_eq!(
+        rows[0].get::<_, Option<String>>(2).as_deref(),
+        Some("unsupported_kind")
+    );
+    assert_eq!(rows[1].get::<_, String>(0), "evt_thin");
+    assert!(rows[1].get::<_, bool>(1));
+    assert_eq!(rows[1].get::<_, Option<String>>(2), None);
+    // Only an account repair keeps a report.
+    assert!(rows.iter().all(|row| row.get::<_, bool>(3)));
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated BILLING_TEST_DATABASE_URL"]
 async fn unsupported_work_remains_pending_and_visible_without_provider_calls() {
     let f = Fixture::new().await;
     let before = f.provider.lock().unwrap().snapshot_reads;
@@ -807,7 +860,7 @@ async fn incompatible_executors_refuse_before_provider_calls_while_v1_producers_
         .unwrap();
     f.service
         .store()
-        .enqueue_event("evt_future_executor", "refund.updated", "re_1")
+        .enqueue_event("evt_future_executor", "v1.refund.updated", "re_1")
         .await
         .unwrap();
     f.service
@@ -853,7 +906,7 @@ async fn incompatible_executors_refuse_before_provider_calls_while_v1_producers_
     assert!(
         f.service
             .store()
-            .enqueue_event("evt_new", "refund.updated", "re_2")
+            .enqueue_event("evt_new", "v1.refund.updated", "re_2")
             .await
             .is_err()
     );
