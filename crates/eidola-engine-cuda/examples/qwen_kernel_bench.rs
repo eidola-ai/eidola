@@ -44,7 +44,7 @@
 //! - `dn_chunk`: the fast profile's blocked DeltaNet at the same width, blocks of 16
 //!   (both kernels, and the intra kernel alone): prefills of 2,048 positions as one, two
 //!   and four runs, one of 10,240 and 64 of 1,760 (tokens a second a layer, and the
-//!   48 layers' time); 1, 8 and 64 decode rows of one new position each, and of one and
+//!   48 layers' time); 1, 2, 4, 8 and 64 decode rows of one new position each, and of one and
 //!   three drafts, with 0, 7 and 15 of its block's positions before it read from the tail
 //!   cache, in the unfused form (its three kernels) and the fused one (`fused_us`);
 //! - `cipher`: the idle cipher over one 157 MB state image;
@@ -419,6 +419,11 @@ fn main() {
         (1, 7, 1),
         (1, 15, 1),
         (1, 7, 4),
+        (2, 7, 1),
+        (4, 0, 1),
+        (4, 7, 1),
+        (4, 15, 1),
+        (4, 7, 4),
         (8, 0, 1),
         (8, 7, 1),
         (8, 15, 1),

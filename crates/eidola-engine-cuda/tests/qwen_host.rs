@@ -279,23 +279,27 @@ fn blocked_deltanet_prepares_only_new_positions() {
     });
 }
 
-/// In blocks a launch whose every run fits the tail cache ring (a decode step's, every
-/// rung's) takes the fused form, and any other (a prefill's) the unfused one: on the eager
-/// and the rung path, at blocks of 16 and widths 0 and 3, each form exactly where it
-/// should, the fused form on every path and width and the unfused one among them. (The
+/// In blocks a launch of at most `DN_FUSED_MAX_RUNS` runs, every one within the tail cache
+/// ring (a decode step's of few rows, a rung's of few rows), takes the fused form, and any
+/// other (a prefill's, or many rows') the unfused one: on the eager and the rung path, at
+/// blocks of 16 and widths 0 and 3, each form exactly where it should, the fused form on
+/// every path and width and the unfused one among them. (The
 /// host device's fused form holds its intra body to the unfused one's scratch bit for bit,
 /// so the suites above check its arithmetic.)
 #[test]
 fn blocked_deltanet_decodes_in_one_launch() {
+    use eidola_engine::engine::CacheScope;
+    use eidola_engine::sampling::SamplingParams;
     use eidola_engine_cuda::qwen::abi::{DnChunkParams, DnSeq};
     use eidola_engine_cuda::qwen::host::HostDevice;
+    use eidola_engine_cuda::qwen::kernels::DN_FUSED_MAX_RUNS;
     use eidola_engine_cuda::qwen::{CudaGraphs, DecodePath};
     use std::sync::{Arc, Mutex};
     let Some(lib) = qwen_common::library() else {
         return;
     };
-    // (fused, the longest run, the ring) a launch.
-    let seen = Arc::new(Mutex::new(Vec::<(bool, u32, u32)>::new()));
+    // (fused, the longest run, the ring, the runs) a launch.
+    let seen = Arc::new(Mutex::new(Vec::<(bool, u32, u32, usize)>::new()));
     let make = || {
         let inner = qwen_common::host_launch(lib.clone());
         let seen = seen.clone();
@@ -307,14 +311,18 @@ fn blocked_deltanet_decodes_in_one_launch() {
             if family == "dn_state" {
                 // SAFETY: the host device hands `dn_state` its `DnChunkParams`, whose runs
                 // are a host array of `seq_count` descriptors.
-                let (longest, ring) = unsafe {
+                let (longest, ring, n) = unsafe {
                     let p = &*params.cast::<DnChunkParams>();
                     let runs =
                         std::slice::from_raw_parts(p.seqs as *const DnSeq, p.seq_count as usize);
-                    (runs.iter().map(|s| s.count).max().unwrap_or(0), p.ring)
+                    (
+                        runs.iter().map(|s| s.count).max().unwrap_or(0),
+                        p.ring,
+                        runs.len(),
+                    )
                 };
                 let f = std::mem::take(&mut *fused.lock().expect("lock"));
-                seen.lock().expect("lock").push((f, longest, ring));
+                seen.lock().expect("lock").push((f, longest, ring, n));
             }
             inner(family, params, gx, gy);
         }))
@@ -325,12 +333,32 @@ fn blocked_deltanet_decodes_in_one_launch() {
             for k in [0u32, 3] {
                 seen.lock().expect("lock").clear();
                 qwen_common::with_path(CudaGraphs::Off, path, || {
-                    qwen_common::invariance::workload(&make, k)
+                    qwen_common::invariance::workload(&make, k);
+                    // Eight sequences decoding together: launches of more runs than the
+                    // fused form takes.
+                    let mut rng = qwen_common::pair::TestRng(4242);
+                    let mut r = qwen_common::invariance::Run::new(make(), k, 6);
+                    for id in 0..8u64 {
+                        r.submit(
+                            id,
+                            rng.tokens(5, qwen_common::pair::VOCAB),
+                            SamplingParams::greedy(),
+                            8,
+                            CacheScope::Private,
+                        );
+                    }
+                    r.run();
                 });
                 let seen = seen.lock().expect("lock");
+                assert!(
+                    seen.iter().any(|l| l.3 > DN_FUSED_MAX_RUNS && !l.0),
+                    "{path:?} at width {k}: no launch of many runs"
+                );
                 let wrong: Vec<_> = seen
                     .iter()
-                    .filter(|&&(f, longest, ring)| f != (longest <= ring))
+                    .filter(|&&(f, longest, ring, n)| {
+                        f != (longest <= ring && n <= DN_FUSED_MAX_RUNS)
+                    })
                     .collect();
                 assert!(
                     wrong.is_empty(),

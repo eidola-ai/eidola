@@ -56,6 +56,7 @@ use eidola_engine_model::qwen::config::{LayerKind, QwenConfig};
 
 use super::abi::*;
 use super::device::{CipherRange, QwenDevice, QwenProfile};
+use super::kernels::DN_FUSED_MAX_RUNS;
 use super::plan::{
     self, AttnRows, DrafterPass, Fa2Geometry, Geo, Item, Layout, SAMPLE_WORDS, Shape, StepPlan,
     TargetPass, buf,
@@ -1267,7 +1268,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         }
         tp.conv_rows = cv;
         tp.tiles = tile;
-        tp.fused = blocked && !long;
+        tp.fused = blocked && !long && runs.len() <= DN_FUSED_MAX_RUNS;
         tp
     }
 
@@ -1728,8 +1729,9 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         // and every new position into the tail kept.
         let t = &mut s.target;
         t.tiles = r * (fold + 1 + wu).div_ceil(self.chunk() as usize);
-        // A rung's rows are decode rows: each run within the tail cache ring.
-        t.fused = self.blocked();
+        // A rung's rows are decode rows, each run within the tail cache ring: the fused form
+        // for a rung of few enough of them.
+        t.fused = self.blocked() && r <= DN_FUSED_MAX_RUNS;
         t.staged = if self.blocked() {
             r * (1 + wu)
         } else {
