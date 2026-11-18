@@ -29,7 +29,7 @@ The worker needs the database settings and `STRIPE_API_KEY`, but no webhook secr
 
 Both roles handle SIGTERM and SIGINT. Receivers stop accepting connections and allow active requests up to 30 seconds to finish. Workers stop taking new batches and allow an active batch up to 30 seconds to finish. After that, incomplete work remains durable and its database locks are released when the process exits. Set the container termination grace longer than 30 seconds. Runtime logs report fixed failure categories/counts to stderr without event bodies, account references, or credentials.
 
-The image recipe is [oci/eidola-billing/Containerfile](../../oci/eidola-billing/Containerfile). Build from the repository root:
+The image recipe is [oci/eidola-billing/Containerfile](../../oci/eidola-billing/Containerfile). The artifacts workflow builds it reproducibly and publishes it as `ghcr.io/eidola-ai/eidola-billing` (tags `main`, `sha-<short>` and each release's `v*`); from manifest schema 5 a release's `artifact-manifest.json` records its digest as `eidola-billing`, so deploy by that digest. Billing is outside the attested boundary: nothing verifies the image at runtime, and the digest is checked by pulling it or by rebuilding. To build it locally, from the repository root:
 
 ```sh
 docker buildx build --platform linux/amd64 --load \
