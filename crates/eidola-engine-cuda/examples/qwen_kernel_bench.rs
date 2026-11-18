@@ -19,6 +19,11 @@
 //!   with RoPE), `widen` (the DeltaNet's conv inputs, 10,240 wide), `quant` (over
 //!   activation-like values), `gate` (fast f32 and exact f64), `dn_prep`, `dn_norm`: one
 //!   launch at the released widths, at 1, 8, 64, 256 and 2,048 rows;
+//! - `fa2`: one target layer's FA2 decode launch (and its merge) as a rung runs it, at
+//!   the released heads (24 query, 4 KV, 256 wide; pages of 256 positions): 1, 8, 16, 32
+//!   and 64 rows of one query (`decode`) and of four (`drafted`: a host token and three
+//!   drafts), each row at 1,024, 4,096 and 12,288 keys, its keys split at 256, 512 (the
+//!   executor's `plan::SPLIT_KEYS`) and 1,024 (the split before it) positions;
 //! - `head`: the BF16 head (248,320 × 5,120), fast;
 //! - `sample`: Qwen's sampler over the released vocabulary at 1, 8, 64 and 256 rows,
 //!   greedy, at temperature 1 alone, and with top-k 20 and top-p 0.95 (the conversation
@@ -236,6 +241,7 @@ fn main() {
     }
 
     small_kernels(&fast, it, &mut keep);
+    fa2_decode(&fast, it, &mut keep);
     sampler(&fast, &dir, it, &mut keep);
     copies(&fast, &dir, it, &mut keep);
 
@@ -528,6 +534,123 @@ fn main() {
 }
 
 /// One JSON line of a small kernel's mean launch time.
+/// One FA2 decode launch of a target layer as a rung makes it (`PassCaps` for its rows,
+/// a fixed grid walking the work list, the merge), over KV pages of zeros: the kernels'
+/// time does not depend on the values.
+fn fa2_decode(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::Any>>) {
+    use eidola_engine_cuda::mimo::attention::{
+        AttnLayer, AttnRequest, HostPlan, Partials, PassCaps, Reduction,
+    };
+    use eidola_engine_cuda::qwen::attention::{
+        Fa2Args, HEAD_DIM, MAX_TILE, PARTIAL_BYTES_PER_HEAD, pass_words,
+    };
+    let (hq, hk, bs) = (24u32, 4u32, 256u32);
+    let w = u64::from(hk * HEAD_DIM);
+    let block_bytes = u64::from(bs) * w * 2 * 2;
+    let max_rows = 64u32;
+    let max_queries = 4u32;
+    let max_ctx = 12_288u32;
+    let blocks = max_rows * max_ctx.div_ceil(bs);
+    let us = |x: u64| usize::try_from(x).unwrap_or_else(|e| fail(e));
+    let pool = alloc(fast, us(u64::from(blocks) * block_bytes), keep);
+    let qrows = (max_rows * max_queries) as usize;
+    let q = alloc(fast, qrows * hq as usize * HEAD_DIM as usize * 2, keep);
+    fill(fast, q, qrows * hq as usize * HEAD_DIM as usize * 2, 7);
+    let o = alloc(fast, qrows * hq as usize * HEAD_DIM as usize * 2, keep);
+    let sink = alloc(fast, hq as usize * 4, keep);
+    let inf: Vec<u8> = (0..hq)
+        .flat_map(|_| f32::NEG_INFINITY.to_le_bytes())
+        .collect();
+    // SAFETY: `hq` f32 of the allocation just made.
+    unsafe { fast.upload(sink, &inf) }.unwrap_or_else(|e| fail(e));
+    let most_partials = max_rows * max_queries * max_ctx.div_ceil(256);
+    let part_v = alloc(
+        fast,
+        most_partials as usize * hq as usize * HEAD_DIM as usize * 2,
+        keep,
+    );
+    let part_s = alloc(fast, most_partials as usize * hq as usize * 4, keep);
+    debug_assert_eq!(PARTIAL_BYTES_PER_HEAD, HEAD_DIM as usize * 2 + 4);
+    let words = alloc(fast, 4 << 20, keep);
+    let layer = AttnLayer {
+        k_base: pool,
+        v_base: pool + u64::from(bs) * w * 2,
+        k_page_stride: w32(us(u64::from(bs) * w * 2)),
+        v_page_stride: w32(us(u64::from(bs) * w * 2)),
+        num_kv_heads: hk,
+        page_size: bs,
+        window_left: -1,
+        sink,
+    };
+    for (form, queries) in [("decode", 1u32), ("drafted", max_queries)] {
+        for rows in [1u32, 8, 16, 32, 64] {
+            for ctx in [1024u32, 4096, 12_288] {
+                for keys in [256u32, 512, 1024] {
+                    let pages = ctx.div_ceil(bs);
+                    let requests: Vec<AttnRequest> = (0..rows)
+                        .map(|r| AttnRequest {
+                            q_start: r * queries,
+                            qo_len: queries,
+                            pages: (r * pages..(r + 1) * pages).collect(),
+                            kv_start: 0,
+                            kv_len: ctx,
+                        })
+                        .collect();
+                    let caps = PassCaps::with_split_keys(
+                        Reduction::Split,
+                        rows,
+                        queries,
+                        hq / hk,
+                        bs,
+                        pages,
+                        ctx,
+                        MAX_TILE,
+                        keys,
+                    )
+                    .unwrap_or_else(|e| fail(e));
+                    let plan = HostPlan::with_split_keys(
+                        &requests,
+                        hq / hk,
+                        bs,
+                        Reduction::Split,
+                        most_partials,
+                        MAX_TILE,
+                        keys,
+                    )
+                    .unwrap_or_else(|e| fail(e));
+                    let (table, view) =
+                        pass_words(&plan, 0, &caps, words).unwrap_or_else(|e| fail(e));
+                    // SAFETY: the table fits the 4 MiB just made.
+                    unsafe { fast.upload(words, bytes_of(&table).as_slice()) }
+                        .unwrap_or_else(|e| fail(e));
+                    let a = Fa2Args {
+                        view,
+                        layer,
+                        num_qo_heads: hq,
+                        q,
+                        o,
+                        partials: Partials {
+                            v: part_v,
+                            s: part_s,
+                            rows: most_partials,
+                            heads: hq,
+                        },
+                        scale: 1.0 / 16.0,
+                    };
+                    // SAFETY: the plan's pages lie in the pool; the buffers hold its rows.
+                    let t = time(fast, it, || {
+                        unsafe { fast.fa2(&a) }.unwrap_or_else(|e| fail(e))
+                    });
+                    println!(
+                        "{{\"bench\":\"fa2\",\"form\":\"{form}\",\"rows\":{rows},\"keys\":{ctx},\"split_keys\":{keys},\"us\":{:.1}}}",
+                        t * 1e6
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn line(bench: &str, form: &str, rows: u32, s: f64) {
     println!(
         "{{\"bench\":\"{bench}\",\"form\":\"{form}\",\"rows\":{rows},\"us\":{:.2}}}",

@@ -21,7 +21,7 @@
 use eidola_engine::spec::NULL_BLOCK;
 
 use super::abi::DnSeq;
-use crate::mimo::attention::{AttnRequest, HostPlan, PassCaps, Reduction, SPLIT_KEYS};
+use crate::mimo::attention::{AttnRequest, HostPlan, PassCaps, Reduction};
 use crate::sampler::SampleRow;
 use crate::{CudaError, Result, narrow};
 
@@ -190,6 +190,28 @@ pub struct StepPlan {
 
 // ---- shapes ----
 
+/// Qwen3.8's FA2 split: every query's keys are reduced in chunks of this many absolute
+/// positions (from each group's first key), each chunk a work item of its own and the
+/// chunks merged in order, so a row at key `p` merges chunks `0 ..= p / SPLIT_KEYS`
+/// whether it is decoded or prefilled. At a decode step a row's attention is then as many
+/// CTAs as it has chunks, each walking at most `SPLIT_KEYS` keys (MiMo's plan splits at
+/// 1,024). A multiple of the 64-key tile.
+pub const SPLIT_KEYS: u32 = 512;
+
+/// Keys a forward row's partial rows are counted at for FA2's scratch: the scratch holds
+/// one partial row per this many positions of every forward row, or a decode rung's rows
+/// at [`SPLIT_KEYS`], whichever is more ([`partial_rows`]). A prefill pass whose rows need
+/// more (long positions at the shorter chunk) is cut into passes that fit.
+pub const PARTIAL_KEYS: u32 = 1024;
+
+/// One FA2 launch of an attention: its reservation, and the first query row its merge
+/// writes (0 for a pass that is its attention's only one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fa2Pass {
+    pub caps: PassCaps,
+    pub out_row: u32,
+}
+
 /// An FA2 launch's geometry: query heads per KV head, the page size, and the partial
 /// rows the scratch holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,16 +222,17 @@ pub struct Fa2Geometry {
 }
 
 /// What every launch of one attention takes as counts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttnShape {
     pub rows: usize,
     /// The exact kernel's block-table width (0 in the fast profile).
     pub table_width: usize,
-    /// The FA2 pass's reservation (fast profile).
-    pub fa2: Option<PassCaps>,
+    /// The FA2 passes' reservations (fast profile): one for a decode rung, as many as
+    /// the partial rows need for an eager step.
+    pub fa2: Vec<Fa2Pass>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetShape {
     pub token_copies: usize,
     pub runs: usize,
@@ -224,7 +247,7 @@ pub struct TargetShape {
     pub attn: AttnShape,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DrafterShape {
     pub kv_only: bool,
     pub attn: AttnShape,
@@ -257,34 +280,36 @@ pub struct Geo {
     pub drafter: Fa2Geometry,
 }
 
-/// The FA2 plan of `requests`, one pass.
+/// The FA2 plan of `requests` at [`SPLIT_KEYS`], in passes whose partial rows fit the
+/// scratch.
 pub fn fa2_plan(requests: &[AttnRequest], g: &Fa2Geometry) -> Result<HostPlan> {
-    let plan = HostPlan::with_max_tile(
+    HostPlan::with_split_keys(
         requests,
         g.group_size,
         g.page_size,
         Reduction::Split,
         g.partial_rows,
         super::attention::MAX_TILE,
-    )?;
-    if plan.passes().len() != 1 {
-        return Err(CudaError::new(format!(
-            "attention: {} passes; the partial rows hold one",
-            plan.passes().len()
-        )));
-    }
-    Ok(plan)
+        SPLIT_KEYS,
+    )
 }
 
-/// An eager launch's reservation: exactly its plan's own.
-fn own_caps(plan: &HostPlan) -> Result<PassCaps> {
-    let p = &plan.passes()[0];
-    let shape = p.shape(plan)?;
-    Ok(PassCaps {
-        shape,
-        work_items: shape.grid,
-        pages: narrow(p.indices.len(), "pages")?,
-    })
+/// An eager attention's reservations: exactly its plan's own passes.
+fn own_passes(plan: &HostPlan) -> Result<Vec<Fa2Pass>> {
+    plan.passes()
+        .iter()
+        .map(|p| {
+            let shape = p.shape(plan)?;
+            Ok(Fa2Pass {
+                caps: PassCaps {
+                    shape,
+                    work_items: shape.grid,
+                    pages: narrow(p.indices.len(), "pages")?,
+                },
+                out_row: p.q_rows.start,
+            })
+        })
+        .collect()
 }
 
 fn attn_shape(a: &AttnRows, geo: &Geo, g: &Fa2Geometry) -> Result<AttnShape> {
@@ -292,9 +317,9 @@ fn attn_shape(a: &AttnRows, geo: &Geo, g: &Fa2Geometry) -> Result<AttnShape> {
         rows: a.rope.len(),
         table_width: if geo.fast { 0 } else { geo.table_width },
         fa2: if geo.fast && !a.requests.is_empty() {
-            Some(own_caps(&fa2_plan(&a.requests, g)?)?)
+            own_passes(&fa2_plan(&a.requests, g)?)?
         } else {
-            None
+            Vec::new()
         },
     })
 }
@@ -320,7 +345,7 @@ impl Shape {
             let mut attn = attn_shape(&d.attn, geo, &geo.drafter)?;
             if d.kv_only {
                 // Only the KV write: no attention reads.
-                attn.fa2 = None;
+                attn.fa2 = Vec::new();
                 attn.table_width = 0;
             }
             Ok(DrafterShape {
@@ -370,10 +395,12 @@ pub struct ItemsAt {
     pub items: usize,
 }
 
-/// One FA2 pass's arrays (a `PaddedPass`'s), and its reservation.
+/// One FA2 pass's arrays (a `PaddedPass`'s), its reservation, and the first query row
+/// its merge writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fa2At {
     pub caps: PassCaps,
+    pub out_row: u32,
     pub q_indptr: Arr,
     pub indices: Arr,
     pub indptr: Arr,
@@ -387,7 +414,7 @@ pub struct Fa2At {
     pub counts: Arr,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttnAt {
     pub rows: usize,
     pub rope: Arr,
@@ -395,10 +422,10 @@ pub struct AttnAt {
     pub targets: Arr,
     pub tables: Arr,
     pub table_width: usize,
-    pub fa2: Option<Fa2At>,
+    pub fa2: Vec<Fa2At>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetAt {
     pub tokens: Arr,
     pub token_copies: ItemsAt,
@@ -424,7 +451,7 @@ impl TargetAt {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DrafterAt {
     pub token_copies: ItemsAt,
     pub hidden_copies: ItemsAt,
@@ -490,19 +517,24 @@ impl Arena {
             targets: self.arr(s.rows),
             tables: self.arr(s.rows * s.table_width),
             table_width: s.table_width,
-            fa2: s.fa2.map(|caps| Fa2At {
-                caps,
-                q_indptr: self.arr(caps.request_words()),
-                indptr: self.arr(caps.request_words()),
-                last_page_len: self.arr(caps.request_words() - 1),
-                o_indptr: self.arr(caps.request_words()),
-                merge_indptr: self.arr(caps.merge_words()),
-                request_indices: self.arr(caps.work_items as usize),
-                qo_tile_indices: self.arr(caps.work_items as usize),
-                kv_tile_indices: self.arr(caps.work_items as usize),
-                counts: self.arr(2),
-                indices: self.arr(caps.pages as usize),
-            }),
+            fa2: s
+                .fa2
+                .iter()
+                .map(|&Fa2Pass { caps, out_row }| Fa2At {
+                    caps,
+                    out_row,
+                    q_indptr: self.arr(caps.request_words()),
+                    indptr: self.arr(caps.request_words()),
+                    last_page_len: self.arr(caps.request_words() - 1),
+                    o_indptr: self.arr(caps.request_words()),
+                    merge_indptr: self.arr(caps.merge_words()),
+                    request_indices: self.arr(caps.work_items as usize),
+                    qo_tile_indices: self.arr(caps.work_items as usize),
+                    kv_tile_indices: self.arr(caps.work_items as usize),
+                    counts: self.arr(2),
+                    indices: self.arr(caps.pages as usize),
+                })
+                .collect(),
         }
     }
 
@@ -645,8 +677,24 @@ fn attn(words: &mut [u32], at: &AttnAt, a: &AttnRows, g: &Fa2Geometry, what: &st
     if at.table_width > 0 {
         exact(words, at.tables, &a.tables, what)?;
     }
-    if let Some(f) = &at.fa2 {
-        let p = fa2_plan(&a.requests, g)?.padded(&f.caps)?;
+    if at.fa2.is_empty() {
+        return Ok(());
+    }
+    let plan = fa2_plan(&a.requests, g)?;
+    if plan.passes().len() != at.fa2.len() {
+        return Err(refuse(format!(
+            "{what}: {} attention passes in a shape of {}",
+            plan.passes().len(),
+            at.fa2.len()
+        )));
+    }
+    for (i, f) in at.fa2.iter().enumerate() {
+        let p = plan.padded_pass(i, &f.caps)?;
+        if p.out_row != f.out_row {
+            return Err(refuse(format!(
+                "{what}: attention pass {i} starts elsewhere"
+            )));
+        }
         exact(words, f.q_indptr, &p.q_indptr, what)?;
         exact(words, f.indptr, &p.indptr, what)?;
         exact(words, f.last_page_len, &p.last_page_len, what)?;
@@ -788,9 +836,13 @@ pub fn pad_page(pad_block: u32, page_size: u32, block_size: u32) -> u32 {
 /// `NULL_BLOCK` as a table word.
 pub const NULL: u32 = NULL_BLOCK;
 
-/// The partial rows FA2's scratch needs for `rows` query rows reaching `positions`.
-pub fn partial_rows(rows: u32, positions: u32) -> u32 {
-    rows.saturating_mul(positions.div_ceil(SPLIT_KEYS).max(1))
+/// The partial rows FA2's scratch holds for forwards of `rows` query rows and decode
+/// rungs of `decode_rows`, every row reaching `positions`: a forward row's at one per
+/// [`PARTIAL_KEYS`] positions or a rung row's at one per [`SPLIT_KEYS`], the more of the
+/// two. A rung's attention is one pass; an eager forward's takes as many as its rows need.
+pub fn partial_rows(rows: u32, decode_rows: u32, positions: u32) -> u32 {
+    rows.saturating_mul(positions.div_ceil(PARTIAL_KEYS).max(1))
+        .max(decode_rows.saturating_mul(positions.div_ceil(SPLIT_KEYS).max(1)))
 }
 
 #[cfg(test)]
@@ -940,8 +992,8 @@ mod tests {
     #[test]
     fn fa2_requests_pack_into_a_rungs_reservation() {
         let g = geo(true);
-        // A rung of 4 decode rows reaching key 2,100 (three chunks of 1,024).
-        let caps = PassCaps::with_max_tile(
+        // A rung of 4 decode rows reaching key 2,200 (five chunks of 512).
+        let caps = PassCaps::with_split_keys(
             Reduction::Split,
             4,
             1,
@@ -950,6 +1002,7 @@ mod tests {
             600,
             2200,
             super::super::attention::MAX_TILE,
+            SPLIT_KEYS,
         )
         .expect("caps");
         let mut p = StepPlan {
@@ -960,12 +1013,13 @@ mod tests {
             .map(|r| request(r, 1, 100 + 600 * r, 4, &mut |j| j + 1))
             .collect();
         let mut s = Shape::of(&p, &g).expect("shape");
-        s.target.attn.fa2 = Some(caps);
+        s.target.attn.fa2 = vec![Fa2Pass { caps, out_row: 0 }];
         let l = Layout::new(&s);
         let w = pack(&p, &l, &g).expect("pack");
-        let f = l.target.attn.fa2.expect("fa2");
-        // Work items: one per row and chunk (1 + 1 + 2 + 2), walked by the fixed grid.
-        assert_eq!(w[f.counts.at], 6);
+        let f = l.target.attn.fa2[0];
+        // Work items: one per row and chunk of 512 (keys 101, 701, 1,301 and 1,901: 1 + 2
+        // + 3 + 4), walked by the fixed grid.
+        assert_eq!(w[f.counts.at], 10);
         assert_eq!(w[f.counts.at + 1], SPLIT_KEYS);
         assert_eq!(caps.shape.grid, caps.work_items.min(148));
         // Rows past the reservation's pages (600 a row) are refused.
@@ -973,6 +1027,53 @@ mod tests {
             .map(|r| request(r, 1, 2403, 4, &mut |j| j + 1))
             .collect();
         assert!(pack(&p, &l, &g).is_err());
+    }
+
+    /// An eager attention whose partial rows outgrow the scratch runs in passes, each
+    /// packed into its own reservation and merging its own rows; every row's chunks are
+    /// `0 ..= key / SPLIT_KEYS` whichever pass it lands in, as at a decode step.
+    #[test]
+    fn eager_attention_takes_the_passes_its_partials_need() {
+        let mut g = geo(true);
+        // 128 prefill rows at keys 2,000 .. 2,128: 4 or 5 chunks a row, about 540 partial
+        // rows against a scratch of 200.
+        g.target.partial_rows = 200;
+        let mut p = StepPlan {
+            target: row_pass(128, 128, true),
+            ..StepPlan::default()
+        };
+        p.target.attn.requests = vec![request(0, 128, 2127, 4, &mut |j| j + 1)];
+        p.target.attn.rope = (2000..2128).collect();
+        p.target.attn.query = (2000..2128).collect();
+        let s = Shape::of(&p, &g).expect("shape");
+        let passes = &s.target.attn.fa2;
+        assert!(passes.len() >= 3, "{} passes", passes.len());
+        assert_eq!(passes[0].out_row, 0);
+        assert!(passes.windows(2).all(|w| w[0].out_row < w[1].out_row));
+        assert!(passes.iter().all(|f| f.caps.shape.partial_rows <= 200));
+        let l = Layout::new(&s);
+        let w = pack(&p, &l, &g).expect("pack");
+        // Every query row's chunks across the passes: its key over 512, plus one.
+        let mut chunks_of_rows = Vec::new();
+        for f in &l.target.attn.fa2 {
+            let items = w[f.counts.at] as usize;
+            assert_eq!(w[f.counts.at + 1], SPLIT_KEYS);
+            let rows = f.caps.shape.merge_rows as usize;
+            let merge = &w[f.merge_indptr.at..f.merge_indptr.at + rows + 1];
+            for r in 0..rows {
+                chunks_of_rows.push(merge[r + 1] - merge[r]);
+            }
+            assert!(items > 0);
+        }
+        let want: Vec<u32> = (2000..2128u32).map(|k| k / SPLIT_KEYS + 1).collect();
+        assert_eq!(chunks_of_rows, want);
+        // A shape of another pass count is refused.
+        let mut fewer = s.clone();
+        fewer.target.attn.fa2.pop();
+        assert!(pack(&p, &Layout::new(&fewer), &g).is_err());
+        // The scratch sized as the executor sizes it holds a decode rung in one pass.
+        assert!(partial_rows(2048, 256, 32_769) >= 256 * 32_769u32.div_ceil(SPLIT_KEYS));
+        assert!(partial_rows(2048, 256, 32_769) >= 2048 * 32_769u32.div_ceil(PARTIAL_KEYS));
     }
 
     #[test]

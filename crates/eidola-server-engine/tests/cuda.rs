@@ -1214,6 +1214,15 @@ fn the_nodes_qwen_pools_and_scratch_are_the_shared_counts() {
     }
 }
 
+/// The shared scratch rule counts FA2's partial rows at the executor's own chunks.
+#[test]
+fn the_shared_rule_counts_the_executors_attention_chunks() {
+    use eidola_common::engine_deployment::{RECURRENT_PARTIAL_KEYS, RECURRENT_SPLIT_KEYS};
+    use eidola_engine_cuda::qwen::plan::{PARTIAL_KEYS, SPLIT_KEYS};
+    assert_eq!(u64::from(SPLIT_KEYS), RECURRENT_SPLIT_KEYS);
+    assert_eq!(u64::from(PARTIAL_KEYS), RECURRENT_PARTIAL_KEYS);
+}
+
 // ---------------------------------------------------------------------------------------
 // With a device: real Flash weights.
 // ---------------------------------------------------------------------------------------

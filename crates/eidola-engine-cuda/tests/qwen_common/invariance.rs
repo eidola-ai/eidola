@@ -103,9 +103,26 @@ pub struct Run<D: QwenDevice> {
 
 impl<D: QwenDevice> Run<D> {
     pub fn new(dev: D, k: u32, chunk: u32) -> Self {
+        Self::with_config(dev, k, chunk, cuda_config(&Geometry::plain(k)))
+    }
+
+    /// [`Run::new`] for sequences up to 2,048 positions: past several of FA2's 512-key
+    /// chunks, and with prefill chunks whose attention outgrows the partial rows of one
+    /// pass.
+    pub fn long(dev: D, chunk: u32) -> Self {
+        let mut c = cuda_config(&Geometry::plain(0));
+        c.max_model_len = 2048;
+        Self::with_config(dev, 0, chunk, c)
+    }
+
+    fn with_config(
+        dev: D,
+        k: u32,
+        chunk: u32,
+        cfg: eidola_engine_cuda::qwen::QwenCudaExecutorConfig,
+    ) -> Self {
         let model = fixture();
-        let mut ex =
-            QwenCudaExecutor::new(dev, &model, cuda_config(&Geometry::plain(k))).expect("executor");
+        let mut ex = QwenCudaExecutor::new(dev, &model, cfg).expect("executor");
         super::apply_path(&mut ex);
         let rec = Recorder {
             inner: ex,
@@ -322,6 +339,7 @@ pub fn all<D: QwenDevice>(make: &dyn Fn() -> D) -> Vec<(&'static str, Result<Str
     })();
     out.push(("draft_widths", res));
     out.push(("drafting", drafting(make, &prompt, &crowd)));
+    out.push(("long_context", long_context(make)));
     out
 }
 
@@ -438,6 +456,39 @@ pub fn blocks<D: QwenDevice>(make: &dyn Fn() -> D) -> Vec<(&'static str, Result<
     })();
     out.push(("block draft widths", res));
     out
+}
+
+/// A prompt of 1,800 positions (four of FA2's 512-key chunks at its end), prefilled in
+/// chunks of 256 (whose last full chunk's attention takes two passes of the partial rows)
+/// and of 100 (one pass each), then decoded: the same tokens and logits bits; and decoded
+/// positions against the same positions prefilled.
+pub fn long_context<D: QwenDevice>(make: &dyn Fn() -> D) -> Result<String, String> {
+    let g = SamplingParams::greedy();
+    let prompt = TestRng(9191).tokens(1800, VOCAB);
+    let run = |chunk: u32, p: Vec<u32>, max: u32| {
+        let mut r = Run::long(make(), chunk);
+        r.submit(1, p, g, max, CacheScope::Private);
+        r.run();
+        r
+    };
+    let wide = run(256, prompt.clone(), 6);
+    let narrow = run(100, prompt.clone(), 6);
+    ensure(
+        wide.outputs[&1] == narrow.outputs[&1],
+        "tokens differ between prefill chunks of 256 and 100".into(),
+    )?;
+    let mut n = agree("chunks of 256 and 100", wide.book(), narrow.book())?;
+    ensure(n >= 6, format!("only {n} prefixes compared"))?;
+    let mut p = prompt;
+    p.extend_from_slice(&wide.outputs[&1][..3]);
+    let prefilled = run(256, p, 1);
+    let m = agree("decoded and prefilled", wide.book(), prefilled.book())?;
+    ensure(
+        m == 1,
+        format!("decoded and prefilled: {m} prefixes compared"),
+    )?;
+    n += m;
+    Ok(format!("{n} prefixes past 1,800 positions"))
 }
 
 /// With drafting on (width 3): a greedy and a seeded sampled request each alone, beside

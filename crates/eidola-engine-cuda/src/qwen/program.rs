@@ -1142,9 +1142,8 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         if kv_only {
             return Ok(());
         }
-        match &at.fa2 {
-            Some(f) => self.fa2(f, group, layer)?,
-            None => {
+        match at.fa2.as_slice() {
+            [] => {
                 let ap = AttnParams {
                     q: s.q.addr,
                     pool: pool.data.addr,
@@ -1170,6 +1169,12 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                 // SAFETY: the tables cover every visible position; the scores hold the
                 // capacity's rows at the fixed stride.
                 unsafe { self.dev.attention(&ap)? };
+            }
+            // FA2 pass by pass: each merges its own rows from its first one on.
+            passes => {
+                for f in passes {
+                    self.fa2(f, group, layer)?;
+                }
             }
         }
         let gp = GateParams {
@@ -1223,7 +1228,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         };
         let view = PlanView {
             shape: f.caps.shape,
-            out_row: 0,
+            out_row: f.out_row,
             q_indptr: self.tw(f.q_indptr),
             indices: self.tw(f.indices),
             indptr: self.tw(f.indptr),

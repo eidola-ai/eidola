@@ -1718,7 +1718,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             let len = self.cfg.max_model_len + self.cfg.draft_tokens + 1;
             let blocks = self.spec.max_blocks_per_seq();
             let caps = |queries: u32, g: &Fa2Geometry, pages: u32| {
-                PassCaps::with_max_tile(
+                PassCaps::with_split_keys(
                     Reduction::Split,
                     rows,
                     queries,
@@ -1727,11 +1727,18 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                     pages,
                     len,
                     super::attention::MAX_TILE,
+                    plan::SPLIT_KEYS,
                 )
             };
-            s.target.attn.fa2 = Some(caps(1 + w, &geo.target, blocks)?);
+            s.target.attn.fa2 = vec![plan::Fa2Pass {
+                caps: caps(1 + w, &geo.target, blocks)?,
+                out_row: 0,
+            }];
             for d in &mut s.lead {
-                d.attn.fa2 = Some(caps(1, &geo.drafter, len)?);
+                d.attn.fa2 = vec![plan::Fa2Pass {
+                    caps: caps(1, &geo.drafter, len)?,
+                    out_row: 0,
+                }];
             }
         }
         Ok(s)
@@ -2534,6 +2541,7 @@ fn capacities(cfg: &QwenCudaExecutorConfig, tail_cap: u32) -> Caps {
         tiles: chunk_tiles(staged, r + 1, block_chunk(cfg.block_size)),
         readback: 1 + r + r * (k + 1) + r,
         score_stride: positions as usize,
-        partial_rows: plan::partial_rows(n32(rows), positions) as usize,
+        // A rung's rows: every sequence's host token and drafts.
+        partial_rows: plan::partial_rows(n32(rows), n32(r * (k + 1)), positions) as usize,
     }
 }
