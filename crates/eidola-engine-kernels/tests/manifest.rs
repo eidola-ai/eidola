@@ -145,7 +145,11 @@ fn mma(manifest: &Manifest, name: &str, arch: &str, family: &str) -> u64 {
 fn sass_uses_the_intended_tensor_core_path() {
     let manifest = Manifest::embedded();
     for arch in ["sm_100a", "sm_103a", "sm_100f"] {
-        for gemm in ["cutlass_fp8_blockwise_gemm", "deepgemm_fp8_fp4_grouped"] {
+        for gemm in [
+            "cutlass_fp8_blockwise_gemm",
+            "cutlass_fp8_blockwise_swap",
+            "deepgemm_fp8_fp4_grouped",
+        ] {
             assert!(mma(manifest, gemm, arch, "UTCQMMA") > 0, "{gemm} {arch}");
             assert_eq!(mma(manifest, gemm, arch, "HMMA"), 0, "{gemm} {arch}");
         }
@@ -167,6 +171,7 @@ fn sass_uses_the_intended_tensor_core_path() {
             "engine_ops",
             "engine_ops_reference",
             "kv_cipher",
+            "qwen_fast",
         ] {
             let cubin = manifest.cubin(own, arch).expect("cubin");
             assert!(cubin.mma_sass.is_empty(), "{own} {arch}");
@@ -532,5 +537,39 @@ fn qwen_fa2_d256_is_the_mma_sync_path() {
             ],
             "{arch}"
         );
+    }
+}
+
+/// The fast profile's own kernels: the `own` profile (contraction allowed: their bodies
+/// spell out the fused multiply-adds they mean), no tensor cores, exactly their two
+/// entries; and the swapped FP8 GEMM's image exactly its three tile instances.
+#[test]
+fn qwen_fast_images_hold_their_entries() {
+    let manifest = Manifest::embedded();
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        for (name, profile, entries) in [
+            (
+                "qwen_fast",
+                "own",
+                &["eidola_qwen_fast_gate", "eidola_qwen_fast_gemm_bf16"][..],
+            ),
+            (
+                "cutlass_fp8_blockwise_swap",
+                "cutlass",
+                &[
+                    "eidola_cutlass_fp8_blockwise_swap16_bf16",
+                    "eidola_cutlass_fp8_blockwise_swap32_bf16",
+                    "eidola_cutlass_fp8_blockwise_swap64_bf16",
+                ][..],
+            ),
+        ] {
+            let cubin = manifest
+                .cubin(name, arch)
+                .unwrap_or_else(|| panic!("no cubin {name} {arch}"));
+            assert_eq!(cubin.profile, profile, "{name}");
+            let mut symbols: Vec<&str> = cubin.entries.iter().map(|e| e.symbol.as_str()).collect();
+            symbols.sort_unstable();
+            assert_eq!(symbols, entries, "{name} {arch}");
+        }
     }
 }

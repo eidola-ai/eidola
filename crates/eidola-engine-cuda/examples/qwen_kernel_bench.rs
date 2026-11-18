@@ -3,8 +3,14 @@
 //!     qwen_kernel_bench <kernel dir> [--quick]
 //!
 //! - `copy`: device-to-device bandwidth (the streaming roofline every estimate assumes);
-//! - `lin8`: the FP8 linear at the released fused shapes, fast (CUTLASS) at 1 to 2,048
-//!   rows and exact at 1 and 4: µs, TB/s of weights, TFLOP/s;
+//! - `lin8`: the FP8 linear at the released fused shapes, fast (CUTLASS, the GEMM
+//!   `fp8_kind` dispatches to) at 1 to 2,048 rows and exact at 1 and 4: µs, TB/s of
+//!   weights, TFLOP/s; and `lin8_kind`, every fast GEMM forced (the swapped kernel at
+//!   each activation tile, and the unswapped one) at 1, 8, 64 and 2,048 rows;
+//! - `small_gemm`: the DeltaNet's stacked `a` and `b` projections (96 × 5,120) on the
+//!   small-N kernel and on CUTLASS's BF16 GEMM, at 1, 8, 64 and 2,048 rows;
+//! - `norm`, `quant`, `gate` (fast f32 and exact f64), `dn_prep`, `dn_norm`: one launch
+//!   at the released widths, at 1, 8, 64 and 2,048 rows;
 //! - `head`: the BF16 head (248,320 × 5,120), fast;
 //! - `dn_rec`: one DeltaNet layer's recurrence at the released width, 1 to 64 rows, with
 //!   a fold of 0 and 9 positions before 4 outputs; one row prefilling 2,048 and 10,240
@@ -22,7 +28,7 @@ use eidola_engine_cuda::KernelDir;
 use eidola_engine_cuda::qwen::QwenDevice;
 use eidola_engine_cuda::qwen::QwenProfile;
 use eidola_engine_cuda::qwen::abi::*;
-use eidola_engine_cuda::qwen::cuda::CudaDevice;
+use eidola_engine_cuda::qwen::cuda::{CudaDevice, FP8_KINDS};
 use eidola_engine_cuda::qwen::kernels::QwenKernels;
 
 fn fail(what: impl std::fmt::Display) -> ! {
@@ -117,7 +123,7 @@ fn main() {
             .collect();
         // SAFETY: as above.
         unsafe { fast.upload(scales, &sa) }.unwrap_or_else(|e| fail(e));
-        for rows in [1u32, 4, 16, 64, 256, 1024, 2048] {
+        for rows in [1u32, 4, 8, 16, 32, 64, 256, 1024, 2048] {
             let m_pad = rows.next_multiple_of(4);
             let p = Lin8Params {
                 a: codes,
@@ -148,8 +154,25 @@ fn main() {
                     2.0 * bytes * f64::from(rows) / s / 1e12
                 );
             }
+            if [1, 8, 64, 2048].contains(&rows) {
+                for kind in FP8_KINDS {
+                    // SAFETY: as above.
+                    let s = time(&fast, it, || {
+                        unsafe { fast.lin8_on(&p, kind) }.unwrap_or_else(|e| fail(e))
+                    });
+                    let bytes = f64::from(n) * f64::from(k);
+                    println!(
+                        "{{\"bench\":\"lin8_kind\",\"kind\":\"{kind:?}\",\"n\":{n},\"k\":{k},\"rows\":{rows},\"us\":{:.1},\"weight_tb_per_s\":{:.2},\"tflops\":{:.1}}}",
+                        s * 1e6,
+                        bytes / s / 1e12,
+                        2.0 * bytes * f64::from(rows) / s / 1e12
+                    );
+                }
+            }
         }
     }
+
+    small_kernels(&fast, it, &mut keep);
 
     let (vocab, hidden) = (248_320u32, 5120u32);
     let head = alloc(&fast, vocab as usize * hidden as usize * 2, &mut keep);
@@ -290,4 +313,164 @@ fn main() {
         image as f64 / d2h / 1e9,
         image as f64 / h2d / 1e9
     );
+}
+
+/// One JSON line of a small kernel's mean launch time.
+fn line(bench: &str, form: &str, rows: u32, s: f64) {
+    println!(
+        "{{\"bench\":\"{bench}\",\"form\":\"{form}\",\"rows\":{rows},\"us\":{:.2}}}",
+        s * 1e6
+    );
+}
+
+/// The kernels around the linears, at the released widths: the norm (hidden 5,120 with
+/// the residual add), the quantiser (5,120 and 17,408), the gates (the MLP's 17,408,
+/// fast and exact), the DeltaNet's stacked `a`/`b` projection (small-N and CUTLASS), its
+/// preparation and gated norm.
+fn small_kernels(fast: &CudaDevice, it: u32, keep: &mut Vec<Box<dyn std::any::Any>>) {
+    let rows_max = 2048usize;
+    let (hidden, inter) = (5120u32, 17408u32);
+    let x = alloc(fast, rows_max * inter as usize * 2, keep);
+    fill(fast, x, rows_max * inter as usize * 2, 11);
+    let y = alloc(fast, rows_max * inter as usize * 2, keep);
+    fill(fast, y, rows_max * inter as usize * 2, 12);
+    let out = alloc(fast, rows_max * inter as usize * 4, keep);
+    let w = alloc(fast, inter as usize * 4, keep);
+    let ones: Vec<u8> = (0..inter).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+    // SAFETY: the weight vector just made.
+    unsafe { fast.upload(w, &ones) }.unwrap_or_else(|e| fail(e));
+    let codes = alloc(fast, rows_max * inter as usize, keep);
+    let scales = alloc(fast, (inter as usize / 128) * rows_max * 4, keep);
+    let ab_w = alloc(fast, 96 * hidden as usize * 2, keep);
+    fill(fast, ab_w, 96 * hidden as usize * 2, 13);
+    for rows in [1u32, 8, 64, 2048] {
+        let norm = NormParams {
+            x,
+            add: y,
+            weight: w,
+            out,
+            rows,
+            units: 1,
+            n: hidden,
+            x_stride: hidden,
+            add_stride: hidden,
+            out_stride: hidden,
+            eps: 1e-6,
+            ..NormParams::default()
+        };
+        // SAFETY: every buffer covers 2,048 rows of the widest width.
+        let s = time(fast, it, || {
+            unsafe { fast.norm(&norm) }.unwrap_or_else(|e| fail(e))
+        });
+        line("norm", "exact", rows, s);
+        for k in [hidden, inter] {
+            let q = QuantParams {
+                x,
+                codes,
+                scales,
+                rows,
+                k,
+                x_stride: k,
+                m_pad: rows.next_multiple_of(4),
+            };
+            // SAFETY: as above.
+            let s = time(fast, it, || {
+                unsafe { fast.quant(&q) }.unwrap_or_else(|e| fail(e))
+            });
+            line("quant", &format!("k{k}"), rows, s);
+        }
+        let gate = GateParams {
+            a: x,
+            g: y,
+            out,
+            rows,
+            width: inter,
+            a_stride: inter,
+            g_stride: inter,
+            out_stride: inter,
+            unit: inter,
+            g_unit_stride: inter,
+            kind: GATE_SWIGLU,
+        };
+        // SAFETY: as above.
+        let s = time(fast, it, || {
+            unsafe { fast.gate(&gate) }.unwrap_or_else(|e| fail(e))
+        });
+        line("gate", "fast", rows, s);
+        // SAFETY: as above.
+        let s = time(fast, it, || {
+            unsafe { fast.gate_exact(&gate) }.unwrap_or_else(|e| fail(e))
+        });
+        line("gate", "exact", rows, s);
+        let ab = LinearParams {
+            x,
+            w: ab_w,
+            out,
+            rows,
+            n: 96,
+            k: hidden,
+            x_stride: hidden,
+            out_stride: 96,
+            out_f32: 1,
+        };
+        // SAFETY: as above.
+        let s = time(fast, it, || {
+            unsafe { fast.gemm_bf16(&ab) }.unwrap_or_else(|e| fail(e))
+        });
+        line("small_gemm", "small_n", rows, s);
+        // SAFETY: as above.
+        let s = time(fast, it, || {
+            unsafe { fast.gemm_bf16_cutlass(&ab) }.unwrap_or_else(|e| fail(e))
+        });
+        line("small_gemm", "cutlass", rows, s);
+        // The DeltaNet at the released width: 16 key heads, 48 value heads of 128; the
+        // conv rows and gates read from the filled buffers, every window its own row.
+        let (kh, vh, kd, vd) = (16u32, 48u32, 128u32, 128u32);
+        let window: Vec<u8> = (0..rows).flat_map(|r| r.to_le_bytes()).collect();
+        let wb = alloc(fast, window.len().max(8), keep);
+        // SAFETY: the window array just made.
+        unsafe { fast.upload(wb, &window) }.unwrap_or_else(|e| fail(e));
+        let prep = DnPrepParams {
+            conv_in: out,
+            window: wb,
+            ab: out,
+            conv_w: w,
+            exp_a_log: w,
+            dt_bias: w,
+            q: y,
+            k: y,
+            v: y,
+            beta: y,
+            alpha: y,
+            positions: rows,
+            k_heads: kh,
+            v_heads: vh,
+            k_dim: kd,
+            v_dim: vd,
+            reserved: 0,
+        };
+        // SAFETY: the prep reads at most 2,048 + 3 rows of 10,240 f32 values from `out`
+        // (2,048 × 17,408 f32) and writes 2,048 rows of 6,144 f32 values into `y`.
+        let s = time(fast, it, || {
+            unsafe { fast.dn_prep(&prep) }.unwrap_or_else(|e| fail(e))
+        });
+        line("dn_prep", "exact", rows, s);
+        let dn_norm = DnNormParams {
+            o: out,
+            z: x,
+            weight: w,
+            out: y,
+            rows,
+            v_heads: vh,
+            v_dim: vd,
+            z_stride: vh * vd,
+            eps: 1e-6,
+            reserved: 0,
+        };
+        // SAFETY: as above.
+        let s = time(fast, it, || {
+            unsafe { fast.dn_norm(&dn_norm) }.unwrap_or_else(|e| fail(e))
+        });
+        line("dn_norm", "exact", rows, s);
+    }
 }

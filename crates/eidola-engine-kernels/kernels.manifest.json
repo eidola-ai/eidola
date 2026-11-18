@@ -114,6 +114,10 @@
       "sha256": "0d0b0a25f98192d772de6e56da1e25366882604006f8eb6a0dcde595932efc5c"
     },
     {
+      "path": "csrc/cutlass_fp8_blockwise_swap.cu",
+      "sha256": "8ccc3cc792db34757e00fc43a0777782aba6c9fdc8fff44aa7243beb96d339c8"
+    },
+    {
       "path": "csrc/deepgemm_fp8_fp4_grouped.cu",
       "sha256": "10d4c6cdc6bd1ac6d8e2f62342196e7ea06c0b5e0ce95544b6e3591af069d1e7"
     },
@@ -211,7 +215,7 @@
     },
     {
       "path": "csrc/kernels.json",
-      "sha256": "07de608199fdea601f1df64739939c4a73518782313aa9fa6b960ba744e96a60"
+      "sha256": "8a18c916f2f8ca74af3244c775ae664356f42e5c3b293d3db770c15d15b1fcd4"
     },
     {
       "path": "csrc/kv_cipher.cu",
@@ -226,16 +230,24 @@
       "sha256": "578cce444474c9be107e43359bca219e33fd7fd86f01b579721bd8db38b0284c"
     },
     {
+      "path": "csrc/qwen_fast.cu",
+      "sha256": "f30834ed9b905a0ff537fadf5ba405c2c7a4a5a2c594e33f93b2a004bfbc9d2a"
+    },
+    {
+      "path": "csrc/qwen_fast.cuh",
+      "sha256": "daac371b419bee41ed2bc2600a8a057dc459f5deedb2dab17bf8b8e371d79387"
+    },
+    {
       "path": "csrc/qwen_ops.cu",
       "sha256": "b752f8f2765d7bd9346063b281a9285f42e017ff3f96bfdceb4d466c7387ce48"
     },
     {
       "path": "csrc/qwen_ops.cuh",
-      "sha256": "ca67bbd1e5a2d9cc71b3bed64f8b959554feaf5621da7fe3c4406fa5622f096c"
+      "sha256": "5720b3f612f76062e9392ef89668da014a62401e3a696d77b69e69457e9e159f"
     },
     {
       "path": "csrc/qwen_ops_div.cu",
-      "sha256": "0fe90a73e9d54d124d295a8af9f1e97aad227c16a14a7abc1ca851c379387134"
+      "sha256": "32c99fd12a47dc56c0cce27daf70b9df5715850a87272ec057974e67e1206626"
     },
     {
       "path": "csrc/rmsnorm.cu",
@@ -409,6 +421,114 @@
         "UTCATOMSWS": 3,
         "UTCBAR": 2,
         "UTCQMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_fp8_blockwise_swap",
+      "arch": "sm_100a",
+      "source": "csrc/cutlass_fp8_blockwise_swap.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_fp8_blockwise_swap.sm_100a.cubin",
+      "sha256": "030029b9c2aa8cc048a8e8536e69d7bec6c5c93e4247df0c8719b5ec695015e2",
+      "size": 278000,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_swap16_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_swap16_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_swap16_bf16_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_swap32_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_swap32_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_swap32_bf16_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_swap64_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_swap64_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_swap64_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_fp8_blockwise_swap16_bf16_meta",
+        "eidola_cutlass_fp8_blockwise_swap32_bf16_meta",
+        "eidola_cutlass_fp8_blockwise_swap64_bf16_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 9,
+        "UTCBAR": 6,
+        "UTCQMMA": 12
+      }
+    },
+    {
+      "name": "cutlass_fp8_blockwise_swap",
+      "arch": "sm_100f",
+      "source": "csrc/cutlass_fp8_blockwise_swap.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_fp8_blockwise_swap.sm_100f.cubin",
+      "sha256": "d4705ef8d6d5cec9907fa8917c5139a125783b570799c93fc711a54db88ceb43",
+      "size": 278000,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_swap16_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_swap16_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_swap16_bf16_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_swap32_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_swap32_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_swap32_bf16_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_swap64_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_swap64_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_swap64_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_fp8_blockwise_swap16_bf16_meta",
+        "eidola_cutlass_fp8_blockwise_swap32_bf16_meta",
+        "eidola_cutlass_fp8_blockwise_swap64_bf16_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 9,
+        "UTCBAR": 6,
+        "UTCQMMA": 12
+      }
+    },
+    {
+      "name": "cutlass_fp8_blockwise_swap",
+      "arch": "sm_103a",
+      "source": "csrc/cutlass_fp8_blockwise_swap.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_fp8_blockwise_swap.sm_103a.cubin",
+      "sha256": "727b6f3b2ecd97f0b3fd812748cc902cc2bbd0da1f9d3cb5ae4f2d9723d1760b",
+      "size": 278000,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_swap16_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_swap16_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_swap16_bf16_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_swap32_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_swap32_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_swap32_bf16_meta"
+        },
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_swap64_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_swap64_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_swap64_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_fp8_blockwise_swap16_bf16_meta",
+        "eidola_cutlass_fp8_blockwise_swap32_bf16_meta",
+        "eidola_cutlass_fp8_blockwise_swap64_bf16_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 9,
+        "UTCBAR": 6,
+        "UTCQMMA": 12
       }
     },
     {
@@ -2737,6 +2857,84 @@
       }
     },
     {
+      "name": "qwen_fast",
+      "arch": "sm_100a",
+      "source": "csrc/qwen_fast.cu",
+      "profile": "own",
+      "file": "cubin/qwen_fast.sm_100a.cubin",
+      "sha256": "f43c2dbc43871d221c1ce5ff23a24bac390dad96d30a986ffba8b53bba5d907c",
+      "size": 56576,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_fast_gate",
+          "demangled": "eidola_qwen_fast_gate",
+          "meta": "eidola_qwen_fast_gate_meta"
+        },
+        {
+          "symbol": "eidola_qwen_fast_gemm_bf16",
+          "demangled": "eidola_qwen_fast_gemm_bf16",
+          "meta": "eidola_qwen_fast_gemm_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_fast_gate_meta",
+        "eidola_qwen_fast_gemm_bf16_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "qwen_fast",
+      "arch": "sm_100f",
+      "source": "csrc/qwen_fast.cu",
+      "profile": "own",
+      "file": "cubin/qwen_fast.sm_100f.cubin",
+      "sha256": "7d2638d7f5a407fba3a096ff22a855a984c26196dbc7bf2f5433894becc9c7dd",
+      "size": 56576,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_fast_gate",
+          "demangled": "eidola_qwen_fast_gate",
+          "meta": "eidola_qwen_fast_gate_meta"
+        },
+        {
+          "symbol": "eidola_qwen_fast_gemm_bf16",
+          "demangled": "eidola_qwen_fast_gemm_bf16",
+          "meta": "eidola_qwen_fast_gemm_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_fast_gate_meta",
+        "eidola_qwen_fast_gemm_bf16_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "qwen_fast",
+      "arch": "sm_103a",
+      "source": "csrc/qwen_fast.cu",
+      "profile": "own",
+      "file": "cubin/qwen_fast.sm_103a.cubin",
+      "sha256": "fb6f0311f77347977e0947d63aab7baddf6538112729a54ddd9a2b9b52b25a38",
+      "size": 56576,
+      "entries": [
+        {
+          "symbol": "eidola_qwen_fast_gate",
+          "demangled": "eidola_qwen_fast_gate",
+          "meta": "eidola_qwen_fast_gate_meta"
+        },
+        {
+          "symbol": "eidola_qwen_fast_gemm_bf16",
+          "demangled": "eidola_qwen_fast_gemm_bf16",
+          "meta": "eidola_qwen_fast_gemm_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_qwen_fast_gate_meta",
+        "eidola_qwen_fast_gemm_bf16_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
       "name": "qwen_ops",
       "arch": "sm_100a",
       "source": "csrc/qwen_ops.cu",
@@ -2910,8 +3108,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_100a.cubin",
-      "sha256": "094903705b5c6af03ca6506ede9209f1bdd4924f2d78eb7df194da5d8792592e",
-      "size": 159888,
+      "sha256": "df5827496de08ff1d88d4eee68262a7178bb4ed196456ab2b0bc688ccbc0a40e",
+      "size": 211432,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -2956,8 +3154,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1468,
-        "sass_fma": 317
+        "ptx_rounded": 1666,
+        "sass_fma": 416
       }
     },
     {
@@ -2966,8 +3164,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_100f.cubin",
-      "sha256": "29b2b3241a84570fd9c47ab82d3cd89eec64e45639d3f351c4172855e0547f03",
-      "size": 159888,
+      "sha256": "570a9a0dbb4b000f5dd87530f8f3fbef45620b4ecd12622fab1635431fc99941",
+      "size": 211432,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -3012,8 +3210,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1468,
-        "sass_fma": 317
+        "ptx_rounded": 1666,
+        "sass_fma": 416
       }
     },
     {
@@ -3022,8 +3220,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_103a.cubin",
-      "sha256": "b03760ecf16d5d2b6aa0c9a27800d3a71cd65f0b9b079a90788d3751002e7ccc",
-      "size": 203632,
+      "sha256": "ba3f887700e85b4ab24c3226a1c6ef6962303ac0ed4441ae4ec571d0ee4f790f",
+      "size": 265032,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -3068,8 +3266,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1468,
-        "sass_fma": 317
+        "ptx_rounded": 1666,
+        "sass_fma": 416
       }
     },
     {
@@ -3227,6 +3425,16 @@
       "file": "fatbin/cutlass_fp8_blockwise_gemm.fatbin",
       "sha256": "76715860a4724b1cf0ee924c4ea6bcf2e93c3d6cf887389fd4e0959626f542e9",
       "size": 160360,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "cutlass_fp8_blockwise_swap",
+      "file": "fatbin/cutlass_fp8_blockwise_swap.fatbin",
+      "sha256": "59f6920c97d86d702db7338a6315a2eb0057dfd78064331fcf6ad40a17afc12c",
+      "size": 556232,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -3393,6 +3601,16 @@
       ]
     },
     {
+      "name": "qwen_fast",
+      "file": "fatbin/qwen_fast.fatbin",
+      "sha256": "8348f8da99434031108685d661e903c918a9d0dc485939e81173cde9b14810e0",
+      "size": 113384,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
       "name": "qwen_ops",
       "file": "fatbin/qwen_ops.fatbin",
       "sha256": "83b828bbcdc18ffe1f190df4a1c00b6ec558679cef83cff3ea6eb03faa08d53d",
@@ -3405,8 +3623,8 @@
     {
       "name": "qwen_ops_div",
       "file": "fatbin/qwen_ops_div.fatbin",
-      "sha256": "80dc5444758277b3abfb5f2d232a6c20a8aea20afbe6b54c925297723e8bf8df",
-      "size": 363752,
+      "sha256": "4a3dcc22d99531314129aad5b8609a9401b28a8b2bc2e20154b60beaf3ca6313",
+      "size": 476696,
       "archs": [
         "sm_100a",
         "sm_103a"

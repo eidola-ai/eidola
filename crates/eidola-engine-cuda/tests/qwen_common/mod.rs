@@ -113,6 +113,40 @@ pub fn quant_thread_reference(
     }
 }
 
+/// The fast profile's small-N GEMM body compiled for the host (`qwen_host_fast_gemm`),
+/// over host buffers: a [`cases::small_gemm`] runner.
+pub fn small_gemm_host(lib: Arc<libloading::Library>) -> impl cases::SmallGemmRun {
+    move |x, w, rows, first, n, k| {
+        let mut out = vec![0.0f32; rows * n];
+        let p = eidola_engine_cuda::qwen::abi::LinearParams {
+            x: x[first * k..].as_ptr() as u64,
+            w: w.as_ptr() as u64,
+            out: out.as_mut_ptr() as u64,
+            rows: u32::try_from(rows).expect("rows"),
+            n: u32::try_from(n).expect("n"),
+            k: u32::try_from(k).expect("k"),
+            x_stride: u32::try_from(k).expect("k"),
+            out_stride: u32::try_from(n).expect("n"),
+            out_f32: 1,
+        };
+        let [gx, gy, _] =
+            eidola_engine_cuda::qwen::kernels::small_gemm_grid(&p).map_err(|e| e.to_string())?;
+        // SAFETY: `qwen_host_fast_gemm` takes a `QwLinearParams` and the grid; the
+        // addresses are the host vectors above, alive for the call.
+        unsafe {
+            let f: libloading::Symbol<HostFn> = lib
+                .get(b"qwen_host_fast_gemm\0")
+                .expect("the small-N GEMM body");
+            f(
+                (&p as *const eidola_engine_cuda::qwen::abi::LinearParams).cast(),
+                gx,
+                gy,
+            );
+        }
+        Ok(out)
+    }
+}
+
 /// A [`HostDevice`] planning as the fast profile: the compiled bodies, and FA2's launches
 /// checked and computing nothing.
 pub fn planning_fast(lib: Arc<libloading::Library>) -> HostDevice {

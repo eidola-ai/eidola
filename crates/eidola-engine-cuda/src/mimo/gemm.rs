@@ -1,7 +1,7 @@
 //! The CUTLASS GEMMs' launch parameters, built in Rust.
 //!
-//! Both CUTLASS kernels (`cutlass_fp8_blockwise_gemm`, `cutlass_bf16_gemm`)
-//! take CUTLASS 3.x's `GemmUniversal::Params` by value: 2048 bytes holding the
+//! The CUTLASS kernels (`cutlass_fp8_blockwise_gemm`, `cutlass_bf16_gemm`, and
+//! the swapped FP8 instances of `cutlass_fp8_blockwise_swap`) take CUTLASS 3.x's `GemmUniversal::Params` by value: 2048 bytes holding the
 //! problem shape, the mainloop's TMA descriptors (and, for the blockwise
 //! kernel, its scale-factor pointers and layouts), the epilogue's scalar and
 //! output descriptor, the cluster-launch-control tile scheduler's parameters,
@@ -34,6 +34,32 @@ pub enum GemmKind {
     Fp8Blockwise,
     /// `D (f32) = alpha · A · Bᵀ`: BF16 A `[M, K]` and B `[N, K]`.
     Bf16,
+    /// [`GemmKind::Fp8Blockwise`]'s product with the same operands and scale
+    /// arrays, computed transposed (`cutlass_fp8_blockwise_swap`): CUTLASS's A
+    /// is the weight, its B the `M` activation rows, tiled 16, 32 or 64 rows at
+    /// a time, its D `[N, M]` column-major (the same bytes as `[M, N]`
+    /// row-major). For few rows.
+    Fp8Swap(SwapTile),
+}
+
+/// The activation rows a swapped FP8 GEMM's tile holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SwapTile {
+    T16,
+    T32,
+    T64,
+}
+
+impl SwapTile {
+    pub const ALL: [SwapTile; 3] = [SwapTile::T16, SwapTile::T32, SwapTile::T64];
+
+    pub fn rows(self) -> u32 {
+        match self {
+            SwapTile::T16 => 16,
+            SwapTile::T32 => 32,
+            SwapTile::T64 => 64,
+        }
+    }
 }
 
 /// One GEMM's operands (device addresses) and shape.
@@ -83,6 +109,30 @@ impl GemmKind {
                 "eidola_cutlass_fp8_blockwise_gemm_bf16",
             ),
             GemmKind::Bf16 => ("cutlass_bf16_gemm", "eidola_cutlass_bf16_gemm_f32"),
+            GemmKind::Fp8Swap(t) => (
+                "cutlass_fp8_blockwise_swap",
+                match t {
+                    SwapTile::T16 => "eidola_cutlass_fp8_blockwise_swap16_bf16",
+                    SwapTile::T32 => "eidola_cutlass_fp8_blockwise_swap32_bf16",
+                    SwapTile::T64 => "eidola_cutlass_fp8_blockwise_swap64_bf16",
+                },
+            ),
+        }
+    }
+
+    /// CUTLASS's own problem (M, N): the transposed one for a swapped kind.
+    fn cutlass_mn(self, a: &GemmArgs) -> (u32, u32) {
+        match self {
+            GemmKind::Fp8Swap(_) => (a.n, a.m),
+            _ => (a.m, a.n),
+        }
+    }
+
+    /// CUTLASS's CTA tile (M, N).
+    fn tile(self) -> (u32, u32) {
+        match self {
+            GemmKind::Fp8Swap(t) => (TILE_M, t.rows()),
+            _ => (TILE_M, TILE_N),
         }
     }
 
@@ -126,6 +176,32 @@ impl GemmKind {
                     TmaSwizzle::B64,
                 ),
             ],
+            GemmKind::Fp8Swap(t) => [
+                spec(
+                    TmaType::U8,
+                    a.b,
+                    [k, n, 1],
+                    k,
+                    [128, 128, 1],
+                    TmaSwizzle::B128,
+                ),
+                spec(
+                    TmaType::U8,
+                    a.a,
+                    [k, m, 1],
+                    k,
+                    [128, t.rows(), 1],
+                    TmaSwizzle::B128,
+                ),
+                spec(
+                    TmaType::Bf16,
+                    a.d,
+                    [n, m, 1],
+                    2 * n,
+                    [64, t.rows().min(32), 1],
+                    TmaSwizzle::B128,
+                ),
+            ],
             GemmKind::Bf16 => [
                 spec(
                     TmaType::Bf16,
@@ -156,10 +232,15 @@ impl GemmKind {
     }
 
     /// Whether CUTLASS accepts the shape (`can_implement`): K a multiple of
-    /// the 16-byte TMA alignment and, for the blockwise kernel, of the
-    /// 128-wide scale block, with M a multiple of 4.
+    /// the 16-byte TMA alignment and, for the blockwise kernels, of the
+    /// 128-wide scale block, with M a multiple of 4 for the unswapped one.
     pub fn check(self, a: &GemmArgs) -> Result<()> {
         let ok = match self {
+            // The swapped kernel's activation scales are not a TMA operand, so
+            // any row count serves.
+            GemmKind::Fp8Swap(_) => {
+                a.k.is_multiple_of(128) && a.n.is_multiple_of(16) && a.m > 0 && a.n > 0
+            }
             GemmKind::Fp8Blockwise => {
                 a.m.is_multiple_of(4)
                     && a.k.is_multiple_of(128)
@@ -180,8 +261,7 @@ impl GemmKind {
     /// along M when there are more N tiles than M tiles, else along N unless
     /// that would overflow the grid's Y limit. Returns (along_n, grid).
     pub fn grid(self, a: &GemmArgs) -> (bool, [u32; 3]) {
-        let tiles_m = a.m.div_ceil(TILE_M);
-        let tiles_n = a.n.div_ceil(TILE_N);
+        let (tiles_m, tiles_n) = self.tiles(a);
         let along_n = tiles_n <= tiles_m && tiles_m <= 0xffff;
         let grid = if along_n {
             [tiles_n, tiles_m, 1]
@@ -189,6 +269,13 @@ impl GemmKind {
             [tiles_m, tiles_n, 1]
         };
         (along_n, grid)
+    }
+
+    /// CUTLASS's output tiles along its M and N.
+    fn tiles(self, a: &GemmArgs) -> (u32, u32) {
+        let (m, n) = self.cutlass_mn(a);
+        let (tm, tn) = self.tile();
+        (m.div_ceil(tm), n.div_ceil(tn))
     }
 
     /// The Params bytes and the grid, with each descriptor produced by
@@ -209,7 +296,8 @@ impl GemmKind {
         };
         // mode = kGemm (0); problem shape (M, N, K, L).
         put32(&mut p, OFF_MODE, 0);
-        for (i, v) in [a.m, a.n, a.k, 1].into_iter().enumerate() {
+        let (cm, cn) = self.cutlass_mn(a);
+        for (i, v) in [cm, cn, a.k, 1].into_iter().enumerate() {
             put32(&mut p, OFF_PROBLEM + 4 * i, v);
         }
         let [sa, sb, sd] = self.tma_specs(a);
@@ -246,15 +334,32 @@ impl GemmKind {
                 }
                 put32(&mut p, OFF_ALPHA, 1.0f32.to_bits());
             }
+            GemmKind::Fp8Swap(_) => {
+                let kb = a.k.div_ceil(128);
+                let nb = a.n.div_ceil(128);
+                // CUTLASS's SFA is the weight's scales: ((128, N/128), (128, K/128), L) :
+                // ((0, 1), (0, N/128), ·).
+                put64(&mut p, OFF_PTR_SFA, a.sfb);
+                for (i, v) in [nb, kb, 1, nb, nb * kb].into_iter().enumerate() {
+                    put32(&mut p, OFF_LAYOUT_SFA + 4 * i, v);
+                }
+                // Its SFB the activations': ((1, M), (128, K/128), L) : ((0, 1), (0, M), ·).
+                put64(&mut p, OFF_PTR_SFB, a.sfa);
+                for (i, v) in [a.m, kb, 1, a.m, a.m * kb].into_iter().enumerate() {
+                    put32(&mut p, OFF_LAYOUT_SFB + 4 * i, v);
+                }
+                put32(&mut p, OFF_ALPHA, 1.0f32.to_bits());
+            }
             GemmKind::Bf16 => put32(&mut p, OFF_ALPHA, a.alpha.to_bits()),
         }
         // Scheduler: tiles (M, N, L), FastDivmod(cluster m = 1), FastDivmod(
         // cluster n = 1), swizzle divmod unused (divisor 0), raster order,
         // log swizzle 0.
         let (along_n, grid) = self.grid(a);
+        let (tiles_m, tiles_n) = self.tiles(a);
         let s = OFF_SCHEDULER;
-        put32(&mut p, s, a.m.div_ceil(TILE_M));
-        put32(&mut p, s + 4, a.n.div_ceil(TILE_N));
+        put32(&mut p, s, tiles_m);
+        put32(&mut p, s + 4, tiles_n);
         put32(&mut p, s + 8, 1);
         put32(&mut p, s + 12, 1);
         put32(&mut p, s + 24, 1);
