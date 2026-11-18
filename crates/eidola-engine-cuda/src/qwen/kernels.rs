@@ -15,15 +15,15 @@ use eidola_engine::sampling::Stream;
 
 use super::abi::*;
 use super::attention::Fa2Args;
-pub use crate::mimo::engine_ops::{COPY_BUFFERS, CopyArgs, STATUS_BAD_INDEX, copy_grid};
 pub use crate::sampler::AcceptLaunch;
 use crate::{CudaError, Result};
 
-/// One `eidola_sample` launch over device rows (`crate::sampler`): for each of
-/// `num_rows` sample rows at `rows` (`SampleRow`s), the processed distribution over the
-/// first `n` logits of its logit row into `probs[r · n ..]` (f64) and, with `draw`, a
-/// token drawn from it with that stream into `tokens[r]` (a greedy row takes the
-/// argmax). Non-finite logits raise `STATUS_NON_FINITE` in `status`.
+/// One sample launch over device rows (`super::sampler`): for each of `num_rows` sample
+/// rows at `rows` (`SampleRow`s), the processed distribution over the first `n` logits of
+/// its logit row into `probs[r · n ..]` (f64) and, with `draw`, a token drawn from it with
+/// that stream into `tokens[r]` (a greedy row takes the argmax), through a work area of
+/// `super::sampler::sample_work_bytes(num_rows)` bytes at `work`. Non-finite logits raise
+/// `STATUS_NON_FINITE` in `status`.
 #[derive(Clone, Copy, Debug)]
 pub struct SampleArgs {
     pub logits: u64,
@@ -35,6 +35,7 @@ pub struct SampleArgs {
     pub probs: u64,
     pub tokens: u64,
     pub status: u64,
+    pub work: u64,
 }
 
 /// The kernel families of the forward.
@@ -71,16 +72,22 @@ pub trait QwenKernels {
     unsafe fn attention(&self, p: &AttnParams) -> Result<()>;
     unsafe fn dn_prep(&self, p: &DnPrepParams) -> Result<()>;
     unsafe fn dn_rec(&self, p: &DnRecParams) -> Result<()>;
+    /// The recurrence's short form (`eidola_qwen_dn_rec_short`): the same bits as
+    /// [`Self::dn_rec`] over the same grid, faster when every run is a few positions
+    /// (at most about [`DN_SHORT_RUN`]: a decode step, a draft check).
+    unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()>;
     unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()>;
     unsafe fn widen(&self, p: &WidenParams) -> Result<()>;
     unsafe fn round(&self, p: &RoundParams) -> Result<()>;
-    /// Row copies between up to [`COPY_BUFFERS`] buffers (`eidola_copy_rows`): every
-    /// buffer and row index bounded, an item out of range copying nothing and raising
-    /// [`STATUS_BAD_INDEX`].
-    unsafe fn copy_rows(&self, a: &CopyArgs) -> Result<()>;
+    /// Row copies of up to [`COPY_GROUPS`] groups, each between up to [`COPY_BUFFERS`]
+    /// buffers (`eidola_qwen_copy_rows`): every buffer and row index bounded, an item out
+    /// of range copying nothing and raising [`STATUS_BAD_INDEX`], an item onto its own
+    /// row copying nothing.
+    unsafe fn copy_rows(&self, p: &CopyParams) -> Result<()>;
     /// The device sampler ([`SampleArgs`]).
     unsafe fn sample(&self, a: &SampleArgs) -> Result<()>;
-    /// Chain acceptance (`eidola_chain_accept`).
+    /// Chain acceptance (`super::sampler::QwenSampler::accept`), its `scratch` a work
+    /// area of `super::sampler::accept_work_bytes(num_rows)` bytes.
     unsafe fn accept(&self, a: &AcceptLaunch) -> Result<()>;
     /// One FA2 head-dim-256 pass and its merge (the fast profile's attention).
     unsafe fn fa2(&self, a: &Fa2Args) -> Result<()>;
@@ -107,8 +114,41 @@ const BLOCK_THREADS: u32 = 128;
 const LIN_ROWS: u32 = 8;
 /// 128-wide blocks a CTA of the quantiser takes, a warp each (`kQuantWarps`).
 const QUANT_WARPS: u32 = BLOCK_THREADS / 32;
-/// Rows a quantiser CTA covers (`kQuantRows`).
+/// Rows a quantiser CTA covers at prefill sizes (`kQuantRows`).
 const QUANT_ROWS: u32 = 4;
+/// CTAs the quantiser has at [`QUANT_ROWS`] rows a CTA from which it takes that many;
+/// below, a CTA a row, so a decode-size launch spreads over as many CTAs as it has rows.
+const QUANT_GROUPED_CTAS: u32 = 1024;
+
+/// The driver's grid limit in x.
+const MAX_GRID_X: u32 = 0x7fff_ffff;
+
+/// Positions a run of the recurrence's short form stages at once (`kDnChunk`): a launch
+/// whose runs average at most this many takes the short form.
+pub const DN_SHORT_RUN: usize = 8;
+
+/// The grouped row copy's grid: a block an item, the groups' items in order. Checks
+/// the groups' count, each non-empty group's width and arrays, and the status word.
+pub fn copy_grid(p: &CopyParams) -> Result<[u32; 3]> {
+    ensure(p.groups as usize <= COPY_GROUPS, "copy: groups")?;
+    ensure(p.status != 0, "copy: no status word")?;
+    let mut items = 0u32;
+    for g in &p.group[..p.groups as usize] {
+        if g.items == 0 {
+            continue;
+        }
+        ensure(g.width > 0, "copy: rows of no words")?;
+        ensure(
+            g.src_buf != 0 && g.src_row != 0 && g.dst_buf != 0 && g.dst_row != 0,
+            "copy: null item arrays",
+        )?;
+        items = items
+            .checked_add(g.items)
+            .filter(|&n| n <= MAX_GRID_X)
+            .ok_or_else(|| refuse("copy: items past the grid"))?;
+    }
+    Ok([items, 1, 1])
+}
 
 pub fn embed_grid(p: &EmbedParams) -> Result<[u32; 3]> {
     ensure(
@@ -163,10 +203,15 @@ pub fn quant_grid(p: &QuantParams) -> Result<[u32; 3]> {
         p.x.is_multiple_of(8) && p.x_stride.is_multiple_of(4) && p.codes.is_multiple_of(4),
         "quant: a lane's 8-byte load and 4-byte store aligned",
     )?;
-    rows_grid(
-        (p.k / BLOCK).div_ceil(QUANT_WARPS),
-        p.rows.div_ceil(QUANT_ROWS),
-    )
+    let cols = (p.k / BLOCK).div_ceil(QUANT_WARPS);
+    let grouped = p.rows.div_ceil(QUANT_ROWS);
+    // The kernel reads its rows a CTA as ⌈rows / y⌉: 1 here, at most QUANT_ROWS there.
+    let y = if cols.saturating_mul(grouped) >= QUANT_GROUPED_CTAS {
+        grouped
+    } else {
+        p.rows
+    };
+    rows_grid(cols, y)
 }
 
 pub fn lin8_grid(p: &Lin8Params) -> Result<[u32; 3]> {
@@ -438,16 +483,51 @@ mod tests {
             x_stride: 5120,
             m_pad: 4,
         };
-        assert_eq!(quant_grid(&q).unwrap(), [10, 1, 1]);
-        assert_eq!(quant_grid(&QuantParams { k: 640, ..q }).unwrap(), [2, 1, 1]);
+        // Decode sizes: a CTA a row.
+        assert_eq!(quant_grid(&q).unwrap(), [10, 3, 1]);
+        assert_eq!(quant_grid(&QuantParams { k: 640, ..q }).unwrap(), [2, 3, 1]);
         assert_eq!(
             quant_grid(&QuantParams {
-                rows: 9,
-                m_pad: 12,
+                rows: 256,
+                m_pad: 256,
                 ..q
             })
             .unwrap(),
-            [10, 3, 1]
+            [10, 256, 1]
+        );
+        // Prefill sizes: four rows a CTA, once that still leaves 1,024 CTAs.
+        let big = QuantParams {
+            rows: 2047,
+            m_pad: 2048,
+            ..q
+        };
+        assert_eq!(quant_grid(&big).unwrap(), [10, 512, 1]);
+        assert_eq!(
+            quant_grid(&QuantParams {
+                k: 17_408,
+                x_stride: 17_408,
+                ..big
+            })
+            .unwrap(),
+            [34, 512, 1]
+        );
+        assert_eq!(
+            quant_grid(&QuantParams {
+                rows: 409,
+                m_pad: 412,
+                ..q
+            })
+            .unwrap(),
+            [10, 103, 1]
+        );
+        assert_eq!(
+            quant_grid(&QuantParams {
+                rows: 408,
+                m_pad: 408,
+                ..q
+            })
+            .unwrap(),
+            [10, 408, 1]
         );
         for bad in [
             QuantParams { k: 100, ..q },

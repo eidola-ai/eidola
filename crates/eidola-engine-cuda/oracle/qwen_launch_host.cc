@@ -46,9 +46,9 @@ void qwen_host_norm(const QwNormParams* p, uint32_t gx, uint32_t gy) {
     }
 }
 
-// `eidola_qwen_quant`'s entry: a warp per block and `kQuantRows` rows, its
-// lanes' amaxes combined by the butterfly the device's shuffles run, in the
-// same operand order.
+// `eidola_qwen_quant`'s entry: a warp per block and row (however the grid
+// groups rows into CTAs), its lanes' amaxes combined by the butterfly the
+// device's shuffles run, in the same operand order.
 void qwen_host_quant(const QwQuantParams* p, uint32_t gx, uint32_t gy) {
   constexpr uint32_t kW = qwk::kWarp;
   float v[kW][qwk::kQuantLane];

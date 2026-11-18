@@ -16,20 +16,22 @@ extern "C" __global__ void __launch_bounds__(qwk::kElementThreads)
 }
 EIDOLA_KERNEL_META(eidola_qwen_norm, qwk::kElementThreads, 1, 1, 0, 1, 1, 1, sizeof(QwNormParams));
 
-// The warp form (`qwen_ops.cuh`): a warp per block and `kQuantRows` rows, its
-// lanes' amaxes combined by a butterfly of shuffles.
+// The warp form (`qwen_ops.cuh`): a warp per block and up to `kQuantRows` rows
+// (the rows over the grid's y: one a CTA at decode sizes, four at prefill
+// sizes), its lanes' amaxes combined by a butterfly of shuffles.
 extern "C" __global__ void __launch_bounds__(qwk::kBlockThreads)
     eidola_qwen_quant(const __grid_constant__ QwQuantParams p) {
   const uint32_t l = threadIdx.x % qwk::kWarp;
   uint32_t b;
   // Uniform across the warp: the block is the warp's.
   if (!qwk::quant_block_of(p, blockIdx.x, threadIdx.x / qwk::kWarp, &b)) return;
-  const uint32_t r0 = blockIdx.y * qwk::kQuantRows;
+  const uint32_t per = (p.rows + gridDim.y - 1) / gridDim.y;
+  const uint32_t r0 = blockIdx.y * per;
   float v[qwk::kQuantRows][qwk::kQuantLane];
   float m[qwk::kQuantRows];
 #pragma unroll
   for (uint32_t r = 0; r < qwk::kQuantRows; ++r) {
-    m[r] = r0 + r < p.rows ? qwk::quant_lane_load(p, r0 + r, b, l, v[r]) : 0.0f;
+    m[r] = r < per && r0 + r < p.rows ? qwk::quant_lane_load(p, r0 + r, b, l, v[r]) : 0.0f;
   }
 #pragma unroll
   for (uint32_t r = 0; r < qwk::kQuantRows; ++r) {
@@ -39,7 +41,7 @@ extern "C" __global__ void __launch_bounds__(qwk::kBlockThreads)
   }
 #pragma unroll
   for (uint32_t r = 0; r < qwk::kQuantRows; ++r) {
-    if (r0 + r < p.rows) qwk::quant_lane_store(p, r0 + r, b, l, v[r], m[r]);
+    if (r < per && r0 + r < p.rows) qwk::quant_lane_store(p, r0 + r, b, l, v[r], m[r]);
   }
 }
 EIDOLA_KERNEL_META(eidola_qwen_quant, qwk::kBlockThreads, 1, 1, 0, 1, 1, 1, sizeof(QwQuantParams));

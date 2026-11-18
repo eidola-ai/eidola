@@ -244,9 +244,10 @@ DS_FN void quant_thread(const QwQuantParams& p, uint32_t bx, uint32_t row, uint3
 
 // The warp form (`eidola_qwen_quant`): a warp per 128-wide block, lane `l`
 // holding the block's elements `4l .. 4l + 4`, `kQuantWarps` blocks per CTA,
-// each for `kQuantRows` consecutive rows (every row's loads issued before any
-// row's arithmetic, so a large launch keeps several loads in flight a lane and
-// a quarter of the CTAs). Lane amaxes start from +0 like the reference's, and the warp
+// each for one row at decode sizes, or for up to `kQuantRows` consecutive rows
+// at prefill sizes (every row's loads issued before any row's arithmetic, so a
+// large launch keeps several loads in flight a lane and a quarter of the
+// CTAs); the grid's y says which. Lane amaxes start from +0 like the reference's, and the warp
 // combines them by `max32` across a butterfly. That is the reference's amax
 // bit for bit in any order: every operand is a magnitude (no sign bit, so +0
 // and -0 never meet) and `max32` drops a NaN operand, so the result is the

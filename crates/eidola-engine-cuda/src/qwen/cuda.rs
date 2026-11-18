@@ -11,8 +11,9 @@
 //! caller names, rounded to BF16 by `eidola_qwen_round`, and the DeltaNet's stacked `a`
 //! and `b` projections (`gemm_bf16`) our small-N kernel (`qwen_fast.cu`); the gates are
 //! computed in f32 there too (`eidola_qwen_fast_gate`); and
-//! attention runs FA2 at head dimension 256 ([`super::attention`]). Both profiles load the
-//! shared sampler (`sampling`) and the row copy (`engine_ops`'s `eidola_copy_rows`). Graphs
+//! attention runs FA2 at head dimension 256 ([`super::attention`]). Both profiles load
+//! Qwen's sampler (`qwen_sampling`, [`super::sampler`]); the grouped row copy is
+//! `qwen_ops`'s. Graphs
 //! are captured on the device's one stream ([`QwenDevice::capture`]).
 
 use std::any::Any;
@@ -27,12 +28,11 @@ use super::abi::*;
 use super::attention::{Fa2Args, QwenAttention};
 use super::device::{QwenDevice, QwenProfile};
 use super::kernels::*;
+use super::sampler::QwenSampler;
 use crate::kv_cipher::{CipherItem, CipherItems, KvCipher};
 use crate::launch::dptr;
-use crate::mimo::engine_ops::EngineOps;
 use crate::mimo::gemm::{Gemm, GemmArgs, GemmKind, SwapTile};
 use crate::module::{Kernel, KernelDir, KernelModule};
-use crate::sampler::{SampleLaunch, Sampler};
 use crate::{CudaError, Gpu, Result};
 
 /// The Qwen3.8 kernel images.
@@ -52,9 +52,11 @@ struct Kernels {
     attn: Kernel,
     dn_prep: Kernel,
     dn_rec: Kernel,
+    dn_rec_short: Kernel,
     dn_norm: Kernel,
     widen: Kernel,
     round: Kernel,
+    copy: Kernel,
 }
 
 /// The fast profile's FP8 GEMM for `m` activation rows (the padded count the
@@ -97,8 +99,7 @@ pub struct CudaDevice {
     profile: QwenProfile,
     k: Kernels,
     fast: Option<Fast>,
-    rows: EngineOps,
-    sampler: Sampler,
+    sampler: QwenSampler,
     cipher: Mutex<KvCipher>,
     _modules: Vec<KernelModule>,
 }
@@ -129,6 +130,7 @@ impl CudaDevice {
             kv_write: bound::<KvWriteParams>(&ops, "qwen_ops", "eidola_qwen_kv_write")?,
             widen: bound::<WidenParams>(&ops, "qwen_ops", "eidola_qwen_widen")?,
             round: bound::<RoundParams>(&ops, "qwen_ops", "eidola_qwen_round")?,
+            copy: bound::<CopyParams>(&ops, "qwen_ops", "eidola_qwen_copy_rows")?,
             norm: bound::<NormParams>(&div, "qwen_ops_div", "eidola_qwen_norm")?,
             quant: bound::<QuantParams>(&div, "qwen_ops_div", "eidola_qwen_quant")?,
             gate: bound::<GateParams>(&div, "qwen_ops_div", "eidola_qwen_gate")?,
@@ -136,6 +138,7 @@ impl CudaDevice {
             dn_prep: bound::<DnPrepParams>(&div, "qwen_ops_div", "eidola_qwen_dn_prep")?,
             dn_norm: bound::<DnNormParams>(&div, "qwen_ops_div", "eidola_qwen_dn_norm")?,
             dn_rec: bound::<DnRecParams>(&dn, "qwen_deltanet", "eidola_qwen_dn_rec")?,
+            dn_rec_short: bound::<DnRecParams>(&dn, "qwen_deltanet", "eidola_qwen_dn_rec_short")?,
         };
         let cipher = KvCipher::load(&gpu, dir)?;
         let fast = match profile {
@@ -163,14 +166,12 @@ impl CudaDevice {
                 })
             }
         };
-        let rows = EngineOps::load(&gpu, dir)?;
-        let sampler = Sampler::load(&gpu, dir)?;
+        let sampler = QwenSampler::load(&gpu, dir)?;
         Ok(CudaDevice {
             gpu,
             profile,
             k,
             fast,
-            rows,
             sampler,
             cipher: Mutex::new(cipher),
             _modules: vec![ops, div, dn],
@@ -421,6 +422,13 @@ impl QwenKernels for CudaDevice {
         let g = dn_rec_grid(p)?;
         unsafe { self.go(&self.k.dn_rec, p, g) }
     }
+    unsafe fn dn_rec_short(&self, p: &DnRecParams) -> Result<()> {
+        if p.seq_count == 0 {
+            return Ok(());
+        }
+        let g = dn_rec_grid(p)?;
+        unsafe { self.go(&self.k.dn_rec_short, p, g) }
+    }
     unsafe fn dn_norm(&self, p: &DnNormParams) -> Result<()> {
         if p.rows == 0 {
             return Ok(());
@@ -442,28 +450,21 @@ impl QwenKernels for CudaDevice {
         let g = round_grid(p)?;
         unsafe { self.go(&self.k.round, p, g) }
     }
-    unsafe fn copy_rows(&self, a: &CopyArgs) -> Result<()> {
+    unsafe fn copy_rows(&self, p: &CopyParams) -> Result<()> {
+        let g = copy_grid(p)?;
+        if g[0] == 0 {
+            return Ok(());
+        }
         // SAFETY: the caller's buffers and item arrays.
-        unsafe { self.rows.copy_rows(&self.gpu, *a) }
+        unsafe { self.go(&self.k.copy, p, g) }
     }
     unsafe fn sample(&self, a: &SampleArgs) -> Result<()> {
-        let l = SampleLaunch {
-            logits: a.logits,
-            logits_stride: a.logits_stride,
-            n: a.n,
-            rows: a.rows,
-            num_rows: a.num_rows,
-            draw: a.draw,
-            probs: a.probs,
-            tokens: a.tokens,
-            status: a.status,
-        };
         // SAFETY: the caller's rows and buffers.
-        unsafe { self.sampler.launch_sample(&self.gpu, l) }
+        unsafe { self.sampler.sample(&self.gpu, a) }
     }
     unsafe fn accept(&self, a: &AcceptLaunch) -> Result<()> {
         // SAFETY: the caller's rows and buffers.
-        unsafe { self.sampler.launch_accept(&self.gpu, *a) }
+        unsafe { self.sampler.accept(&self.gpu, a) }
     }
     unsafe fn fa2(&self, a: &Fa2Args) -> Result<()> {
         let f = self
