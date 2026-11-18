@@ -1,6 +1,6 @@
 # Model catalog
 
-One hand-written file per model the gateway sells: `models/<family>/<label>.toml` (each component `[a-z0-9][a-z0-9._-]*`; the names are for people). A model is identified by its **weights hash**, which the file holds as `sha256`, never by its file name or its tags. The gateway's build reads every file here, checks it, binds it to the engine pins in `releases/trust/engine-enclaves.json` and compiles the catalog in, so what `/v1/models` publishes is a function of this directory and the measured image. It holds one model, `mimo/mimo-v2.6-flash.toml`, pinned to the deployment under `deploy/engine/mimo-v2.6-flash/`.
+One hand-written file per model the gateway sells: `models/<family>/<label>.toml` (each component `[a-z0-9][a-z0-9._-]*`; the names are for people). A model is identified by its **weights hash**, which the file holds as `sha256`, never by its file name or its tags. The gateway's build reads every file here, checks it, binds it to the engine pins in `releases/trust/engine-enclaves.json` and compiles the catalog in, so what `/v1/models` publishes is a function of this directory and the measured image. It holds two models: `mimo/mimo-v2.6-flash.toml`, pinned to the deployment under `deploy/engine/mimo-v2.6-flash/`, and `qwen/qwen3.8-27b.toml`, whose deployment under `deploy/engine/qwen3.8-27b/` is not yet pinned and whose price is provisional.
 
 The hash, its per-file manifest and how to reproduce both from the published files: [`docs/model-identity.md`](../docs/model-identity.md).
 

@@ -18,11 +18,11 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Architecture, CacheConfig, ExecutorSettings, GpuCc, MeasuredConfig, ModelPack, WeightsStorage,
-    artifact_data_bytes, check_container_gpu_access, check_cvm_image, check_device_resources,
-    check_env_names, check_gpu_attestation, check_kernels_dir, check_resources, check_secrets,
-    check_shim_paths, check_vm_resources, check_weights_pack, env, is_safe_component,
-    parse_cvm_version, parse_measured,
+    Architecture, CacheConfig, ExecutorSettings, GpuCc, MeasuredConfig, ModelPack, SupportedGpu,
+    WeightsStorage, artifact_data_bytes, check_container_gpu_access, check_cvm_image,
+    check_device_resources, check_env_names, check_gpu_attestation, check_kernels_dir,
+    check_resources, check_secrets, check_shim_paths, check_vm_resources, check_weights_pack, env,
+    is_safe_component, parse_cvm_version, parse_measured,
 };
 
 /// The image every engine deployment runs, pinned by digest.
@@ -48,6 +48,8 @@ pub struct Deployment {
     pub weights_revision: String,
     /// The GPU evidence items a pin must require, if any.
     pub expected_gpus: Option<u64>,
+    /// The GPU its devices run on, which its device memory is held to.
+    pub gpu: SupportedGpu,
     /// Where the Intel TDX machine policy comes from, when the deployment is
     /// TDX.
     pub tdx: Option<TdxMachines>,
@@ -385,6 +387,7 @@ pub fn check_deployment(
                 weights_bytes,
                 c.memory,
                 c.gpus.unwrap_or(0),
+                &side.gpu,
             )
         }
         devices => check_device_resources(
@@ -396,6 +399,7 @@ pub fn check_deployment(
             weights_bytes,
             c.memory,
             c.gpus.unwrap_or(0),
+            &side.gpu,
         ),
     }
     .map_err(|e| format!("{at}: {e}"))?;
@@ -407,6 +411,7 @@ pub fn check_deployment(
         weights_repo: side.repo,
         weights_revision: side.revision,
         expected_gpus: side.expected_gpus,
+        gpu: side.gpu,
         tdx: side.tdx,
     })
 }
@@ -793,6 +798,7 @@ struct Sidecar {
     repo: String,
     revision: String,
     expected_gpus: Option<u64>,
+    gpu: SupportedGpu,
     tdx: Option<TdxMachines>,
 }
 
@@ -810,6 +816,8 @@ struct SidecarFile {
     weights: SidecarWeights,
     #[serde(default, deserialize_with = "present")]
     expected_gpus: Option<u32>,
+    /// A [`SupportedGpu`] name, as its driver reports it.
+    gpu: String,
     #[serde(default, deserialize_with = "present")]
     tdx: Option<SidecarTdx>,
 }
@@ -885,6 +893,13 @@ impl Sidecar {
                  on it"
             ));
         }
+        let gpu = SupportedGpu::from_name(&file.gpu).ok_or_else(|| {
+            format!(
+                "{path}: gpu {:?} is not a supported GPU ({})",
+                file.gpu,
+                SupportedGpu::ALL.map(|g| g.name).join(", ")
+            )
+        })?;
         if !is_repo(&file.weights.repo) {
             return Err(format!(
                 "{path}: weights.repo must be <owner>/<name> of [A-Za-z0-9._-]"
@@ -931,6 +946,7 @@ impl Sidecar {
             repo: file.weights.repo,
             revision: file.weights.revision,
             expected_gpus: file.expected_gpus.map(u64::from),
+            gpu,
             tdx,
         })
     }
@@ -1081,6 +1097,27 @@ shim:
         include_bytes!("../../../../deploy/engine/mimo-v2.6-flash/b300x1/tinfoil-config.yml");
     const MIMO_SIDECAR: &[u8] =
         include_bytes!("../../../../deploy/engine/mimo-v2.6-flash/b300x1/deployment.json");
+
+    /// The sidecar names the GPU the deployment runs on, one the fit check
+    /// knows: the committed deployment's is the B300, and an unknown name, or
+    /// none, is refused.
+    #[test]
+    fn the_sidecar_names_a_supported_gpu() {
+        let d = check_deployment("config", MIMO_CONFIG, "sidecar", MIMO_SIDECAR).unwrap();
+        assert_eq!(d.gpu, SupportedGpu::B300);
+        let text = std::str::from_utf8(MIMO_SIDECAR).unwrap();
+        let other = text.replace("NVIDIA B300 SXM6 AC", "NVIDIA H100 80GB HBM3");
+        let err = check_deployment("config", MIMO_CONFIG, "sidecar", other.as_bytes()).unwrap_err();
+        assert!(err.contains("not a supported GPU"), "{err}");
+        let none = text.replace("  \"gpu\": \"NVIDIA B300 SXM6 AC\",\n", "");
+        assert_ne!(none, text);
+        let err = check_deployment("config", MIMO_CONFIG, "sidecar", none.as_bytes()).unwrap_err();
+        assert!(err.contains("gpu"), "{err}");
+        assert_eq!(
+            SupportedGpu::from_name("NVIDIA B200"),
+            Some(SupportedGpu::B200)
+        );
+    }
 
     /// The committed MiMo-V2.6-Flash deployment reads as it always has: one
     /// device, its one KV budget, its pack and sidecar.

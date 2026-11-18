@@ -188,14 +188,50 @@ pub mod caps {
 /// prefix cache enabled (the node's `cuda::RETENTION_POINTS`).
 pub const RETENTION_POINTS: u64 = 3;
 
-/// The one GPU the CUDA executor runs on (`eidola-engine-cuda`: Blackwell,
-/// `sm_103a`), by the name its driver reports. A node uses one of them.
+/// The B300, the largest GPU the CUDA executor runs on (`eidola-engine-cuda`:
+/// Blackwell, `sm_103a`), by the name its driver reports. The grammar's caps
+/// are its; a deployment names its own GPU ([`SupportedGpu`]).
 pub const SUPPORTED_GPU: &str = "NVIDIA B300 SXM6 AC";
 
-/// The supported GPU's device memory, in bytes, as its driver reports it
+/// The B300's device memory, in bytes, as its driver reports it
 /// (`cuDeviceTotalMem`, the node's `/v1/engine/info` `device.memory_bytes`
 /// on that part): about 267.7 GiB, not the 288 GB of HBM it is sold with.
 pub const SUPPORTED_GPU_MEMORY_BYTES: u64 = 287_428_640_768;
+
+/// A GPU a deployment may run the CUDA executor on: the name its driver
+/// reports and its device memory as the driver reports it. A deployment's
+/// `deployment.json` names one (`gpu`), and [`check_resources`] holds what
+/// the node allocates on each device to its memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SupportedGpu {
+    pub name: &'static str,
+    pub memory_bytes: u64,
+}
+
+impl SupportedGpu {
+    /// The NVIDIA B300 SXM6 AC ([`SUPPORTED_GPU`]).
+    pub const B300: SupportedGpu = SupportedGpu {
+        name: SUPPORTED_GPU,
+        memory_bytes: SUPPORTED_GPU_MEMORY_BYTES,
+    };
+
+    /// The NVIDIA B200 (Blackwell, `sm_100a`): 183,359 MiB, about 179.1 GiB,
+    /// as its driver reports it in `nvidia-smi`'s listing (whole MiB, as the
+    /// B300's byte count also is). Not yet read from a node's
+    /// `/v1/engine/info` on one.
+    pub const B200: SupportedGpu = SupportedGpu {
+        name: "NVIDIA B200",
+        memory_bytes: 183_359 << 20,
+    };
+
+    /// Every supported GPU.
+    pub const ALL: [SupportedGpu; 2] = [SupportedGpu::B300, SupportedGpu::B200];
+
+    /// The supported GPU its driver names `name`, if there is one.
+    pub fn from_name(name: &str) -> Option<SupportedGpu> {
+        Self::ALL.into_iter().find(|g| g.name == name)
+    }
+}
 
 /// Device memory the CUDA executor holds whatever its sizing: the CUDA
 /// context, the loaded kernel modules, the decode graphs' captures (a few
@@ -862,11 +898,11 @@ pub fn cuda_kv_host_min_bytes(
 /// (`kv_host_bytes`, `KV_HOST_BYTES`: page-locked, so it can never be paged
 /// out to make room), plus, for the `cpu` executor, its KV cache
 /// (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`Shape::kv_bytes_per_position`]). For the
-/// `cuda` executor, which runs on one [`SUPPORTED_GPU`], the VM has a GPU,
+/// `cuda` executor, which runs on one `gpu` (the deployment's), the VM has a GPU,
 /// `KV_DEVICE_BYTES` holds at least [`cuda_kv_min_bytes`], a non-zero
 /// `KV_HOST_BYTES` at least [`cuda_kv_host_min_bytes`], and
 /// `KV_DEVICE_BYTES` + `weights_bytes` + [`cuda_device_reserve_bytes`] fit
-/// [`SUPPORTED_GPU_MEMORY_BYTES`]. `weights_bytes` bounds the weights' device
+/// its memory. `weights_bytes` bounds the weights' device
 /// footprint from above: the pack's data size ([`artifact_data_bytes`]),
 /// every file of it, whether the node loads it or not.
 #[allow(clippy::too_many_arguments)]
@@ -879,6 +915,7 @@ pub fn check_resources(
     weights_bytes: u64,
     memory_mib: u64,
     gpus: u64,
+    gpu: &SupportedGpu,
 ) -> Result<(), String> {
     let host_kv = match executor {
         ExecutorSettings::Cpu { kv_blocks } => u64::from(*kv_blocks)
@@ -928,12 +965,14 @@ pub fn check_resources(
         let device = kv_device_bytes
             .saturating_add(weights_bytes)
             .saturating_add(reserve);
-        if device > SUPPORTED_GPU_MEMORY_BYTES {
+        if device > gpu.memory_bytes {
             return Err(format!(
                 "{} ({kv_device_bytes}), the weights ({weights_bytes}) and the executor's \
                  reserve ({reserve}) need {device} bytes of device memory, more than the \
-                 {SUPPORTED_GPU}'s {SUPPORTED_GPU_MEMORY_BYTES}",
-                env::KV_DEVICE_BYTES
+                 {}'s {}",
+                env::KV_DEVICE_BYTES,
+                gpu.name,
+                gpu.memory_bytes
             ));
         }
     }
@@ -950,8 +989,7 @@ pub fn check_resources(
 ///   budget per device, in device order.
 /// - On device `d`: its budget holds at least [`cuda_kv_min_bytes`] of its
 ///   shape, and the budget, [`Shape::weights_bytes`] and
-///   [`cuda_device_reserve_bytes`] of its shape fit
-///   [`SUPPORTED_GPU_MEMORY_BYTES`].
+///   [`cuda_device_reserve_bytes`] of its shape fit `gpu`'s memory.
 /// - The pack's data size (`weights_bytes`, [`artifact_data_bytes`]) is at
 ///   most the devices' weights together, so the per-device bounds are bounds
 ///   on the weights the deployment pins.
@@ -976,6 +1014,7 @@ pub fn check_device_resources(
     weights_bytes: u64,
     memory_mib: u64,
     gpus: u64,
+    gpu: &SupportedGpu,
 ) -> Result<(), String> {
     let host_kv = match executor {
         ExecutorSettings::Cpu { kv_blocks } => devices.iter().fold(0u64, |sum, d| {
@@ -1060,12 +1099,14 @@ pub fn check_device_resources(
         // What the executor loads: the drafter's weights only when it drafts.
         let loaded = device_weights_bytes(shape, sizing).unwrap_or(weights);
         let device = budget.saturating_add(loaded).saturating_add(reserve);
-        if device > SUPPORTED_GPU_MEMORY_BYTES {
+        if device > gpu.memory_bytes {
             return Err(format!(
                 "device {d}: its {} budget ({budget}), its weights ({loaded}) and the \
                  executor's reserve ({reserve}) need {device} bytes of device memory, more \
-                 than the {SUPPORTED_GPU}'s {SUPPORTED_GPU_MEMORY_BYTES}",
-                env::KV_DEVICE_BYTES
+                 than the {}'s {}",
+                env::KV_DEVICE_BYTES,
+                gpu.name,
+                gpu.memory_bytes
             ));
         }
     }
@@ -2227,6 +2268,83 @@ mod tests {
         max_age_secs: 7200,
     };
 
+    /// Qwen3.8-27B on one B200 at its whole 262,144-position context: 32
+    /// seats, steps of 128 tokens (a decode row of each seat with three drafts),
+    /// the cache on. The executor's step scratch (every layer's, held to the
+    /// forward's end, the exact attention's scores among it) is what bounds
+    /// the step: about 42.5 GB at this step, so the reserve is about 72 GB,
+    /// and beside the weights an 80 GiB budget holds the state pool's 161
+    /// buffers and about 862,000 positions of KV.
+    #[test]
+    fn qwen_fits_one_b200_at_its_whole_context() {
+        use crate::architecture::Architecture;
+        let shape = Architecture::Qwen38Dense27B.shape();
+        let dims = shape.recurrent.unwrap();
+        let sizing = Sizing {
+            kv_block_size: 16,
+            max_model_len: 262_144,
+            max_seqs: 32,
+            max_batched_tokens: 128,
+            max_prefill_chunk: 128,
+            draft_tokens: 3,
+            max_requests: 32,
+        };
+        assert_eq!(decode_step_tokens(&sizing), 128);
+        let reserve = cuda_device_reserve_bytes(shape, &sizing);
+        assert_eq!(reserve / 1_000_000_000, 71, "{reserve}");
+        let scratch = recurrent_step_scratch_bytes(&dims, &sizing);
+        assert_eq!(scratch / 1_000_000_000, 61, "{scratch}");
+        // Every covered file of the checkpoint is 30.88 GB; the pack holds its
+        // other files too.
+        let pack = 31_000_000_000;
+        let budget = 80u64 << 30;
+        assert_eq!(recurrent_state_buffers(&sizing, &DS_CACHE), 161);
+        let blocks =
+            (budget - 161 * dims.state_image_bytes()) / recurrent_kv_block_bytes(&dims, &sizing);
+        assert_eq!(blocks * 16 / 1000, 862, "{blocks}");
+        assert!(budget >= cuda_kv_min_bytes(shape, &sizing, &DS_CACHE));
+        let check = |budget: u64, host: u64, gpu: &SupportedGpu| {
+            check_resources(
+                shape,
+                &sizing,
+                &DS_CACHE,
+                &cuda_on(&[budget]),
+                host,
+                pack,
+                196_608,
+                1,
+                gpu,
+            )
+        };
+        check(budget, 64 << 30, &SupportedGpu::B200).unwrap();
+        // What the B200 leaves is under 4 GB more.
+        let room = SupportedGpu::B200.memory_bytes - pack - reserve;
+        assert!(room - budget < 4_000_000_000, "{room}");
+        let err = check(room + 1, 0, &SupportedGpu::B200).unwrap_err();
+        assert!(err.contains("NVIDIA B200"), "{err}");
+        check(room + 1, 0, &SupportedGpu::B300).unwrap();
+        // Steps of twice the tokens do not fit at this context.
+        let wide = Sizing {
+            max_batched_tokens: 256,
+            max_prefill_chunk: 256,
+            ..sizing
+        };
+        assert!(
+            check_resources(
+                shape,
+                &wide,
+                &DS_CACHE,
+                &cuda_on(&[cuda_kv_min_bytes(shape, &wide, &DS_CACHE)]),
+                0,
+                pack,
+                196_608,
+                1,
+                &SupportedGpu::B200,
+            )
+            .is_err()
+        );
+    }
+
     /// The published text-only pack, bounded: the shards and files of the
     /// released checkpoint, 510.29 GB, under the devices' 510.66 GB.
     const DS_PACK_BYTES: u64 = 510_300_000_000;
@@ -2363,6 +2481,7 @@ mod tests {
                 DS_PACK_BYTES,
                 196_608,
                 2,
+                &SupportedGpu::B300,
             )
         };
         for (draft_tokens, step, room1) in [(0, 8192, 10_233_054_144), (3, 4096, 10_713_172_224)] {
@@ -2488,6 +2607,7 @@ mod tests {
                 pack,
                 memory_mib,
                 gpus,
+                &SupportedGpu::B300,
             )
         };
         assert_eq!(check(&[room0, room1], 2, DS_PACK_BYTES, 0), Ok(()));
@@ -2556,6 +2676,7 @@ mod tests {
             DS_PACK_BYTES,
             memory_mib,
             2,
+            &SupportedGpu::B300,
         )
         .unwrap_err();
         assert!(
@@ -2566,7 +2687,19 @@ mod tests {
         // The cpu executor runs both devices' pools in host memory.
         let cpu = ExecutorSettings::Cpu { kv_blocks: 64 };
         let per_block = 256 * (534 + 20 * 528 + 356 + 20 * 528 + 3 * 528);
-        let host = |mib| check_device_resources(devices, &sizing, &DS_CACHE, &cpu, 0, 0, mib, 0);
+        let host = |mib| {
+            check_device_resources(
+                devices,
+                &sizing,
+                &DS_CACHE,
+                &cpu,
+                0,
+                0,
+                mib,
+                0,
+                &SupportedGpu::B300,
+            )
+        };
         let needed = host_memory_bytes(&sizing) + 64 * per_block;
         assert_eq!(host(needed.div_ceil(1 << 20)), Ok(()));
         assert!(host(needed / (1 << 20) - 1).is_err());
@@ -2677,7 +2810,20 @@ mod tests {
             max_age_secs: 3600,
         };
         let kv = cuda(64 << 30);
-        assert!(check_resources(FLASH, &sizing, &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_ok());
+        assert!(
+            check_resources(
+                FLASH,
+                &sizing,
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                65_536,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_ok()
+        );
         // A request slot is 645,922,816 bytes at the caps: a 32 MiB body read
         // with both parses (3 × 32 MiB of text, 512 bytes for each of 2^18
         // values) and admitted with its tree (32 MiB of text, 160 bytes a
@@ -2710,15 +2856,78 @@ mod tests {
             ..sizing
         };
         // Six slots, the headroom and the tables fit 8 GiB; eight do not.
-        assert!(check_resources(FLASH, &near(6), &cache, &kv, 0, FIXTURE_PACK, 8192, 8).is_ok());
-        assert!(check_resources(FLASH, &near(8), &cache, &kv, 0, FIXTURE_PACK, 8192, 8).is_err());
-        // Near the limit: 99 slots fit 64 GiB; 100 do not.
-        assert!(check_resources(FLASH, &near(99), &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_ok());
         assert!(
-            check_resources(FLASH, &near(100), &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_err()
+            check_resources(
+                FLASH,
+                &near(6),
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                8192,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_ok()
+        );
+        assert!(
+            check_resources(
+                FLASH,
+                &near(8),
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                8192,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_err()
+        );
+        // Near the limit: 99 slots fit 64 GiB; 100 do not.
+        assert!(
+            check_resources(
+                FLASH,
+                &near(99),
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                65_536,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_ok()
+        );
+        assert!(
+            check_resources(
+                FLASH,
+                &near(100),
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                65_536,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_err()
         );
         // The cuda executor needs a GPU.
-        assert!(check_resources(FLASH, &sizing, &cache, &kv, 0, FIXTURE_PACK, 65_536, 0).is_err());
+        assert!(
+            check_resources(
+                FLASH,
+                &sizing,
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                65_536,
+                0,
+                &SupportedGpu::B300
+            )
+            .is_err()
+        );
         // Block size 1 at the longest model length: 2^20 entries per slot.
         let tables = Sizing {
             kv_block_size: 1,
@@ -2726,7 +2935,20 @@ mod tests {
             max_seqs: caps::MAX_SEQS,
             ..sizing
         };
-        assert!(check_resources(FLASH, &tables, &cache, &kv, 0, FIXTURE_PACK, 16_384, 8).is_err());
+        assert!(
+            check_resources(
+                FLASH,
+                &tables,
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                16_384,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_err()
+        );
         // The cpu executor's KV is host memory: 2^20 blocks of 16 positions
         // are 3.4 TiB.
         let cpu = |kv_blocks| ExecutorSettings::Cpu { kv_blocks };
@@ -2739,7 +2961,8 @@ mod tests {
                 0,
                 FIXTURE_PACK,
                 65_536,
-                0
+                0,
+                &SupportedGpu::B300
             )
             .is_ok()
         );
@@ -2752,7 +2975,8 @@ mod tests {
                 0,
                 FIXTURE_PACK,
                 65_536,
-                0
+                0,
+                &SupportedGpu::B300
             )
             .is_err()
         );
@@ -2809,6 +3033,7 @@ mod tests {
                 FIXTURE_PACK,
                 65_536,
                 1,
+                &SupportedGpu::B300,
             )
         };
         assert!(fits(min).is_ok());
@@ -2909,6 +3134,7 @@ mod tests {
                 FLASH_PACK,
                 65_536,
                 8,
+                &SupportedGpu::B300,
             )
         };
         assert!(fits_drafting(64 << 30).is_ok());
@@ -2916,7 +3142,17 @@ mod tests {
         assert!(fits_drafting(room).is_ok());
         assert!(fits_drafting(room + 1).is_err());
         let fits = |kv: u64, weights: u64, gpus: u64| {
-            check_resources(FLASH, &sizing, &cache, &cuda(kv), 0, weights, 65_536, gpus)
+            check_resources(
+                FLASH,
+                &sizing,
+                &cache,
+                &cuda(kv),
+                0,
+                weights,
+                65_536,
+                gpus,
+                &SupportedGpu::B300,
+            )
         };
         // A realistic Flash deployment: 64 GiB of KV beside the checkpoint.
         assert!(fits(64 << 30, FLASH_PACK, 1).is_ok());
@@ -3354,6 +3590,7 @@ mod tests {
                 FIXTURE_PACK,
                 memory,
                 8,
+                &SupportedGpu::B300,
             )
         };
         let room = 65_536u64 << 20;

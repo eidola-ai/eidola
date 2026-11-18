@@ -2,7 +2,7 @@
 
 `Qwen/Qwen3.8-27B-FP8`, text only, on one Blackwell GPU. The architecture is `eidola_common::architecture::Architecture::Qwen38Dense27B`.
 
-**Status: in progress.** The reference forward and the chat format are implemented and verified; the serving core carries the recurrent state (below); the CPU executor reproduces the forward bit for bit through the real scheduler, drafting included; the CUDA executor and its kernels are built, equal to the CPU executor on host-compiled kernel bodies, not yet run on a GPU; and the inference node serves the architecture (below). The variant is implemented: its `Shape` is known, so a catalog row and a deployment may name it. None is committed.
+**Status: in progress.** The reference forward and the chat format are implemented and verified; the serving core carries the recurrent state (below); the CPU executor reproduces the forward bit for bit through the real scheduler, drafting included; the CUDA executor and its kernels are built, equal to the CPU executor on host-compiled kernel bodies, not yet run on a GPU; and the inference node serves the architecture (below). The variant is implemented: its `Shape` is known. Its catalog row is `models/qwen/qwen3.8-27b.toml` and its deployment `deploy/engine/qwen3.8-27b/b200x1/` (one B200), not yet pinned.
 
 ## The model
 
@@ -43,13 +43,13 @@ The DeltaNet layers' state is a pool of state buffers beside the KV groups (`eid
 | `eidola-engine-kernels` | `csrc/qwen_abi.cuh`, `csrc/qwen_ops.cuh`, `csrc/qwen_ops.cu`, `csrc/qwen_ops_div.cu`, `csrc/qwen_deltanet.cu`, `csrc/flashinfer_fa2_sink_paged_d256.cu` and their `kernels.json` entries; `tests/manifest.rs` (`qwen_*`) |
 | `eidola-engine-cuda` | `src/qwen/` (`QwenCudaExecutor`, its devices and kernel families); `oracle/qwen_launch_host.cc`; `tests/qwen_*` and `tests/qwen_common/`; `examples/qwen_whole.rs`, `examples/qwen_kernel_bench.rs`; `scripts/qwen_*` |
 | `eidola-server-engine` | the Qwen arms in `lib.rs` (`qwen_cpu_config`), `cuda.rs` (`prepare_qwen`, `qwen_config`, `derive_qwen_pools`, `derive_qwen_host_pools`), `model.rs` (`Served::Qwen`), `pipeline.rs` (`render_qwen`, `qwen_options`); `tests/qwen.rs`, the Qwen tests in `tests/cuda.rs`, and the dev model in `tests/common/fixture.rs` |
-| `models/`, `deploy/engine/` | a catalog row and a pinned one-GPU deployment, once the engine serves it |
+| `models/`, `deploy/engine/` | `models/qwen/qwen3.8-27b.toml`; `deploy/engine/qwen3.8-27b/b200x1/` |
 
 ## Outstanding work
 
 - the reference forward against the reference as released on a GPU, and its drafter against vLLM's (prepared: `golden/qwen/full_session.sh`);
 - the CUDA executor on a GPU (the prepared sessions), its CUDA graphs, FA2 at head dim 256 in the fast profile (built, not wired), device sampling, and tuning from the profiles;
-- the catalog row and the deployment;
+- the deployment's weights pack reference (the modelwrap schema 1 pack of the row's `repo@revision`), then its pin; and the catalog row's price, which is provisional;
 - the CUDA executor's step scratch: a forward allocates as it goes and holds every layer's scratch, the exact attention's scores among it, to its end, so the step budget times the context is what a GPU's memory bounds (per-layer reuse and FA2 would lift it);
 - the CPU reference executor refuses to embed a sampled vision placeholder, which ends its engine, where the CUDA executor embeds its row;
 - speed measured against a reference serving stack on the same GPU.

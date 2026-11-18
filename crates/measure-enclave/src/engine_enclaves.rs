@@ -349,6 +349,7 @@ containers:
         "architecture": "MimoV26Flash",
         "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
         "expected_gpus": 8,
+        "gpu": "NVIDIA B300 SXM6 AC",
         "tdx": {
             "platform_endorsements": {
                 "release": "platform-v0.1.11",
@@ -582,7 +583,8 @@ containers:
         let no_machines = r#"{
             "architecture": "MimoV26Flash",
             "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
-            "expected_gpus": 8
+            "expected_gpus": 8,
+            "gpu": "NVIDIA B300 SXM6 AC"
         }"#;
         assert!(entry(&good, no_machines).contains("only TDX deployments"));
         let unpinned = good.replace(&format!("@sha256:{release_sha}"), "");
