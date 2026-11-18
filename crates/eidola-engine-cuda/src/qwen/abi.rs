@@ -70,8 +70,19 @@ pub struct NormParams {
     pub out_unit_stride: u32,
     pub rotary: u32,
     pub eps: f32,
+    /// A split FP8 GEMM's partial sums as the residual add's input (fast profile), in
+    /// place of `add`: `add_splits` arrays of `add_part_rows` rows of `n` f32.
+    pub add_parts: u64,
+    /// The normed rows quantised as `eidola_qwen_quant` would (`[rows, n]` codes, f32
+    /// scales `[n / 128][m_pad]`), or 0.
+    pub codes: u64,
+    pub scales: u64,
+    pub add_splits: u32,
+    pub add_part_rows: u32,
+    pub m_pad: u32,
+    pub reserved: u32,
 }
-layout!(NormParams, 96, { positions: 48, rows: 56, rotary: 88, eps: 92 });
+layout!(NormParams, 136, { positions: 48, rows: 56, rotary: 88, eps: 92, add_parts: 96, add_splits: 120, m_pad: 128 });
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

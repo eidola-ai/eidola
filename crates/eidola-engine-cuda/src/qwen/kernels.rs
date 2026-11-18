@@ -57,6 +57,11 @@ pub trait QwenKernels {
     /// an f32 scratch of `splits · m_pad · n` values for its partial sums, there (and on a
     /// host device planning as the fast profile does); the exact profile ignores it.
     unsafe fn lin8(&self, p: &Lin8Params, parts: Option<u64>) -> Result<()>;
+    /// A split shape's FP8 linear without its sum (fast profile): the [`fp8_splits`]
+    /// ranges' partial sums of `m_pad` rows into `parts` (`[splits][m_pad][n]` f32),
+    /// `p.out` unwritten, for a norm whose residual add reads them (`NormParams::
+    /// add_parts`). The sum the norm takes is the one [`QwenKernels::lin8`] would store.
+    unsafe fn lin8_parts(&self, p: &Lin8Params, parts: u64) -> Result<()>;
     /// The BF16 linear: exact (`linear_bf16_rows`) in the exact profile, the tensor-core
     /// form in the fast one for the large linears (the head and the drafter's input
     /// projection), which name an f32 scratch of `rows · n` values in `fast`; `None` for
@@ -187,6 +192,29 @@ pub fn norm_grid(p: &NormParams) -> Result<[u32; 3]> {
             "norm: a residual add over one unit",
         )?;
     }
+    if p.add_parts != 0 {
+        ensure(
+            p.add == 0
+                && p.units == 1
+                && p.add_splits >= 2
+                && p.add_part_rows >= p.rows
+                && p.add_parts.is_multiple_of(4),
+            "norm: a residual add of partial sums over one unit",
+        )?;
+    }
+    if p.codes != 0 {
+        ensure(
+            p.scales != 0
+                && p.units == 1
+                && p.rotary == 0
+                && p.n.is_multiple_of(BLOCK)
+                && p.m_pad >= p.rows
+                && p.codes.is_multiple_of(4)
+                && p.scales.is_multiple_of(4),
+            "norm: a fused quantisation of whole 128-blocks of one unrotated unit",
+        )?;
+    }
+    ensure(p.reserved == 0, "norm: reserved")?;
     if p.rotary > 0 {
         ensure(
             p.rope_cos != 0 && p.rope_sin != 0 && p.positions != 0,
@@ -207,6 +235,12 @@ pub fn norm_grid(p: &NormParams) -> Result<[u32; 3]> {
         NORM_ITEMS,
         "norm: units",
     )
+}
+
+/// Whether a norm takes its fused forms' kernel (`eidola_qwen_norm_fused`): a residual
+/// add from partial sums, or the normed rows quantised.
+pub fn norm_is_fused(p: &NormParams) -> bool {
+    p.add_parts != 0 || p.codes != 0
 }
 
 /// Units a norm stages a warp each (`kNormWarpMax`), eight a CTA (`kNormItems`); wider

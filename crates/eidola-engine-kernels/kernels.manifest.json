@@ -227,7 +227,7 @@
     },
     {
       "path": "csrc/qwen_abi.cuh",
-      "sha256": "bef02497b5b91e394f2f0407c457c4be8090388a9e250132f85846679812d9b3"
+      "sha256": "a5c33234a70f8c4f39c935a6c2a41cdb932aeba7b8d59f25afaabaab5c2912e3"
     },
     {
       "path": "csrc/qwen_deltanet.cu",
@@ -239,7 +239,7 @@
     },
     {
       "path": "csrc/qwen_fast.cuh",
-      "sha256": "48edbaefd0825adbb9e0eff19a168330564dde74c289dca580c580aa9f36650d"
+      "sha256": "9b3dabb8604520bcbca3213132bb2de502cc646ae6974da2723517c6d69daf44"
     },
     {
       "path": "csrc/qwen_fast_deltanet.cu",
@@ -251,15 +251,15 @@
     },
     {
       "path": "csrc/qwen_ops.cu",
-      "sha256": "a083eab3b57051d23bb7710266abb4da53acccf8ed3d988ecfba505c74c1eec8"
+      "sha256": "8bce64674c757b7349f9f72928d4cbd47ad5e5ec1a3c355e74840120cfa11906"
     },
     {
       "path": "csrc/qwen_ops.cuh",
-      "sha256": "c550bb1dc369928e6c4e13cfd0d08901b3907958ac4708be5242ccd5fc254f53"
+      "sha256": "8ebeca57e4f0891d831a4bce321094395ba4919a9067218b8dc83ef06e0914af"
     },
     {
       "path": "csrc/qwen_ops_div.cu",
-      "sha256": "bbc9bef69e9ac29eadce008d7956ed800cfb079d9653f7baca71d5a9807725a4"
+      "sha256": "d58047bd354512c72574344f104b0efc3a314b0f47584fd8c63b4ee5e3dd9945"
     },
     {
       "path": "csrc/qwen_sampling.cu",
@@ -3022,8 +3022,8 @@
       "source": "csrc/qwen_fast.cu",
       "profile": "own",
       "file": "cubin/qwen_fast.sm_100a.cubin",
-      "sha256": "0297f2e06bb3a85c88266e1ae2609c49f5ed690f2628d7c7e92516f179a8565f",
-      "size": 108352,
+      "sha256": "b1e2260e6a796d9865b55e43f212061d1170b125a098efaa3846a741a71a0c65",
+      "size": 149360,
       "entries": [
         {
           "symbol": "eidola_qwen_fast_gate",
@@ -3060,8 +3060,8 @@
       "source": "csrc/qwen_fast.cu",
       "profile": "own",
       "file": "cubin/qwen_fast.sm_100f.cubin",
-      "sha256": "c25a5a4fc7662cfcbfea9a0353a62fe91a84267104e54809ee196176096bb29a",
-      "size": 108352,
+      "sha256": "5e5b7cf3dda6fb8a67e59b5e8c2500d0850a18b3f531d2fa677b68811edbca81",
+      "size": 149360,
       "entries": [
         {
           "symbol": "eidola_qwen_fast_gate",
@@ -3098,8 +3098,8 @@
       "source": "csrc/qwen_fast.cu",
       "profile": "own",
       "file": "cubin/qwen_fast.sm_103a.cubin",
-      "sha256": "f15b58e81533ba88168e03f4aee10d26d69cb80d4341b73d5233a7c3a642fc1e",
-      "size": 108352,
+      "sha256": "d8cd4f3289c8f62ee4d86b40b57414915837fb327a6b5de9a38cee273880d846",
+      "size": 149360,
       "entries": [
         {
           "symbol": "eidola_qwen_fast_gate",
@@ -3274,8 +3274,8 @@
       "source": "csrc/qwen_ops.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops.sm_100a.cubin",
-      "sha256": "c86b5935f7c4bcce7bf7ffd7695bad8363f9a7800860cd194a3f9dc2f98a034d",
-      "size": 84904,
+      "sha256": "1ec8052ebf1f98d537d5ead23fecdd71d6b323a19beec47072bbff7e3cba9f25",
+      "size": 79688,
       "entries": [
         {
           "symbol": "eidola_qwen_copy_rows",
@@ -3336,8 +3336,8 @@
       "source": "csrc/qwen_ops.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops.sm_100f.cubin",
-      "sha256": "3d032f4e7b7c3b0fe1ce409a089617fe6812f21fdcfb40be4c659a51395df8fe",
-      "size": 84904,
+      "sha256": "9e302c4f1434e2d8205f65c11d4b4e45d514e1093308c68a93d8f9a7b3ae087f",
+      "size": 79688,
       "entries": [
         {
           "symbol": "eidola_qwen_copy_rows",
@@ -3398,8 +3398,8 @@
       "source": "csrc/qwen_ops.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops.sm_103a.cubin",
-      "sha256": "e4dcd393ccb82f5fa8321509471d1e60841def6ce3d8d51ec2c59103a902553b",
-      "size": 86056,
+      "sha256": "e1921d0283697594ec2098cbfe68abc7686a4f7fd0146aae57c3cdcc6b04c6c4",
+      "size": 80840,
       "entries": [
         {
           "symbol": "eidola_qwen_copy_rows",
@@ -3460,8 +3460,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_100a.cubin",
-      "sha256": "93b8e50c2d2f59b87ecc4d1b19ff0f8802e6de8c171b0aa9ab835420a338bc01",
-      "size": 248368,
+      "sha256": "ee912dcfd355ee973e39cedd49a559df9ea3e52edcf8ec6f672cde6c5ac8630d",
+      "size": 455344,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -3489,6 +3489,11 @@
           "meta": "eidola_qwen_norm_meta"
         },
         {
+          "symbol": "eidola_qwen_norm_fused",
+          "demangled": "eidola_qwen_norm_fused",
+          "meta": "eidola_qwen_norm_fused_meta"
+        },
+        {
           "symbol": "eidola_qwen_quant",
           "demangled": "eidola_qwen_quant",
           "meta": "eidola_qwen_quant_meta"
@@ -3499,6 +3504,7 @@
         "eidola_qwen_dn_norm_meta",
         "eidola_qwen_dn_prep_meta",
         "eidola_qwen_gate_meta",
+        "eidola_qwen_norm_fused_meta",
         "eidola_qwen_norm_meta",
         "eidola_qwen_quant_meta"
       ],
@@ -3506,8 +3512,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1733,
-        "sass_fma": 492
+        "ptx_rounded": 3105,
+        "sass_fma": 586
       }
     },
     {
@@ -3516,8 +3522,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_100f.cubin",
-      "sha256": "1bb053a4e836d9fcfb4208f4d98c0f9d383829ab0f96fab13b38efb372c533f0",
-      "size": 248368,
+      "sha256": "ca5143edec0076831bef639f500878661f0feeb75416c46c51bdcbecc6de6482",
+      "size": 455344,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -3545,6 +3551,11 @@
           "meta": "eidola_qwen_norm_meta"
         },
         {
+          "symbol": "eidola_qwen_norm_fused",
+          "demangled": "eidola_qwen_norm_fused",
+          "meta": "eidola_qwen_norm_fused_meta"
+        },
+        {
           "symbol": "eidola_qwen_quant",
           "demangled": "eidola_qwen_quant",
           "meta": "eidola_qwen_quant_meta"
@@ -3555,6 +3566,7 @@
         "eidola_qwen_dn_norm_meta",
         "eidola_qwen_dn_prep_meta",
         "eidola_qwen_gate_meta",
+        "eidola_qwen_norm_fused_meta",
         "eidola_qwen_norm_meta",
         "eidola_qwen_quant_meta"
       ],
@@ -3562,8 +3574,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1733,
-        "sass_fma": 492
+        "ptx_rounded": 3105,
+        "sass_fma": 586
       }
     },
     {
@@ -3572,8 +3584,8 @@
       "source": "csrc/qwen_ops_div.cu",
       "profile": "exact",
       "file": "cubin/qwen_ops_div.sm_103a.cubin",
-      "sha256": "d00f9e221ff140054edaaf888522fd3b99ba81f28ac194b8dd5c2d99a7558db7",
-      "size": 324792,
+      "sha256": "b92ae017bb2a226ae399b063b36e6d111a320a75caaa36de0eae631d7a98c378",
+      "size": 531768,
       "entries": [
         {
           "symbol": "eidola_qwen_attn",
@@ -3601,6 +3613,11 @@
           "meta": "eidola_qwen_norm_meta"
         },
         {
+          "symbol": "eidola_qwen_norm_fused",
+          "demangled": "eidola_qwen_norm_fused",
+          "meta": "eidola_qwen_norm_fused_meta"
+        },
+        {
           "symbol": "eidola_qwen_quant",
           "demangled": "eidola_qwen_quant",
           "meta": "eidola_qwen_quant_meta"
@@ -3611,6 +3628,7 @@
         "eidola_qwen_dn_norm_meta",
         "eidola_qwen_dn_prep_meta",
         "eidola_qwen_gate_meta",
+        "eidola_qwen_norm_fused_meta",
         "eidola_qwen_norm_meta",
         "eidola_qwen_quant_meta"
       ],
@@ -3618,8 +3636,8 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 1733,
-        "sass_fma": 492
+        "ptx_rounded": 3105,
+        "sass_fma": 586
       }
     },
     {
@@ -4133,8 +4151,8 @@
     {
       "name": "qwen_fast",
       "file": "fatbin/qwen_fast.fatbin",
-      "sha256": "ee3649cf9ca8e3ca80587bedb2bd4e159ec03a61b2fecaff93e8182eec3e7b73",
-      "size": 216936,
+      "sha256": "9dd07be715593a12177c472155cca43aef3f74ab8ed14643161ae18c35722bb7",
+      "size": 298952,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -4153,8 +4171,8 @@
     {
       "name": "qwen_ops",
       "file": "fatbin/qwen_ops.fatbin",
-      "sha256": "ababa4e7da9f032f0b59527b8286b67c0080d9dd190c8773eb21903593e47f81",
-      "size": 171192,
+      "sha256": "a82d4d5633041057202c2c8f22acff0d552500b3b36daef203a052cbb1d3be61",
+      "size": 160760,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -4163,8 +4181,8 @@
     {
       "name": "qwen_ops_div",
       "file": "fatbin/qwen_ops_div.fatbin",
-      "sha256": "0a50d1541159db0c7d88bab298c23fdee93e928256ffb73bd9055b887d19f70b",
-      "size": 573392,
+      "sha256": "43f9db357734f3a0b4d9c91bfedd4625bafebc55c715c06f2c8e0e521a4cacf9",
+      "size": 987344,
       "archs": [
         "sm_100a",
         "sm_103a"

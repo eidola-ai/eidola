@@ -497,6 +497,7 @@ fn qwen_kernels_fuse_nothing() {
                 "eidola_qwen_dn_prep",
                 "eidola_qwen_gate",
                 "eidola_qwen_norm",
+                "eidola_qwen_norm_fused",
                 "eidola_qwen_quant",
             ],
         ),

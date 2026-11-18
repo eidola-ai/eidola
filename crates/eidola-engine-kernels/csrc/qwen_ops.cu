@@ -51,8 +51,16 @@ extern "C" __global__ void __launch_bounds__(qwk::kElementThreads)
 EIDOLA_KERNEL_META(eidola_qwen_round, qwk::kElementThreads, 1, 1, 0, 1, 1, 1,
                    sizeof(QwRoundParams));
 
+// Vectors (or words) a thread of the row copy loads before it stores any.
+constexpr uint32_t kCopyBatch = 8;
+
 // Item `blockIdx.x` of the groups taken in order: its row copied by the
 // block, sixteen bytes a thread at a time when both rows are aligned to them.
+// A thread loads a batch of `kCopyBatch` of its vectors (or words) before it
+// stores any: an item's source and destination rows never overlap (a row onto
+// itself copies nothing), so the batch only overlaps the loads' round trips,
+// which one load and store at a time would serialise (a 10,240-word convolution
+// row is ten of a thread's vectors).
 extern "C" __global__ void __launch_bounds__(qwk::kElementThreads)
     eidola_qwen_copy_rows(const __grid_constant__ QwCopyParams p) {
   uint32_t i = blockIdx.x, g = 0;
@@ -72,9 +80,34 @@ extern "C" __global__ void __launch_bounds__(qwk::kElementThreads)
       ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) == 0) {
     const uint4* s4 = reinterpret_cast<const uint4*>(src);
     uint4* d4 = reinterpret_cast<uint4*>(dst);
-    for (uint32_t w = threadIdx.x; w < c.width / 4; w += qwk::kElementThreads) d4[w] = s4[w];
+    const uint32_t n = c.width / 4;
+    for (uint32_t w0 = threadIdx.x; w0 < n; w0 += kCopyBatch * qwk::kElementThreads) {
+      uint4 v[kCopyBatch];
+#pragma unroll
+      for (uint32_t j = 0; j < kCopyBatch; ++j) {
+        const uint32_t w = w0 + j * qwk::kElementThreads;
+        if (w < n) v[j] = s4[w];
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < kCopyBatch; ++j) {
+        const uint32_t w = w0 + j * qwk::kElementThreads;
+        if (w < n) d4[w] = v[j];
+      }
+    }
   } else {
-    for (uint32_t w = threadIdx.x; w < c.width; w += qwk::kElementThreads) dst[w] = src[w];
+    for (uint32_t w0 = threadIdx.x; w0 < c.width; w0 += kCopyBatch * qwk::kElementThreads) {
+      uint32_t v[kCopyBatch];
+#pragma unroll
+      for (uint32_t j = 0; j < kCopyBatch; ++j) {
+        const uint32_t w = w0 + j * qwk::kElementThreads;
+        if (w < c.width) v[j] = src[w];
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < kCopyBatch; ++j) {
+        const uint32_t w = w0 + j * qwk::kElementThreads;
+        if (w < c.width) dst[w] = v[j];
+      }
+    }
   }
 }
 EIDOLA_KERNEL_META(eidola_qwen_copy_rows, qwk::kElementThreads, 1, 1, 0, 1, 1, 1,

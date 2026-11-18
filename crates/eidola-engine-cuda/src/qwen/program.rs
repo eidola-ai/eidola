@@ -18,7 +18,7 @@ use eidola_engine::sampling::Stream;
 use super::super::abi::*;
 use super::super::attention::{Fa2Args, HEAD_DIM, PARTIAL_BYTES_PER_HEAD};
 use super::super::device::QwenDevice;
-use super::super::kernels::{AcceptLaunch, DN_SHORT_RUN, SampleArgs, split_width};
+use super::super::kernels::{AcceptLaunch, DN_SHORT_RUN, SampleArgs, fp8_splits, split_width};
 use super::super::plan::{AttnAt, DrafterAt, Fa2At, ItemsAt, Layout, SAMPLE_WORDS, TargetAt};
 use super::super::sampler::{accept_work_bytes, sample_work_bytes};
 use super::super::weights::{AttentionW, DeltaNetW, LayerW, MixerW, ab_rows};
@@ -660,10 +660,23 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         unsafe { self.dev.linear(&p, fast) }
     }
 
-    fn norm(&self, x: u64, add: u64, w: u64, out: u64, rows: usize, n: u32) -> Result<()> {
-        let p = NormParams {
+    /// The residual norm of `rows` rows of `x` (`n` wide) into `out`, the residual add's
+    /// input `add`; with `quant`, its normed rows also quantised into the codes and scales
+    /// scratch, as [`Self::quant`] would, for the FP8 GEMM that reads them
+    /// ([`Self::gemm8`]).
+    #[allow(clippy::too_many_arguments)]
+    fn norm(
+        &self,
+        x: u64,
+        add: Residual,
+        w: u64,
+        out: u64,
+        rows: usize,
+        n: u32,
+        quant: bool,
+    ) -> Result<()> {
+        let mut p = NormParams {
             x,
-            add,
             weight: w,
             out,
             rows: n32(rows),
@@ -675,7 +688,22 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             eps: self.dims.eps,
             ..NormParams::default()
         };
-        // SAFETY: `rows · n` BF16 values at each.
+        match add {
+            Residual::None => {}
+            Residual::Bf16(a) => p.add = a,
+            Residual::Parts { splits, part_rows } => {
+                p.add_parts = self.scratch.parts.addr;
+                p.add_splits = splits;
+                p.add_part_rows = part_rows;
+            }
+        }
+        if quant {
+            p.codes = self.scratch.codes.addr;
+            p.scales = self.scratch.scales.addr;
+            p.m_pad = n32(pad4(rows));
+        }
+        // SAFETY: `rows · n` BF16 values at each; the partials are the parts scratch's,
+        // the codes and scales the quantiser's scratch, which hold the capacity's rows.
         unsafe { self.dev.norm(&p) }
     }
 
@@ -684,6 +712,32 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
     fn lin8(&self, x: u64, rows: usize, w: &super::super::weights::Fp8W, out: u64) -> Result<()> {
         self.quant(x, rows, w.k)?;
         self.gemm8(rows, w, out)
+    }
+
+    /// The FP8 linear of `rows` rows of `x` by `w` whose output only the next norm's
+    /// residual add reads: in the fast profile a split shape's partial sums, left in the
+    /// parts scratch for that norm to add; otherwise its BF16 rows in `out`.
+    fn lin8_residual(
+        &self,
+        x: u64,
+        rows: usize,
+        w: &super::super::weights::Fp8W,
+        out: u64,
+    ) -> Result<Residual> {
+        let splits = fp8_splits(w.n, w.k);
+        if self.dev.profile() == super::QwenProfile::Exact || splits < 2 {
+            self.lin8(x, rows, w, out)?;
+            return Ok(Residual::Bf16(out));
+        }
+        self.quant(x, rows, w.k)?;
+        let l = self.lin8_params(rows, w, out);
+        // SAFETY: the codes and scales of `m_pad` rows; the parts scratch holds
+        // `parts_width` f32 a row.
+        unsafe { self.dev.lin8_parts(&l, self.scratch.parts.addr)? };
+        Ok(Residual::Parts {
+            splits,
+            part_rows: l.m_pad,
+        })
     }
 
     /// `rows` rows of `x`, `k` wide, quantised into the codes and scales scratch.
@@ -704,8 +758,18 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
     /// The FP8 GEMM of the `rows` rows [`Self::quant`] left by `w` into `out`, the split
     /// shapes' partial sums through the parts scratch.
     fn gemm8(&self, rows: usize, w: &super::super::weights::Fp8W, out: u64) -> Result<()> {
+        let l = self.lin8_params(rows, w, out);
+        let parts =
+            (self.dev.profile() == super::QwenProfile::Fast).then_some(self.scratch.parts.addr);
+        // SAFETY: the codes and scales of `m_pad` rows; `out` holds `m_pad` rows (the fast
+        // forms write the padding rows); the parts scratch holds `parts_width` f32 a row.
+        unsafe { self.dev.lin8(&l, parts) }
+    }
+
+    /// The FP8 linear of the quantiser's scratch by `w` into `out`.
+    fn lin8_params(&self, rows: usize, w: &super::super::weights::Fp8W, out: u64) -> Lin8Params {
         let m_pad = n32(pad4(rows));
-        let l = Lin8Params {
+        Lin8Params {
             a: self.scratch.codes.addr,
             a_scales: self.scratch.scales.addr,
             w: w.codes,
@@ -717,12 +781,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             m_pad,
             out_stride: w.n,
             reserved: 0,
-        };
-        let parts =
-            (self.dev.profile() == super::QwenProfile::Fast).then_some(self.scratch.parts.addr);
-        // SAFETY: the codes and scales of `m_pad` rows; `out` holds `m_pad` rows (the fast
-        // forms write the padding rows); the parts scratch holds `parts_width` f32 a row.
-        unsafe { self.dev.lin8(&l, parts) }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -816,10 +875,12 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         unsafe { self.dev.widen(&p) }
     }
 
-    fn mlp(&self, l: &LayerW, x: u64, rows: usize, m: u64) -> Result<()> {
+    /// The MLP of `rows` rows whose input the norm before it quantised (`x` normed), its
+    /// down projection for the next norm's residual add ([`Self::lin8_residual`], `m`).
+    fn mlp(&self, l: &LayerW, rows: usize, m: u64) -> Result<Residual> {
         let s = &self.scratch;
         let inter = self.dims.inter;
-        self.lin8(x, rows, &l.gate_up, s.gate_up.addr)?;
+        self.gemm8(rows, &l.gate_up, s.gate_up.addr)?;
         let p = GateParams {
             a: s.gate_up.addr + u64::from(inter) * 2,
             g: s.gate_up.addr,
@@ -835,7 +896,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         };
         // SAFETY: `rows · inter` values in each.
         unsafe { self.dev.gate(&p)? };
-        self.lin8(s.hmid.addr, rows, &l.down, m)
+        self.lin8_residual(s.hmid.addr, rows, &l.down, m)
     }
 
     /// One DeltaNet layer's staging, recurrence and keeping, over the pass's runs.
@@ -1009,12 +1070,12 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         }
         self.embed(self.tw(at.tokens), t, s.h.addr)?;
         let (mut dn, mut layer) = (0usize, 0u32);
-        let mut prev_m = 0u64;
+        let mut prev = Residual::None;
         for lw in &self.weights.layers {
-            self.norm(s.h.addr, prev_m, lw.input_norm, s.x.addr, t, d.hidden)?;
-            match &lw.mixer {
+            self.norm(s.h.addr, prev, lw.input_norm, s.x.addr, t, d.hidden, true)?;
+            let mix = match &lw.mixer {
                 MixerW::DeltaNet(w) => {
-                    self.lin8(s.x.addr, t, &w.qkvz, s.qkvz.addr)?;
+                    self.gemm8(t, &w.qkvz, s.qkvz.addr)?;
                     self.ab_projections(s.x.addr, t, w)?;
                     self.deltanet(at, dn, w, true)?;
                     let p = DnNormParams {
@@ -1031,27 +1092,25 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
                     };
                     // SAFETY: `t` rows of each.
                     unsafe { self.dev.dn_norm(&p)? };
-                    self.lin8(s.nrm.addr, t, &w.out, s.mix.addr)?;
                     dn += 1;
+                    self.lin8_residual(s.nrm.addr, t, &w.out, s.mix.addr)?
                 }
                 MixerW::Attention(w) => {
-                    self.attention_mix(
-                        w, s.x.addr, t, TARGET, layer, 0, &at.attn, s.mix.addr, false,
-                    )?;
                     layer += 1;
+                    self.attention_mix(w, t, TARGET, layer - 1, 0, &at.attn, s.mix.addr, false)?
                 }
-            }
-            self.norm(s.h.addr, s.mix.addr, lw.post_norm, s.x.addr, t, d.hidden)?;
-            self.mlp(lw, s.x.addr, t, s.m.addr)?;
-            prev_m = s.m.addr;
+            };
+            self.norm(s.h.addr, mix, lw.post_norm, s.x.addr, t, d.hidden, true)?;
+            prev = self.mlp(lw, t, s.m.addr)?;
         }
         self.norm(
             s.h.addr,
-            prev_m,
+            prev,
             self.weights.final_norm,
             normed,
             t,
             d.hidden,
+            false,
         )
     }
 
@@ -1070,13 +1129,13 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         unsafe { self.dev.embed(&p) }
     }
 
-    /// One attention layer's mixer over `rows` normed rows `x` into `mix`; with
-    /// `kv_only`, only the KV write.
+    /// One attention layer's mixer over `rows` normed rows, which the norm before it
+    /// quantised, its output projection for the next norm's residual add
+    /// ([`Self::lin8_residual`], `mix`); with `kv_only`, only the KV write.
     #[allow(clippy::too_many_arguments)]
     fn attention_mix(
         &self,
         w: &AttentionW,
-        x: u64,
         rows: usize,
         group: usize,
         layer: u32,
@@ -1084,7 +1143,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         at: &AttnAt,
         mix: u64,
         kv_only: bool,
-    ) -> Result<()> {
+    ) -> Result<Residual> {
         let s = &self.scratch;
         let d = &self.dims;
         let (hq, hd, kvw) = (d.q_heads, d.head_dim, d.kv_width());
@@ -1092,7 +1151,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let r = n32(rows);
         // One GEMM over the stacked projections, the passes that write KV alone too, so
         // every pass computes a position's keys and values by the same GEMM.
-        self.lin8(x, rows, &w.qkv, s.qkv.addr)?;
+        self.gemm8(rows, &w.qkv, s.qkv.addr)?;
         let stride = 2 * qw + 2 * kvw;
         let (kk, vv) = (
             s.qkv.addr + u64::from(2 * qw) * 2,
@@ -1145,7 +1204,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
             self.dev.kv_write(&kvp)?;
         }
         if kv_only {
-            return Ok(());
+            return Ok(Residual::None);
         }
         match at.fa2.as_slice() {
             [] => {
@@ -1197,7 +1256,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         };
         // SAFETY: `rows` rows of each.
         unsafe { self.dev.gate(&gp)? };
-        self.lin8(s.y.addr, rows, &w.o, mix)
+        self.lin8_residual(s.y.addr, rows, &w.o, mix)
     }
 
     fn fa2(&self, f: &Fa2At, group: usize, layer: u32) -> Result<()> {
@@ -1323,17 +1382,32 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
         let MixerW::Attention(w) = &lw.mixer else {
             unreachable!("the drafter's layer is an attention layer")
         };
-        self.norm(s.d_h.addr, 0, lw.input_norm, s.x.addr, n, d.hidden)?;
-        self.attention_mix(
-            w, s.x.addr, n, DRAFTER, 0, 1, &at.attn, s.mix.addr, at.kv_only,
+        self.norm(
+            s.d_h.addr,
+            Residual::None,
+            lw.input_norm,
+            s.x.addr,
+            n,
+            d.hidden,
+            true,
         )?;
+        let mix = self.attention_mix(w, n, DRAFTER, 0, 1, &at.attn, s.mix.addr, at.kv_only)?;
         if at.kv_only {
             return Ok(());
         }
-        self.norm(s.d_h.addr, s.mix.addr, lw.post_norm, s.x.addr, n, d.hidden)?;
-        self.mlp(lw, s.x.addr, n, s.m.addr)?;
-        self.norm(s.d_h.addr, s.m.addr, mtp.norm, s.d_normed.addr, n, d.hidden)
+        self.norm(s.d_h.addr, mix, lw.post_norm, s.x.addr, n, d.hidden, true)?;
+        let m = self.mlp(lw, n, s.m.addr)?;
+        self.norm(s.d_h.addr, m, mtp.norm, s.d_normed.addr, n, d.hidden, false)
     }
+}
+
+/// What a residual norm adds: nothing, BF16 rows, or the split FP8 GEMM's partial sums
+/// in the parts scratch.
+#[derive(Clone, Copy, Debug)]
+enum Residual {
+    None,
+    Bf16(u64),
+    Parts { splits: u32, part_rows: u32 },
 }
 
 fn n32(x: usize) -> u32 {

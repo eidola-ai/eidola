@@ -49,6 +49,7 @@ pub const FAST_DN_IMAGE: &str = "qwen_fast_deltanet";
 struct Kernels {
     embed: Kernel,
     norm: Kernel,
+    norm_fused: Kernel,
     quant: Kernel,
     lin8: Kernel,
     linear: Kernel,
@@ -154,6 +155,7 @@ impl CudaDevice {
             round: bound::<RoundParams>(&ops, "qwen_ops", "eidola_qwen_round")?,
             copy: bound::<CopyParams>(&ops, "qwen_ops", "eidola_qwen_copy_rows")?,
             norm: bound::<NormParams>(&div, "qwen_ops_div", "eidola_qwen_norm")?,
+            norm_fused: bound::<NormParams>(&div, "qwen_ops_div", "eidola_qwen_norm_fused")?,
             quant: bound::<QuantParams>(&div, "qwen_ops_div", "eidola_qwen_quant")?,
             gate: bound::<GateParams>(&div, "qwen_ops_div", "eidola_qwen_gate")?,
             attn: bound::<AttnParams>(&div, "qwen_ops_div", "eidola_qwen_attn")?,
@@ -534,7 +536,12 @@ impl QwenKernels for CudaDevice {
             return Ok(());
         }
         let g = norm_grid(p)?;
-        unsafe { self.go(&self.k.norm, p, g) }
+        let k = if norm_is_fused(p) {
+            &self.k.norm_fused
+        } else {
+            &self.k.norm
+        };
+        unsafe { self.go(k, p, g) }
     }
     unsafe fn quant(&self, p: &QuantParams) -> Result<()> {
         if p.rows == 0 {
@@ -553,6 +560,18 @@ impl QwenKernels for CudaDevice {
             // SAFETY: the caller's.
             Some(_) => unsafe { self.lin8_on(p, fp8_kind(p.m_pad, p.n, p.k), parts) },
         }
+    }
+    unsafe fn lin8_parts(&self, p: &Lin8Params, parts: u64) -> Result<()> {
+        if p.rows == 0 {
+            return Ok(());
+        }
+        let GemmKind::Fp8Split(tile, splits) = fp8_kind(p.m_pad, p.n, p.k) else {
+            return Err(CudaError::new(
+                "an FP8 linear that does not split has no partials",
+            ));
+        };
+        // SAFETY: the caller's.
+        unsafe { self.fp8_split_parts(p, tile, splits, parts) }
     }
     unsafe fn linear(&self, p: &LinearParams, fast: Option<u64>) -> Result<()> {
         if p.rows == 0 {

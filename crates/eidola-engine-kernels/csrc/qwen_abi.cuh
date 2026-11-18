@@ -60,6 +60,17 @@ QW_ABI_FIELD(QwEmbedParams, out_stride, 44);
 // position (`attention::apply_rope`: `bf16(bf16(x·cos) + bf16(rot(x)·sin))`,
 // pairs `(j, j + rotary / 2)`) from the host's BF16-valued tables
 // `[positions][rotary]`.
+//
+// Two forms the fast profile's decode path takes (one unit per row, no
+// rotation, the unit whole 128-wide blocks for the second):
+//
+// - With `add_parts` in place of `add`, the residual add's input is a split
+//   FP8 GEMM's partial sums, `add_splits` arrays of `add_part_rows` rows of `n`
+//   f32: each element their sum in split order from the first, rounded once to
+//   BF16, as `eidola_qwen_fast_split_sum` stores it.
+// - With `codes`, the normed rows are also quantised as `eidola_qwen_quant`
+//   quantises them (`linear::act_quant`): codes `[rows, n]`, scales
+//   `[n / 128][m_pad]`.
 struct QwNormParams {
   uint16_t* x;                 // [rows, x_stride]; unit u at u · x_unit_stride
   const uint16_t* add;         // [rows, add_stride] or null
@@ -78,8 +89,18 @@ struct QwNormParams {
   uint32_t out_unit_stride;
   uint32_t rotary;
   float eps;
+  const float* add_parts;  // [add_splits][add_part_rows][n] or null
+  uint8_t* codes;          // [rows, n] or null
+  float* scales;           // [n / 128][m_pad] with `codes`
+  uint32_t add_splits;
+  uint32_t add_part_rows;
+  uint32_t m_pad;
+  uint32_t reserved;
 };
-QW_ABI_STRUCT(QwNormParams, 96);
+QW_ABI_STRUCT(QwNormParams, 136);
+QW_ABI_FIELD(QwNormParams, add_parts, 96);
+QW_ABI_FIELD(QwNormParams, add_splits, 120);
+QW_ABI_FIELD(QwNormParams, m_pad, 128);
 QW_ABI_FIELD(QwNormParams, positions, 48);
 QW_ABI_FIELD(QwNormParams, rows, 56);
 QW_ABI_FIELD(QwNormParams, rotary, 88);

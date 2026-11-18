@@ -57,6 +57,11 @@ constexpr uint32_t kWarp = 32;
 constexpr uint32_t kSmallWarps = 4;   // outputs per CTA, a warp each
 constexpr uint32_t kSmallRows = 4;    // rows per CTA
 constexpr uint32_t kSmallChunk = 8;   // a lane's elements per load (16 bytes of BF16)
+// A lane's chunks the device loads all at once before its sums (a K of up to 5,120):
+// each of its weight chunks, then each row's chunks, so a decode-size launch makes
+// one round trip to memory for the weight and one a row, where a loop that loads
+// as it sums makes one every few chunks. The sums are the same, in the same order.
+constexpr uint32_t kSmallPrefetch = 20;
 
 // Lane `l`'s partial sums of output `n` for rows `r0 ..` (`rows` of them, at
 // most `kSmallRows`), into `acc`.
@@ -66,6 +71,36 @@ QF_FN void small_gemm_lane(const QwLinearParams& p, uint32_t n, uint32_t r0, uin
   const uint32_t chunks = p.k / kSmallChunk;
   const uint16_t* w = p.w + static_cast<uint64_t>(n) * p.k;
 #if defined(__CUDA_ARCH__)
+  if (chunks <= kSmallPrefetch * kWarp) {
+    uint4 wq[kSmallPrefetch];
+#pragma unroll
+    for (uint32_t j = 0; j < kSmallPrefetch; ++j) {
+      const uint32_t c = l + j * kWarp;
+      if (c < chunks) wq[j] = *reinterpret_cast<const uint4*>(w + c * kSmallChunk);
+    }
+    for (uint32_t r = 0; r < kSmallRows; ++r) {
+      if (r >= rows) break;
+      const uint16_t* x = p.x + static_cast<uint64_t>(r0 + r) * p.x_stride;
+      uint4 xq[kSmallPrefetch];
+#pragma unroll
+      for (uint32_t j = 0; j < kSmallPrefetch; ++j) {
+        const uint32_t c = l + j * kWarp;
+        if (c < chunks) xq[j] = *reinterpret_cast<const uint4*>(x + c * kSmallChunk);
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < kSmallPrefetch; ++j) {
+        if (l + j * kWarp >= chunks) continue;
+        const uint32_t ww[4] = {wq[j].x, wq[j].y, wq[j].z, wq[j].w};
+        const uint32_t xw[4] = {xq[j].x, xq[j].y, xq[j].z, xq[j].w};
+        for (uint32_t e = 0; e < kSmallChunk; ++e) {
+          const uint16_t xe = static_cast<uint16_t>(xw[e / 2] >> (16 * (e % 2)));
+          const uint16_t we = static_cast<uint16_t>(ww[e / 2] >> (16 * (e % 2)));
+          acc[r] = fma32(bf16_value(xe), bf16_value(we), acc[r]);
+        }
+      }
+    }
+    return;
+  }
 #pragma unroll 4
 #endif
   for (uint32_t c = l; c < chunks; c += kWarp) {

@@ -754,6 +754,9 @@ mod counting {
         unsafe fn lin8(&self, p: &Lin8Params, parts: Option<u64>) -> Result<()> {
             unsafe { self.inner.lin8(p, parts) }
         }
+        unsafe fn lin8_parts(&self, p: &Lin8Params, parts: u64) -> Result<()> {
+            unsafe { self.inner.lin8_parts(p, parts) }
+        }
         unsafe fn linear(&self, p: &LinearParams, fast: Option<u64>) -> Result<()> {
             unsafe { self.inner.linear(p, fast) }
         }
