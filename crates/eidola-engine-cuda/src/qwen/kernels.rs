@@ -144,8 +144,9 @@ pub const DN_SHORT_RUN: usize = 8;
 
 /// Runs a launch of the blocked DeltaNet's fused form takes at most. A fused CTA computes its
 /// block's intra body for its own value head and columns, so the form wins while its CTAs
-/// (96 a run at the released width) all run at once and loses once they take two rounds (measured on a B200:
-/// 1 row 21 µs against 31, 8 rows 46 against 42, 64 rows 244 against 143).
+/// (96 a run at the released width) all run at once and loses once they take two rounds
+/// (measured on a B200: 1 row 21 µs against 31, 8 rows 46 against 42, 64 rows 244
+/// against 143).
 pub const DN_FUSED_MAX_RUNS: usize = 4;
 
 /// The grouped row copy's grid: a block an item, the groups' items in order. Checks
