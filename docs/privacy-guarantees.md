@@ -17,7 +17,7 @@ Every item is a permanent property of a specific release. Most are inherent attr
 
 **1.2.** `unlinked` endpoints accept only anonymous credential tokens ([Privacy Pass ACT](https://datatracker.ietf.org/doc/draft-schlesinger-privacypass-act/)), and refuse a request that carries any other credential. They never receive, derive, persist, or log any identifier that ties a request to its issuance transaction, to the account it was issued to, or to other requests from the same client, beyond what the client itself sends to link them: a prefix-cache key (§2.6), credentials presented together (§2.9), or a trace context it asks to have exported (§3.3).
 
-**1.3.** `linked` endpoints never accept an anonymous credential. Those authenticated as the account holder accept the account's identifier and secret and nothing else. Two are authenticated otherwise, of necessity: account creation, which mints the credential it would otherwise require, and the Stripe webhook, which is authenticated by HMAC signature over the request body. None of them receives or emits inference request or response content.
+**1.3.** `linked` endpoints never accept an anonymous credential. Those authenticated as the account holder accept the account's identifier and secret and nothing else. One is authenticated otherwise, of necessity: account creation, which mints the credential it would otherwise require. None of them receives or emits inference request or response content.
 
 **1.4.** No personally identifiable information is requested or accepted at account creation. Email, phone, name, address, and government identifiers are never collected by Eidola's API or stored on Eidola's servers. Payment runs through Stripe; what Stripe collects and retains is conduct outside the attested source, covered by the [privacy policy](https://www.eidola.ai/privacy/) and bounded in §8.4.
 
@@ -47,7 +47,7 @@ Every item is a permanent property of a specific release. Most are inherent attr
 
 **3.2.** Inference content is never included in logs, telemetry, traces, error reports, or crash dumps, nor in any derived form that could meaningfully identify a request or link it to other requests — including content hashes, content lengths at request granularity, or per-request metadata beyond what is needed to bill, route, or operate the request.
 
-**3.3.** Telemetry is limited to generic, unidentifiable fields as aggregate counters and histograms, keyed only by low-cardinality attributes fixed in the code (route template, model, operation, status, outcome), unless a request explicitly asks to be traced. An aggregate covering an interval in which a single request fell describes that request. Diagnostic logs are written per-event, but carry no content, no value derived from content, and no span context by which to group them back into a request. Values that originate outside Eidola, such as a Stripe event type, are resolved against a fixed list before use, and anything unrecognized collapses to a shared bucket. The model a request names is resolved, as the request arrives, to the weights hash of a model Eidola sells; from then on logs, telemetry, routing and billing know the request's model only by that hash, never by the name the client used.
+**3.3.** The gateway's and engines' telemetry is limited to generic, unidentifiable fields as aggregate counters and histograms, keyed only by low-cardinality attributes fixed in the code (route template, model, operation, status, outcome), unless a request explicitly asks to be traced. An aggregate covering an interval in which a single request fell describes that request. Their diagnostic logs are written per-event, but carry no content, no value derived from content, and no span context by which to group them back into a request. Values that originate outside Eidola are resolved against a fixed list before use, and anything unrecognized collapses to a shared bucket. The model a request names is resolved, as the request arrives, to the weights hash of a model Eidola sells; from then on logs, telemetry, routing and billing know the request's model only by that hash, never by the name the client used.
 
 **3.4.** Eidola service handlers do not persist or emit client IP addresses, user-agent strings, TLS fingerprints, or other network-layer identifiers. Network infrastructure outside the enclave (CDNs, load balancers, ISPs, the user's own network path) may log such identifiers and is out of scope for this invariant; the application-level promise is that Eidola code does not re-introduce them into its own observability or persistence surfaces.
 
@@ -114,11 +114,9 @@ Every item is a permanent property of a specific release. Most are inherent attr
 
 **7.4.** Source dependencies are pinned by version and hash. Updates are explicit commits.
 
-**7.5.** Logging and telemetry destinations are part of the attested configuration (§5.1). Changing a destination is a release event with a fresh human attestation.
+**7.5.** No feature is added whose privacy depends on operator trustworthiness when a comparable feature with cryptographic enforcement is implementable. New items follow the introduction's enforcement-disclosure convention.
 
-**7.6.** No feature is added whose privacy depends on operator trustworthiness when a comparable feature with cryptographic enforcement is implementable. New items follow the introduction's enforcement-disclosure convention.
-
-**7.7.** Any feature whose existence would let an operator answer the question "did account X ever do Y", for anything done on the `unlinked` surface, is a violation of this document, regardless of operator intent or cited rationale.
+**7.6.** Any feature whose existence would let an operator answer the question "did account X ever do Y", for anything done on the `unlinked` surface, is a violation of this document, regardless of operator intent or cited rationale.
 
 ---
 
