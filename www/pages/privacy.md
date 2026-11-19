@@ -46,7 +46,7 @@ In general, when a single IP address is shared by many users, profiling based on
 
 Creating an account collects no personal information: no email, phone, name, address, or government identifier — we never ask. Our billing database holds the account's random identifier, a hash of its secret, an append-only ledger of credit grants and spends, and, once you make a purchase, a Stripe customer reference. That reference is the only path from an account to a human identity, which makes these records pseudonymous rather than anonymous.
 
-Payments are processed by **Stripe**, configured to collect the minimum it permits. Stripe necessarily receives your payment details and, in addition to acting as our processor, operates as an independent controller under its own [privacy policy](https://stripe.com/privacy) for purposes such as fraud prevention across its network and its legal compliance obligations. We do not promise anonymity against Stripe with respect to payment metadata.
+Payments are processed by **Stripe**. Stripe necessarily receives your payment details and, in addition to acting as our processor, operates as an independent controller under its own [privacy policy](https://stripe.com/privacy) for purposes such as fraud prevention across its network and its legal compliance obligations. We do not promise anonymity against Stripe with respect to payment metadata.
 
 While you interact with Stripe's checkout and billing pages, Stripe also collects your IP address and related technical information under its own policy. Those records persist at the Stripe layer, linked to your payment identity, and are available to us.
 
