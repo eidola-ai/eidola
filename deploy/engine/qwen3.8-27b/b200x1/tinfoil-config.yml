@@ -8,11 +8,11 @@
 # engine-enclaves.json, from `measure-engine-enclaves`). Any change here is a
 # different engine identity, and needs a re-measure and a gateway release.
 #
-# GATEWAY_TOKEN_HASH below is the Argon2id hash of a placeholder token that
-# was generated and discarded: no gateway holds it, so a node booted from
-# this exact file accepts no caller. Before deploying, replace it with the
-# hash of the token the gateway's ENGINE_TOKEN secret carries
-# (`cargo run -p hash-secret`) and re-measure.
+# Secrets are organisation-scoped and reach a container by their own names,
+# so the node's carry a prefix: `EIDOLA_ENV_PREFIX` names it, and the node
+# reads every variable under it. Its one secret, ENGINE_GATEWAY_TOKEN, is the
+# token the gateway's GATEWAY_ENGINE_TOKEN carries; it is not measured, so
+# rotating it changes no identity.
 #
 # The weights pack is the modelwrap schema 1 pack of the repo below; its
 # reference is reproducible from the repo at that revision (`modelwrap
@@ -41,30 +41,30 @@ containers:
     models: ["weights"]
     gpus: all
     secrets:
-      - GATEWAY_TOKEN
+      - ENGINE_GATEWAY_TOKEN
     env:
-      - EIDOLA_ENGINE_MODEL_ID: "4fc667ee21b46b0f7127370ea42c8766988e62433a7737b7eb434f77b93035e1"
-      - EIDOLA_ENGINE_WEIGHTS_DIR: "/tinfoil/models/weights"
-      - EIDOLA_ENGINE_WEIGHTS_SHA256: "4fc667ee21b46b0f7127370ea42c8766988e62433a7737b7eb434f77b93035e1"
-      - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
-      - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$YnP+HUZjI0xMXVVdzdLstg$snezWkujWWxWuLu4j1nTwopyn7h7oY/Mw23gIPeUdHE"
-      - EIDOLA_ENGINE_EXECUTOR: "cuda"
-      - EIDOLA_ENGINE_BIND_ADDR: "0.0.0.0:8080"
-      - EIDOLA_ENGINE_KV_BLOCK_SIZE: "16"
-      - EIDOLA_ENGINE_KV_DEVICE_BYTES: "123480309760"
-      - EIDOLA_ENGINE_KERNELS_DIR: "/opt/eidola/kernels"
-      - EIDOLA_ENGINE_CUDA_GRAPHS: "on"
-      - EIDOLA_ENGINE_GPU_CC: "required"
-      - EIDOLA_ENGINE_MAX_MODEL_LEN: "262144"
-      - EIDOLA_ENGINE_MAX_SEQS: "64"
-      - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "2048"
-      - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "256"
-      - EIDOLA_ENGINE_DRAFT_TOKENS: "3"
-      - EIDOLA_ENGINE_MAX_REQUESTS: "64"
-      - EIDOLA_ENGINE_PREFIX_CACHE: "true"
-      - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
-      - EIDOLA_ENGINE_CACHE_MAX_AGE_SECS: "7200"
-      - EIDOLA_ENGINE_KV_HOST_BYTES: "68719476736"
+      - EIDOLA_ENV_PREFIX: "ENGINE_"
+      - ENGINE_MODEL_ID: "4fc667ee21b46b0f7127370ea42c8766988e62433a7737b7eb434f77b93035e1"
+      - ENGINE_WEIGHTS_DIR: "/tinfoil/models/weights"
+      - ENGINE_WEIGHTS_SHA256: "4fc667ee21b46b0f7127370ea42c8766988e62433a7737b7eb434f77b93035e1"
+      - ENGINE_WEIGHTS_STORAGE: "verified-readonly"
+      - ENGINE_EXECUTOR: "cuda"
+      - ENGINE_BIND_ADDR: "0.0.0.0:8080"
+      - ENGINE_KV_BLOCK_SIZE: "16"
+      - ENGINE_KV_DEVICE_BYTES: "123480309760"
+      - ENGINE_KERNELS_DIR: "/opt/eidola/kernels"
+      - ENGINE_CUDA_GRAPHS: "on"
+      - ENGINE_GPU_CC: "required"
+      - ENGINE_MAX_MODEL_LEN: "262144"
+      - ENGINE_MAX_SEQS: "64"
+      - ENGINE_MAX_BATCHED_TOKENS: "2048"
+      - ENGINE_MAX_PREFILL_CHUNK: "256"
+      - ENGINE_DRAFT_TOKENS: "3"
+      - ENGINE_MAX_REQUESTS: "64"
+      - ENGINE_PREFIX_CACHE: "true"
+      - ENGINE_CACHE_IDLE_TTL_SECS: "900"
+      - ENGINE_CACHE_MAX_AGE_SECS: "7200"
+      - ENGINE_KV_HOST_BYTES: "68719476736"
 
 shim:
   upstream-port: 8080

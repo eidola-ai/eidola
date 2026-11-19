@@ -1,22 +1,24 @@
 //! Gateway authentication.
 //!
 //! The gateway authenticates with a bearer token. The token is a secret delivered to the
-//! node as `GATEWAY_TOKEN`; its Argon2id hash is the measured half (`GATEWAY_TOKEN_HASH`),
-//! exactly as the gateway binds its injected secrets. Boot verifies the token against the
-//! hash once and refuses to start on a mismatch, a malformed hash, or either value
-//! missing. Per request, the presented bearer is compared with the verified token in
-//! constant time (over SHA-256 digests, so the comparison does not depend on where the
-//! two differ or on the presented length); running Argon2 per request would hand any
-//! caller a cheap way to burn the node's CPU.
+//! node as `GATEWAY_TOKEN` (under the environment's prefix), and nothing else about it is
+//! configured: boot refuses to start when it is missing or not of the token shape
+//! (`eidola_common::engine_deployment::is_gateway_token`), and the node then accepts the
+//! bearer that equals it. Per request, the presented bearer is compared with the token in
+//! constant time, over SHA-256 digests, so the comparison does not depend on where the two
+//! differ or on the presented length.
 //!
 //! This check is about money, not privacy: it keeps anyone but the gateway (which bills)
-//! from spending the node's GPUs. No privacy property depends on who can call the node.
+//! from spending the node's GPUs. No privacy property depends on who can call the node, so
+//! the token is not bound to the node's measurement: a measured binding would hold the
+//! operator, who holds the token, to nothing a client can use, and would make rotating it
+//! a new engine identity.
 
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
-/// The verified gateway token, held only as its SHA-256 digest.
+/// The gateway token, held only as its SHA-256 digest.
 pub struct GatewayToken {
     digest: [u8; 32],
 }
@@ -34,38 +36,20 @@ impl Drop for GatewayToken {
 }
 
 impl GatewayToken {
-    /// Verifies `token` against the measured Argon2id `hash`. The error names the
-    /// variables, never a value.
-    pub fn verify(mut token: String, hash: &str) -> Result<Self, String> {
-        use argon2::PasswordVerifier;
-        let result = (|| {
-            // The token shape the gateway holds its token to: a token outside it
-            // is refused before the node serves, whatever the hash says.
-            if !eidola_common::engine_deployment::is_gateway_token(&token) {
-                return Err(format!(
-                    "{} must be {} to {} visible ASCII characters",
-                    crate::config::env::GATEWAY_TOKEN,
-                    eidola_common::engine_deployment::GATEWAY_TOKEN_MIN_LEN,
-                    eidola_common::engine_deployment::GATEWAY_TOKEN_MAX_LEN
-                ));
-            }
-            // The gateway's pin check reads the measured hash through this same
-            // function, so it accepts exactly the hashes this node boots with.
-            let parsed = eidola_common::engine_deployment::parse_gateway_token_hash(hash)
-                .map_err(|e| format!("{}: {e}", crate::config::env::GATEWAY_TOKEN_HASH))?;
-            argon2::Argon2::default()
-                .verify_password(token.as_bytes(), &parsed)
-                .map_err(|_| {
-                    format!(
-                        "{} does not match the measured hash in {}",
-                        crate::config::env::GATEWAY_TOKEN,
-                        crate::config::env::GATEWAY_TOKEN_HASH
-                    )
-                })?;
+    /// Holds `token`, read from the variable `name`, if it is of the token shape the
+    /// gateway holds its token to. The error names the variable, never the value.
+    pub fn new(mut token: String, name: &str) -> Result<Self, String> {
+        let result = if eidola_common::engine_deployment::is_gateway_token(&token) {
             Ok(GatewayToken {
                 digest: Sha256::digest(token.as_bytes()).into(),
             })
-        })();
+        } else {
+            Err(format!(
+                "{name} must be {} to {} visible ASCII characters",
+                eidola_common::engine_deployment::GATEWAY_TOKEN_MIN_LEN,
+                eidola_common::engine_deployment::GATEWAY_TOKEN_MAX_LEN
+            ))
+        };
         token.zeroize();
         result
     }
@@ -86,21 +70,13 @@ impl GatewayToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::PasswordHasher;
-
-    fn hash(secret: &str) -> String {
-        argon2::Argon2::default()
-            .hash_password(secret.as_bytes())
-            .unwrap()
-            .to_string()
-    }
 
     #[test]
-    fn verifies_and_accepts_only_the_token() {
-        let t = GatewayToken::verify("s3cret-gateway-token".into(), &hash("s3cret-gateway-token"))
-            .unwrap();
+    fn accepts_only_the_token() {
+        let t = GatewayToken::new("s3cret-gateway-token".into(), "GATEWAY_TOKEN").unwrap();
         assert!(t.accepts(Some(b"Bearer s3cret-gateway-token")));
         assert!(!t.accepts(Some(b"Bearer s3cret-gateway-token ")));
+        assert!(!t.accepts(Some(b"Bearer other-gateway-token")));
         assert!(!t.accepts(Some(b"bearer s3cret-gateway-token")));
         assert!(!t.accepts(Some(b"s3cret-gateway-token")));
         assert!(!t.accepts(None));
@@ -108,10 +84,11 @@ mod tests {
     }
 
     #[test]
-    fn refuses_mismatch_and_malformed_hashes_without_echoing() {
-        let e = GatewayToken::verify("s3cret-gateway-token".into(), &hash("other-gateway-token"))
-            .unwrap_err();
-        assert!(!e.contains("s3cret") && !e.contains("other"), "{e}");
-        assert!(GatewayToken::verify("s3cret-gateway-token".into(), "not-a-hash").is_err());
+    fn refuses_a_malformed_token_without_echoing() {
+        for bad in ["short", "has a space-in-it", "non-ascii-tøken-xx"] {
+            let e = GatewayToken::new(bad.into(), "ENGINE_GATEWAY_TOKEN").unwrap_err();
+            assert!(e.starts_with("ENGINE_GATEWAY_TOKEN must be"), "{e}");
+            assert!(!e.contains(bad), "{e}");
+        }
     }
 }

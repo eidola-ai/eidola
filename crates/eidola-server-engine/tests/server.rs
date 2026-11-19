@@ -1506,7 +1506,6 @@ fn configuration_refuses_anything_missing_or_malformed() {
     }
     let bad = [
         (env::GATEWAY_TOKEN, "not-the-token"),
-        (env::GATEWAY_TOKEN_HASH, "not-a-hash"),
         (env::WEIGHTS_SHA256, "abc"),
         (env::EXECUTOR, "gpu"),
         (env::BIND_ADDR, "localhost"),
@@ -1552,45 +1551,73 @@ fn configuration_refuses_anything_missing_or_malformed() {
         let err = config_from(&map).unwrap_err();
         assert!(err.contains(key) && err.contains("cuda"), "{key}: {err}");
     }
-    // An argon2i (not argon2id) hash is refused.
-    let mut map = full.clone();
-    let argon2i = {
-        use argon2::PasswordHasher;
-        argon2::Argon2::new(
-            argon2::Algorithm::Argon2i,
-            argon2::Version::V0x13,
-            Default::default(),
-        )
-        .hash_password(TOKEN.as_bytes())
-        .unwrap()
-        .to_string()
-    };
-    map.insert(env::GATEWAY_TOKEN_HASH, argon2i);
-    assert!(config_from(&map).unwrap_err().contains("Argon2id"));
 }
 
 /// Boot refuses a gateway token outside the shape the gateway holds its own
-/// token to (`eidola_common::engine_deployment::is_gateway_token`), even one
-/// that verifies against its measured hash.
+/// token to (`eidola_common::engine_deployment::is_gateway_token`).
 #[test]
 fn boot_refuses_a_token_of_the_wrong_shape() {
-    use argon2::PasswordHasher;
     for token in [
         "has a space in it",
         "line\nbreak-token-xx",
         "non-ascii-tøken-xxx",
         "short",
     ] {
-        let hash = argon2::Argon2::default()
-            .hash_password(token.as_bytes())
-            .unwrap()
-            .to_string();
         let mut map = env_map();
         map.insert(env::GATEWAY_TOKEN, token.to_string());
-        map.insert(env::GATEWAY_TOKEN_HASH, hash);
         let err = config_from(&map).unwrap_err();
         assert!(err.contains("visible ASCII characters"), "{token:?}: {err}");
         assert!(!err.contains(token), "{err}");
+    }
+}
+
+/// Under `EIDOLA_ENV_PREFIX` every variable, the token included, is read by its
+/// prefixed name, never the bare one, and an error names the variable as read; a
+/// prefix of another form refuses the boot.
+#[test]
+fn boot_reads_every_variable_under_the_prefix() {
+    let bare = env_map();
+    let prefixed: std::collections::HashMap<String, String> = bare
+        .iter()
+        .map(|(name, value)| (format!("ENGINE_{name}"), value.clone()))
+        .chain([("EIDOLA_ENV_PREFIX".to_string(), "ENGINE_".to_string())])
+        .collect();
+    let read = |map: &std::collections::HashMap<String, String>| {
+        eidola_server_engine::config::Config::from_lookup(|name| map.get(name).cloned())
+            .map_err(|e| e.to_string())
+    };
+    let config = read(&prefixed).unwrap();
+    assert_eq!(config.env.prefix(), "ENGINE_");
+    assert!(
+        config
+            .gateway_token
+            .accepts(Some(format!("Bearer {TOKEN}").as_bytes()))
+    );
+    assert_eq!(
+        config.sizing,
+        config_from(&bare).unwrap().sizing,
+        "the same configuration, read under the prefix"
+    );
+
+    // The bare names are not read under a prefix.
+    let mut bare_too: std::collections::HashMap<String, String> = bare
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.clone()))
+        .collect();
+    bare_too.insert("EIDOLA_ENV_PREFIX".into(), "ENGINE_".into());
+    let err = read(&bare_too).unwrap_err();
+    assert!(err.contains("ENGINE_MODEL_ID is not set"), "{err}");
+    let mut no_token = prefixed.clone();
+    no_token.remove("ENGINE_GATEWAY_TOKEN");
+    no_token.insert("GATEWAY_TOKEN".into(), TOKEN.into());
+    let err = read(&no_token).unwrap_err();
+    assert!(err.contains("ENGINE_GATEWAY_TOKEN is not set"), "{err}");
+
+    for bad in ["ENGINE", "engine_", "_ENGINE_"] {
+        let mut map = prefixed.clone();
+        map.insert("EIDOLA_ENV_PREFIX".into(), bad.into());
+        let err = read(&map).unwrap_err();
+        assert!(err.contains("EIDOLA_ENV_PREFIX must be"), "{bad}: {err}");
     }
 }
 

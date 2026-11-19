@@ -51,7 +51,7 @@ use crate::{CudaError, Gpu, Result, narrow};
 
 /// Whether decode steps replay captured graphs: the executor's kill switch
 /// (`CudaExecutorConfig::graphs`, the inference node's
-/// `EIDOLA_ENGINE_CUDA_GRAPHS`).
+/// `CUDA_GRAPHS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CudaGraphs {
     /// Every step runs eagerly; nothing is captured.

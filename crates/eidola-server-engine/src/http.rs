@@ -28,7 +28,7 @@
 //! **Memory before the engine is bounded.** A request holds a slot of the read bound
 //! (`AppState::reading`, as many slots as the admission bound) from before its first
 //! body byte is read until it holds an admission permit or is refused, so at most
-//! `EIDOLA_ENGINE_MAX_REQUESTS` bodies (each at most [`MAX_BODY_BYTES`]) and their parses
+//! `MAX_REQUESTS` bodies (each at most [`MAX_BODY_BYTES`]) and their parses
 //! exist outside admission at once, and at most as many parsed requests inside it. With
 //! no read slot free a request is refused at once (`overloaded`), unread.
 

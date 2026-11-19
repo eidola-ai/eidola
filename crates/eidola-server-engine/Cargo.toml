@@ -8,7 +8,7 @@ publish.workspace = true
 license = "AGPL-3.0-only"
 
 [features]
-# The CUDA executor (`eidola-engine-cuda`): `EIDOLA_ENGINE_EXECUTOR=cuda` parses only in
+# The CUDA executor (`eidola-engine-cuda`): `EXECUTOR=cuda` parses only in
 # a build with this feature. The driver is loaded at run time, so the feature builds on
 # a machine without CUDA.
 # It also loads the driver's NVML (`libloading`, already in the graph through the
@@ -23,14 +23,13 @@ path = "src/main.rs"
 # The wire contract shared with clients and the gateway (the cache key's shape,
 # the weights header), and the grammar of this node's measured configuration
 # the gateway checks its pins with (`engine_deployment`).
-eidola-common = { path = "../eidola-common", features = ["argon2"] }
+eidola-common = { path = "../eidola-common" }
 eidola-engine = { path = "../eidola-engine" }
 eidola-engine-chat = { path = "../eidola-engine-chat" }
 eidola-engine-cpu = { path = "../eidola-engine-cpu" }
 eidola-engine-cuda = { path = "../eidola-engine-cuda", optional = true }
 eidola-engine-model = { path = "../eidola-engine-model" }
 
-argon2 = "0.6"
 axum = "0.8"
 base64 = "0.23"
 futures-util = "0.3"

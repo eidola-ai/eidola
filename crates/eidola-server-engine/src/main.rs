@@ -5,8 +5,9 @@
 //! measured image rather than read from the environment: everything that changes the
 //! node's behaviour is measured, and a level (or a per-crate directive) delivered any other
 //! way could turn on a dependency's debug logging, which this crate's content-free
-//! discipline does not cover. Nothing request-derived is ever logged: no prompt, output,
-//! cache key, salt or per-request size.
+//! discipline does not cover. Colour follows whether stdout is a terminal, so the logger
+//! reads no variable either (its default would read a bare `NO_COLOR`). Nothing
+//! request-derived is ever logged: no prompt, output, cache key, salt or per-request size.
 //!
 //! Exit status: 0 after a graceful shutdown; 1 when boot refuses or the engine thread
 //! stops; `worker::STALL_EXIT_STATUS` when the step watchdog finds the engine wedged.
@@ -18,6 +19,7 @@ use eidola_server_engine::config::Config;
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -30,6 +32,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
+    tracing::info!("environment variable prefix: {:?}", config.env.prefix());
     let bind = config.bind_addr;
     tracing::info!(
         model = %config.model_id,

@@ -59,17 +59,17 @@ fn cuda_env(dir: &Path, hash: &str) -> HashMap<&'static str, String> {
     map.insert(env::DRAFT_TOKENS, "0".into());
     map.insert(env::KV_DEVICE_BYTES, (8u64 << 30).to_string());
     map.insert(env::KERNELS_DIR, "/nonexistent/eidola-kernels".into());
-    // The process's own setting when it has one (the GPU tests run either way), else
-    // off.
+    // The harness's `EIDOLA_ENGINE_CUDA_GRAPHS` when set, as the executor's own GPU
+    // tests read it (the GPU tests run either way), else off.
     map.insert(
         env::CUDA_GRAPHS,
-        std::env::var(env::CUDA_GRAPHS).unwrap_or_else(|_| "off".into()),
+        std::env::var("EIDOLA_ENGINE_CUDA_GRAPHS").unwrap_or_else(|_| "off".into()),
     );
-    // Likewise the GPU confidential-computing check: `required` on a CC-mode GPU, else
-    // `not-required` (a development GPU, or none).
+    // Likewise the GPU confidential-computing check, from `EIDOLA_ENGINE_GPU_CC`:
+    // `required` on a CC-mode GPU, else `not-required` (a development GPU, or none).
     map.insert(
         env::GPU_CC,
-        std::env::var(env::GPU_CC).unwrap_or_else(|_| "not-required".into()),
+        std::env::var("EIDOLA_ENGINE_GPU_CC").unwrap_or_else(|_| "not-required".into()),
     );
     map
 }
@@ -302,7 +302,7 @@ fn gpu_cc_required_is_checked_before_the_device() {
     let mut map = cuda_env(dir, hash);
     map.insert(env::GPU_CC, "required".into());
     let err = boot_err(&map);
-    let refusal = "EIDOLA_ENGINE_GPU_CC is required, but the GPUs are not in production \
+    let refusal = "GPU_CC is required, but the GPUs are not in production \
                    confidential-computing mode";
     if driver_reports_cc() {
         assert!(!err.contains(env::GPU_CC), "{err}");
@@ -479,7 +479,7 @@ fn deepseek_gpu_cc_required_is_checked_before_the_devices() {
     let mut map = ds_cuda_env();
     map.insert(env::GPU_CC, "required".into());
     let err = boot_err(&map);
-    let refusal = "EIDOLA_ENGINE_GPU_CC is required, but the driver does not report 2 GPUs in \
+    let refusal = "GPU_CC is required, but the driver does not report 2 GPUs in \
                    production confidential-computing mode";
     if driver_reports_two_cc_gpus() {
         assert!(!err.contains(env::GPU_CC), "{err}");

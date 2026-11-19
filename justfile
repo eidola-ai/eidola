@@ -175,7 +175,8 @@ run system *args:
         # An inference node on 127.0.0.1:8090 serving the synthetic dev model (random
         # weights, gibberish output) through the CPU executor: MiMo-V2.6's, or with
         # `qwen` as the first argument Qwen3.8's. Gateway token: `dev-gateway-token`;
-        # the weights hash is printed below and served by GET /v1/engine/info. See
+        # the weights hash is printed below and served by GET /v1/engine/info. No
+        # EIDOLA_ENV_PREFIX, so the names are read as written. See
         # crates/eidola-server-engine/AGENTS.md.
         set -- {{ args }}
         dir=target/engine-dev-model id=mimo-dev family=
@@ -185,26 +186,25 @@ run system *args:
         fi
         hash=$(cargo run -q -p eidola-server-engine --example dev_model -- ${family:+"$family"} "$dir")
         echo "weights hash: $hash"
-        EIDOLA_ENGINE_MODEL_ID="$id" \
-        EIDOLA_ENGINE_WEIGHTS_DIR="$dir" \
-        EIDOLA_ENGINE_WEIGHTS_SHA256="$hash" \
-        EIDOLA_ENGINE_WEIGHTS_STORAGE=dev-writable \
+        MODEL_ID="$id" \
+        WEIGHTS_DIR="$dir" \
+        WEIGHTS_SHA256="$hash" \
+        WEIGHTS_STORAGE=dev-writable \
         GATEWAY_TOKEN=dev-gateway-token \
-        GATEWAY_TOKEN_HASH="$(cargo run -q -p hash-secret -- dev-gateway-token)" \
-        EIDOLA_ENGINE_EXECUTOR=cpu \
-        EIDOLA_ENGINE_BIND_ADDR=127.0.0.1:8090 \
-        EIDOLA_ENGINE_KV_BLOCK_SIZE=16 \
-        EIDOLA_ENGINE_KV_BLOCKS=1024 \
-        EIDOLA_ENGINE_MAX_MODEL_LEN=4096 \
-        EIDOLA_ENGINE_MAX_SEQS=8 \
-        EIDOLA_ENGINE_MAX_BATCHED_TOKENS=512 \
-        EIDOLA_ENGINE_MAX_PREFILL_CHUNK=512 \
-        EIDOLA_ENGINE_DRAFT_TOKENS=2 \
-        EIDOLA_ENGINE_MAX_REQUESTS=32 \
-        EIDOLA_ENGINE_PREFIX_CACHE=true \
-        EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS=900 \
-        EIDOLA_ENGINE_CACHE_MAX_AGE_SECS=7200 \
-        EIDOLA_ENGINE_KV_HOST_BYTES=0 \
+        EXECUTOR=cpu \
+        BIND_ADDR=127.0.0.1:8090 \
+        KV_BLOCK_SIZE=16 \
+        KV_BLOCKS=1024 \
+        MAX_MODEL_LEN=4096 \
+        MAX_SEQS=8 \
+        MAX_BATCHED_TOKENS=512 \
+        MAX_PREFILL_CHUNK=512 \
+        DRAFT_TOKENS=2 \
+        MAX_REQUESTS=32 \
+        PREFIX_CACHE=true \
+        CACHE_IDLE_TTL_SECS=900 \
+        CACHE_MAX_AGE_SECS=7200 \
+        KV_HOST_BYTES=0 \
           cargo run -p eidola-server-engine -- "$@"
         ;;
       *)

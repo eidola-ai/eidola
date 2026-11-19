@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use eidola_billing::env::Env;
+use eidola_common::env::Env;
 use eidola_server_gateway::AppState;
 use eidola_server_gateway::backend::Catalog;
 use eidola_server_gateway::credentials;
@@ -63,18 +63,9 @@ impl Config {
 
         let stripe_api_key = env.var("STRIPE_API_KEY").filter(|s| !s.is_empty());
 
-        // Read here for measurement verification; `telemetry::init` reads it
-        // too, to configure the exporter. Grafana routes by these auth
-        // headers to a tenant, so leaving the hash unverified would let a
-        // different telemetry destination be injected without a measurement
-        // change (privacy-guarantees.md §7.4).
-        let otel_exporter_otlp_headers = env
-            .var("OTEL_EXPORTER_OTLP_HEADERS")
-            .filter(|s| !s.is_empty());
-
-        // The gateway's token for Eidola's inference nodes: a secret, measured
-        // by its Argon2id hash like the others when `ENGINE_TOKEN_HASH` is set.
-        // Absent, the gateway starts without an engine router (see `main`).
+        // The gateway's token for Eidola's inference nodes: a secret, like the
+        // others. Absent, the gateway starts without an engine router (see
+        // `main`).
         let engine_token = env.var("ENGINE_TOKEN").filter(|s| !s.is_empty());
 
         let master_key_var = env.name("CREDENTIAL_MASTER_KEY");
@@ -88,26 +79,6 @@ impl Config {
         let credential_master_key: [u8; 32] = key_bytes
             .try_into()
             .map_err(|_| format!("{master_key_var} must be exactly 32 bytes (64 hex chars)"))?;
-
-        // Verify measured secret hashes: for each *_HASH env var that is set
-        // (in a deployment's config, and so in its measurement), the runtime
-        // secret must match it.
-        verify_measured_secrets(
-            env,
-            &[
-                ("CREDENTIAL_MASTER_KEY", &credential_master_key_hex),
-                (
-                    "DATABASE_PASSWORD",
-                    database_password.as_deref().unwrap_or(""),
-                ),
-                ("STRIPE_API_KEY", stripe_api_key.as_deref().unwrap_or("")),
-                (
-                    "OTEL_EXPORTER_OTLP_HEADERS",
-                    otel_exporter_otlp_headers.as_deref().unwrap_or(""),
-                ),
-                ("ENGINE_TOKEN", engine_token.as_deref().unwrap_or("")),
-            ],
-        )?;
 
         // Terms-acceptance gate. Two independent sources feed the shared
         // `required_document` table (both through the same monotonic
@@ -207,53 +178,6 @@ impl Config {
             engine_placement_refresh,
         })
     }
-}
-
-/// Verify that runtime secrets match their measured hashes.
-///
-/// For each `(name, value)` pair, checks if `{name}_HASH` is set as an env var
-/// (under the environment's prefix, like `name` itself). If present, verifies
-/// the Argon2id hash matches `value`. If absent, the secret is not measured and
-/// no check is performed.
-///
-/// A `_HASH` env var committed in a deployment's `tinfoil-config.yml` is part
-/// of the enclave measurement, and binds the secret injected beside it to that
-/// measurement without exposing its plaintext. The gateway's own config
-/// measures none: every secret it names reaches a service trusted as its
-/// operator is, so binding its value would hold the operator to nothing.
-fn verify_measured_secrets(env: &Env, secrets: &[(&str, &str)]) -> Result<(), String> {
-    use argon2::PasswordVerifier;
-
-    for (name, value) in secrets {
-        if value.is_empty() {
-            continue;
-        }
-        let Some(expected_hash) = env.var(&format!("{name}_HASH")) else {
-            continue;
-        };
-        let name = env.name(name);
-        let hash_var = format!("{name}_HASH");
-        if expected_hash.is_empty() {
-            continue;
-        }
-
-        let parsed = argon2::PasswordHash::new(&expected_hash)
-            .map_err(|e| format!("{hash_var}: invalid Argon2 hash: {e}"))?;
-
-        argon2::Argon2::default()
-            .verify_password(value.as_bytes(), &parsed)
-            .map_err(|_| {
-                format!(
-                    "{name} does not match measured hash in {hash_var}.\n\
-                     The injected secret differs from what was committed in the \
-                     enclave configuration. Refusing to start."
-                )
-            })?;
-
-        tracing::info!("{name} verified against measured hash");
-    }
-
-    Ok(())
 }
 
 #[tokio::main]
@@ -533,10 +457,9 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     /// Written by argon2 0.5.3 (`Argon2::default()`, random salt) for the
-    /// secret below. Measured `*_HASH` values in deployment configs and
-    /// every stored account hash were produced by that version, so an argon2
-    /// upgrade must keep verifying them — or the enclave refuses to start
-    /// (`verify_measured_secrets`) and every account stops authenticating.
+    /// secret below. Every stored account hash was produced by that version,
+    /// so an argon2 upgrade must keep verifying them, or every account stops
+    /// authenticating.
     const ARGON2_0_5_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$6pErOZUqn/EOSXWM1TCvWQ$iGAfGeBFsWcYRHUv3H6CSSISW1RVT8L3V2DeGpWw14Y";
     const ARGON2_0_5_SECRET: &[u8] = b"argon2-0.5-fixture-secret";
 
@@ -555,11 +478,10 @@ mod tests {
     }
 
     #[test]
-    fn new_hashes_keep_the_measured_parameters() {
+    fn new_hashes_keep_the_default_parameters() {
         use argon2::PasswordHasher;
-        // `hash-secret` and account creation both rely on the default
-        // parameters; a change here would silently change what new hashes
-        // cost and how they read in a deployment's `tinfoil-config.yml`.
+        // Account creation relies on the default parameters; a change here
+        // would silently change what new hashes cost.
         let hash = argon2::Argon2::default()
             .hash_password(ARGON2_0_5_SECRET)
             .expect("hash")

@@ -85,7 +85,7 @@ pub struct CheckedModel {
     /// The config path of every accepted deployment, in file order.
     pub deployments: Vec<String>,
     /// The longest sequence every one of its deployments serves: the
-    /// smallest `EIDOLA_ENGINE_MAX_MODEL_LEN` among them.
+    /// smallest `MAX_MODEL_LEN` among them.
     pub max_model_len: u32,
 }
 
@@ -209,7 +209,7 @@ pub fn check(
 /// A catalog row's context window is one its deployments serve: `windows` is
 /// each row's path, weights hash and `context_length`, and for every hash
 /// that is pinned the window must be at most the smallest
-/// `EIDOLA_ENGINE_MAX_MODEL_LEN` among its deployments. A wider window would
+/// `MAX_MODEL_LEN` among its deployments. A wider window would
 /// publish a length clients size prompts to and the engine refuses. A row
 /// with no pin is the catalog binding's to refuse, not this check's.
 pub fn check_context_windows(
@@ -222,7 +222,7 @@ pub fn check_context_windows(
         {
             return Err(format!(
                 "{path}: context_length is {context_length}, but a deployment of {sha256} \
-                 serves at most {} positions (EIDOLA_ENGINE_MAX_MODEL_LEN)",
+                 serves at most {} positions (MAX_MODEL_LEN)",
                 model.max_model_len
             ));
         }
@@ -429,8 +429,12 @@ fn check_deployment(
     };
     if weights.sha256 != checked.measured.weights_sha256 {
         return Err(format!(
-            "{at}: EIDOLA_ENGINE_WEIGHTS_SHA256 is {}, but the pin requires {}",
-            checked.measured.weights_sha256, weights.sha256
+            "{at}: {} is {}, but the pin requires {}",
+            checked
+                .env
+                .name(eidola_common::engine_deployment::env::WEIGHTS_SHA256),
+            checked.measured.weights_sha256,
+            weights.sha256
         ));
     }
     if weights.repo != checked.weights_repo || weights.revision != checked.weights_revision {

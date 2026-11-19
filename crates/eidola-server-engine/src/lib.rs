@@ -264,7 +264,7 @@ fn cpu_host_blocks(
     Ok(blocks as u32)
 }
 
-/// Refuses unless `EIDOLA_ENGINE_KV_DEVICE_BYTES` names one budget for each device the
+/// Refuses unless `KV_DEVICE_BYTES` names one budget for each device the
 /// served architecture runs on (`eidola_common::architecture::Architecture::devices`):
 /// the node opens exactly the devices its configuration names, device `d` on GPU `d`.
 pub fn check_device_budgets(

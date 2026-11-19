@@ -14,8 +14,11 @@
 //! `credentials` member a spend travels in and the ACT parameter `L`
 //! (`spend_credentials`, behind the `spend-credentials` feature), the
 //! platform-endorsements release tag grammar every reader of a vendored
-//! release and `tinfoil-verifier` parse with ([`platform_release`]), and the
-//! embed-marker recognition rule shared between the
+//! release and `tinfoil-verifier` parse with ([`platform_release`]), how a
+//! process reads its environment under `EIDOLA_ENV_PREFIX` ([`env`]: the
+//! gateway, the billing binary and the inference node read theirs through it,
+//! and an engine deployment's config is read under the prefix it declares),
+//! and the embed-marker recognition rule shared between the
 //! markdown editor's embed plugin and app-core's upstream quote expansion
 //! ([`embed`]). It is intentionally lib-only, pure Rust, and float-free so
 //! `eidola-app-core`, `eidola-server-gateway`, `eidola-server-engine`, and
@@ -31,18 +34,18 @@
 //!
 //! > **A dependency is admissible here only if it is already in every
 //! > consumer's graph and is required for contract fidelity.** Today that
-//! > set is `serde_json`, plus `argon2` behind the optional `argon2` feature
-//! > and `serde_yaml`, `serde` (derive) and `unsafe-libyaml` behind the
-//! > optional `deployment` feature, and `base64` and `serde` behind the
-//! > optional `spend-credentials` feature. Any addition needs the same argument written
-//! > down.
+//! > set is `serde_json`, plus `serde_yaml`, `serde` (derive) and
+//! > `unsafe-libyaml` behind the optional `deployment` feature, and `base64`
+//! > and `serde` behind the optional `spend-credentials` feature. Any
+//! > addition needs the same argument written down.
 //!
-//! `argon2` qualifies because it is optional: it enters a graph only when a
-//! consumer enables the feature, and the two that do (the inference node and
-//! the gateway) already depend on `argon2 0.6` directly. It is what lets the
-//! node's boot and the gateway's pin check read a gateway-token hash through
-//! one function ([`engine_deployment::parse_gateway_token_hash`]). `serde_yaml`
-//! is optional on the same terms: `deployment` (which implies `argon2`) is
+//! [`env`] adds no dependency (it is `std` alone), and belongs here because
+//! how a prefix applies is a contract between a measured config and the code
+//! that reads it: the node boots from its environment under the prefix, and
+//! the engine-deployment grammar must read a config's names by the same rule,
+//! or a pin could name a configuration the node reads differently.
+//!
+//! `serde_yaml` is optional: `deployment` is
 //! enabled by the gateway's build and tests and by `measure-enclave`, the
 //! readers of engine deployment configs, so the one deployment check
 //! (`engine_deployment::deployment`) parses YAML once for both; `unsafe-libyaml`
@@ -131,6 +134,7 @@ pub mod architecture;
 pub mod embed;
 pub mod engine_deployment;
 pub mod engine_protocol;
+pub mod env;
 pub mod issuer_calendar;
 #[cfg(feature = "catalog")]
 pub mod model_catalog;

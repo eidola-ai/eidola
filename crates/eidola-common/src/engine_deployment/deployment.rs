@@ -12,8 +12,8 @@
 //! returned [`Deployment`], and the measurer computes the launch identity
 //! from the platform release.
 //!
-//! Behind this crate's `deployment` feature, which adds `serde_yaml` (and
-//! `argon2`) only to the consumers that enable it.
+//! Behind this crate's `deployment` feature, which adds `serde_yaml` only to
+//! the consumers that enable it.
 
 use std::collections::BTreeMap;
 
@@ -21,9 +21,10 @@ use super::{
     Architecture, CacheConfig, ExecutorSettings, GpuCc, MeasuredConfig, ModelPack, SupportedGpu,
     WeightsStorage, artifact_data_bytes, check_container_gpu_access, check_cvm_image,
     check_device_resources, check_env_names, check_gpu_attestation, check_kernels_dir,
-    check_resources, check_secrets, check_shim_paths, check_vm_resources, check_weights_pack, env,
-    is_safe_component, parse_cvm_version, parse_measured,
+    check_resources, check_secrets, check_shim_paths, check_vm_resources, check_weights_pack,
+    deployment_env, env, is_safe_component, parse_cvm_version, parse_measured,
 };
+use crate::env::Env;
 
 /// The image every engine deployment runs, pinned by digest.
 pub const ENGINE_IMAGE_PREFIX: &str = "ghcr.io/eidola-ai/eidola-server-engine@sha256:";
@@ -38,6 +39,8 @@ pub const PACK_SCHEMAS: &[u64] = &[1, 2];
 pub struct Deployment {
     /// The config's `cvm-version`, as written (with its inline manifest pin).
     pub cvm_version: String,
+    /// The prefix the config's env declares, which every name in it carries.
+    pub env: Env,
     /// The node's measured configuration.
     pub measured: MeasuredConfig,
     /// The architecture of the weights it serves (implemented, so its shape
@@ -230,10 +233,14 @@ pub fn check_release_manifest(
 /// its sidecar (`sidecar_path`, read as `sidecar`). Errors name the file and
 /// the rule, never a secret.
 ///
+/// The config's env declares the prefix the node reads it under
+/// (`EIDOLA_ENV_PREFIX`, required: [`deployment_env`]), and every other name
+/// in it, and its secret, is read under that prefix.
+///
 /// A deployment is identified by the weights it serves: its node's model id
-/// (`EIDOLA_ENGINE_MODEL_ID`) must be its weights hash
-/// (`EIDOLA_ENGINE_WEIGHTS_SHA256`), so the name a request reaches the node
-/// under is the hash the gateway resolved it to, and nothing else.
+/// (`MODEL_ID`) must be its weights hash (`WEIGHTS_SHA256`), so the name a
+/// request reaches the node under is the hash the gateway resolved it to, and
+/// nothing else.
 pub fn check_deployment(
     config_path: &str,
     config: &[u8],
@@ -243,16 +250,21 @@ pub fn check_deployment(
     let c = EngineConfig::parse(config, config_path)?;
     let at = config_path;
 
-    // The whole measured environment, read by the node's own boot grammar,
-    // and nothing else in it.
-    let measured = parse_measured(&|name| c.env.get(name).cloned())
+    // The prefix the env is read under, then the whole measured environment,
+    // read by the node's own boot grammar under it, and nothing else in it.
+    let lookup = |name: &str| c.env.get(name).cloned();
+    let prefix = deployment_env(&lookup).map_err(|e| format!("{at}: {e}"))?;
+    let n = |name: &str| prefix.name(name);
+    let measured = parse_measured(&prefix, &lookup)
         .map_err(|e| format!("{at}: the node would refuse this env: {e}"))?;
-    if c.env.contains_key(env::GATEWAY_TOKEN) {
-        return Err(format!(
-            "{at}: GATEWAY_TOKEN must not be a measured environment value"
-        ));
+    for token in [n(env::GATEWAY_TOKEN), env::GATEWAY_TOKEN.to_string()] {
+        if c.env.contains_key(&token) {
+            return Err(format!(
+                "{at}: {token} must not be a measured environment value"
+            ));
+        }
     }
-    check_env_names(c.env.keys().map(String::as_str)).map_err(|e| format!("{at}: {e}"))?;
+    check_env_names(&prefix, c.env.keys().map(String::as_str)).map_err(|e| format!("{at}: {e}"))?;
     // A pinned deployment runs the CUDA executor: the CPU executor is the
     // numerics reference and the development path, and nothing confidential
     // ships on it.
@@ -273,7 +285,7 @@ pub fn check_deployment(
     if *gpu_cc != GpuCc::Required {
         return Err(format!(
             "{at}: {} is {:?}, but a pinned deployment must be \"required\"",
-            env::GPU_CC,
+            n(env::GPU_CC),
             gpu_cc.as_str()
         ));
     }
@@ -282,15 +294,17 @@ pub fn check_deployment(
     check_cvm_image(measured.executor.kind(), &release).map_err(|e| format!("{at}: {e}"))?;
     if measured.model_id != measured.weights_sha256 {
         return Err(format!(
-            "{at}: EIDOLA_ENGINE_MODEL_ID is {:?}, but a pinned node is named by its weights \
-             hash, EIDOLA_ENGINE_WEIGHTS_SHA256 ({})",
-            measured.model_id, measured.weights_sha256
+            "{at}: {} is {:?}, but a pinned node is named by its weights hash, {} ({})",
+            n(env::MODEL_ID),
+            measured.model_id,
+            n(env::WEIGHTS_SHA256),
+            measured.weights_sha256
         ));
     }
     if measured.weights_storage != WeightsStorage::VerifiedReadonly {
         return Err(format!(
-            "{at}: EIDOLA_ENGINE_WEIGHTS_STORAGE is {:?}, but a pinned deployment must be \
-             \"verified-readonly\"",
+            "{at}: {} is {:?}, but a pinned deployment must be \"verified-readonly\"",
+            n(env::WEIGHTS_STORAGE),
             measured.weights_storage.as_str()
         ));
     }
@@ -298,22 +312,25 @@ pub fn check_deployment(
     // The shim reaches the node and exposes exactly its routes.
     if u64::from(measured.bind_addr.port()) != c.shim_upstream_port {
         return Err(format!(
-            "{at}: shim.upstream-port is {}, but EIDOLA_ENGINE_BIND_ADDR listens on port {}",
+            "{at}: shim.upstream-port is {}, but {} listens on port {}",
             c.shim_upstream_port,
+            n(env::BIND_ADDR),
             measured.bind_addr.port()
         ));
     }
     if !measured.bind_addr.ip().is_unspecified() {
         return Err(format!(
-            "{at}: EIDOLA_ENGINE_BIND_ADDR must listen on every interface (0.0.0.0 or [::]) \
-             for the shim to reach it"
+            "{at}: {} must listen on every interface (0.0.0.0 or [::]) for the shim to reach \
+             it",
+            n(env::BIND_ADDR)
         ));
     }
     check_shim_paths(&c.shim_paths.iter().map(String::as_str).collect::<Vec<_>>())
         .map_err(|e| format!("{at}: {e}"))?;
 
     // The one secret, and the VM shape.
-    check_secrets(c.secrets.iter().map(String::as_str)).map_err(|e| format!("{at}: {e}"))?;
+    check_secrets(&prefix, c.secrets.iter().map(String::as_str))
+        .map_err(|e| format!("{at}: {e}"))?;
     check_vm_resources(c.cpus, c.memory).map_err(|e| format!("{at}: {e}"))?;
 
     // The sidecar, and the weights it records.
@@ -361,7 +378,7 @@ pub fn check_deployment(
     if measured.sizing.draft_tokens > mtp_layers {
         return Err(format!(
             "{at}: {} is {}, more than {}'s {mtp_layers} MTP layers",
-            env::DRAFT_TOKENS,
+            n(env::DRAFT_TOKENS),
             measured.sizing.draft_tokens,
             side.architecture,
         ));
@@ -374,7 +391,7 @@ pub fn check_deployment(
             if budgets != 1 {
                 return Err(format!(
                     "{at}: {} names {budgets} budgets, but {} runs on one device",
-                    env::KV_DEVICE_BYTES,
+                    n(env::KV_DEVICE_BYTES),
                     side.architecture
                 ));
             }
@@ -406,6 +423,7 @@ pub fn check_deployment(
 
     Ok(Deployment {
         cvm_version: c.cvm_version,
+        env: prefix,
         measured,
         architecture: side.architecture,
         weights_repo: side.repo,
@@ -980,8 +998,8 @@ containers:
   - name: \"eidola-server-engine\"
     image: \"ghcr.io/eidola-ai/eidola-server-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222\"
     env:
-      - EIDOLA_ENGINE_KV_BLOCK_SIZE: \"16\"
-      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"
+      - ENGINE_KV_BLOCK_SIZE: \"16\"
+      - ENGINE_EXECUTOR: \"cuda\"
 shim:
   upstream-port: 8080
 ";
@@ -996,16 +1014,16 @@ shim:
     #[test]
     fn env_text_is_the_same_to_every_reader() {
         let env = env_of(CONFIG).unwrap();
-        assert_eq!(env["EIDOLA_ENGINE_KV_BLOCK_SIZE"], "16");
+        assert_eq!(env["ENGINE_KV_BLOCK_SIZE"], "16");
         let env = env_of(&CONFIG.replace("\"16\"", "\"0100\"")).unwrap();
-        assert_eq!(env["EIDOLA_ENGINE_KV_BLOCK_SIZE"], "0100");
+        assert_eq!(env["ENGINE_KV_BLOCK_SIZE"], "0100");
         for plain in ["0100", "1_000", "cuda8"] {
             let err = env_of(&CONFIG.replace("\"16\"", plain)).unwrap_err();
             assert!(err.contains("with a quoted string value"), "{plain}: {err}");
         }
         let twice = CONFIG.replace(
-            "      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"\n",
-            "      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"\n        EIDOLA_ENGINE_EXECUTOR: \"cpu\"\n",
+            "      - ENGINE_EXECUTOR: \"cuda\"\n",
+            "      - ENGINE_EXECUTOR: \"cuda\"\n        ENGINE_EXECUTOR: \"cpu\"\n",
         );
         let err = env_of(&twice).unwrap_err();
         assert!(err.contains("duplicate mapping key"), "{err}");
@@ -1130,6 +1148,7 @@ shim:
             d.cvm_version,
             "0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f"
         );
+        assert_eq!(d.env.prefix(), "ENGINE_");
         let m = &d.measured;
         assert_eq!(
             (m.model_id.as_str(), m.weights_sha256.as_str()),
@@ -1182,6 +1201,46 @@ shim:
         );
     }
 
+    /// A deployment's env is read under the prefix it declares, which it must
+    /// declare: without it, or under another prefix than its names carry, the
+    /// node would read none of them; and its one secret carries the prefix.
+    #[test]
+    fn a_deployment_is_read_under_the_prefix_it_declares() {
+        let text = std::str::from_utf8(MIMO_CONFIG).unwrap();
+        let check = |config: &str| {
+            check_deployment("config", config.as_bytes(), "sidecar", MIMO_SIDECAR).unwrap_err()
+        };
+        let declared = "      - EIDOLA_ENV_PREFIX: \"ENGINE_\"\n";
+        assert!(text.contains(declared));
+        let err = check(&text.replace(declared, ""));
+        assert!(err.contains("must set EIDOLA_ENV_PREFIX"), "{err}");
+        let err = check(&text.replace(declared, "      - EIDOLA_ENV_PREFIX: \"\"\n"));
+        assert!(err.contains("must set EIDOLA_ENV_PREFIX"), "{err}");
+        let err = check(&text.replace("\"ENGINE_\"", "\"engine_\""));
+        assert!(err.contains("EIDOLA_ENV_PREFIX must be"), "{err}");
+        let err = check(&text.replace("\"ENGINE_\"", "\"NODE_\""));
+        assert!(err.contains("NODE_MODEL_ID is not set"), "{err}");
+        // Renamed whole, it reads the same.
+        let node = text.replace("ENGINE_", "NODE_");
+        let d = check_deployment("config", node.as_bytes(), "sidecar", MIMO_SIDECAR).unwrap();
+        let committed = check_deployment("config", MIMO_CONFIG, "sidecar", MIMO_SIDECAR).unwrap();
+        assert_eq!(d.env.prefix(), "NODE_");
+        assert_eq!(d.measured, committed.measured);
+        // The secret without the prefix, or the token in the measured env.
+        let err = check(&text.replace("      - ENGINE_GATEWAY_TOKEN\n", "      - GATEWAY_TOKEN\n"));
+        assert!(err.contains("[\"ENGINE_GATEWAY_TOKEN\"]"), "{err}");
+        for token in ["ENGINE_GATEWAY_TOKEN", "GATEWAY_TOKEN"] {
+            let err = check(&text.replace(
+                declared,
+                &format!("{declared}      - {token}: \"dev-gateway-token\"\n"),
+            ));
+            assert!(
+                err.contains(&format!("{token} must not be a measured environment value")),
+                "{err}"
+            );
+        }
+    }
+
     /// The MiMo deployment's shape for DeepSeek-V4.1-Flash on two B300s: two
     /// GPUs attested, a KV budget per device, the published text-only pack,
     /// a `max_model_len` context and steps of `step` tokens.
@@ -1189,14 +1248,14 @@ shim:
         let config = std::str::from_utf8(MIMO_CONFIG)
             .unwrap()
             .replace(
-                "EIDOLA_ENGINE_MAX_BATCHED_TOKENS: \"8192\"",
-                &format!("EIDOLA_ENGINE_MAX_BATCHED_TOKENS: \"{step}\""),
+                "ENGINE_MAX_BATCHED_TOKENS: \"8192\"",
+                &format!("ENGINE_MAX_BATCHED_TOKENS: \"{step}\""),
             )
             .replace("gpus: 1\n", &format!("gpus: {gpus}\n"))
             .replace("\"85899345920\"", &format!("\"{kv}\""))
             .replace(
-                "EIDOLA_ENGINE_MAX_MODEL_LEN: \"1048576\"",
-                &format!("EIDOLA_ENGINE_MAX_MODEL_LEN: \"{max_model_len}\""),
+                "ENGINE_MAX_MODEL_LEN: \"1048576\"",
+                &format!("ENGINE_MAX_MODEL_LEN: \"{max_model_len}\""),
             )
             .replace(
                 "XiaomiMiMo/MiMo-V2.6-Flash-MOPD@2479e2d0029eca9a34cc7e7f55a121925f81908e",

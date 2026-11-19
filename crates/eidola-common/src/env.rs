@@ -8,6 +8,12 @@
 //! `GATEWAY_` set, the gateway reads `GATEWAY_DATABASE_URL`, and the bare name
 //! is never consulted. Unset or empty, the prefix is empty and every variable
 //! is read by its own name.
+//!
+//! The gateway, the billing binary and the inference node read their
+//! environment through this. The rule is also a contract with a measured
+//! config: `engine_deployment` reads an engine deployment's env under the
+//! prefix that env declares, by [`Env::name`], so the names a pin is checked
+//! against are the names the node reads.
 
 use std::fmt;
 
