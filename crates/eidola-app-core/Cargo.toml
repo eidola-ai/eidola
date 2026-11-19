@@ -47,7 +47,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 futures-util = { version = "0.3", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-native-certs = "0.8"
-rustls-rustcrypto = "0.0.2-alpha"
+rustls-rustcrypto = "0.1.0-pre.0"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -101,7 +101,7 @@ wiremock = "0.6"
 anonymous-credit-tokens = "0.4"
 hex = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-rustls-rustcrypto = "0.0.2-alpha"
+rustls-rustcrypto = "0.1.0-pre.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

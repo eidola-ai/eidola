@@ -14,4 +14,4 @@ path = "src/main.rs"
 [dependencies]
 eidola-server-gateway = { path = "../eidola-server-gateway" }
 rustls = { version = "0.23", default-features = false }
-rustls-rustcrypto = "0.0.2-alpha"
+rustls-rustcrypto = "0.1.0-pre.0"
