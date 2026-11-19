@@ -44,7 +44,7 @@ networks:
 
 containers:
   - name: "eidola-server-gateway"
-    image: "ghcr.io/eidola-ai/eidola-server-gateway@sha256:872b93f17a7e4c0e5673278c324c48a86d0fa797d974cb3bf125f459e1cd1145"
+    image: "ghcr.io/eidola-ai/eidola-server-gateway@sha256:e26a4724df1d81f9fbe6fae0a744fa8b8539543f0006aef6cf59241276fd508a"
     networks:
       - egress
     secrets:
