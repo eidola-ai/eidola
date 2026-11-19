@@ -42,18 +42,6 @@ pub fn weights_hash() -> &'static str {
     HASH.get_or_init(|| fixture::weights_hash_of(model_dir()))
 }
 
-/// Argon2id hash of [`TOKEN`].
-pub fn token_hash() -> &'static str {
-    static HASH: OnceLock<String> = OnceLock::new();
-    HASH.get_or_init(|| {
-        use argon2::PasswordHasher;
-        argon2::Argon2::default()
-            .hash_password(TOKEN.as_bytes())
-            .unwrap()
-            .to_string()
-    })
-}
-
 /// The model, verified and loaded once per test binary (it is ~300 MB as f32).
 pub fn loaded() -> Arc<LoadedModel> {
     static MODEL: OnceLock<Arc<LoadedModel>> = OnceLock::new();
@@ -80,7 +68,6 @@ pub fn env_map() -> HashMap<&'static str, String> {
         (env::WEIGHTS_SHA256, weights_hash().to_string()),
         (env::WEIGHTS_STORAGE, "dev-writable".into()),
         (env::GATEWAY_TOKEN, TOKEN.to_string()),
-        (env::GATEWAY_TOKEN_HASH, token_hash().to_string()),
         (env::EXECUTOR, "cpu".into()),
         (env::BIND_ADDR, "127.0.0.1:0".into()),
         (env::KV_BLOCK_SIZE, "16".into()),

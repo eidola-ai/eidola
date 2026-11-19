@@ -1,6 +1,6 @@
 //! The node's own check that its GPUs are in confidential-computing mode, run before the
 //! CUDA executor opens a device when the measured configuration says
-//! `EIDOLA_ENGINE_GPU_CC=required`.
+//! `GPU_CC=required`.
 //!
 //! The platform's GPU image already refuses to open the GPUs to work unless NVIDIA's local
 //! verifier has passed for every one of them at boot; this makes the same claim the node's

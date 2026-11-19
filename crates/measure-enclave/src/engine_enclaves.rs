@@ -314,30 +314,30 @@ containers:
     gpus: all
     models: ["weights"]
     secrets:
-      - GATEWAY_TOKEN
+      - ENGINE_GATEWAY_TOKEN
     env:
-      - EIDOLA_ENGINE_MODEL_ID: "{weights}"
-      - EIDOLA_ENGINE_WEIGHTS_DIR: "/tinfoil/models/weights"
-      - EIDOLA_ENGINE_WEIGHTS_SHA256: "{weights}"
-      - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
-      - EIDOLA_ENGINE_EXECUTOR: "cuda"
-      - EIDOLA_ENGINE_BIND_ADDR: "0.0.0.0:8080"
-      - EIDOLA_ENGINE_KV_BLOCK_SIZE: "16"
-      - EIDOLA_ENGINE_KV_DEVICE_BYTES: "68719476736"
-      - EIDOLA_ENGINE_KERNELS_DIR: "/opt/eidola/kernels"
-      - EIDOLA_ENGINE_CUDA_GRAPHS: "on"
-      - EIDOLA_ENGINE_GPU_CC: "required"
-      - EIDOLA_ENGINE_MAX_MODEL_LEN: "131072"
-      - EIDOLA_ENGINE_MAX_SEQS: "64"
-      - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "8192"
-      - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "4096"
-      - EIDOLA_ENGINE_DRAFT_TOKENS: "3"
-      - EIDOLA_ENGINE_MAX_REQUESTS: "8"
-      - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$unNYT/KTNSNW0JCH9+9OQ2zBApPLxGNZiw746903Q8E"
-      - EIDOLA_ENGINE_PREFIX_CACHE: "true"
-      - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
-      - EIDOLA_ENGINE_CACHE_MAX_AGE_SECS: "7200"
-      - EIDOLA_ENGINE_KV_HOST_BYTES: "34359738368"
+      - EIDOLA_ENV_PREFIX: "ENGINE_"
+      - ENGINE_MODEL_ID: "{weights}"
+      - ENGINE_WEIGHTS_DIR: "/tinfoil/models/weights"
+      - ENGINE_WEIGHTS_SHA256: "{weights}"
+      - ENGINE_WEIGHTS_STORAGE: "verified-readonly"
+      - ENGINE_EXECUTOR: "cuda"
+      - ENGINE_BIND_ADDR: "0.0.0.0:8080"
+      - ENGINE_KV_BLOCK_SIZE: "16"
+      - ENGINE_KV_DEVICE_BYTES: "68719476736"
+      - ENGINE_KERNELS_DIR: "/opt/eidola/kernels"
+      - ENGINE_CUDA_GRAPHS: "on"
+      - ENGINE_GPU_CC: "required"
+      - ENGINE_MAX_MODEL_LEN: "131072"
+      - ENGINE_MAX_SEQS: "64"
+      - ENGINE_MAX_BATCHED_TOKENS: "8192"
+      - ENGINE_MAX_PREFILL_CHUNK: "4096"
+      - ENGINE_DRAFT_TOKENS: "3"
+      - ENGINE_MAX_REQUESTS: "8"
+      - ENGINE_PREFIX_CACHE: "true"
+      - ENGINE_CACHE_IDLE_TTL_SECS: "900"
+      - ENGINE_CACHE_MAX_AGE_SECS: "7200"
+      - ENGINE_KV_HOST_BYTES: "34359738368"
 "#,
             digest = "2".repeat(64),
             weights = "3".repeat(64),
@@ -571,8 +571,8 @@ containers:
 
         // A pinned node is named by its weights hash.
         let named = good.replace(
-            &format!("EIDOLA_ENGINE_MODEL_ID: \"{}\"", "3".repeat(64)),
-            "EIDOLA_ENGINE_MODEL_ID: \"fixture-model\"",
+            &format!("ENGINE_MODEL_ID: \"{}\"", "3".repeat(64)),
+            "ENGINE_MODEL_ID: \"fixture-model\"",
         );
         assert!(entry(&named, SIDECAR).contains("named by its weights hash"));
         // The sidecar names an architecture the engine implements.
@@ -679,7 +679,7 @@ containers:
         assert!(entry(&cpu_image, SIDECAR).contains("is not a GPU image"));
         let no_cc = good.replace("GPU_CC: \"required\"", "GPU_CC: \"not-required\"");
         assert_ne!(no_cc, good);
-        assert!(entry(&no_cc, SIDECAR).contains("EIDOLA_ENGINE_GPU_CC is \"not-required\""));
+        assert!(entry(&no_cc, SIDECAR).contains("ENGINE_GPU_CC is \"not-required\""));
 
         // A companion container, or an engine named by a tag.
         let companion = format!(
@@ -696,8 +696,8 @@ containers:
         assert!(entry(&no_runtime, SIDECAR).contains("runtime: nvidia"));
         // Another secret, a partial shim, an ungranted pack.
         let extra_secret = good.replace(
-            "      - GATEWAY_TOKEN\n",
-            "      - GATEWAY_TOKEN\n      - RUST_LOG\n",
+            "      - ENGINE_GATEWAY_TOKEN\n",
+            "      - ENGINE_GATEWAY_TOKEN\n      - ENGINE_RUST_LOG\n",
         );
         assert!(entry(&extra_secret, SIDECAR).contains("secrets must be exactly"));
         let partial = good.replace("    - /*\n", "    - /v1/chat/completions\n");
@@ -707,8 +707,8 @@ containers:
         // A variable the node does not read, and a VM shape the platform does
         // not launch.
         let ambient = good.replace(
-            "      - EIDOLA_ENGINE_MODEL_ID",
-            "      - TOKIO_WORKER_THREADS: \"0\"\n      - EIDOLA_ENGINE_MODEL_ID",
+            "      - ENGINE_MODEL_ID",
+            "      - TOKIO_WORKER_THREADS: \"0\"\n      - ENGINE_MODEL_ID",
         );
         assert!(entry(&ambient, SIDECAR).contains("may not set \"TOKIO_WORKER_THREADS\""));
         let tiny = good.replace("memory: 65536", "memory: 1");
@@ -718,7 +718,7 @@ containers:
 
         // The generator runs the gateway's whole deployment check: a variable
         // the node requires, missing, is refused here as it is there.
-        for name in ["EIDOLA_ENGINE_BIND_ADDR", "EIDOLA_ENGINE_MAX_REQUESTS"] {
+        for name in ["ENGINE_BIND_ADDR", "ENGINE_MAX_REQUESTS"] {
             let line = good.lines().find(|l| l.contains(name)).unwrap();
             let missing = good.replace(&format!("{line}\n"), "");
             let err = entry(&missing, SIDECAR);

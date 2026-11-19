@@ -12,90 +12,93 @@
 //!   for a config the node would refuse, or that it reads differently;
 //! - `measure-enclave`, which turns the config into that pin.
 //!
-//! The Argon2id rule, and with it [`parse_measured`] (the whole measured
-//! environment), need the `argon2` crate and sit behind this crate's
-//! `argon2` feature: only the node and the gateway enable it, and both
-//! already depend on `argon2` themselves (see the crate docs' dependency
-//! rule).
+//! The node reads every variable under its environment's prefix
+//! ([`crate::env`]: `EIDOLA_ENV_PREFIX`, read bare), and a deployment's config
+//! declares the prefix it is read under ([`deployment_env`]), so the names
+//! here are bare: `MODEL_ID` is `ENGINE_MODEL_ID` in a config that sets
+//! `EIDOLA_ENV_PREFIX: "ENGINE_"`, and `MODEL_ID` in an unprefixed
+//! development boot.
 
 pub use crate::architecture::{Architecture, HybridDims, Shape};
+use crate::env::Env;
 
-/// The node's environment variables. Every one is required (an empty value
+/// The node's environment variables, each read under the environment's
+/// prefix ([`crate::env::Env::name`]). Every one is required (an empty value
 /// counts as missing) except where noted.
 pub mod env {
     /// The one model id this node serves.
-    pub const MODEL_ID: &str = "EIDOLA_ENGINE_MODEL_ID";
+    pub const MODEL_ID: &str = "MODEL_ID";
     /// Directory holding the model's weights and chat artifacts.
-    pub const WEIGHTS_DIR: &str = "EIDOLA_ENGINE_WEIGHTS_DIR";
+    pub const WEIGHTS_DIR: &str = "WEIGHTS_DIR";
     /// The weights hash the directory must have (64 hex digits).
-    pub const WEIGHTS_SHA256: &str = "EIDOLA_ENGINE_WEIGHTS_SHA256";
+    pub const WEIGHTS_SHA256: &str = "WEIGHTS_SHA256";
     /// `verified-readonly` (production: a read-only, kernel-verified mount) or
     /// `dev-writable`.
-    pub const WEIGHTS_STORAGE: &str = "EIDOLA_ENGINE_WEIGHTS_STORAGE";
+    pub const WEIGHTS_STORAGE: &str = "WEIGHTS_STORAGE";
     /// The gateway's bearer token. Secret, so not part of the measured
-    /// configuration [`super::parse_measured`] reads.
+    /// configuration [`super::parse_measured`] reads, and never bound to it:
+    /// the token keeps anyone but the gateway from spending the node's GPUs,
+    /// which is the operator's interest, not a client's.
     pub const GATEWAY_TOKEN: &str = "GATEWAY_TOKEN";
-    /// Argon2id hash of the gateway token (measured).
-    pub const GATEWAY_TOKEN_HASH: &str = "GATEWAY_TOKEN_HASH";
     /// `cpu` or `cuda`.
-    pub const EXECUTOR: &str = "EIDOLA_ENGINE_EXECUTOR";
+    pub const EXECUTOR: &str = "EXECUTOR";
     /// Listen address, `host:port`.
-    pub const BIND_ADDR: &str = "EIDOLA_ENGINE_BIND_ADDR";
+    pub const BIND_ADDR: &str = "BIND_ADDR";
     /// Positions per KV block.
-    pub const KV_BLOCK_SIZE: &str = "EIDOLA_ENGINE_KV_BLOCK_SIZE";
+    pub const KV_BLOCK_SIZE: &str = "KV_BLOCK_SIZE";
     /// Physical KV blocks per group, including the reserved null block
     /// (`cpu` only).
-    pub const KV_BLOCKS: &str = "EIDOLA_ENGINE_KV_BLOCKS";
+    pub const KV_BLOCKS: &str = "KV_BLOCKS";
     /// Device memory for the KV pools, in bytes, one value per device the
     /// model runs on, comma-separated in device order; the node derives the
     /// per-group block counts from it (`cuda` only).
-    pub const KV_DEVICE_BYTES: &str = "EIDOLA_ENGINE_KV_DEVICE_BYTES";
+    pub const KV_DEVICE_BYTES: &str = "KV_DEVICE_BYTES";
     /// The kernel build output the CUDA executor loads its images from, each
     /// checked against the compiled-in kernel manifest (`cuda` only).
-    pub const KERNELS_DIR: &str = "EIDOLA_ENGINE_KERNELS_DIR";
+    pub const KERNELS_DIR: &str = "KERNELS_DIR";
     /// Whether the CUDA executor replays captured graphs for decode steps:
     /// `on` or `off` (`cuda` only).
-    pub const CUDA_GRAPHS: &str = "EIDOLA_ENGINE_CUDA_GRAPHS";
+    pub const CUDA_GRAPHS: &str = "CUDA_GRAPHS";
     /// Host memory for the prefix cache's host tier, in bytes: page-locked
     /// memory of the confidential VM where idle entries evicted from the KV
     /// pools under pressure are kept (as ciphertext) instead of dropped. 0
     /// disables the tier; a non-zero value needs the prefix cache. The node
     /// derives the per-group host block counts from it.
-    pub const KV_HOST_BYTES: &str = "EIDOLA_ENGINE_KV_HOST_BYTES";
+    pub const KV_HOST_BYTES: &str = "KV_HOST_BYTES";
     /// Whether the node requires its GPUs in confidential-computing mode
     /// before it opens one: `required` (production; checked through NVML) or
     /// `not-required` (development on a GPU without it) (`cuda` only).
-    pub const GPU_CC: &str = "EIDOLA_ENGINE_GPU_CC";
+    pub const GPU_CC: &str = "GPU_CC";
     /// Longest sequence (prompt plus completion), in tokens.
-    pub const MAX_MODEL_LEN: &str = "EIDOLA_ENGINE_MAX_MODEL_LEN";
+    pub const MAX_MODEL_LEN: &str = "MAX_MODEL_LEN";
     /// Sequences per step (and per-sequence state slots).
-    pub const MAX_SEQS: &str = "EIDOLA_ENGINE_MAX_SEQS";
+    pub const MAX_SEQS: &str = "MAX_SEQS";
     /// Query tokens per step.
-    pub const MAX_BATCHED_TOKENS: &str = "EIDOLA_ENGINE_MAX_BATCHED_TOKENS";
+    pub const MAX_BATCHED_TOKENS: &str = "MAX_BATCHED_TOKENS";
     /// Largest prefill chunk for one sequence in one step.
-    pub const MAX_PREFILL_CHUNK: &str = "EIDOLA_ENGINE_MAX_PREFILL_CHUNK";
+    pub const MAX_PREFILL_CHUNK: &str = "MAX_PREFILL_CHUNK";
     /// Speculative draft width `k` (MTP depths); 0 disables speculation.
-    pub const DRAFT_TOKENS: &str = "EIDOLA_ENGINE_DRAFT_TOKENS";
+    pub const DRAFT_TOKENS: &str = "DRAFT_TOKENS";
     /// Requests admitted to the engine at once (running plus queued).
-    pub const MAX_REQUESTS: &str = "EIDOLA_ENGINE_MAX_REQUESTS";
+    pub const MAX_REQUESTS: &str = "MAX_REQUESTS";
     /// Whether finished keyed requests' KV is kept for reuse (`true` / `false`).
-    pub const PREFIX_CACHE: &str = "EIDOLA_ENGINE_PREFIX_CACHE";
+    pub const PREFIX_CACHE: &str = "PREFIX_CACHE";
     /// Prefix-cache idle lifetime, seconds.
-    pub const CACHE_IDLE_TTL_SECS: &str = "EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS";
+    pub const CACHE_IDLE_TTL_SECS: &str = "CACHE_IDLE_TTL_SECS";
     /// Prefix-cache maximum age, seconds.
-    pub const CACHE_MAX_AGE_SECS: &str = "EIDOLA_ENGINE_CACHE_MAX_AGE_SECS";
+    pub const CACHE_MAX_AGE_SECS: &str = "CACHE_MAX_AGE_SECS";
 
     /// Every variable of the measured environment: exactly the names
-    /// [`super::parse_measured`] reads. A deployment's env sets these and
-    /// nothing else, so no variable a dependency happens to consume
-    /// (`TOKIO_WORKER_THREADS`, `RUST_MIN_STACK`, `MALLOC_*`, `LD_*`,
-    /// `CUDA_*`, …) can reach the node through its measured config.
+    /// [`super::parse_measured`] reads. A deployment's env sets these, under
+    /// its prefix, and nothing else but the prefix itself, so no variable a
+    /// dependency happens to consume (`TOKIO_WORKER_THREADS`,
+    /// `RUST_MIN_STACK`, `MALLOC_*`, `LD_*`, `CUDA_*`, …) can reach the node
+    /// through its measured config.
     pub const MEASURED: &[&str] = &[
         MODEL_ID,
         WEIGHTS_DIR,
         WEIGHTS_SHA256,
         WEIGHTS_STORAGE,
-        GATEWAY_TOKEN_HASH,
         EXECUTOR,
         BIND_ADDR,
         KV_BLOCK_SIZE,
@@ -117,15 +120,45 @@ pub mod env {
     ];
 }
 
-/// Whether a deployment's measured env sets only [`env::MEASURED`] names.
-pub fn check_env_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
-    match names.into_iter().find(|name| !env::MEASURED.contains(name)) {
+/// Whether a deployment's measured env sets only [`env::MEASURED`] names
+/// under `prefix`, and the variable that names the prefix.
+pub fn check_env_names<'a>(
+    prefix: &Env,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let allowed = |name: &str| {
+        name == crate::env::PREFIX_VAR
+            || env::MEASURED
+                .iter()
+                .any(|measured| prefix.name(measured) == name)
+    };
+    match names.into_iter().find(|name| !allowed(name)) {
         None => Ok(()),
         Some(name) => Err(format!(
-            "the engine container's env may not set {name:?}; it sets exactly the node's \
-             measured variables"
+            "the engine container's env may not set {name:?}; it sets exactly {} and the \
+             node's measured variables under its prefix {:?}",
+            crate::env::PREFIX_VAR,
+            prefix.prefix()
         )),
     }
+}
+
+/// The environment a deployment's measured env is read under: the prefix its
+/// `EIDOLA_ENV_PREFIX` names, which a deployment must set, to a valid prefix
+/// that is not empty. The platform hands a secret to a container under the
+/// secret's own name, and secrets are shared across an organisation, so a
+/// deployment's names carry a prefix of their own. `lookup` answers for the
+/// config's env.
+pub fn deployment_env(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Env, String> {
+    let var = crate::env::PREFIX_VAR;
+    let prefix = lookup(var).unwrap_or_default();
+    if prefix.is_empty() {
+        return Err(format!(
+            "the engine container's env must set {var}, the prefix the node reads every \
+             other variable under"
+        ));
+    }
+    Env::with_prefix(&prefix).map_err(|e| e.to_string())
 }
 
 /// Caps on the node's allocation-driving sizes. Each follows from the
@@ -1354,8 +1387,6 @@ pub struct MeasuredConfig {
     /// Lowercase hex.
     pub weights_sha256: String,
     pub weights_storage: WeightsStorage,
-    /// A validated Argon2id PHC string.
-    pub gateway_token_hash: String,
     pub executor: ExecutorSettings,
     pub bind_addr: core::net::SocketAddr,
     pub sizing: Sizing,
@@ -1378,35 +1409,40 @@ impl core::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// Parse a node's measured configuration through `lookup` (its environment,
-/// or a deployment config's env list). **This is the node's boot grammar**:
-/// the node calls it and then verifies its secret token against the hash, so
-/// a configuration this accepts is one the node boots with, up to checks
+/// or a deployment config's env list), each variable read under `prefix`;
+/// errors name the variable as read. **This is the node's boot grammar**:
+/// the node calls it and then reads its secret token beside it, so a
+/// configuration this accepts is one the node boots with, up to checks
 /// against its weights (model length, MTP depth, executor availability) that
 /// need the model itself. The gateway's build check runs every pinned
 /// deployment's whole env through it.
-#[cfg(feature = "argon2")]
 pub fn parse_measured(
+    prefix: &Env,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<MeasuredConfig, ConfigError> {
+    let n = |name: &str| prefix.name(name);
     let get = |name: &str| -> Result<String, ConfigError> {
-        lookup(name)
+        lookup(&n(name))
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| ConfigError(format!("{name} is not set")))
+            .ok_or_else(|| ConfigError(format!("{} is not set", n(name))))
     };
     let positive = |name: &str| -> Result<u32, ConfigError> {
         match get(name)?.parse::<u32>() {
-            Ok(n) if n > 0 => Ok(n),
-            _ => Err(ConfigError(format!("{name} must be a positive integer"))),
+            Ok(v) if v > 0 => Ok(v),
+            _ => Err(ConfigError(format!(
+                "{} must be a positive integer",
+                n(name)
+            ))),
         }
     };
     let non_negative = |name: &str| -> Result<u32, ConfigError> {
         get(name)?
             .parse::<u32>()
-            .map_err(|_| ConfigError(format!("{name} must be a non-negative integer")))
+            .map_err(|_| ConfigError(format!("{} must be a non-negative integer", n(name))))
     };
     let seconds = |name: &str| -> Result<u64, ConfigError> {
         parse_cache_seconds(&get(name)?)
-            .ok_or_else(|| ConfigError(format!("{name} must be a positive number of seconds")))
+            .ok_or_else(|| ConfigError(format!("{} must be a positive number of seconds", n(name))))
     };
 
     let model_id = get(env::MODEL_ID)?;
@@ -1416,7 +1452,7 @@ pub fn parse_measured(
     {
         return Err(ConfigError(format!(
             "{} must not contain whitespace or control characters",
-            env::MODEL_ID
+            n(env::MODEL_ID)
         )));
     }
     let weights_dir = get(env::WEIGHTS_DIR)?;
@@ -1428,7 +1464,7 @@ pub fn parse_measured(
     {
         return Err(ConfigError(format!(
             "{} must be 64 hexadecimal digits",
-            env::WEIGHTS_SHA256
+            n(env::WEIGHTS_SHA256)
         )));
     }
     let weights_storage = match get(env::WEIGHTS_STORAGE)?.as_str() {
@@ -1437,29 +1473,27 @@ pub fn parse_measured(
         _ => {
             return Err(ConfigError(format!(
                 "{} must be `verified-readonly` or `dev-writable`",
-                env::WEIGHTS_STORAGE
+                n(env::WEIGHTS_STORAGE)
             )));
         }
     };
-    let gateway_token_hash = get(env::GATEWAY_TOKEN_HASH)?;
-    parse_gateway_token_hash(&gateway_token_hash)
-        .map_err(|e| ConfigError(format!("{}: {e}", env::GATEWAY_TOKEN_HASH)))?;
     let kind = match get(env::EXECUTOR)?.as_str() {
         "cpu" => Executor::Cpu,
         "cuda" => Executor::Cuda,
         _ => {
             return Err(ConfigError(format!(
                 "{}: expected `cpu` or `cuda`",
-                env::EXECUTOR
+                n(env::EXECUTOR)
             )));
         }
     };
     // Each executor's own settings are required with it and refused without
     // it.
     let refuse_unless = |name: &str, executor: &str| -> Result<(), ConfigError> {
-        match lookup(name) {
+        match lookup(&n(name)) {
             Some(v) if !v.is_empty() => Err(ConfigError(format!(
-                "{name} applies only to the {executor} executor"
+                "{} applies only to the {executor} executor",
+                n(name)
             ))),
             _ => Ok(()),
         }
@@ -1474,13 +1508,13 @@ pub fn parse_measured(
             if kv_blocks < 2 {
                 return Err(ConfigError(format!(
                     "{} must be at least 2 (block 0 is reserved)",
-                    env::KV_BLOCKS
+                    n(env::KV_BLOCKS)
                 )));
             }
             if kv_blocks > caps::KV_BLOCKS {
                 return Err(ConfigError(format!(
                     "{} must be at most {}",
-                    env::KV_BLOCKS,
+                    n(env::KV_BLOCKS),
                     caps::KV_BLOCKS
                 )));
             }
@@ -1488,14 +1522,16 @@ pub fn parse_measured(
         }
         Executor::Cuda => {
             refuse_unless(env::KV_BLOCKS, "cpu")?;
-            let mut budgets = parse_kv_device_bytes(&get(env::KV_DEVICE_BYTES)?)?.into_iter();
+            let mut budgets =
+                parse_kv_device_bytes(&n(env::KV_DEVICE_BYTES), &get(env::KV_DEVICE_BYTES)?)?
+                    .into_iter();
             let kv_device_bytes = budgets.next().expect("at least one budget");
             let further_kv_device_bytes: Vec<u64> = budgets.collect();
             let kernels_dir = get(env::KERNELS_DIR)?;
             if !is_clean_absolute_path(&kernels_dir) {
                 return Err(ConfigError(format!(
                     "{} must be an absolute path with no empty, `.` or `..` component",
-                    env::KERNELS_DIR
+                    n(env::KERNELS_DIR)
                 )));
             }
             let graphs = match get(env::CUDA_GRAPHS)?.as_str() {
@@ -1504,7 +1540,7 @@ pub fn parse_measured(
                 _ => {
                     return Err(ConfigError(format!(
                         "{}: expected `on` or `off`",
-                        env::CUDA_GRAPHS
+                        n(env::CUDA_GRAPHS)
                     )));
                 }
             };
@@ -1514,7 +1550,7 @@ pub fn parse_measured(
                 _ => {
                     return Err(ConfigError(format!(
                         "{}: expected `required` or `not-required`",
-                        env::GPU_CC
+                        n(env::GPU_CC)
                     )));
                 }
             };
@@ -1529,7 +1565,7 @@ pub fn parse_measured(
     };
     let bind_addr = get(env::BIND_ADDR)?
         .parse::<core::net::SocketAddr>()
-        .map_err(|_| ConfigError(format!("{} must be host:port", env::BIND_ADDR)))?;
+        .map_err(|_| ConfigError(format!("{} must be host:port", n(env::BIND_ADDR))))?;
 
     let sizing = Sizing {
         kv_block_size: positive(env::KV_BLOCK_SIZE)?,
@@ -1574,7 +1610,7 @@ pub fn parse_measured(
         (env::MAX_REQUESTS, sizing.max_requests, caps::MAX_REQUESTS),
     ] {
         if value > cap {
-            return Err(ConfigError(format!("{name} must be at most {cap}")));
+            return Err(ConfigError(format!("{} must be at most {cap}", n(name))));
         }
     }
     // A decode row costs `1 + draft_tokens` query slots, and the scheduler
@@ -1587,10 +1623,10 @@ pub fn parse_measured(
         return Err(ConfigError(format!(
             "{} must be at least {} x (1 + {}): a step holds every seat's decode row, \
              1 + {} query slots each",
-            env::MAX_BATCHED_TOKENS,
-            env::MAX_SEQS,
-            env::DRAFT_TOKENS,
-            env::DRAFT_TOKENS
+            n(env::MAX_BATCHED_TOKENS),
+            n(env::MAX_SEQS),
+            n(env::DRAFT_TOKENS),
+            n(env::DRAFT_TOKENS)
         )));
     }
     // The CUDA executor drafts with the model's MTP layers, one per depth:
@@ -1600,13 +1636,17 @@ pub fn parse_measured(
     if kind == Executor::Cuda && sizing.draft_tokens > caps::CUDA_DRAFT_TOKENS {
         return Err(ConfigError(format!(
             "{} must be at most {} with the cuda executor (the model's MTP layers)",
-            env::DRAFT_TOKENS,
+            n(env::DRAFT_TOKENS),
             caps::CUDA_DRAFT_TOKENS
         )));
     }
 
-    let enabled = parse_prefix_cache(&get(env::PREFIX_CACHE)?)
-        .ok_or_else(|| ConfigError(format!("{} must be `true` or `false`", env::PREFIX_CACHE)))?;
+    let enabled = parse_prefix_cache(&get(env::PREFIX_CACHE)?).ok_or_else(|| {
+        ConfigError(format!(
+            "{} must be `true` or `false`",
+            n(env::PREFIX_CACHE)
+        ))
+    })?;
     let cache = CacheConfig {
         enabled,
         idle_ttl_secs: seconds(env::CACHE_IDLE_TTL_SECS)?,
@@ -1615,8 +1655,8 @@ pub fn parse_measured(
     if cache.idle_ttl_secs > cache.max_age_secs {
         return Err(ConfigError(format!(
             "{} must not exceed {}",
-            env::CACHE_IDLE_TTL_SECS,
-            env::CACHE_MAX_AGE_SECS
+            n(env::CACHE_IDLE_TTL_SECS),
+            n(env::CACHE_MAX_AGE_SECS)
         )));
     }
     // A client declares a cached prefix in multiples of a quantum, which must
@@ -1624,21 +1664,21 @@ pub fn parse_measured(
     if cache.enabled && !crate::engine_protocol::quantum_covers_block_size(sizing.kv_block_size) {
         return Err(ConfigError(format!(
             "{} must divide {} when {} is true",
-            env::KV_BLOCK_SIZE,
+            n(env::KV_BLOCK_SIZE),
             crate::engine_protocol::CACHED_PREFIX_QUANTUM,
-            env::PREFIX_CACHE
+            n(env::PREFIX_CACHE)
         )));
     }
     let kv_host_bytes = get(env::KV_HOST_BYTES)?.parse::<u64>().map_err(|_| {
         ConfigError(format!(
             "{} must be a non-negative number of bytes",
-            env::KV_HOST_BYTES
+            n(env::KV_HOST_BYTES)
         ))
     })?;
     if kv_host_bytes > caps::KV_HOST_BYTES {
         return Err(ConfigError(format!(
             "{} must be at most {}",
-            env::KV_HOST_BYTES,
+            n(env::KV_HOST_BYTES),
             caps::KV_HOST_BYTES
         )));
     }
@@ -1648,8 +1688,8 @@ pub fn parse_measured(
     if kv_host_bytes > 0 && !cache.enabled {
         return Err(ConfigError(format!(
             "{} must be 0 when {} is false",
-            env::KV_HOST_BYTES,
-            env::PREFIX_CACHE
+            n(env::KV_HOST_BYTES),
+            n(env::PREFIX_CACHE)
         )));
     }
 
@@ -1658,7 +1698,6 @@ pub fn parse_measured(
         weights_dir,
         weights_sha256,
         weights_storage,
-        gateway_token_hash,
         executor,
         bind_addr,
         sizing,
@@ -1667,13 +1706,14 @@ pub fn parse_measured(
     })
 }
 
-/// `EIDOLA_ENGINE_KV_DEVICE_BYTES`: one budget per device, comma-separated
+/// `KV_DEVICE_BYTES` (`name`, the variable it was read from, under its
+/// prefix): one budget per device, comma-separated
 /// in device order (a model on one GPU names one), each a positive number of
 /// bytes of at most [`caps::KV_DEVICE_BYTES`], at most as many as
 /// [`CUDA_GPU_COUNTS`] allows GPUs. How many devices the model runs on is its
 /// architecture's ([`check_device_resources`]); the node holds the count to
 /// its weights.
-pub fn parse_kv_device_bytes(text: &str) -> Result<Vec<u64>, ConfigError> {
+pub fn parse_kv_device_bytes(name: &str, text: &str) -> Result<Vec<u64>, ConfigError> {
     let mut budgets = Vec::new();
     for part in text.split(',') {
         let n = match part.parse::<u64>() {
@@ -1681,14 +1721,14 @@ pub fn parse_kv_device_bytes(text: &str) -> Result<Vec<u64>, ConfigError> {
             _ => {
                 return Err(ConfigError(format!(
                     "{} must be one positive number of bytes per device, comma-separated",
-                    env::KV_DEVICE_BYTES
+                    name
                 )));
             }
         };
         if n > caps::KV_DEVICE_BYTES {
             return Err(ConfigError(format!(
                 "{} must be at most {} per device",
-                env::KV_DEVICE_BYTES,
+                name,
                 caps::KV_DEVICE_BYTES
             )));
         }
@@ -1697,7 +1737,7 @@ pub fn parse_kv_device_bytes(text: &str) -> Result<Vec<u64>, ConfigError> {
     if budgets.len() as u64 > *CUDA_GPU_COUNTS.end() {
         return Err(ConfigError(format!(
             "{} names more devices than the {} GPUs a deployment may attach",
-            env::KV_DEVICE_BYTES,
+            name,
             CUDA_GPU_COUNTS.end()
         )));
     }
@@ -1755,19 +1795,24 @@ pub fn is_gateway_token(token: &str) -> bool {
         && token.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// The one secret an engine container takes: everything else it reads is in
-/// the measured env. A secret is delivered outside the measurement, so any
-/// other one (a log level, say) would change the node's behaviour unmeasured.
+/// The one secret an engine container takes, under its prefix: everything
+/// else it reads is in the measured env. A secret is delivered outside the
+/// measurement, so any other one (a log level, say) would change the node's
+/// behaviour unmeasured.
 pub const SECRETS: &[&str] = &[env::GATEWAY_TOKEN];
 
-/// Whether the engine container's `secrets` are exactly [`SECRETS`].
-pub fn check_secrets<'a>(secrets: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
-    let secrets: Vec<&str> = secrets.into_iter().collect();
-    if secrets == SECRETS {
+/// Whether the engine container's `secrets` are exactly [`SECRETS`] under
+/// `prefix`.
+pub fn check_secrets<'a>(
+    prefix: &Env,
+    secrets: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let expected: Vec<String> = SECRETS.iter().map(|name| prefix.name(name)).collect();
+    if secrets.into_iter().eq(expected.iter().map(String::as_str)) {
         Ok(())
     } else {
         Err(format!(
-            "the engine container's secrets must be exactly {SECRETS:?}; any other secret \
+            "the engine container's secrets must be exactly {expected:?}; any other secret \
              reaches the node outside the measurement"
         ))
     }
@@ -1782,7 +1827,7 @@ pub const MODEL_MOUNT_ROOT: &str = "/tinfoil/models";
 /// like) inside the container.
 pub const TINFOIL_MOUNT_ROOT: &str = "/tinfoil";
 
-/// Whether `kernels_dir` (`EIDOLA_ENGINE_KERNELS_DIR`) names a directory of
+/// Whether `kernels_dir` (`KERNELS_DIR`) names a directory of
 /// the measured image: the kernels the CUDA executor loads ship in the image
 /// the deployment pins, never in an attached mount.
 pub fn check_kernels_dir(kernels_dir: &str) -> Result<(), String> {
@@ -1895,7 +1940,7 @@ pub fn check_weights_pack(
             });
     if !inside {
         return Err(format!(
-            "EIDOLA_ENGINE_WEIGHTS_DIR must be inside the weights pack's mount, {mount}"
+            "WEIGHTS_DIR must be inside the weights pack's mount, {mount}"
         ));
     }
     Ok(())
@@ -2016,8 +2061,8 @@ mod yaml_events;
 /// retention in milliseconds as a `u64`.
 pub const MAX_CACHE_SECONDS: u64 = u64::MAX / 1000;
 
-/// A prefix-cache retention bound (`EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS`,
-/// `EIDOLA_ENGINE_CACHE_MAX_AGE_SECS`): a positive whole number of seconds,
+/// A prefix-cache retention bound (`CACHE_IDLE_TTL_SECS`,
+/// `CACHE_MAX_AGE_SECS`): a positive whole number of seconds,
 /// at most [`MAX_CACHE_SECONDS`].
 pub fn parse_cache_seconds(text: &str) -> Option<u64> {
     text.parse::<u64>()
@@ -2025,7 +2070,7 @@ pub fn parse_cache_seconds(text: &str) -> Option<u64> {
         .filter(|n| *n > 0 && *n <= MAX_CACHE_SECONDS)
 }
 
-/// The prefix-cache switch (`EIDOLA_ENGINE_PREFIX_CACHE`): exactly `true` or
+/// The prefix-cache switch (`PREFIX_CACHE`): exactly `true` or
 /// `false`.
 pub fn parse_prefix_cache(text: &str) -> Option<bool> {
     match text {
@@ -2121,106 +2166,6 @@ pub fn check_cvm_image(executor: Executor, release: &CvmVersion<'_>) -> Result<(
             release.version
         )),
     }
-}
-
-/// Why a gateway-token hash is refused.
-#[cfg(feature = "argon2")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenHashError {
-    /// Not a PHC string `argon2` can read.
-    NotAPhcString,
-    /// A PHC string for an algorithm other than Argon2id.
-    NotArgon2id,
-    /// No salt, or no hash output, so no token can ever verify against it.
-    Incomplete,
-    /// Parameters outside the operational profile ([`TOKEN_HASH_M_COST`] and
-    /// its siblings), refused before anything is hashed.
-    OutsideProfile,
-    /// Parameters, version, salt or output length `argon2` refuses to hash
-    /// with (a memory cost below its minimum, a salt shorter than eight
-    /// bytes, …), so no token can ever verify against it.
-    Unusable,
-}
-
-#[cfg(feature = "argon2")]
-impl core::fmt::Display for TokenHashError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::NotAPhcString => "not a valid Argon2 hash string",
-            Self::NotArgon2id => "must be an Argon2id hash",
-            Self::Incomplete => "must carry a salt and a hash output",
-            Self::Unusable => "has parameters, a salt or an output Argon2 cannot verify with",
-            Self::OutsideProfile => {
-                "must use the hash-secret profile: Argon2id v=19, m 19456 to 65536 KiB, t 2 to 4, \
-                 p 1 to 4, a 32-byte output"
-            }
-        })
-    }
-}
-
-/// The Argon2 version a gateway-token hash must use (0x13, `v=19`).
-#[cfg(feature = "argon2")]
-pub const TOKEN_HASH_VERSION: u32 = 0x13;
-/// Memory cost, KiB: from `hash-secret`'s own (`Argon2::default()`, 19,456,
-/// OWASP's minimum for Argon2id) up to 64 MiB, a small band for a stronger
-/// hash that still costs a boot nothing worth noticing.
-#[cfg(feature = "argon2")]
-pub const TOKEN_HASH_M_COST: std::ops::RangeInclusive<u32> = 19_456..=65_536;
-/// Passes: `hash-secret`'s 2 up to 4.
-#[cfg(feature = "argon2")]
-pub const TOKEN_HASH_T_COST: std::ops::RangeInclusive<u32> = 2..=4;
-/// Lanes: `hash-secret`'s 1 up to 4.
-#[cfg(feature = "argon2")]
-pub const TOKEN_HASH_P_COST: std::ops::RangeInclusive<u32> = 1..=4;
-/// Output length: `hash-secret`'s 32 bytes, exactly.
-#[cfg(feature = "argon2")]
-pub const TOKEN_HASH_OUTPUT_LEN: usize = 32;
-
-/// Parse the gateway token's measured hash (`GATEWAY_TOKEN_HASH`): an
-/// Argon2id PHC string that a token can actually verify against.
-///
-/// Verification (`PasswordVerifier::verify_password`, which the node runs at
-/// boot) needs a salt and an output, and hashes the candidate with the
-/// hash's own algorithm, version and parameters; any of those `argon2`
-/// refuses makes every token fail. So this runs that same hashing step, with
-/// the same `Argon2::default()` the node verifies with, over an empty
-/// candidate, and keeps only hashes for which it succeeds: the set this
-/// accepts is the set some token verifies against. The comparison itself is
-/// the node's, against its secret.
-#[cfg(feature = "argon2")]
-pub fn parse_gateway_token_hash(hash: &str) -> Result<argon2::PasswordHash, TokenHashError> {
-    use argon2::CustomizedPasswordHasher as _;
-
-    let parsed = argon2::PasswordHash::new(hash).map_err(|_| TokenHashError::NotAPhcString)?;
-    if parsed.algorithm.as_str() != "argon2id" {
-        return Err(TokenHashError::NotArgon2id);
-    }
-    let (Some(salt), Some(_)) = (&parsed.salt, &parsed.hash) else {
-        return Err(TokenHashError::Incomplete);
-    };
-    let params = argon2::Params::try_from(&parsed).map_err(|_| TokenHashError::Unusable)?;
-    // The operational profile, checked before anything is hashed: a hash's
-    // parameters decide how much memory and time verifying it costs, so an
-    // extreme one would turn the check (and the node's boot) into an
-    // allocation of the hash's choosing.
-    let in_profile = parsed.version == Some(TOKEN_HASH_VERSION)
-        && TOKEN_HASH_M_COST.contains(&params.m_cost())
-        && TOKEN_HASH_T_COST.contains(&params.t_cost())
-        && TOKEN_HASH_P_COST.contains(&params.p_cost())
-        && params.output_len() == Some(TOKEN_HASH_OUTPUT_LEN);
-    if !in_profile {
-        return Err(TokenHashError::OutsideProfile);
-    }
-    argon2::Argon2::default()
-        .hash_password_customized(
-            b"",
-            salt,
-            Some(parsed.algorithm.as_str()),
-            parsed.version,
-            params,
-        )
-        .map_err(|_| TokenHashError::Unusable)?;
-    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -2745,14 +2690,22 @@ mod tests {
     #[test]
     fn kv_device_bytes_name_one_budget_per_device() {
         assert_eq!(
-            parse_kv_device_bytes("85899345920"),
+            parse_kv_device_bytes(env::KV_DEVICE_BYTES, "85899345920"),
             Ok(vec![85_899_345_920])
         );
-        assert_eq!(parse_kv_device_bytes("1,2"), Ok(vec![1, 2]));
-        assert_eq!(parse_kv_device_bytes(&["1"; 8].join(",")).unwrap().len(), 8);
+        assert_eq!(
+            parse_kv_device_bytes(env::KV_DEVICE_BYTES, "1,2"),
+            Ok(vec![1, 2])
+        );
+        assert_eq!(
+            parse_kv_device_bytes(env::KV_DEVICE_BYTES, &["1"; 8].join(","))
+                .unwrap()
+                .len(),
+            8
+        );
         let cap = caps::KV_DEVICE_BYTES;
         assert_eq!(
-            parse_kv_device_bytes(&format!("{cap},{cap}")),
+            parse_kv_device_bytes(env::KV_DEVICE_BYTES, &format!("{cap},{cap}")),
             Ok(vec![cap, cap])
         );
         for bad in [
@@ -2768,7 +2721,10 @@ mod tests {
             format!("1,{}", cap + 1),
             ["1"; 9].join(","),
         ] {
-            assert!(parse_kv_device_bytes(&bad).is_err(), "{bad:?}");
+            assert!(
+                parse_kv_device_bytes(env::KV_DEVICE_BYTES, &bad).is_err(),
+                "{bad:?}"
+            );
         }
     }
 
@@ -2777,13 +2733,14 @@ mod tests {
     /// configuration, so no pinned deployment can name either.
     #[test]
     fn dev_only_placements_have_no_spelling() {
+        let prefix = Env::with_prefix("ENGINE_").unwrap();
         for name in [
-            "EIDOLA_ENGINE_STAGED_EXPERTS",
-            "EIDOLA_ENGINE_EXPERTS_ON_HOST",
-            "EIDOLA_ENGINE_ENGRAM_ON_HOST",
-            "EIDOLA_ENGINE_ENGRAM_HOST_BYTES",
+            "ENGINE_STAGED_EXPERTS",
+            "ENGINE_EXPERTS_ON_HOST",
+            "ENGINE_ENGRAM_ON_HOST",
+            "ENGINE_ENGRAM_HOST_BYTES",
         ] {
-            assert!(check_env_names([name]).is_err(), "{name}");
+            assert!(check_env_names(&prefix, [name]).is_err(), "{name}");
         }
         for name in env::MEASURED {
             assert!(
@@ -3267,40 +3224,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "argon2")]
-    #[test]
-    fn an_extreme_token_hash_is_refused_before_hashing() {
-        let good = "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$unNYT/KTNSNW0JCH9+9OQ2zBApPLxGNZiw746903Q8E";
-        assert!(parse_gateway_token_hash(good).is_ok());
-        let started = std::time::Instant::now();
-        for params in [
-            "m=4294967295,t=2,p=1",
-            "m=19456,t=4294967295,p=1",
-            "m=19456,t=2,p=255",
-            "m=8192,t=2,p=1",
-            "m=19456,t=1,p=1",
-        ] {
-            let extreme = good.replace("m=19456,t=2,p=1", params);
-            assert_eq!(
-                parse_gateway_token_hash(&extreme).unwrap_err(),
-                TokenHashError::OutsideProfile,
-                "{params}"
-            );
-        }
-        // A 16-byte output and a pre-1.3 version are outside the profile too.
-        let short = "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$aGFzaGhhc2hoYXNoaGFzaA";
-        assert_eq!(
-            parse_gateway_token_hash(short).unwrap_err(),
-            TokenHashError::OutsideProfile
-        );
-        assert_eq!(
-            parse_gateway_token_hash(&good.replace("v=19", "v=16")).unwrap_err(),
-            TokenHashError::OutsideProfile
-        );
-        // Refused without hashing: an m of 4 TiB would take far longer.
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-    }
-
     #[test]
     fn path_components_are_safe() {
         for good in ["mimo-v2", "tdx-8x.h200", "0a_b"] {
@@ -3340,15 +3263,59 @@ mod tests {
 
     #[test]
     fn the_env_names_are_exactly_the_measured_ones() {
-        assert!(check_env_names(env::MEASURED.iter().copied()).is_ok());
+        let prefix = Env::with_prefix("ENGINE_").unwrap();
+        let names: Vec<String> = env::MEASURED.iter().map(|n| prefix.name(n)).collect();
+        let named = || names.iter().map(String::as_str);
+        assert!(check_env_names(&prefix, named()).is_ok());
+        assert!(check_env_names(&prefix, named().chain([crate::env::PREFIX_VAR])).is_ok());
         for extra in [
             "TOKIO_WORKER_THREADS",
             "RUST_MIN_STACK",
             "CUDA_VISIBLE_DEVICES",
             "LD_PRELOAD",
             "GATEWAY_TOKEN",
+            "ENGINE_GATEWAY_TOKEN",
+            "ENGINE_RUST_LOG",
+            "ENGINE_EIDOLA_ENV_PREFIX",
+            // A measured name without the prefix.
+            "MODEL_ID",
+            "OTHER_MODEL_ID",
         ] {
-            assert!(check_env_names([env::MODEL_ID, extra]).is_err(), "{extra}");
+            assert!(
+                check_env_names(&prefix, ["ENGINE_MODEL_ID", extra]).is_err(),
+                "{extra}"
+            );
+        }
+    }
+
+    /// A deployment declares its prefix: set, not empty, and of the accepted
+    /// form.
+    #[test]
+    fn a_deployment_declares_its_prefix() {
+        let env_of = |value: Option<&'static str>| {
+            move |name: &str| {
+                value
+                    .filter(|_| name == crate::env::PREFIX_VAR)
+                    .map(String::from)
+            }
+        };
+        assert_eq!(
+            deployment_env(&env_of(Some("ENGINE_"))).unwrap().prefix(),
+            "ENGINE_"
+        );
+        assert_eq!(
+            deployment_env(&env_of(Some("ENGINE_B300_")))
+                .unwrap()
+                .prefix(),
+            "ENGINE_B300_"
+        );
+        for missing in [None, Some("")] {
+            let err = deployment_env(&env_of(missing)).unwrap_err();
+            assert!(err.contains("must set EIDOLA_ENV_PREFIX"), "{err}");
+        }
+        for bad in ["ENGINE", "engine_", "_ENGINE_", "ENGINE-"] {
+            let err = deployment_env(&env_of(Some(bad))).unwrap_err();
+            assert!(err.contains("EIDOLA_ENV_PREFIX must be"), "{bad}: {err}");
         }
     }
 
@@ -3392,10 +3359,14 @@ mod tests {
 
     #[test]
     fn the_only_secret_is_the_gateway_token() {
-        assert!(check_secrets(["GATEWAY_TOKEN"]).is_ok());
-        assert!(check_secrets([]).is_err());
-        assert!(check_secrets(["GATEWAY_TOKEN", "RUST_LOG"]).is_err());
-        assert!(check_secrets(["GATEWAY_TOKEN", "GATEWAY_TOKEN"]).is_err());
+        let prefix = Env::with_prefix("ENGINE_").unwrap();
+        assert!(check_secrets(&prefix, ["ENGINE_GATEWAY_TOKEN"]).is_ok());
+        assert!(check_secrets(&prefix, []).is_err());
+        assert!(check_secrets(&prefix, ["GATEWAY_TOKEN"]).is_err());
+        assert!(check_secrets(&prefix, ["ENGINE_GATEWAY_TOKEN", "ENGINE_RUST_LOG"]).is_err());
+        assert!(check_secrets(&prefix, ["ENGINE_GATEWAY_TOKEN", "ENGINE_GATEWAY_TOKEN"]).is_err());
+        let err = check_secrets(&prefix, []).unwrap_err();
+        assert!(err.contains("[\"ENGINE_GATEWAY_TOKEN\"]"), "{err}");
     }
 
     #[test]
@@ -3515,17 +3486,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "argon2")]
     fn cuda_env() -> std::collections::BTreeMap<&'static str, String> {
         [
             (env::MODEL_ID, "m"),
             (env::WEIGHTS_DIR, "/tinfoil/models/weights"),
             (env::WEIGHTS_SHA256, &"ab".repeat(32)),
             (env::WEIGHTS_STORAGE, "verified-readonly"),
-            (
-                env::GATEWAY_TOKEN_HASH,
-                "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$unNYT/KTNSNW0JCH9+9OQ2zBApPLxGNZiw746903Q8E",
-            ),
             (env::EXECUTOR, "cuda"),
             (env::BIND_ADDR, "0.0.0.0:8080"),
             (env::KV_BLOCK_SIZE, "16"),
@@ -3552,7 +3518,6 @@ mod tests {
     /// With the prefix cache on, the block size divides the declared-prefix
     /// quantum (every divisor of 256 is accepted, nothing else); with it off,
     /// any block size within its cap is.
-    #[cfg(feature = "argon2")]
     #[test]
     fn a_cached_block_size_divides_the_declared_prefix_quantum() {
         let base = cuda_env();
@@ -3579,7 +3544,6 @@ mod tests {
     /// The host tier's size is required, a number of bytes up to its cap,
     /// bound into the measured configuration as given, refused with the
     /// prefix cache off unless 0, and charged to the VM's memory.
-    #[cfg(feature = "argon2")]
     #[test]
     fn the_host_tier_size_is_measured_and_charged_to_the_vm() {
         let base = cuda_env();
@@ -3655,7 +3619,6 @@ mod tests {
         }
     }
     /// The settings only the cuda executor takes.
-    #[cfg(feature = "argon2")]
     const CUDA_SETTINGS: [&str; 4] = [
         env::KV_DEVICE_BYTES,
         env::KERNELS_DIR,
@@ -3663,14 +3626,39 @@ mod tests {
         env::GPU_CC,
     ];
 
-    #[cfg(feature = "argon2")]
     fn parse_map(
         map: &std::collections::BTreeMap<&'static str, String>,
     ) -> Result<MeasuredConfig, String> {
-        parse_measured(&|name| map.get(name).cloned()).map_err(|e| e.0)
+        parse_measured(&Env::default(), &|name| map.get(name).cloned()).map_err(|e| e.0)
     }
 
-    #[cfg(feature = "argon2")]
+    /// Under a prefix every variable is read by its prefixed name, never the
+    /// bare one, and an error names the variable as read.
+    #[test]
+    fn a_prefixed_environment_is_read_under_its_prefix() {
+        let bare = cuda_env();
+        let prefix = Env::with_prefix("ENGINE_").unwrap();
+        let prefixed: std::collections::BTreeMap<String, String> = bare
+            .iter()
+            .map(|(name, value)| (prefix.name(name), value.clone()))
+            .collect();
+        let read = |map: &std::collections::BTreeMap<String, String>| {
+            parse_measured(&prefix, &|name| map.get(name).cloned()).map_err(|e| e.0)
+        };
+        assert_eq!(read(&prefixed).unwrap(), parse_map(&bare).unwrap());
+        let bare_only: std::collections::BTreeMap<String, String> = bare
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect();
+        assert_eq!(read(&bare_only).unwrap_err(), "ENGINE_MODEL_ID is not set");
+        let mut bad = prefixed.clone();
+        bad.insert("ENGINE_MAX_SEQS".into(), "0".into());
+        assert_eq!(
+            read(&bad).unwrap_err(),
+            "ENGINE_MAX_SEQS must be a positive integer"
+        );
+    }
+
     #[test]
     fn each_executor_takes_its_own_settings_and_refuses_the_others() {
         let cuda = cuda_env();
@@ -3750,7 +3738,6 @@ mod tests {
 
     /// A step that cannot hold every seat's decode row is refused: the
     /// scheduler would leave the rows it cannot afford out of each step.
-    #[cfg(feature = "argon2")]
     #[test]
     fn a_step_holds_every_seats_decode_row() {
         let mut cpu = cuda_env();
@@ -3772,8 +3759,7 @@ mod tests {
                 let err = parse_map(&cpu).unwrap_err();
                 assert!(
                     err.contains(
-                        "EIDOLA_ENGINE_MAX_BATCHED_TOKENS must be at least \
-                         EIDOLA_ENGINE_MAX_SEQS x (1 + EIDOLA_ENGINE_DRAFT_TOKENS)"
+                        "MAX_BATCHED_TOKENS must be at least MAX_SEQS x (1 + DRAFT_TOKENS)"
                     ),
                     "{err}"
                 );
@@ -3792,7 +3778,6 @@ mod tests {
         parse_map(&cuda).expect("64 seats x 4 slots are 256");
     }
 
-    #[cfg(feature = "argon2")]
     #[test]
     fn the_cuda_settings_are_exact() {
         let cuda = cuda_env();
@@ -3859,79 +3844,5 @@ mod tests {
         let mut most = cuda.clone();
         most.insert(env::KV_DEVICE_BYTES, caps::KV_DEVICE_BYTES.to_string());
         assert!(parse_map(&most).is_ok());
-    }
-
-    #[cfg(feature = "argon2")]
-    #[test]
-    fn the_token_hash_is_a_whole_argon2id_phc_string() {
-        let good = "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$unNYT/KTNSNW0JCH9+9OQ2zBApPLxGNZiw746903Q8E";
-        assert!(parse_gateway_token_hash(good).is_ok());
-        assert_eq!(
-            parse_gateway_token_hash("$argon2id$garbage").unwrap_err(),
-            TokenHashError::NotAPhcString
-        );
-        assert_eq!(
-            parse_gateway_token_hash(&good.replace("argon2id", "argon2i")).unwrap_err(),
-            TokenHashError::NotArgon2id
-        );
-        assert_eq!(
-            parse_gateway_token_hash("").unwrap_err(),
-            TokenHashError::NotAPhcString
-        );
-    }
-
-    /// The hashes `parse_gateway_token_hash` refuses are exactly ones no token
-    /// verifies against: `verify_password` itself fails for each, even with
-    /// the token that would match a well-formed hash.
-    #[cfg(feature = "argon2")]
-    #[test]
-    fn the_token_hash_is_one_a_token_can_verify_against() {
-        use argon2::{PasswordHasher, PasswordVerifier};
-
-        let token = b"dev-gateway-token";
-        let good = argon2::Argon2::default()
-            .hash_password(token)
-            .unwrap()
-            .to_string();
-        let parsed = parse_gateway_token_hash(&good).unwrap();
-        argon2::Argon2::default()
-            .verify_password(token, &parsed)
-            .unwrap();
-
-        let (head, tail) = good.split_once("$m=").unwrap();
-        let (_, rest) = tail.split_once('$').unwrap();
-        let (salt, output) = rest.split_once('$').unwrap();
-        for (bad, error) in [
-            (
-                format!("{head}$m=1,t=2,p=1${rest}"),
-                TokenHashError::Unusable,
-            ),
-            (
-                format!("{head}$m=19456,t=0,p=1${rest}"),
-                TokenHashError::Unusable,
-            ),
-            (
-                format!("{head}$m=19456,t=2,p=1$c2FsdA${output}"),
-                TokenHashError::NotAPhcString,
-            ),
-            (
-                format!("{head}$m=19456,t=2,p=1"),
-                TokenHashError::Incomplete,
-            ),
-            (
-                format!("{head}$m=19456,t=2,p=1${salt}"),
-                TokenHashError::Incomplete,
-            ),
-        ] {
-            assert_eq!(parse_gateway_token_hash(&bad).unwrap_err(), error, "{bad}");
-            if let Ok(phc) = argon2::PasswordHash::new(&bad) {
-                assert!(
-                    argon2::Argon2::default()
-                        .verify_password(token, &phc)
-                        .is_err(),
-                    "{bad} verifies, so refusing it is wrong"
-                );
-            }
-        }
     }
 }

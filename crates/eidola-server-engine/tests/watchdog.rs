@@ -142,7 +142,7 @@ async fn a_stalled_step_ends_the_stream_with_an_error_and_exits() {
         device: None,
         max_model_len: 1024,
         model,
-        token: GatewayToken::verify(common::TOKEN.into(), common::token_hash()).unwrap(),
+        token: GatewayToken::new(common::TOKEN.into(), "GATEWAY_TOKEN").unwrap(),
         salts: SaltDeriver::new(),
         engine: handle.clone(),
         admission: admission.clone(),

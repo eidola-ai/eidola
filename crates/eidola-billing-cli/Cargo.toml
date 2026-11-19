@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 eidola-billing = { path = "../eidola-billing" }
+# `env`: the environment read under `EIDOLA_ENV_PREFIX`, the rule the gateway
+# and the inference node read theirs by.
+eidola-common = { path = "../eidola-common" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4", "serde"] }

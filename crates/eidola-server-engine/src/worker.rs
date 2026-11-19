@@ -23,7 +23,7 @@
 //! has left the engine **and** its buffered output has been drained or dropped. With
 //! every permit taken a request is refused at once with `overloaded`; nothing queues
 //! without bound in front of the engine, and buffered output is bounded by
-//! `EIDOLA_ENGINE_MAX_REQUESTS × EVENT_BUFFER` events.
+//! `MAX_REQUESTS × EVENT_BUFFER` events.
 //!
 //! **Cancellation**: dropping a request's [`RequestGuard`] (the HTTP response future or
 //! stream going away, for example on a client disconnect) sends `Cancel`, and the engine

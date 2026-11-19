@@ -48,7 +48,7 @@
 #                 both and, with CPU_RECORDED, the CPU reference executor's; then the
 #                 throughput prompts (1,024 in, 256 out) at widths 0 and 5 and
 #                 concurrencies 1, 8 and 32 (ds_two/generate.json, bench.json)     10-15
-#   node_w0, node_w3  the node binary on the checkpoint, EIDOLA_ENGINE_EXECUTOR=cuda,
+#   node_w0, node_w3  the node binary on the checkpoint, EXECUTOR=cuda,
 #                 a 131,072-position context, the measured GEMM form (exact), draft
 #                 width 0 then 3 (the most the node's grammar takes with cuda): the
 #                 health requests and the generation prompts over its HTTP API, each
@@ -254,7 +254,6 @@ build() {
         --test deepseek_tiny --test smoke --test manifest --no-run
     cargo_r build --release --locked -p eidola-server-engine --features cuda --bin eidola-server-engine
     cargo_r test --release --locked -p eidola-server-engine --features cuda --test cuda --no-run
-    cargo_r build --release --locked -p hash-secret
 }
 
 kernels() {
@@ -358,22 +357,19 @@ two_serving() {
 node() {
     local width="$1" name="node_w$1"
     need_kernels; need_checkpoint; gpus_free
-    local bin="$CARGO_TARGET_DIR/release/eidola-server-engine" token hash
+    local bin="$CARGO_TARGET_DIR/release/eidola-server-engine" token
     token="$("$PY" -I -c 'import secrets; print(secrets.token_urlsafe(32))')"
-    if [ -n "$DRY_RUN" ]; then hash="<argon2id hash>"; else
-        hash="$("$CARGO_TARGET_DIR/release/hash-secret" "$token")"
-    fi
     local env=(
-        EIDOLA_ENGINE_MODEL_ID=ds EIDOLA_ENGINE_WEIGHTS_DIR="$CHECKPOINT"
-        EIDOLA_ENGINE_WEIGHTS_SHA256="$(weights)" EIDOLA_ENGINE_WEIGHTS_STORAGE=dev-writable
-        GATEWAY_TOKEN="$token" GATEWAY_TOKEN_HASH="$hash"
-        EIDOLA_ENGINE_EXECUTOR=cuda EIDOLA_ENGINE_BIND_ADDR=127.0.0.1:8090
-        EIDOLA_ENGINE_KV_BLOCK_SIZE=256 EIDOLA_ENGINE_KV_DEVICE_BYTES="$((8 << 30)),$((8 << 30))"
-        EIDOLA_ENGINE_KERNELS_DIR="$KERNELS" EIDOLA_ENGINE_CUDA_GRAPHS=off EIDOLA_ENGINE_GPU_CC=not-required
-        EIDOLA_ENGINE_KV_HOST_BYTES=0 EIDOLA_ENGINE_MAX_MODEL_LEN=131072
-        EIDOLA_ENGINE_MAX_SEQS=4 EIDOLA_ENGINE_MAX_BATCHED_TOKENS=2048 EIDOLA_ENGINE_MAX_PREFILL_CHUNK=2048
-        EIDOLA_ENGINE_DRAFT_TOKENS="$width" EIDOLA_ENGINE_MAX_REQUESTS=8 EIDOLA_ENGINE_PREFIX_CACHE=true
-        EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS=600 EIDOLA_ENGINE_CACHE_MAX_AGE_SECS=3600
+        MODEL_ID=ds WEIGHTS_DIR="$CHECKPOINT"
+        WEIGHTS_SHA256="$(weights)" WEIGHTS_STORAGE=dev-writable
+        GATEWAY_TOKEN="$token"
+        EXECUTOR=cuda BIND_ADDR=127.0.0.1:8090
+        KV_BLOCK_SIZE=256 KV_DEVICE_BYTES="$((8 << 30)),$((8 << 30))"
+        KERNELS_DIR="$KERNELS" CUDA_GRAPHS=off GPU_CC=not-required
+        KV_HOST_BYTES=0 MAX_MODEL_LEN=131072
+        MAX_SEQS=4 MAX_BATCHED_TOKENS=2048 MAX_PREFILL_CHUNK=2048
+        DRAFT_TOKENS="$width" MAX_REQUESTS=8 PREFIX_CACHE=true
+        CACHE_IDLE_TTL_SECS=600 CACHE_MAX_AGE_SECS=3600
     )
     # The driver's libraries, where an image keeps them off the loader's default path.
     [ -n "${LD_LIBRARY_PATH:-}" ] && env+=(LD_LIBRARY_PATH="$LD_LIBRARY_PATH")

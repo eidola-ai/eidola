@@ -5,7 +5,7 @@
 //! HTTP/protobuf.
 //!
 //! These variables, read under the environment's prefix
-//! (`eidola_billing::env`) like every other, configure it:
+//! (`eidola_common::env`) like every other, configure it:
 //! - `OTEL_EXPORTER_OTLP_ENDPOINT` — OTLP endpoint (e.g., `https://otlp-gateway-*.grafana.net/otlp`)
 //! - `OTEL_EXPORTER_OTLP_HEADERS` — auth headers (e.g., `Authorization=Basic <base64>`)
 //! - `OTEL_SERVICE_NAME` — overrides the default `eidola-server-gateway`
@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use eidola_billing::env::Env;
+use eidola_common::env::Env;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::{Link, SpanKind, TraceContextExt, TraceId, TracerProvider as _};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};

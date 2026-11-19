@@ -54,7 +54,7 @@ pub const CACHE_KEY_BYTES: usize = 32;
 pub const CACHE_KEY_TEXT_LEN: usize = (CACHE_KEY_BYTES * 8).div_ceil(6);
 
 /// Largest chat request body a node reads, in bytes. A node holds at most one
-/// such body per admission slot (`EIDOLA_ENGINE_MAX_REQUESTS`), so a
+/// such body per admission slot (`MAX_REQUESTS`), so a
 /// deployment's host-memory check counts it.
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 

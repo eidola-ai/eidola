@@ -49,7 +49,9 @@ fn fixture_measured(tree: &Tree) -> engine_deployment::MeasuredConfig {
             Some((name.to_string(), value.trim_matches('"').to_string()))
         })
         .collect();
-    engine_deployment::parse_measured(&|name| env.get(name).cloned())
+    let lookup = |name: &str| env.get(name).cloned();
+    let prefix = engine_deployment::deployment_env(&lookup).expect("the fixture's prefix");
+    engine_deployment::parse_measured(&prefix, &lookup)
         .expect("the fixture's env is one the node boots with")
 }
 
@@ -286,7 +288,7 @@ fn the_fixture_deployment_is_accepted() {
 
 /// A catalog row may not publish a longer context window than its
 /// deployments serve: clients size prompts to the published window, and the
-/// node refuses a sequence beyond its `EIDOLA_ENGINE_MAX_MODEL_LEN`.
+/// node refuses a sequence beyond its `MAX_MODEL_LEN`.
 #[test]
 fn a_rows_window_is_one_its_deployments_serve() {
     let checked = Tree::fixture().check().expect("the fixture is valid");
@@ -297,7 +299,7 @@ fn a_rows_window_is_one_its_deployments_serve() {
     manifest::check_context_windows(&[(row, &model, 8_192)], &checked).expect("a shorter window");
     let err = manifest::check_context_windows(&[(row, &model, 131_073)], &checked).unwrap_err();
     assert!(
-        err.contains(row) && err.contains("EIDOLA_ENGINE_MAX_MODEL_LEN"),
+        err.contains(row) && err.contains("(MAX_MODEL_LEN)"),
         "{err}"
     );
     // An unpinned row is the catalog binding's to refuse.
@@ -655,8 +657,8 @@ fn the_config_serves_this_model_and_these_weights() {
     // A pinned node is named by its weights hash.
     let mut tree = Tree::fixture();
     tree.edit_config(
-        &format!("EIDOLA_ENGINE_MODEL_ID: \"{MODEL}\""),
-        "EIDOLA_ENGINE_MODEL_ID: \"fixture-model\"",
+        &format!("ENGINE_MODEL_ID: \"{MODEL}\""),
+        "ENGINE_MODEL_ID: \"fixture-model\"",
     );
     refused(&tree, "a pinned node is named by its weights hash");
 
@@ -690,15 +692,15 @@ fn the_config_serves_this_model_and_these_weights() {
     let mut tree = Tree::fixture();
     let text = tree.config_text().replace(&"3".repeat(64), &"8".repeat(64));
     tree.set_config(text);
-    refused(&tree, "EIDOLA_ENGINE_WEIGHTS_SHA256 is");
+    refused(&tree, "ENGINE_WEIGHTS_SHA256 is");
 
     let mut tree = Tree::fixture();
     tree.deployment()["weights"]["sha256"] = "8".repeat(64).into();
-    refused(&tree, "EIDOLA_ENGINE_WEIGHTS_SHA256 is");
+    refused(&tree, "ENGINE_WEIGHTS_SHA256 is");
 
     let mut tree = Tree::fixture();
     tree.edit_config("\"verified-readonly\"", "\"dev-writable\"");
-    refused(&tree, "EIDOLA_ENGINE_WEIGHTS_STORAGE is \"dev-writable\"");
+    refused(&tree, "ENGINE_WEIGHTS_STORAGE is \"dev-writable\"");
 }
 
 /// The node's own GPU confidential-computing check is on in every pinned
@@ -708,10 +710,10 @@ fn the_config_serves_this_model_and_these_weights() {
 fn a_pinned_deployment_requires_gpu_confidential_computing() {
     let mut tree = Tree::fixture();
     tree.edit_config(
-        "EIDOLA_ENGINE_GPU_CC: \"required\"",
-        "EIDOLA_ENGINE_GPU_CC: \"not-required\"",
+        "ENGINE_GPU_CC: \"required\"",
+        "ENGINE_GPU_CC: \"not-required\"",
     );
-    refused(&tree, "EIDOLA_ENGINE_GPU_CC is \"not-required\"");
+    refused(&tree, "ENGINE_GPU_CC is \"not-required\"");
 }
 
 #[test]
@@ -735,7 +737,7 @@ fn the_prompt_cache_policy_is_the_configs() {
 
     let mut tree = Tree::fixture();
     tree.edit_config("PREFIX_CACHE: \"true\"", "PREFIX_CACHE: \"false\"");
-    refused(&tree, "EIDOLA_ENGINE_KV_HOST_BYTES must be 0");
+    refused(&tree, "ENGINE_KV_HOST_BYTES must be 0");
     tree.edit_config("KV_HOST_BYTES: \"34359738368\"", "KV_HOST_BYTES: \"0\"");
     refused(
         &tree,
@@ -748,42 +750,59 @@ fn the_prompt_cache_policy_is_the_configs() {
 }
 
 #[test]
-fn the_gateway_token_is_a_secret_and_only_its_hash_is_measured() {
+fn the_gateway_token_is_a_secret_and_never_measured() {
     let mut tree = Tree::fixture();
-    tree.edit_config("      - GATEWAY_TOKEN\n", "");
-    refused(&tree, "secrets must be exactly [\"GATEWAY_TOKEN\"]");
+    tree.edit_config("      - ENGINE_GATEWAY_TOKEN\n", "");
+    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\"]");
+
+    // The secret carries the prefix too.
+    let mut tree = Tree::fixture();
+    tree.edit_config("      - ENGINE_GATEWAY_TOKEN\n", "      - GATEWAY_TOKEN\n");
+    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\"]");
+
+    for token in ["ENGINE_GATEWAY_TOKEN", "GATEWAY_TOKEN"] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(
+            "      - ENGINE_MODEL_ID",
+            &format!("      - {token}: \"dev-gateway-token\"\n      - ENGINE_MODEL_ID"),
+        );
+        refused(
+            &tree,
+            &format!("{token} must not be a measured environment value"),
+        );
+    }
+}
+
+/// The config declares the prefix its env is read under, and every name in
+/// it carries that prefix: without the declaration, or with the names under
+/// another prefix, the node would read none of them.
+#[test]
+fn the_env_is_read_under_the_prefix_it_declares() {
+    let mut tree = Tree::fixture();
+    tree.edit_config("      - EIDOLA_ENV_PREFIX: \"ENGINE_\"\n", "");
+    refused(&tree, "must set EIDOLA_ENV_PREFIX");
 
     let mut tree = Tree::fixture();
     tree.edit_config(
-        "      - EIDOLA_ENGINE_MODEL_ID",
-        "      - GATEWAY_TOKEN: \"dev-gateway-token\"\n      - EIDOLA_ENGINE_MODEL_ID",
+        "EIDOLA_ENV_PREFIX: \"ENGINE_\"",
+        "EIDOLA_ENV_PREFIX: \"engine\"",
     );
-    refused(
-        &tree,
-        "GATEWAY_TOKEN must not be a measured environment value",
-    );
+    refused(&tree, "EIDOLA_ENV_PREFIX must be");
 
     let mut tree = Tree::fixture();
-    tree.edit_config("$argon2id$", "$argon2i$");
-    refused(&tree, "GATEWAY_TOKEN_HASH: must be an Argon2id hash");
-
-    // The node parses the whole PHC string, not just its prefix.
-    let mut tree = Tree::fixture();
-    let hash = "$argon2id$v=19$m=19456,t=2,p=1$Mz9P1/uk98yKEflNjzvn5g$unNYT/KTNSNW0JCH9+9OQ2zBApPLxGNZiw746903Q8E";
-    tree.edit_config(hash, "$argon2id$garbage");
-    refused(&tree, "GATEWAY_TOKEN_HASH: not a valid Argon2 hash string");
-
-    // A well-formed string no token can verify against, as the node would
-    // find at boot: a memory cost below Argon2's minimum, no salt or output.
-    let mut tree = Tree::fixture();
-    tree.edit_config("m=19456,t=2,p=1", "m=1,t=2,p=1");
-    refused(&tree, "GATEWAY_TOKEN_HASH: has parameters");
-    let mut tree = Tree::fixture();
-    tree.edit_config(hash, "$argon2id$v=19$m=19456,t=2,p=1");
-    refused(
-        &tree,
-        "GATEWAY_TOKEN_HASH: must carry a salt and a hash output",
+    tree.edit_config(
+        "EIDOLA_ENV_PREFIX: \"ENGINE_\"",
+        "EIDOLA_ENV_PREFIX: \"NODE_\"",
     );
+    refused(&tree, "NODE_MODEL_ID is not set");
+
+    // A bare name beside the prefixed ones.
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "      - ENGINE_MODEL_ID",
+        "      - MAX_SEQS: \"64\"\n      - ENGINE_MODEL_ID",
+    );
+    refused(&tree, "env may not set \"MAX_SEQS\"");
 }
 
 /// A retention bound the node refuses at boot is refused here even when the
@@ -858,10 +877,10 @@ fn the_config_runs_one_digest_pinned_engine_with_quoted_values() {
 
     let mut tree = Tree::fixture();
     tree.edit_config(
-        "      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"\n",
-        "      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"\n      - EIDOLA_ENGINE_EXECUTOR: \"cpu\"\n",
+        "      - ENGINE_EXECUTOR: \"cuda\"\n",
+        "      - ENGINE_EXECUTOR: \"cuda\"\n      - ENGINE_EXECUTOR: \"cpu\"\n",
     );
-    refused(&tree, "env sets EIDOLA_ENGINE_EXECUTOR twice");
+    refused(&tree, "env sets ENGINE_EXECUTOR twice");
 }
 
 #[test]
@@ -1095,7 +1114,6 @@ fn every_variable_the_node_requires_is_checked() {
         env::WEIGHTS_DIR,
         env::WEIGHTS_SHA256,
         env::WEIGHTS_STORAGE,
-        env::GATEWAY_TOKEN_HASH,
         env::EXECUTOR,
         env::BIND_ADDR,
         env::KV_BLOCK_SIZE,
@@ -1115,6 +1133,7 @@ fn every_variable_the_node_requires_is_checked() {
     ];
     let text = Tree::fixture().config_text();
     for name in required {
+        let name = format!("ENGINE_{name}");
         let line = text
             .lines()
             .find(|l| l.trim_start().starts_with(&format!("- {name}:")))
@@ -1149,6 +1168,7 @@ fn every_variable_the_node_requires_is_checked() {
         (env::MODEL_ID, "has space"),
         (env::WEIGHTS_SHA256, "abc"),
     ] {
+        let name = format!("ENGINE_{name}");
         let line = text
             .lines()
             .find(|l| l.trim_start().starts_with(&format!("- {name}:")))
@@ -1165,12 +1185,12 @@ fn every_variable_the_node_requires_is_checked() {
     // The cpu executor's block count is refused with cuda, not ignored.
     let mut tree = Tree::fixture();
     tree.edit_config(
-        "      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"\n",
-        "      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"\n      - EIDOLA_ENGINE_KV_BLOCKS: \"256\"\n",
+        "      - ENGINE_EXECUTOR: \"cuda\"\n",
+        "      - ENGINE_EXECUTOR: \"cuda\"\n      - ENGINE_KV_BLOCKS: \"256\"\n",
     );
     refused(
         &tree,
-        "configuration refused: EIDOLA_ENGINE_KV_BLOCKS applies only to the cpu executor",
+        "configuration refused: ENGINE_KV_BLOCKS applies only to the cpu executor",
     );
 }
 
@@ -1351,15 +1371,12 @@ fn a_cuda_deployment_attests_its_gpus() {
     tree.edit_config("    gpus: all\n", "");
     tree.edit_config("EXECUTOR: \"cuda\"", "EXECUTOR: \"cpu\"");
     tree.edit_config(
-        "      - EIDOLA_ENGINE_KV_DEVICE_BYTES: \"68719476736\"\n",
-        "      - EIDOLA_ENGINE_KV_BLOCKS: \"4096\"\n",
+        "      - ENGINE_KV_DEVICE_BYTES: \"68719476736\"\n",
+        "      - ENGINE_KV_BLOCKS: \"4096\"\n",
     );
-    tree.edit_config(
-        "      - EIDOLA_ENGINE_KERNELS_DIR: \"/opt/eidola/kernels\"\n",
-        "",
-    );
-    tree.edit_config("      - EIDOLA_ENGINE_CUDA_GRAPHS: \"on\"\n", "");
-    tree.edit_config("      - EIDOLA_ENGINE_GPU_CC: \"required\"\n", "");
+    tree.edit_config("      - ENGINE_KERNELS_DIR: \"/opt/eidola/kernels\"\n", "");
+    tree.edit_config("      - ENGINE_CUDA_GRAPHS: \"on\"\n", "");
+    tree.edit_config("      - ENGINE_GPU_CC: \"required\"\n", "");
     set_expected_gpus(&mut tree, None);
     refused(&tree, "a pinned deployment runs the cuda executor");
 }
@@ -1369,16 +1386,16 @@ fn a_cuda_deployment_attests_its_gpus() {
 #[test]
 fn allocations_are_capped_and_fit_the_deployment() {
     for (name, from, to) in [
-        ("EIDOLA_ENGINE_MAX_SEQS", "\"64\"", "\"4294967295\""),
-        ("EIDOLA_ENGINE_MAX_SEQS", "\"64\"", "\"1025\""),
-        ("EIDOLA_ENGINE_MAX_BATCHED_TOKENS", "\"8192\"", "\"65537\""),
-        ("EIDOLA_ENGINE_MAX_PREFILL_CHUNK", "\"4096\"", "\"65537\""),
-        ("EIDOLA_ENGINE_MAX_MODEL_LEN", "\"131072\"", "\"1048577\""),
-        ("EIDOLA_ENGINE_MAX_REQUESTS", "\"8\"", "\"4097\""),
-        ("EIDOLA_ENGINE_DRAFT_TOKENS", "\"3\"", "\"9\""),
-        ("EIDOLA_ENGINE_KV_BLOCK_SIZE", "\"16\"", "\"1025\""),
+        ("ENGINE_MAX_SEQS", "\"64\"", "\"4294967295\""),
+        ("ENGINE_MAX_SEQS", "\"64\"", "\"1025\""),
+        ("ENGINE_MAX_BATCHED_TOKENS", "\"8192\"", "\"65537\""),
+        ("ENGINE_MAX_PREFILL_CHUNK", "\"4096\"", "\"65537\""),
+        ("ENGINE_MAX_MODEL_LEN", "\"131072\"", "\"1048577\""),
+        ("ENGINE_MAX_REQUESTS", "\"8\"", "\"4097\""),
+        ("ENGINE_DRAFT_TOKENS", "\"3\"", "\"9\""),
+        ("ENGINE_KV_BLOCK_SIZE", "\"16\"", "\"1025\""),
         (
-            "EIDOLA_ENGINE_KV_DEVICE_BYTES",
+            "ENGINE_KV_DEVICE_BYTES",
             "\"68719476736\"",
             "\"309237645313\"",
         ),
@@ -1420,7 +1437,7 @@ fn allocations_are_capped_and_fit_the_deployment() {
         "KV_HOST_BYTES: \"34359738368\"",
         &format!("KV_HOST_BYTES: \"{}\"", rest + 1),
     );
-    refused(&tree, "host tier (EIDOLA_ENGINE_KV_HOST_BYTES)");
+    refused(&tree, "host tier (KV_HOST_BYTES)");
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_HOST_BYTES: \"34359738368\"",
@@ -1429,7 +1446,7 @@ fn allocations_are_capped_and_fit_the_deployment() {
             engine_deployment::caps::KV_HOST_BYTES + 1
         ),
     );
-    refused(&tree, "EIDOLA_ENGINE_KV_HOST_BYTES must be at most");
+    refused(&tree, "ENGINE_KV_HOST_BYTES must be at most");
     // Device: the KV budget holds one longest sequence, every seat's sliding
     // windows and, drafting three tokens, the drafter pool of as many blocks
     // with their boundary taps, each pool with its pad block, at their
@@ -1519,7 +1536,7 @@ fn allocations_are_capped_and_fit_the_deployment() {
     );
     refused(
         &tree,
-        "EIDOLA_ENGINE_KERNELS_DIR must be a clean absolute path inside the image",
+        ": KERNELS_DIR must be a clean absolute path inside the image",
     );
 }
 
@@ -1530,7 +1547,7 @@ fn the_shim_reaches_the_node() {
     tree.edit_config("upstream-port: 8080", "upstream-port: 8081");
     refused(
         &tree,
-        "shim.upstream-port is 8081, but EIDOLA_ENGINE_BIND_ADDR listens on port 8080",
+        "shim.upstream-port is 8081, but ENGINE_BIND_ADDR listens on port 8080",
     );
 
     let mut tree = Tree::fixture();
@@ -1772,7 +1789,7 @@ fn the_weights_dir_is_the_granted_pinned_pack() {
         tree.edit_config("\"/tinfoil/models/weights\"", &format!("\"{dir}\""));
         refused(
             &tree,
-            "EIDOLA_ENGINE_WEIGHTS_DIR must be inside the weights pack's mount",
+            ": WEIGHTS_DIR must be inside the weights pack's mount",
         );
     }
 
@@ -1801,10 +1818,10 @@ fn the_weights_dir_is_the_granted_pinned_pack() {
 fn the_gateway_token_is_the_only_secret() {
     let mut tree = Tree::fixture();
     tree.edit_config(
-        "      - GATEWAY_TOKEN\n",
-        "      - GATEWAY_TOKEN\n      - RUST_LOG\n",
+        "      - ENGINE_GATEWAY_TOKEN\n",
+        "      - ENGINE_GATEWAY_TOKEN\n      - ENGINE_RUST_LOG\n",
     );
-    refused(&tree, "secrets must be exactly [\"GATEWAY_TOKEN\"]");
+    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\"]");
 }
 
 /// The env sets exactly the node's measured variables: a name any dependency
@@ -1820,8 +1837,8 @@ fn the_env_is_exactly_the_measured_variables() {
     ] {
         let mut tree = Tree::fixture();
         tree.edit_config(
-            "      - EIDOLA_ENGINE_MODEL_ID",
-            &format!("      - {name}: \"0\"\n      - EIDOLA_ENGINE_MODEL_ID"),
+            "      - ENGINE_MODEL_ID",
+            &format!("      - {name}: \"0\"\n      - ENGINE_MODEL_ID"),
         );
         refused(&tree, &format!("env may not set {name:?}"));
     }
@@ -1940,13 +1957,13 @@ fn the_config_holds_to_tinfoils_decoder_and_validator() {
         ),
         // validation.go `validEnvironmentName`, on env and on secrets.
         (
-            "      - EIDOLA_ENGINE_MODEL_ID",
-            "      - 1BAD: \"x\"\n      - EIDOLA_ENGINE_MODEL_ID",
+            "      - ENGINE_MODEL_ID",
+            "      - 1BAD: \"x\"\n      - ENGINE_MODEL_ID",
             "invalid environment name \"1BAD\"",
         ),
         (
-            "      - GATEWAY_TOKEN\n",
-            "      - GATEWAY_TOKEN\n      - bad-name\n",
+            "      - ENGINE_GATEWAY_TOKEN\n",
+            "      - ENGINE_GATEWAY_TOKEN\n      - bad-name\n",
             "invalid environment name \"bad-name\"",
         ),
         // validation.go `validateModelAccess`: a grant listed once.
@@ -1967,8 +1984,8 @@ fn the_config_holds_to_tinfoils_decoder_and_validator() {
         ("cpus: 16", "cpus: \"16\"", "cpus"),
         // An env entry that inherits from the host instead of stating a value.
         (
-            "      - EIDOLA_ENGINE_MODEL_ID",
-            "      - INHERITED\n      - EIDOLA_ENGINE_MODEL_ID",
+            "      - ENGINE_MODEL_ID",
+            "      - INHERITED\n      - ENGINE_MODEL_ID",
             "env",
         ),
         // The YAML decoder: one value per key.

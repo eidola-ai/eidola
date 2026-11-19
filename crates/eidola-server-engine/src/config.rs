@@ -5,13 +5,19 @@
 //! choose a value the measurement does not show. What the node derives (the CUDA
 //! executor's per-group KV block counts) it derives from measured values alone, by a
 //! fixed rule, never from the device it finds. The one secret (the gateway token) is
-//! delivered as an environment variable alongside its Argon2id hash, which is the
-//! measured half (see [`crate::auth`]).
+//! delivered as an environment variable beside them and is not measured (see
+//! [`crate::auth`]).
+//!
+//! Every variable is read under the environment's prefix (`eidola_common::env`):
+//! `EIDOLA_ENV_PREFIX`, read bare, names it, and each variable is then read as
+//! `{prefix}{NAME}` with no fallback to the bare name. A deployment's config sets
+//! `ENGINE_`; unset, as in development, names are read as written.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use eidola_common::engine_deployment::ExecutorSettings;
+use eidola_common::env::Env;
 
 use crate::auth::GatewayToken;
 
@@ -82,6 +88,8 @@ impl ExecutorKind {
 /// Everything the node is configured with.
 #[derive(Debug)]
 pub struct Config {
+    /// The prefix every variable was read under.
+    pub env: Env,
     pub model_id: String,
     pub weights_dir: PathBuf,
     /// Lowercase hex.
@@ -116,22 +124,24 @@ impl Config {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
-    /// Reads configuration through `lookup` (the environment, or a map in tests). An
-    /// empty value counts as missing.
+    /// Reads configuration through `lookup` (the environment, or a map in tests), which
+    /// answers for one variable name as read: the prefix first, then every other
+    /// variable under it. An empty value counts as missing.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let prefix = Env::from_lookup(&lookup).map_err(|e| ConfigError(e.to_string()))?;
         // A build without the CUDA executor says so, rather than naming whichever cuda
         // setting it would otherwise find missing.
         #[cfg(not(feature = "cuda"))]
-        if lookup(env::EXECUTOR).as_deref() == Some("cuda") {
-            return Err(no_cuda_executor());
+        if lookup(&prefix.name(env::EXECUTOR)).as_deref() == Some("cuda") {
+            return Err(no_cuda_executor(&prefix));
         }
-        let measured = eidola_common::engine_deployment::parse_measured(&lookup)
+        let measured = eidola_common::engine_deployment::parse_measured(&prefix, &lookup)
             .map_err(|e| ConfigError(e.0))?;
-        let token = lookup(env::GATEWAY_TOKEN)
+        let token_var = prefix.name(env::GATEWAY_TOKEN);
+        let token = lookup(&token_var)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| ConfigError(format!("{} is not set", env::GATEWAY_TOKEN)))?;
-        let gateway_token =
-            GatewayToken::verify(token, &measured.gateway_token_hash).map_err(ConfigError)?;
+            .ok_or_else(|| ConfigError(format!("{token_var} is not set")))?;
+        let gateway_token = GatewayToken::new(token, &token_var).map_err(ConfigError)?;
         let executor = match measured.executor {
             ExecutorSettings::Cpu { kv_blocks } => ExecutorConfig::Cpu { kv_blocks },
             #[cfg(feature = "cuda")]
@@ -156,10 +166,11 @@ impl Config {
                 gpu_cc,
             },
             #[cfg(not(feature = "cuda"))]
-            ExecutorSettings::Cuda { .. } => return Err(no_cuda_executor()),
+            ExecutorSettings::Cuda { .. } => return Err(no_cuda_executor(&prefix)),
         };
 
         Ok(Config {
+            env: prefix,
             model_id: measured.model_id,
             weights_dir: PathBuf::from(measured.weights_dir),
             expected_weights_sha256: measured.weights_sha256,
@@ -176,9 +187,9 @@ impl Config {
 
 /// The refusal of a build without the CUDA executor.
 #[cfg(not(feature = "cuda"))]
-fn no_cuda_executor() -> ConfigError {
+fn no_cuda_executor(prefix: &Env) -> ConfigError {
     ConfigError(format!(
         "{}: this build has no cuda executor (built without the `cuda` feature)",
-        env::EXECUTOR
+        prefix.name(env::EXECUTOR)
     ))
 }

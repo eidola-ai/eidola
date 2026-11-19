@@ -17,7 +17,7 @@ pub mod weights;
 pub use device::{QwenDevice, QwenProfile};
 
 /// The prefill chunk Qwen3.8 is served at (the scheduler's `max_prefill_chunk`, the
-/// node's `EIDOLA_ENGINE_MAX_PREFILL_CHUNK`): 256 positions. The DeltaNet's token
+/// node's `MAX_PREFILL_CHUNK`): 256 positions. The DeltaNet's token
 /// recurrence is serial within a run, one position after another, so a step's prefill
 /// cost follows its longest run; a smaller chunk spreads a long prompt over more steps
 /// while several sequences prefill side by side, which keeps the recurrence's longest

@@ -63,8 +63,8 @@ pub struct PinnedWeights {
 }
 
 /// A pinned model's prompt-cache retention, as its measured configs set it
-/// (`EIDOLA_ENGINE_PREFIX_CACHE`, `EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS`,
-/// `EIDOLA_ENGINE_CACHE_MAX_AGE_SECS`).
+/// (`PREFIX_CACHE`, `CACHE_IDLE_TTL_SECS`, `CACHE_MAX_AGE_SECS`, under the
+/// config's prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptCachePolicy {
     pub enabled: bool,
@@ -75,7 +75,7 @@ pub struct PromptCachePolicy {
 impl PinnedModel {
     /// The model's identity: its weights hash (lowercase hex), which the
     /// catalog keys its row by and the node is named by
-    /// (`EIDOLA_ENGINE_MODEL_ID`).
+    /// (`MODEL_ID`).
     pub const fn id(&self) -> &'static str {
         self.id
     }

@@ -25,7 +25,7 @@ The Gated DeltaNet can be computed token by token or in chunks of tokens, and th
 
 ## Serving
 
-Qwen3.8 is served with prefill chunks of 256 positions (`eidola_engine_cuda::qwen::SERVING_PREFILL_CHUNK`, the node's `EIDOLA_ENGINE_MAX_PREFILL_CHUNK`). The DeltaNet's token recurrence is serial within a run, so a step's prefill cost follows its longest run: a smaller chunk spreads a long prompt over more steps while several sequences prefill side by side, and the steps that carry decode rows stay short. A position's bits do not depend on the chunking, which the executors' invariance is asserted over, so the chunk is a choice of speed alone (`eidola-engine-cuda/AGENTS.md` → Qwen3.8).
+Qwen3.8 is served with prefill chunks of 256 positions (`eidola_engine_cuda::qwen::SERVING_PREFILL_CHUNK`, the node's `MAX_PREFILL_CHUNK`). The DeltaNet's token recurrence is serial within a run, so a step's prefill cost follows its longest run: a smaller chunk spreads a long prompt over more steps while several sequences prefill side by side, and the steps that carry decode rows stay short. A position's bits do not depend on the chunking, which the executors' invariance is asserted over, so the chunk is a choice of speed alone (`eidola-engine-cuda/AGENTS.md` → Qwen3.8).
 
 ## The recurrent state in the serving core
 
