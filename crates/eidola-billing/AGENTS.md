@@ -46,7 +46,7 @@ Closure freezes eligibility when requested and stops new checkout/issuance. Prov
 
 Webhook events and local refund/closure intents are durable work items with bounded retry backoff. Creating a hold or beginning closure creates its local work item in the same transaction, so a process crash needs no new webhook to resume the operation. Retry work does not independently poll Stripe accounts.
 
-Webhook authentication accepts at most five minutes of clock skew in either direction, including all valid `v1` signatures during secret rotation. After authentication, unsupported event types are ignored before requiring a billing-specific object identity; supported types still require valid event and object IDs.
+Webhook authentication accepts at most five minutes of clock skew in either direction, including all valid `v1` signatures during secret rotation. The receiver accepts only Stripe's thin event notifications (`object: "v2.core.event"`), which carry an event's ID, type and related object's ID but never that object's contents; an authenticated snapshot event is refused with 400. After authentication, unsupported thin types are ignored before requiring a related object, which some types lack; supported types still require valid event and related-object IDs. The inbox stores the type exactly as Stripe names it (`v1.refund.updated`), and `BILLING_EVENT_TYPES`, the worker's dispatch and `event_object_kind` use that one spelling. Stripe's `v1.` namespace and the inbox's own `billing.` job kinds never meet. `billing_event` holds identities and scheduling state only; its column comments in `schema/billing.sql` say what each holds, and `report` is constrained to account repair rows.
 
 ## Validation
 

@@ -3,6 +3,9 @@
 #
 # Validates Stripe CLI → receiver → durable inbox → independent worker.
 #
+# stripe-cli forwards the thin (v1.*) versions of the receiver's supported
+# event types, so each trigger below is recorded under its `v1.` name.
+#
 # All triggers create fixture objects with Stripe-generated customer IDs that
 # don't exist in our DB, so jobs remain visible for review. Assertions inspect
 # durable inbox state and receiver health. Local fixture-driven integration
@@ -122,6 +125,8 @@ done
 
 # ── Trigger events ───────────────────────────────────────────────────────────
 
+# `stripe trigger` fixture names. The objects each fixture creates also emit
+# the event's thin version, which is what the receiver records.
 EVENTS=(
     "checkout.session.completed"
     "invoice.paid"
@@ -153,15 +158,16 @@ if ! curl -sf http://localhost:8081/healthz >/dev/null 2>&1; then
     FAILED=1
 fi
 
-# Every fixture event is durable and has reached the separate worker. These
-# event names are fixed literals above, never user/provider input in SQL.
+# Every fixture event's thin notification is durable and has reached the
+# separate worker. These event names are fixed literals above, never
+# user/provider input in SQL.
 for event in "${EVENTS[@]}"; do
     observed=$(docker compose exec -T postgres psql -U eidola -d eidola -tAc \
-        "SELECT EXISTS(SELECT 1 FROM billing_event WHERE kind='$event' AND attempts>0 AND last_error='requires_review' AND completed_at IS NULL)")
+        "SELECT EXISTS(SELECT 1 FROM billing_event WHERE kind='v1.$event' AND attempts>0 AND last_error='requires_review' AND completed_at IS NULL)")
     if [ "$observed" = "t" ]; then
-        echo "  OK: $event durably received and processed for review"
+        echo "  OK: v1.$event durably received and processed for review"
     else
-        echo "FAIL: $event has not reached review in the durable inbox"
+        echo "FAIL: v1.$event has not reached review in the durable inbox"
         FAILED=1
     fi
 done

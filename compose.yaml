@@ -83,10 +83,13 @@ services:
     profiles: ["stripe"]
     environment:
       STRIPE_API_KEY: ${STRIPE_API_KEY}
+    # The receiver accepts thin events only, and these are the types it
+    # supports (`BILLING_EVENT_TYPES` in crates/eidola-billing/src/service.rs).
     command:
       [
         "listen",
-        "--all-snapshot",
+        "--events",
+        "v1.checkout.session.completed,v1.checkout.session.async_payment_succeeded,v1.checkout.session.async_payment_failed,v1.invoice.paid,v1.invoice.payment_succeeded,v1.charge.refunded,v1.charge.succeeded,v1.refund.created,v1.refund.updated,v1.refund.failed,v1.charge.dispute.created,v1.charge.dispute.updated,v1.charge.dispute.closed,v1.charge.dispute.funds_withdrawn,v1.charge.dispute.funds_reinstated",
         "--forward-to",
         "http://billing-receiver:8080/v1/webhooks/stripe",
       ]
