@@ -56,6 +56,8 @@
     { "name": "ds_gemm_tc", "source": "ds_gemm_tc.cu", "profile": "exact" },
     { "name": "cutlass_fp8_blockwise_gemm", "source": "cutlass_fp8_blockwise_gemm.cu", "profile": "cutlass" },
     { "name": "cutlass_bf16_gemm", "source": "cutlass_bf16_gemm.cu", "profile": "cutlass" },
+    { "name": "cutlass_fp8_blockwise_swap", "source": "cutlass_fp8_blockwise_swap.cu", "profile": "cutlass" },
+    { "name": "cutlass_fp8_blockwise_split", "source": "cutlass_fp8_blockwise_split.cu", "profile": "cutlass" },
     {
       "name": "deepgemm_fp8_fp4_grouped",
       "source": "deepgemm_fp8_fp4_grouped.cu",
@@ -74,6 +76,20 @@
       "meta_aliases": {
         "eidola_fa2_merge_states_bf16_d128_meta":
           "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj"
+      }
+    },
+    { "name": "qwen_ops", "source": "qwen_ops.cu", "profile": "exact" },
+    { "name": "qwen_ops_div", "source": "qwen_ops_div.cu", "profile": "exact" },
+    { "name": "qwen_deltanet", "source": "qwen_deltanet.cu", "profile": "exact" },
+    { "name": "qwen_fast", "source": "qwen_fast.cu", "profile": "own" },
+    { "name": "qwen_sampling", "source": "qwen_sampling.cu", "profile": "own" },
+    {
+      "name": "flashinfer_fa2_sink_paged_d256",
+      "source": "flashinfer_fa2_sink_paged_d256.cu",
+      "profile": "flashinfer",
+      "meta_aliases": {
+        "eidola_fa2_merge_states_bf16_d256_meta":
+          "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj32ELj4ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj"
       }
     }
   ]

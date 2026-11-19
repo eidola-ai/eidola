@@ -4,7 +4,8 @@
 //!
 //! [`prepare`] is MiMo-V2.6-Flash's executor on one GPU (`eidola-engine-cuda`'s
 //! `check_supported` and `check_device`); [`prepare_deepseek`] is DeepSeek-V4.1's on two,
-//! device `d` on GPU `d` (`eidola_engine_cuda::deepseek`). The node never narrows or widens
+//! device `d` on GPU `d` (`eidola_engine_cuda::deepseek`); [`prepare_qwen`] is Qwen3.8's on
+//! one, in the fast profile (`eidola_engine_cuda::qwen`). The node never narrows or widens
 //! what an executor supports: it hands the executor the configuration and returns the
 //! executor's own refusal. Nothing here changes a number the model computes; it only
 //! sizes and constructs.
@@ -12,13 +13,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use eidola_common::architecture::HybridDims;
+use eidola_common::engine_deployment::{recurrent_kv_block_bytes, recurrent_state_buffers};
 use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec};
 use eidola_engine_cuda::deepseek::weights::Half;
 use eidola_engine_cuda::deepseek::{DsCudaExecutor, DsCudaExecutorConfig};
 use eidola_engine_cuda::mimo::kv::{GroupGeometry, KvLayout};
 use eidola_engine_cuda::mimo::{CudaExecutor, CudaExecutorConfig, CudaGraphs, KvBlocks, MtpHidden};
+use eidola_engine_cuda::qwen::{
+    QwenCudaExecutor, QwenCudaExecutorConfig, QwenProfile, StateStrategy,
+};
 use eidola_engine_cuda::{Gpu, KernelDir};
 use eidola_engine_model::deepseek::DsConfig;
+use eidola_engine_model::qwen::config::LayerKind;
+use eidola_engine_model::qwen::{QwenConfig, QwenModel};
 use eidola_engine_model::safetensors::WeightSet;
 
 use crate::BootError;
@@ -727,6 +735,330 @@ pub fn prepare_deepseek(
     })
 }
 
+/// The profile the node runs Qwen3.8's executor in: the fast one, the serving mode
+/// (`eidola-engine-cuda/AGENTS.md` → Qwen3.8). Its contract is reproducibility between
+/// calls whatever shares the batch; the exact profile, equal to the CPU executor bit for
+/// bit, is the verification mode.
+pub const QWEN_PROFILE: QwenProfile = QwenProfile::Fast;
+
+/// The dimensions the shared rules count Qwen3.8's pools, seats and scratch from
+/// (`eidola_common::architecture::HybridDims`), of the model loaded: the released
+/// model's are `eidola_common::architecture::QWEN38_DIMS`.
+pub fn qwen_dims(c: &QwenConfig) -> HybridDims {
+    let deltanet = c.layers_of(LayerKind::DeltaNet).count() as u64;
+    let attention = c.layers_of(LayerKind::Attention).count() as u64;
+    let (a, d) = (&c.attention, &c.deltanet);
+    HybridDims {
+        hidden: c.hidden_size as u64,
+        intermediate: c.intermediate_size as u64,
+        vocab: c.vocab_size as u64,
+        attention_layers: attention,
+        deltanet_layers: deltanet,
+        q_heads: a.num_q_heads as u64,
+        kv_heads: a.num_kv_heads as u64,
+        head_dim: a.head_dim as u64,
+        rotary: a.rotary_dim as u64,
+        k_heads: d.num_k_heads as u64,
+        v_heads: d.num_v_heads as u64,
+        k_dim: d.k_head_dim as u64,
+        v_dim: d.v_head_dim as u64,
+    }
+}
+
+/// The Qwen3.8 executor's device pools: every KV group (the target's attention layers
+/// and, drafting, the drafter's) `kv_blocks` blocks, and `state_buffers` state buffers,
+/// the null block and the zero state among them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QwenPools {
+    pub kv_blocks: u32,
+    pub state_buffers: u32,
+}
+
+/// The Qwen3.8 executor's pools from `kv_device_bytes`. With `B` the block size, `S` =
+/// `MAX_SEQS` and `P` = 3 retention points with the prefix cache (else 0):
+///
+/// * the **state pool** gets `1 + S × (2 + P)` buffers
+///   (`eidola_common::engine_deployment::recurrent_state_buffers`): the zero state; per
+///   seat its base and the one fresh buffer a step may store for it, which is the serving
+///   core's minimum progress; and its `P` retention points' snapshots, as MiMo's sliding
+///   pools hold `P` retained windows a seat. Snapshots of finished turns are cache and
+///   share the pool, reclaimed least recently used first;
+/// * every **KV group** gets what is left, `floor((kv_device_bytes − state bytes) / K)`
+///   blocks, `K` the bytes of one block of every group together
+///   (`recurrent_kv_block_bytes`: BF16 K and V of the target's attention layers and,
+///   drafting, of the drafter's layer with its boundary tap), less one: every pool also
+///   holds a pad block past its count, where a decode rung's padding rows write. It must
+///   hold one `MAX_MODEL_LEN` sequence and the null block; it stops at the tables' `i32`
+///   range.
+///
+/// Measured values only,
+/// never the device. The least accepted budget is
+/// `eidola_common::engine_deployment::cuda_kv_min_bytes` of the shape, kept equal by a
+/// test here.
+pub fn derive_qwen_pools(
+    dims: &HybridDims,
+    kv_device_bytes: u64,
+    sizing: &Sizing,
+    cache: &CacheConfig,
+) -> Result<QwenPools, BootError> {
+    let overflow = || BootError(format!("{} overflows the KV sizing", env::KV_DEVICE_BYTES));
+    let states = recurrent_state_buffers(sizing, cache);
+    let state_buffers = u32::try_from(states)
+        .ok()
+        .filter(|&n| n <= i32::MAX as u32)
+        .ok_or_else(overflow)?;
+    let state_bytes = states
+        .checked_mul(dims.state_image_bytes())
+        .ok_or_else(overflow)?;
+    let rest = kv_device_bytes.checked_sub(state_bytes).ok_or_else(|| {
+        BootError(format!(
+            "{} ({kv_device_bytes}) cannot hold the state pool ({states} buffers of {} bytes \
+             for {} sequences)",
+            env::KV_DEVICE_BYTES,
+            dims.state_image_bytes(),
+            sizing.max_seqs
+        ))
+    })?;
+    let block = recurrent_kv_block_bytes(dims, sizing).max(1);
+    // What fits, less the pad block.
+    let blocks = (rest / block).saturating_sub(1);
+    let needed = u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size)) + 1;
+    if blocks < needed {
+        return Err(BootError(format!(
+            "{} ({kv_device_bytes}) leaves {blocks} KV blocks of {block} bytes beside the \
+             state pool, fewer than the {needed} one {} sequence needs",
+            env::KV_DEVICE_BYTES,
+            env::MAX_MODEL_LEN
+        )));
+    }
+    Ok(QwenPools {
+        kv_blocks: u32::try_from(blocks.min(i32::MAX as u64)).expect("capped"),
+        state_buffers,
+    })
+}
+
+/// The Qwen3.8 executor's host tier from `kv_host_bytes`: the device pools' mix scaled to
+/// the budget, as [`derive_host_blocks`] does for MiMo. With `D` the device pools' bytes
+/// (`n` KV blocks of `K` bytes, `s` state buffers of `I`), the KV groups get
+/// `floor(n × H / D)` host blocks and the state pool `floor(s × H / D)` host buffers, so
+/// the tier never exceeds `H`. 0 gives no tier; a budget giving either pool fewer than
+/// two (the null block or reserved buffer, and one to hold an entry) is refused. The
+/// least accepted budget is `eidola_common::engine_deployment::cuda_kv_host_min_bytes`,
+/// kept equal by a test here.
+pub fn derive_qwen_host_pools(
+    dims: &HybridDims,
+    kv_host_bytes: u64,
+    sizing: &Sizing,
+    device: QwenPools,
+) -> Result<QwenPools, BootError> {
+    if kv_host_bytes == 0 {
+        return Ok(QwenPools {
+            kv_blocks: 0,
+            state_buffers: 0,
+        });
+    }
+    let block = u128::from(recurrent_kv_block_bytes(dims, sizing));
+    let image = u128::from(dims.state_image_bytes());
+    let (n, s) = (
+        u128::from(device.kv_blocks),
+        u128::from(device.state_buffers),
+    );
+    let total = (n * block + s * image).max(1);
+    let h = u128::from(kv_host_bytes);
+    let (host_blocks, host_states) = (n * h / total, s * h / total);
+    for (count, what) in [(host_blocks, "KV block"), (host_states, "state buffer")] {
+        if count < 2 {
+            return Err(BootError(format!(
+                "{} ({kv_host_bytes}) gives the host tier fewer than two of each {what}",
+                env::KV_HOST_BYTES
+            )));
+        }
+    }
+    let cap = |x: u128| u32::try_from(x.min(i32::MAX as u128)).expect("capped");
+    Ok(QwenPools {
+        kv_blocks: cap(host_blocks),
+        state_buffers: cap(host_states),
+    })
+}
+
+/// The Qwen3.8 CUDA executor's configuration from the node's measured one, with no device:
+/// one step shape (`MAX_SEQS` × `MAX_BATCHED_TOKENS`), as on the CPU executor; the pools
+/// from the device budget ([`derive_qwen_pools`]) and the host tier's
+/// ([`derive_qwen_host_pools`]); `DRAFT_TOKENS` drafts from the model's MTP layer; the
+/// live state strategy; `graphs` as configured: with `on`, construction captures a graph
+/// for every rung of the decode ladders of that one step shape (draft width 0, and
+/// `DRAFT_TOKENS` when drafting), and uniform decode steps replay them.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_config(
+    qwen: &QwenConfig,
+    sizing: &Sizing,
+    cache: &CacheConfig,
+    kv_device_bytes: u64,
+    kv_host_bytes: u64,
+    graphs: CudaGraphs,
+    sampleable_vocab_size: u32,
+) -> Result<QwenCudaExecutorConfig, BootError> {
+    if sizing.draft_tokens > 0 && qwen.mtp_layers == 0 {
+        return Err(BootError(format!(
+            "{} ({}) needs the model's MTP layer, and it has none",
+            env::DRAFT_TOKENS,
+            sizing.draft_tokens
+        )));
+    }
+    let dims = qwen_dims(qwen);
+    let pools = derive_qwen_pools(&dims, kv_device_bytes, sizing, cache)?;
+    let host = derive_qwen_host_pools(&dims, kv_host_bytes, sizing, pools)?;
+    Ok(QwenCudaExecutorConfig {
+        block_size: sizing.kv_block_size,
+        num_blocks: pools.kv_blocks,
+        host_blocks: host.kv_blocks,
+        state_buffers: pools.state_buffers,
+        host_state_buffers: host.state_buffers,
+        num_state_slots: sizing.max_seqs,
+        max_model_len: sizing.max_model_len,
+        buckets: vec![Bucket {
+            max_seqs: sizing.max_seqs,
+            max_tokens: sizing.max_batched_tokens,
+        }],
+        draft_tokens: sizing.draft_tokens,
+        sampleable_vocab_size,
+        strategy: StateStrategy::Live,
+        graphs,
+    })
+}
+
+/// Everything checked and the device open: what the engine thread builds the Qwen3.8
+/// executor from.
+pub struct QwenPrepared {
+    /// The GPU, held open (its primary context retained) until the executor has opened it.
+    gpu: Gpu,
+    kernels_dir: PathBuf,
+    model: Arc<QwenModel>,
+    config: QwenCudaExecutorConfig,
+    report: DeviceReport,
+}
+
+impl QwenPrepared {
+    /// The device, for `/v1/engine/info`.
+    pub fn report(&self) -> DeviceReport {
+        self.report.clone()
+    }
+
+    /// The executor's configuration, as derived.
+    pub fn config(&self) -> &QwenCudaExecutorConfig {
+        &self.config
+    }
+
+    /// The profile the executor computes in ([`QWEN_PROFILE`]).
+    pub fn profile(&self) -> QwenProfile {
+        QWEN_PROFILE
+    }
+
+    /// Builds the executor: the device with its kernel images (each checked against the
+    /// compiled-in manifest), then the weights and every pool. Runs on the engine thread.
+    pub fn build(
+        self,
+    ) -> Result<QwenCudaExecutor<eidola_engine_cuda::qwen::cuda::CudaDevice>, String> {
+        let dev = eidola_engine_cuda::qwen::cuda::CudaDevice::open(
+            DEVICE_ORDINAL,
+            &KernelDir::new(self.kernels_dir),
+            QWEN_PROFILE,
+        )
+        .map_err(|e| e.to_string())?;
+        let exec = QwenCudaExecutor::new(dev, &self.model, self.config).map_err(|e| e.to_string());
+        drop(self.gpu);
+        exec
+    }
+}
+
+/// Qwen3.8's refusals that need no device, in order ([`qwen_config`]: the MTP layer for
+/// the draft width, the pools from the budget and the host tier's), then,
+/// with `gpu_cc` required, the GPUs' confidential-computing state (`crate::gpu_cc`), then
+/// the device, whose memory the budget must be less than. Nothing is allocated on the
+/// device here.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_qwen(
+    model: &LoadedModel,
+    sizing: &Sizing,
+    cache: &CacheConfig,
+    kernels_dir: &Path,
+    kv_device_bytes: u64,
+    kv_host_bytes: u64,
+    graphs: CudaGraphs,
+    gpu_cc: GpuCc,
+) -> Result<QwenPrepared, BootError> {
+    let Served::Qwen { model: qwen, .. } = model.served() else {
+        return Err(BootError("the loaded model is not Qwen3.8".into()));
+    };
+    let config = qwen_config(
+        qwen.config(),
+        sizing,
+        cache,
+        kv_device_bytes,
+        kv_host_bytes,
+        graphs,
+        model.sampleable_vocab_size(),
+    )?;
+    check_gpu_cc(gpu_cc)?;
+    let refused = |e: eidola_engine_cuda::CudaError| {
+        BootError(format!("the engine refused its configuration: {e}"))
+    };
+    let gpu = Gpu::open(DEVICE_ORDINAL).map_err(refused)?;
+    let report = device_report(&gpu, kv_device_bytes)?;
+    Ok(QwenPrepared {
+        gpu,
+        kernels_dir: kernels_dir.to_path_buf(),
+        model: qwen.clone(),
+        config,
+        report,
+    })
+}
+
+/// With `gpu_cc` required, refuses unless the driver reports the GPUs in production
+/// confidential-computing mode and accepting work; otherwise warns that it is unchecked.
+fn check_gpu_cc(gpu_cc: GpuCc) -> Result<(), BootError> {
+    match gpu_cc {
+        GpuCc::Required => crate::gpu_cc::query()
+            .and_then(|state| crate::gpu_cc::check(&state))
+            .map_err(|e| {
+                BootError(format!(
+                    "{} is required, but the GPUs are not in production confidential-computing \
+                     mode: {e}",
+                    env::GPU_CC
+                ))
+            }),
+        GpuCc::NotRequired => {
+            tracing::warn!(
+                "{} is not-required: the GPUs' confidential-computing mode is not checked \
+                 (development only; no gateway pins this configuration)",
+                env::GPU_CC
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The opened GPU's report for `/v1/engine/info`, refusing a KV budget not less than its
+/// memory.
+fn device_report(gpu: &Gpu, kv_device_bytes: u64) -> Result<DeviceReport, BootError> {
+    let info = gpu.info();
+    let total = info.total_mem_bytes as u64;
+    if kv_device_bytes >= total {
+        return Err(BootError(format!(
+            "{} ({kv_device_bytes}) is not less than the device's memory ({total} bytes)",
+            env::KV_DEVICE_BYTES
+        )));
+    }
+    let (major, minor) = info.compute_capability;
+    Ok(DeviceReport {
+        name: info.name.clone(),
+        compute_capability: format!("{major}.{minor}"),
+        image: gpu.image_arch().map(|a| a.as_str()),
+        sm_count: info.sm_count,
+        memory_bytes: total,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,6 +1115,7 @@ mod tests {
             }],
             window_chain: None,
             token_history: 0,
+            state: None,
         }
     }
 
@@ -1573,5 +1906,230 @@ mod tests {
         );
         assert_eq!(config.sampleable_vocab_size, 90);
         assert!(!config.position_tags && !config.record);
+    }
+
+    fn qwen_config_at(rel: &str) -> QwenConfig {
+        let bytes =
+            std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)).expect("a config");
+        QwenConfig::from_json_bytes(&bytes, rel).unwrap()
+    }
+
+    /// The model crate's synthetic Qwen3.8 fixture: one attention and three DeltaNet
+    /// layers.
+    fn qwen_tiny() -> QwenConfig {
+        qwen_config_at("../eidola-engine-model/tests/fixtures/qwen_tiny/config.json")
+    }
+
+    /// The released Qwen3.8-27B configuration (the model crate's copy of its
+    /// `config.json`).
+    fn qwen_released() -> QwenConfig {
+        qwen_config_at("../eidola-engine-model/tests/data/qwen3.8-27b.config.json")
+    }
+
+    /// The released configuration's dimensions are the shared shape's.
+    #[test]
+    fn the_released_dimensions_are_the_shapes() {
+        use eidola_common::architecture::{Architecture, QWEN38_DIMS};
+        let dims = qwen_dims(&qwen_released());
+        assert_eq!(dims, QWEN38_DIMS);
+        let shape = Architecture::Qwen38Dense27B.shape();
+        assert_eq!(shape.recurrent, Some(dims));
+        assert_eq!(
+            shape.global_kv_bytes_per_position,
+            dims.kv_bytes_per_position()
+        );
+    }
+
+    fn qwen_shape(dims: HybridDims) -> Shape {
+        Shape {
+            recurrent: Some(dims),
+            global_kv_bytes_per_position: dims.kv_bytes_per_position(),
+            drafter_kv_bytes_per_position: dims.drafter_kv_bytes_per_position(),
+            ..*eidola_common::architecture::Architecture::Qwen38Dense27B.shape()
+        }
+    }
+
+    /// The pools follow the documented rule: `1 + S × (2 + P)` state buffers, and every
+    /// KV group what the budget leaves beside them in blocks of every group together.
+    #[test]
+    fn qwen_pools_follow_the_documented_rule() {
+        let dims = qwen_dims(&qwen_released());
+        let sizing = Sizing {
+            kv_block_size: 16,
+            max_model_len: 262_144,
+            max_seqs: 32,
+            max_batched_tokens: 128,
+            max_prefill_chunk: 128,
+            draft_tokens: 3,
+            max_requests: 32,
+        };
+        let budget = 100_000_000_000;
+        let pools = derive_qwen_pools(&dims, budget, &sizing, &cache(true)).unwrap();
+        assert_eq!(pools.state_buffers, 1 + 32 * 5);
+        let block = 16 * 65_536 + 16 * 4096 + 10_240;
+        let states = 161 * 156_917_760u64;
+        // Less the pad block.
+        assert_eq!(u64::from(pools.kv_blocks), (budget - states) / block - 1);
+        let undrafted = Sizing {
+            draft_tokens: 0,
+            ..sizing
+        };
+        let pools = derive_qwen_pools(&dims, budget, &undrafted, &cache(false)).unwrap();
+        assert_eq!(pools.state_buffers, 1 + 32 * 2);
+        assert_eq!(
+            u64::from(pools.kv_blocks),
+            (budget - 65 * 156_917_760) / (16 * 65_536) - 1
+        );
+    }
+
+    /// The gateway's shared minimums are exactly the least budgets the node accepts, device
+    /// and host, over the released configuration and the fixture's, across block sizes,
+    /// context lengths, seats, step sizes, the cache switch and draft widths; and the KV
+    /// count stops at the tables' index range.
+    #[test]
+    fn the_shared_qwen_minimums_are_the_derivations() {
+        use eidola_common::engine_deployment::{cuda_kv_host_min_bytes, cuda_kv_min_bytes};
+        for config in [qwen_released(), qwen_tiny()] {
+            let dims = qwen_dims(&config);
+            let shape = qwen_shape(dims);
+            for block in [1u32, 16, 64, 256] {
+                for len in [64u32, 4096, 262_144] {
+                    for (seats, step) in [(1, 16), (8, 64), (64, 1024)] {
+                        for (enabled, draft) in [(true, 0), (true, 1), (false, 2), (true, 3)] {
+                            let sizing = Sizing {
+                                kv_block_size: block,
+                                max_model_len: len,
+                                max_seqs: seats,
+                                max_batched_tokens: step,
+                                max_prefill_chunk: step,
+                                draft_tokens: draft,
+                                max_requests: 4,
+                            };
+                            let cache = cache(enabled);
+                            let at = (block, len, seats, step, enabled, draft);
+                            let least = cuda_kv_min_bytes(&shape, &sizing, &cache);
+                            let pools = derive_qwen_pools(&dims, least, &sizing, &cache)
+                                .unwrap_or_else(|e| panic!("{at:?}: {e}"));
+                            assert_eq!(
+                                u64::from(pools.kv_blocks),
+                                u64::from(len).div_ceil(u64::from(block)) + 1,
+                                "{at:?}"
+                            );
+                            assert!(
+                                derive_qwen_pools(&dims, least - 1, &sizing, &cache).is_err(),
+                                "{at:?}"
+                            );
+                            for budget in [least, least * 3 + 12_345] {
+                                let pools =
+                                    derive_qwen_pools(&dims, budget, &sizing, &cache).unwrap();
+                                let host = cuda_kv_host_min_bytes(&shape, &sizing, &cache, budget);
+                                derive_qwen_host_pools(&dims, host, &sizing, pools)
+                                    .unwrap_or_else(|e| panic!("{at:?} {budget}: {e}"));
+                                assert!(
+                                    derive_qwen_host_pools(&dims, host - 1, &sizing, pools)
+                                        .is_err(),
+                                    "{at:?} {budget}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Past `i32::MAX` blocks the count stops.
+        let dims = qwen_dims(&qwen_tiny());
+        let sizing = Sizing {
+            kv_block_size: 1,
+            max_model_len: 64,
+            ..sizing()
+        };
+        let pools = derive_qwen_pools(&dims, u64::MAX / 2, &sizing, &cache(true)).unwrap();
+        assert_eq!(pools.kv_blocks, i32::MAX as u32);
+    }
+
+    /// The host tier scales the device pools' mix and stays within its budget; 0 is none.
+    #[test]
+    fn qwen_host_pools_fit_their_budget() {
+        let dims = qwen_dims(&qwen_released());
+        let sizing = Sizing {
+            draft_tokens: 3,
+            ..sizing()
+        };
+        let pools = derive_qwen_pools(&dims, 80_000_000_000, &sizing, &cache(true)).unwrap();
+        let none = derive_qwen_host_pools(&dims, 0, &sizing, pools).unwrap();
+        assert_eq!((none.kv_blocks, none.state_buffers), (0, 0));
+        for budget in [20_000_000_000u64, 68_719_476_736] {
+            let host = derive_qwen_host_pools(&dims, budget, &sizing, pools).unwrap();
+            let bytes = u64::from(host.kv_blocks)
+                * eidola_common::engine_deployment::recurrent_kv_block_bytes(&dims, &sizing)
+                + u64::from(host.state_buffers) * dims.state_image_bytes();
+            assert!(bytes <= budget, "{budget}");
+            assert!(host.kv_blocks >= 2 && host.state_buffers >= 2);
+        }
+        let e = derive_qwen_host_pools(&dims, 1_000_000, &sizing, pools).unwrap_err();
+        assert!(e.0.contains("fewer than two"), "{e}");
+    }
+
+    /// The configuration is the node's sizing, its decode graphs as configured; drafting
+    /// without the MTP layer is refused before any device.
+    #[test]
+    fn the_qwen_configuration_is_the_nodes() {
+        let qwen = qwen_tiny();
+        let sizing = Sizing {
+            draft_tokens: 2,
+            ..sizing()
+        };
+        let c = qwen_config(
+            &qwen,
+            &sizing,
+            &cache(true),
+            1 << 30,
+            0,
+            CudaGraphs::Off,
+            512,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                c.block_size,
+                c.num_state_slots,
+                c.max_model_len,
+                c.draft_tokens
+            ),
+            (16, 8, 4096, 2)
+        );
+        assert_eq!(
+            c.buckets,
+            vec![Bucket {
+                max_seqs: 8,
+                max_tokens: 512
+            }]
+        );
+        assert_eq!(c.strategy, StateStrategy::Live);
+        assert_eq!((c.host_blocks, c.host_state_buffers), (0, 0));
+        assert_eq!(c.graphs, CudaGraphs::Off);
+        let on = qwen_config(
+            &qwen,
+            &sizing,
+            &cache(true),
+            1 << 30,
+            0,
+            CudaGraphs::On,
+            512,
+        )
+        .unwrap();
+        assert_eq!(on.graphs, CudaGraphs::On);
+        let e = qwen_config(
+            &qwen.clone().without_mtp(),
+            &sizing,
+            &cache(true),
+            1 << 30,
+            0,
+            CudaGraphs::Off,
+            512,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("MTP layer"), "{e}");
+        assert_eq!(QWEN_PROFILE, QwenProfile::Fast);
     }
 }

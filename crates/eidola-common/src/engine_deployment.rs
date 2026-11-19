@@ -18,7 +18,7 @@
 //! already depend on `argon2` themselves (see the crate docs' dependency
 //! rule).
 
-pub use crate::architecture::{Architecture, Shape};
+pub use crate::architecture::{Architecture, HybridDims, Shape};
 
 /// The node's environment variables. Every one is required (an empty value
 /// counts as missing) except where noted.
@@ -188,14 +188,49 @@ pub mod caps {
 /// prefix cache enabled (the node's `cuda::RETENTION_POINTS`).
 pub const RETENTION_POINTS: u64 = 3;
 
-/// The one GPU the CUDA executor runs on (`eidola-engine-cuda`: Blackwell,
-/// `sm_103a`), by the name its driver reports. A node uses one of them.
+/// The B300, the largest GPU the CUDA executor runs on (`eidola-engine-cuda`:
+/// Blackwell, `sm_103a`), by the name its driver reports. The grammar's caps
+/// are its; a deployment names its own GPU ([`SupportedGpu`]).
 pub const SUPPORTED_GPU: &str = "NVIDIA B300 SXM6 AC";
 
-/// The supported GPU's device memory, in bytes, as its driver reports it
+/// The B300's device memory, in bytes, as its driver reports it
 /// (`cuDeviceTotalMem`, the node's `/v1/engine/info` `device.memory_bytes`
 /// on that part): about 267.7 GiB, not the 288 GB of HBM it is sold with.
 pub const SUPPORTED_GPU_MEMORY_BYTES: u64 = 287_428_640_768;
+
+/// A GPU a deployment may run the CUDA executor on: the name its driver
+/// reports and its device memory as the driver reports it. A deployment's
+/// `deployment.json` names one (`gpu`), and [`check_resources`] holds what
+/// the node allocates on each device to its memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SupportedGpu {
+    pub name: &'static str,
+    pub memory_bytes: u64,
+}
+
+impl SupportedGpu {
+    /// The NVIDIA B300 SXM6 AC ([`SUPPORTED_GPU`]).
+    pub const B300: SupportedGpu = SupportedGpu {
+        name: SUPPORTED_GPU,
+        memory_bytes: SUPPORTED_GPU_MEMORY_BYTES,
+    };
+
+    /// The NVIDIA B200 (Blackwell, `sm_100a`): 183,359 MiB, about 179.1 GiB,
+    /// as its driver reports it on a node (whole MiB, as the B300's byte
+    /// count also is).
+    pub const B200: SupportedGpu = SupportedGpu {
+        name: "NVIDIA B200",
+        memory_bytes: 183_359 << 20,
+    };
+
+    /// Every supported GPU.
+    pub const ALL: [SupportedGpu; 2] = [SupportedGpu::B300, SupportedGpu::B200];
+
+    /// The supported GPU its driver names `name`, if there is one.
+    pub fn from_name(name: &str) -> Option<SupportedGpu> {
+        Self::ALL.into_iter().find(|g| g.name == name)
+    }
+}
 
 /// Device memory the CUDA executor holds whatever its sizing: the CUDA
 /// context, the loaded kernel modules, the decode graphs' captures (a few
@@ -294,6 +329,9 @@ pub const DRAFT_TABLE_SEAT_BYTES_PER_CHUNK: u64 = 2 * 2 * 3 * 4;
 /// [`StepScratch`](crate::architecture::StepScratch) names in place of the
 /// drafter's.
 pub fn cuda_device_reserve_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
+    if let Some(dims) = &shape.recurrent {
+        return recurrent_device_reserve_bytes(dims, sizing);
+    }
     let blocks_per_seq =
         u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size.max(1)));
     if shape.step_scratch.is_some() {
@@ -342,6 +380,182 @@ pub fn cuda_device_reserve_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
         .saturating_add(
             u64::from(sizing.max_model_len).saturating_mul(shape.rope_device_bytes_per_position),
         )
+}
+
+/// State buffers of a recurrent model's pool (Qwen3.8's): the reserved zero
+/// state and, per seat (`MAX_SEQS`), its base, the one fresh buffer a step
+/// may store for it, and with the prefix cache [`RETENTION_POINTS`]
+/// snapshots (its branch, regeneration and continuation points):
+/// 1 + `MAX_SEQS` × (2 + `P`). The serving core's minimum progress needs
+/// 1 + 2 × `MAX_SEQS` (`eidola-engine/AGENTS.md` → State pool); the rest
+/// holds snapshots, as the sliding pools hold retained windows
+/// ([`cuda_kv_min_bytes`]). Saturates.
+pub fn recurrent_state_buffers(sizing: &Sizing, cache: &CacheConfig) -> u64 {
+    let points = if cache.enabled { RETENTION_POINTS } else { 0 };
+    u64::from(sizing.max_seqs)
+        .saturating_mul(2 + points)
+        .saturating_add(1)
+}
+
+/// Bytes of one KV block of a recurrent model on the device, every group
+/// together: the target's attention layers and, drafting, the drafter's
+/// layer and its block's boundary tap. Every group holds one count of
+/// blocks. Saturates.
+pub fn recurrent_kv_block_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
+    let b = u64::from(sizing.kv_block_size.max(1));
+    let target = b.saturating_mul(dims.kv_bytes_per_position());
+    if sizing.draft_tokens > 0 {
+        target
+            .saturating_add(b.saturating_mul(dims.drafter_kv_bytes_per_position()))
+            .saturating_add(dims.tap_bytes())
+    } else {
+        target
+    }
+}
+
+/// Device bytes a recurrent model's executor keeps per seat: its live
+/// state image, its tail of `KV_BLOCK_SIZE − 1 + DRAFT_TOKENS` positions,
+/// and `DRAFT_TOKENS + 1` kept normed states. Saturates.
+pub fn recurrent_seat_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
+    let k = u64::from(sizing.draft_tokens);
+    let tail = u64::from(sizing.kv_block_size.max(1)) - 1 + k;
+    dims.state_image_bytes()
+        .saturating_add(tail.saturating_mul(dims.tail_bytes_per_position()))
+        .saturating_add((k + 1).saturating_mul(dims.kept_row_bytes()))
+}
+
+/// Bounds the program's allocations of no row (the sink, the status and
+/// zero rows, each allocation's eight-byte floor).
+const RECURRENT_SCRATCH_FIXED_BYTES: u64 = 64 << 10;
+
+/// Step-table words a row of a forward takes besides its attention's pages:
+/// its token, positions, KV target, DeltaNet sequence and copy items, its
+/// FA2 request and work items, sampling and acceptance words. Bounded from
+/// above by the node's `cuda::tests`, which hold the executor's tables to it.
+pub const RECURRENT_TABLE_ROW_WORDS: u64 = 1024;
+
+/// Words of one step table at its largest, for a recurrent model's executor
+/// (`eidola-engine-cuda`'s `qwen::plan`): per target row (the `N` host
+/// tokens and drafts of passes A and B) the pages of a `MAX_MODEL_LEN + k +
+/// 1`-position sequence, a word a block, and per drafter row (with drafting,
+/// `N + 2Sk`: the host positions, the chain and the accepted drafts'
+/// rewrite) a word a position (the drafter's pages are positions), each with
+/// [`RECURRENT_TABLE_ROW_WORDS`]. Saturates.
+pub fn recurrent_table_words(sizing: &Sizing) -> u64 {
+    let n = u64::from(sizing.max_batched_tokens);
+    let s = u64::from(sizing.max_seqs);
+    let k = u64::from(sizing.draft_tokens);
+    let positions = u64::from(sizing.max_model_len) + k + 1;
+    let blocks = positions.div_ceil(u64::from(sizing.kv_block_size.max(1)));
+    let target = n.saturating_mul(blocks.saturating_add(RECURRENT_TABLE_ROW_WORDS));
+    let drafter = if k > 0 {
+        n.saturating_add(s.saturating_mul(2 * k))
+            .saturating_mul(positions.saturating_add(RECURRENT_TABLE_ROW_WORDS))
+    } else {
+        0
+    };
+    target.saturating_add(drafter)
+}
+
+/// Keys per chunk of FA2's split attention (`eidola-engine-cuda`'s
+/// `qwen::plan::SPLIT_KEYS`): a row's keys are reduced in chunks of this
+/// many positions, each a partial row.
+pub const RECURRENT_SPLIT_KEYS: u64 = 512;
+
+/// Keys a forward row's partial rows are counted at for FA2's scratch
+/// (`qwen::plan::PARTIAL_KEYS`): a prefill whose rows need more partial
+/// rows runs its attention in passes.
+pub const RECURRENT_PARTIAL_KEYS: u64 = 1024;
+
+/// A recurrent model's step scratch in the fast profile (the executor's
+/// `capacities` and `program::alloc_scratch`, sized once at construction,
+/// plus its step tables), bounded from above. With `N` =
+/// `MAX_BATCHED_TOKENS`, `S` = `MAX_SEQS`, `k` = `DRAFT_TOKENS`, `B` =
+/// `KV_BLOCK_SIZE`, the tail `T` = `B − 1 + k`, the forward's rows `R` =
+/// max(`N`, `Sk`), padded to 4, and the head's rows `H` = max(`S`, `Sk`, 64):
+///
+/// - per row of `R`, [`HybridDims::program_row_bytes`]; pass A's and pass
+///   B's normed rows;
+/// - the DeltaNet's staging: max(`N + ST`, `Sk`) staged positions
+///   ([`HybridDims::staged_position_bytes`]) and three more convolution rows a
+///   seat;
+/// - FA2's partial rows: `R` rows times the `MAX_MODEL_LEN + k + 1` positions
+///   over [`RECURRENT_PARTIAL_KEYS`], or a decode rung's `S(k + 1)` rows times
+///   the chunks of [`RECURRENT_SPLIT_KEYS`], the more
+///   ([`HybridDims::partial_row_bytes`]):
+///   about 12 bytes per row and position of the context at Qwen3.8's shape,
+///   where the exact profile's scores, which this profile does not allocate,
+///   take 96 a layer;
+/// - the head's input, its f32 output (or the drafter's and the stacked
+///   `a`/`b` projections', the largest), the target's logit rows, max(`S`,
+///   64) and `Sk` more, and the drafter's (`H`), f32 over the head's rows, and the
+///   sampler's f64 distributions: `S` plain, `S(k + 1)` target, `Sk` draft and
+///   `S` acceptance rows;
+/// - the padding rows of the row copies, the draft lanes and the read-back;
+/// - the step tables: the rungs' fixed table and the eager table, which grows
+///   to a power of two, together at most three times
+///   [`recurrent_table_words`] words;
+/// - `RECURRENT_SCRATCH_FIXED_BYTES` (64 KiB).
+///
+/// Saturates.
+pub fn recurrent_step_scratch_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
+    let pad4 = |x: u64| x.next_multiple_of(4).max(4);
+    let n = u64::from(sizing.max_batched_tokens);
+    let s = u64::from(sizing.max_seqs);
+    let k = u64::from(sizing.draft_tokens);
+    let b = u64::from(sizing.kv_block_size.max(1));
+    let tail = b - 1 + k;
+    let positions = u64::from(sizing.max_model_len).saturating_add(k + 1);
+    let (h, v) = (dims.hidden, dims.vocab);
+    let rows = n.max(s * k);
+    let r = pad4(rows);
+    let head = s.max(s * k).max(64);
+    let staged = n.saturating_add(s.saturating_mul(tail)).max(s * k);
+    let conv_rows = 3 * s + staged;
+    let partial_rows = rows
+        .saturating_mul(positions.div_ceil(RECURRENT_PARTIAL_KEYS).max(1))
+        .max((s * (k + 1)).saturating_mul(positions.div_ceil(RECURRENT_SPLIT_KEYS).max(1)));
+    let head_tmp = (pad4(head) * v).max(r * h).max(r * dims.ab_rows()) * 4;
+    let logit_rows = s.max(64) + s * k + head;
+    let distributions = s + s * (k + 1) + (s * k).max(1) + s;
+    let pad_conv = 3 * s + s * (1 + tail) + 3 * 4 * s + 4 * s;
+    let pad_ab = s * (1 + tail) + s;
+    let pad_h = s * (k + 1) + s * ((k + 1) / b + 1) + s * k + s;
+    let readback = 1 + s + s * (k + 1) + s;
+    r.saturating_mul(dims.program_row_bytes())
+        .saturating_add((pad4(n) + pad4((s * k).max(1))) * h * 2)
+        .saturating_add(staged.saturating_mul(dims.staged_position_bytes()))
+        .saturating_add(conv_rows.saturating_mul(dims.conv_row_bytes()))
+        .saturating_add(partial_rows.saturating_mul(dims.partial_row_bytes()))
+        .saturating_add(pad4(head) * h * 2 + head_tmp)
+        .saturating_add(logit_rows.saturating_mul(v * 4))
+        .saturating_add(distributions.saturating_mul(v * 8))
+        .saturating_add(
+            pad_conv * dims.conv_row_bytes()
+                + pad_ab * dims.ab_row_bytes()
+                + s.max(s * k) * dims.value_row_bytes()
+                + pad_h * h * 2
+                + (s * k + s) * 4
+                + (s * k).max(1) * 4
+                + n.max(s * k) * 4
+                + readback * 4,
+        )
+        .saturating_add(recurrent_table_words(sizing).saturating_mul(3 * 4))
+        .saturating_add(RECURRENT_SCRATCH_FIXED_BYTES)
+}
+
+/// [`cuda_device_reserve_bytes`] for a recurrent model: [`DEVICE_FIXED_RESERVE_BYTES`],
+/// [`recurrent_seat_bytes`] for every seat and the padding rows' seat, the RoPE
+/// tables over `MAX_MODEL_LEN + DRAFT_TOKENS + 1` positions, and
+/// [`recurrent_step_scratch_bytes`]. Saturates.
+fn recurrent_device_reserve_bytes(dims: &HybridDims, sizing: &Sizing) -> u64 {
+    let rope_positions = u64::from(sizing.max_model_len) + u64::from(sizing.draft_tokens) + 1;
+    DEVICE_FIXED_RESERVE_BYTES
+        .saturating_add(
+            (u64::from(sizing.max_seqs) + 1).saturating_mul(recurrent_seat_bytes(dims, sizing)),
+        )
+        .saturating_add(rope_positions.saturating_mul(dims.rope_bytes_per_position()))
+        .saturating_add(recurrent_step_scratch_bytes(dims, sizing))
 }
 
 /// The rows a step's scratch is sized for on a device with a
@@ -534,8 +748,24 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
 /// needs ⌈`MAX_MODEL_LEN` / `B`⌉ + 1 blocks of [`uniform_kv_bank_block_bytes`]
 /// beside [`uniform_kv_window_blocks`] of [`uniform_kv_window_block_bytes`].
 /// No pool holds a pad block.
+///
+/// A shape with a [`Shape::recurrent`] state (Qwen3.8's) follows its node's
+/// rule (`cuda::derive_qwen_pools` in `eidola-server-engine`): the state pool
+/// holds [`recurrent_state_buffers`] images of
+/// [`HybridDims::state_image_bytes`], and every KV group one count of blocks,
+/// which must hold one `MAX_MODEL_LEN` sequence and the null block, so the
+/// device needs ⌈`MAX_MODEL_LEN` / `B`⌉ + 1 blocks of
+/// [`recurrent_kv_block_bytes`] and each pool's pad block (where a decode
+/// rung's padding rows write) beside the state pool.
 pub fn cuda_kv_min_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig) -> u64 {
     let b = u64::from(sizing.kv_block_size.max(1));
+    if let Some(dims) = &shape.recurrent {
+        return (u64::from(sizing.max_model_len).div_ceil(b) + 2)
+            .saturating_mul(recurrent_kv_block_bytes(dims, sizing))
+            .saturating_add(
+                recurrent_state_buffers(sizing, cache).saturating_mul(dims.state_image_bytes()),
+            );
+    }
     if !shape.uniform_kv_groups.is_empty() {
         return (u64::from(sizing.max_model_len).div_ceil(b) + 1)
             .saturating_mul(uniform_kv_bank_block_bytes(shape, sizing))
@@ -666,6 +896,12 @@ fn cuda_windowed_pools_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig
 /// for every group of every device, at least two, so this device's share of
 /// the least tier is two blocks of [`uniform_kv_block_bytes`], whatever
 /// `kv_device_bytes`; [`check_device_resources`] sums the devices' shares.
+///
+/// A shape with a [`Shape::recurrent`] state scales the same way over its two
+/// pools (`cuda::derive_qwen_host_pools`): the KV blocks `kv_device_bytes`
+/// leaves beside the state pool, less the pad block (at most `i32::MAX`), of
+/// [`recurrent_kv_block_bytes`], and the [`recurrent_state_buffers`] state
+/// images, each needing two on the host.
 pub fn cuda_kv_host_min_bytes(
     shape: &Shape,
     sizing: &Sizing,
@@ -674,6 +910,17 @@ pub fn cuda_kv_host_min_bytes(
 ) -> u64 {
     if !shape.uniform_kv_groups.is_empty() {
         return uniform_kv_block_bytes(shape, sizing).saturating_mul(2);
+    }
+    if let Some(dims) = &shape.recurrent {
+        let block = recurrent_kv_block_bytes(dims, sizing).max(1);
+        let states = recurrent_state_buffers(sizing, cache);
+        let state_bytes = states.saturating_mul(dims.state_image_bytes());
+        let blocks = (kv_device_bytes.saturating_sub(state_bytes) / block)
+            .saturating_sub(1)
+            .min(i32::MAX as u64);
+        let device = u128::from(blocks) * u128::from(block) + u128::from(state_bytes);
+        let smallest = u128::from(blocks.min(states).max(1));
+        return u64::try_from((2 * device).div_ceil(smallest)).unwrap_or(u64::MAX);
     }
     let windowed = sliding_pool_blocks(shape, sizing, cache);
     let global_bytes = global_block_bytes(shape, sizing).max(1);
@@ -695,11 +942,11 @@ pub fn cuda_kv_host_min_bytes(
 /// (`kv_host_bytes`, `KV_HOST_BYTES`: page-locked, so it can never be paged
 /// out to make room), plus, for the `cpu` executor, its KV cache
 /// (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`Shape::kv_bytes_per_position`]). For the
-/// `cuda` executor, which runs on one [`SUPPORTED_GPU`], the VM has a GPU,
+/// `cuda` executor, which runs on one `gpu` (the deployment's), the VM has a GPU,
 /// `KV_DEVICE_BYTES` holds at least [`cuda_kv_min_bytes`], a non-zero
 /// `KV_HOST_BYTES` at least [`cuda_kv_host_min_bytes`], and
 /// `KV_DEVICE_BYTES` + `weights_bytes` + [`cuda_device_reserve_bytes`] fit
-/// [`SUPPORTED_GPU_MEMORY_BYTES`]. `weights_bytes` bounds the weights' device
+/// its memory. `weights_bytes` bounds the weights' device
 /// footprint from above: the pack's data size ([`artifact_data_bytes`]),
 /// every file of it, whether the node loads it or not.
 #[allow(clippy::too_many_arguments)]
@@ -712,11 +959,15 @@ pub fn check_resources(
     weights_bytes: u64,
     memory_mib: u64,
     gpus: u64,
+    gpu: &SupportedGpu,
 ) -> Result<(), String> {
     let host_kv = match executor {
         ExecutorSettings::Cpu { kv_blocks } => u64::from(*kv_blocks)
             .saturating_mul(u64::from(sizing.kv_block_size))
-            .saturating_mul(shape.kv_bytes_per_position()),
+            .saturating_mul(shape.kv_bytes_per_position())
+            .saturating_add(shape.recurrent.as_ref().map_or(0, |dims| {
+                recurrent_state_buffers(sizing, cache).saturating_mul(dims.state_image_bytes())
+            })),
         ExecutorSettings::Cuda { .. } => 0,
     };
     let host = host_memory_bytes(sizing)
@@ -758,12 +1009,14 @@ pub fn check_resources(
         let device = kv_device_bytes
             .saturating_add(weights_bytes)
             .saturating_add(reserve);
-        if device > SUPPORTED_GPU_MEMORY_BYTES {
+        if device > gpu.memory_bytes {
             return Err(format!(
                 "{} ({kv_device_bytes}), the weights ({weights_bytes}) and the executor's \
                  reserve ({reserve}) need {device} bytes of device memory, more than the \
-                 {SUPPORTED_GPU}'s {SUPPORTED_GPU_MEMORY_BYTES}",
-                env::KV_DEVICE_BYTES
+                 {}'s {}",
+                env::KV_DEVICE_BYTES,
+                gpu.name,
+                gpu.memory_bytes
             ));
         }
     }
@@ -780,8 +1033,7 @@ pub fn check_resources(
 ///   budget per device, in device order.
 /// - On device `d`: its budget holds at least [`cuda_kv_min_bytes`] of its
 ///   shape, and the budget, [`Shape::weights_bytes`] and
-///   [`cuda_device_reserve_bytes`] of its shape fit
-///   [`SUPPORTED_GPU_MEMORY_BYTES`].
+///   [`cuda_device_reserve_bytes`] of its shape fit `gpu`'s memory.
 /// - The pack's data size (`weights_bytes`, [`artifact_data_bytes`]) is at
 ///   most the devices' weights together, so the per-device bounds are bounds
 ///   on the weights the deployment pins.
@@ -806,6 +1058,7 @@ pub fn check_device_resources(
     weights_bytes: u64,
     memory_mib: u64,
     gpus: u64,
+    gpu: &SupportedGpu,
 ) -> Result<(), String> {
     let host_kv = match executor {
         ExecutorSettings::Cpu { kv_blocks } => devices.iter().fold(0u64, |sum, d| {
@@ -890,12 +1143,14 @@ pub fn check_device_resources(
         // What the executor loads: the drafter's weights only when it drafts.
         let loaded = device_weights_bytes(shape, sizing).unwrap_or(weights);
         let device = budget.saturating_add(loaded).saturating_add(reserve);
-        if device > SUPPORTED_GPU_MEMORY_BYTES {
+        if device > gpu.memory_bytes {
             return Err(format!(
                 "device {d}: its {} budget ({budget}), its weights ({loaded}) and the \
                  executor's reserve ({reserve}) need {device} bytes of device memory, more \
-                 than the {SUPPORTED_GPU}'s {SUPPORTED_GPU_MEMORY_BYTES}",
-                env::KV_DEVICE_BYTES
+                 than the {}'s {}",
+                env::KV_DEVICE_BYTES,
+                gpu.name,
+                gpu.memory_bytes
             ));
         }
     }
@@ -2057,6 +2312,75 @@ mod tests {
         max_age_secs: 7200,
     };
 
+    /// Qwen3.8-27B on one B200 at its whole 262,144-position context: 64
+    /// seats, steps of 2,048 tokens of prefill chunks of 256, three drafts,
+    /// the cache on. The reserve
+    /// beside the KV budget is the fixed 4 GiB, 65 seats' state, the RoPE
+    /// tables and the fast profile's step scratch; a 115 GiB budget then holds
+    /// the state pool's 321 buffers and about 1,040,000 positions of KV. The
+    /// state pool is what limits the seats: at 128 the KV would hold about
+    /// 150,000 positions.
+    #[test]
+    fn qwen_fits_one_b200_at_its_whole_context() {
+        use crate::architecture::Architecture;
+        let shape = Architecture::Qwen38Dense27B.shape();
+        let dims = shape.recurrent.unwrap();
+        let sizing = Sizing {
+            kv_block_size: 16,
+            max_model_len: 262_144,
+            max_seqs: 64,
+            max_batched_tokens: 2048,
+            max_prefill_chunk: 256,
+            draft_tokens: 3,
+            max_requests: 64,
+        };
+        let reserve = cuda_device_reserve_bytes(shape, &sizing);
+        assert_eq!(reserve / 100_000_000, 348, "{reserve}");
+        let scratch = recurrent_step_scratch_bytes(&dims, &sizing);
+        assert_eq!(scratch / 100_000_000, 178, "{scratch}");
+        // The pack's data size: the schema 1 modelwrap pack of the checkpoint,
+        // every file of the repository at its revision.
+        let pack = 30_890_057_728;
+        let budget = 115u64 << 30;
+        assert_eq!(recurrent_state_buffers(&sizing, &DS_CACHE), 321);
+        let blocks = (budget - 321 * dims.state_image_bytes())
+            / recurrent_kv_block_bytes(&dims, &sizing)
+            - 1;
+        assert_eq!(blocks * 16 / 10_000, 104, "{blocks}");
+        assert!(budget >= cuda_kv_min_bytes(shape, &sizing, &DS_CACHE));
+        let check = |budget: u64, host: u64, gpu: &SupportedGpu| {
+            check_resources(
+                shape,
+                &sizing,
+                &DS_CACHE,
+                &cuda_on(&[budget]),
+                host,
+                pack,
+                196_608,
+                1,
+                gpu,
+            )
+        };
+        check(budget, 64 << 30, &SupportedGpu::B200).unwrap();
+        // What the B200 leaves is under 4 GB more.
+        let room = SupportedGpu::B200.memory_bytes - pack - reserve;
+        assert!(room - budget < 4_000_000_000, "{room}");
+        let err = check(room + 1, 0, &SupportedGpu::B200).unwrap_err();
+        assert!(err.contains("NVIDIA B200"), "{err}");
+        check(room + 1, 0, &SupportedGpu::B300).unwrap();
+        // At 128 seats the state pool leaves the KV about 150,000 positions.
+        let wide = Sizing {
+            max_seqs: 128,
+            max_requests: 128,
+            ..sizing
+        };
+        let room = SupportedGpu::B200.memory_bytes - pack - cuda_device_reserve_bytes(shape, &wide);
+        let kv = (room - recurrent_state_buffers(&wide, &DS_CACHE) * dims.state_image_bytes())
+            / recurrent_kv_block_bytes(&dims, &wide)
+            * 16;
+        assert_eq!(kv / 10_000, 14, "{kv}");
+    }
+
     /// The published text-only pack, bounded: the shards and files of the
     /// released checkpoint, 510.29 GB, under the devices' 510.66 GB.
     const DS_PACK_BYTES: u64 = 510_300_000_000;
@@ -2193,6 +2517,7 @@ mod tests {
                 DS_PACK_BYTES,
                 196_608,
                 2,
+                &SupportedGpu::B300,
             )
         };
         for (draft_tokens, step, room1) in [(0, 8192, 10_233_054_144), (3, 4096, 10_713_172_224)] {
@@ -2318,6 +2643,7 @@ mod tests {
                 pack,
                 memory_mib,
                 gpus,
+                &SupportedGpu::B300,
             )
         };
         assert_eq!(check(&[room0, room1], 2, DS_PACK_BYTES, 0), Ok(()));
@@ -2386,6 +2712,7 @@ mod tests {
             DS_PACK_BYTES,
             memory_mib,
             2,
+            &SupportedGpu::B300,
         )
         .unwrap_err();
         assert!(
@@ -2396,7 +2723,19 @@ mod tests {
         // The cpu executor runs both devices' pools in host memory.
         let cpu = ExecutorSettings::Cpu { kv_blocks: 64 };
         let per_block = 256 * (534 + 20 * 528 + 356 + 20 * 528 + 3 * 528);
-        let host = |mib| check_device_resources(devices, &sizing, &DS_CACHE, &cpu, 0, 0, mib, 0);
+        let host = |mib| {
+            check_device_resources(
+                devices,
+                &sizing,
+                &DS_CACHE,
+                &cpu,
+                0,
+                0,
+                mib,
+                0,
+                &SupportedGpu::B300,
+            )
+        };
         let needed = host_memory_bytes(&sizing) + 64 * per_block;
         assert_eq!(host(needed.div_ceil(1 << 20)), Ok(()));
         assert!(host(needed / (1 << 20) - 1).is_err());
@@ -2507,7 +2846,20 @@ mod tests {
             max_age_secs: 3600,
         };
         let kv = cuda(64 << 30);
-        assert!(check_resources(FLASH, &sizing, &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_ok());
+        assert!(
+            check_resources(
+                FLASH,
+                &sizing,
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                65_536,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_ok()
+        );
         // A request slot is 645,922,816 bytes at the caps: a 32 MiB body read
         // with both parses (3 × 32 MiB of text, 512 bytes for each of 2^18
         // values) and admitted with its tree (32 MiB of text, 160 bytes a
@@ -2540,15 +2892,78 @@ mod tests {
             ..sizing
         };
         // Six slots, the headroom and the tables fit 8 GiB; eight do not.
-        assert!(check_resources(FLASH, &near(6), &cache, &kv, 0, FIXTURE_PACK, 8192, 8).is_ok());
-        assert!(check_resources(FLASH, &near(8), &cache, &kv, 0, FIXTURE_PACK, 8192, 8).is_err());
-        // Near the limit: 99 slots fit 64 GiB; 100 do not.
-        assert!(check_resources(FLASH, &near(99), &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_ok());
         assert!(
-            check_resources(FLASH, &near(100), &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_err()
+            check_resources(
+                FLASH,
+                &near(6),
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                8192,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_ok()
+        );
+        assert!(
+            check_resources(
+                FLASH,
+                &near(8),
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                8192,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_err()
+        );
+        // Near the limit: 99 slots fit 64 GiB; 100 do not.
+        assert!(
+            check_resources(
+                FLASH,
+                &near(99),
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                65_536,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_ok()
+        );
+        assert!(
+            check_resources(
+                FLASH,
+                &near(100),
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                65_536,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_err()
         );
         // The cuda executor needs a GPU.
-        assert!(check_resources(FLASH, &sizing, &cache, &kv, 0, FIXTURE_PACK, 65_536, 0).is_err());
+        assert!(
+            check_resources(
+                FLASH,
+                &sizing,
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                65_536,
+                0,
+                &SupportedGpu::B300
+            )
+            .is_err()
+        );
         // Block size 1 at the longest model length: 2^20 entries per slot.
         let tables = Sizing {
             kv_block_size: 1,
@@ -2556,7 +2971,20 @@ mod tests {
             max_seqs: caps::MAX_SEQS,
             ..sizing
         };
-        assert!(check_resources(FLASH, &tables, &cache, &kv, 0, FIXTURE_PACK, 16_384, 8).is_err());
+        assert!(
+            check_resources(
+                FLASH,
+                &tables,
+                &cache,
+                &kv,
+                0,
+                FIXTURE_PACK,
+                16_384,
+                8,
+                &SupportedGpu::B300
+            )
+            .is_err()
+        );
         // The cpu executor's KV is host memory: 2^20 blocks of 16 positions
         // are 3.4 TiB.
         let cpu = |kv_blocks| ExecutorSettings::Cpu { kv_blocks };
@@ -2569,7 +2997,8 @@ mod tests {
                 0,
                 FIXTURE_PACK,
                 65_536,
-                0
+                0,
+                &SupportedGpu::B300
             )
             .is_ok()
         );
@@ -2582,7 +3011,8 @@ mod tests {
                 0,
                 FIXTURE_PACK,
                 65_536,
-                0
+                0,
+                &SupportedGpu::B300
             )
             .is_err()
         );
@@ -2639,6 +3069,7 @@ mod tests {
                 FIXTURE_PACK,
                 65_536,
                 1,
+                &SupportedGpu::B300,
             )
         };
         assert!(fits(min).is_ok());
@@ -2739,6 +3170,7 @@ mod tests {
                 FLASH_PACK,
                 65_536,
                 8,
+                &SupportedGpu::B300,
             )
         };
         assert!(fits_drafting(64 << 30).is_ok());
@@ -2746,7 +3178,17 @@ mod tests {
         assert!(fits_drafting(room).is_ok());
         assert!(fits_drafting(room + 1).is_err());
         let fits = |kv: u64, weights: u64, gpus: u64| {
-            check_resources(FLASH, &sizing, &cache, &cuda(kv), 0, weights, 65_536, gpus)
+            check_resources(
+                FLASH,
+                &sizing,
+                &cache,
+                &cuda(kv),
+                0,
+                weights,
+                65_536,
+                gpus,
+                &SupportedGpu::B300,
+            )
         };
         // A realistic Flash deployment: 64 GiB of KV beside the checkpoint.
         assert!(fits(64 << 30, FLASH_PACK, 1).is_ok());
@@ -3184,6 +3626,7 @@ mod tests {
                 FIXTURE_PACK,
                 memory,
                 8,
+                &SupportedGpu::B300,
             )
         };
         let room = 65_536u64 << 20;

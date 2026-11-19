@@ -173,13 +173,19 @@ run system *args:
         ;;
       engine-server)
         # An inference node on 127.0.0.1:8090 serving the synthetic dev model (random
-        # weights, gibberish output) through the CPU executor. Gateway token:
-        # `dev-gateway-token`; the weights hash is printed below and served by
-        # GET /v1/engine/info. See crates/eidola-server-engine/AGENTS.md.
-        dir=target/engine-dev-model
-        hash=$(cargo run -q -p eidola-server-engine --example dev_model -- "$dir")
+        # weights, gibberish output) through the CPU executor: MiMo-V2.6's, or with
+        # `qwen` as the first argument Qwen3.8's. Gateway token: `dev-gateway-token`;
+        # the weights hash is printed below and served by GET /v1/engine/info. See
+        # crates/eidola-server-engine/AGENTS.md.
+        set -- {{ args }}
+        dir=target/engine-dev-model id=mimo-dev family=
+        if [ "${1:-}" = qwen ]; then
+          dir=target/engine-dev-model-qwen id=qwen-dev family=--qwen
+          shift
+        fi
+        hash=$(cargo run -q -p eidola-server-engine --example dev_model -- ${family:+"$family"} "$dir")
         echo "weights hash: $hash"
-        EIDOLA_ENGINE_MODEL_ID=mimo-dev \
+        EIDOLA_ENGINE_MODEL_ID="$id" \
         EIDOLA_ENGINE_WEIGHTS_DIR="$dir" \
         EIDOLA_ENGINE_WEIGHTS_SHA256="$hash" \
         EIDOLA_ENGINE_WEIGHTS_STORAGE=dev-writable \
@@ -199,7 +205,7 @@ run system *args:
         EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS=900 \
         EIDOLA_ENGINE_CACHE_MAX_AGE_SECS=7200 \
         EIDOLA_ENGINE_KV_HOST_BYTES=0 \
-          cargo run -p eidola-server-engine -- {{ args }}
+          cargo run -p eidola-server-engine -- "$@"
         ;;
       *)
         echo "error: unknown system '{{ system }}' (expected: gateway, billing, cli, gui, notepad, www, engine-server)" >&2

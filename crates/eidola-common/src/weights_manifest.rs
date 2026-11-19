@@ -33,8 +33,9 @@ pub const COVERED_FILES: [&str; 5] = [
     "generation_config.json",
 ];
 
-/// The files a MiMo-V2.6 manifest must list besides its shards: the semantic
-/// file and the chat artifacts its node reads ([`required_files`]).
+/// The files a MiMo-V2.6 or Qwen3.8 manifest must list besides its shards:
+/// the semantic file and the chat artifacts its node reads
+/// ([`required_files`]).
 pub const REQUIRED_FILES: [&str; 4] = [
     "config.json",
     "tokenizer.json",
@@ -57,7 +58,12 @@ pub const DEEPSEEK_V4_1_REQUIRED_FILES: [&str; 2] = ["config.json", "tokenizer.j
 /// shards: those its node reads whatever else the directory holds.
 pub fn required_files(architecture: Architecture) -> &'static [&'static str] {
     match architecture {
-        Architecture::MimoV26Flash | Architecture::MimoV26Pro => &REQUIRED_FILES,
+        // Qwen3.8 reads what MiMo-V2.6 does: its own template, its tokenizer,
+        // and `generation_config.json` for its end-of-sequence ids and
+        // sampling defaults.
+        Architecture::MimoV26Flash | Architecture::MimoV26Pro | Architecture::Qwen38Dense27B => {
+            &REQUIRED_FILES
+        }
         Architecture::DeepSeekV41Flash => &DEEPSEEK_V4_1_REQUIRED_FILES,
     }
 }

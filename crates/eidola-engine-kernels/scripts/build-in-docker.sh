@@ -6,10 +6,14 @@
 # checks.
 #
 #   scripts/build-in-docker.sh [--platform linux/arm64|linux/amd64] [--out DIR]
-#                              [--check] [--verify | --update]
+#                              [--cores N] [--check] [--verify | --update]
 #
 #   --platform  builder architecture (default: the Docker host's)
 #   --out       copy the build output here (default: target/engine-kernels/<arch>)
+#   --cores     compiler invocations at once (default: every core the container
+#               sees); fewer bound the build's memory, which CUTLASS's and
+#               DeepGEMM's instances need several GB each of. The output does not
+#               depend on it.
 #   --check     after building, rebuild the derivation from scratch and fail
 #               unless the second build is byte-identical (nix-build --check)
 #   --verify    fail unless the built manifest equals the committed
@@ -29,12 +33,14 @@ repo_dir=$(cd "$crate_dir/../.." && pwd)
 
 platform=""
 out=""
+cores=0
 check=0
 mode=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --platform) platform=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
+    --cores) cores=$2; shift 2 ;;
     --check) check=1; shift ;;
     --verify) mode=verify; shift ;;
     --update) mode=update; shift ;;
@@ -58,7 +64,11 @@ out=$(cd "$out" && pwd)
 # build script makes output independent of the build directory.
 # (Set in nix.conf: on the command line filter-syscalls does not reach every
 # build Nix starts.)
-nix_conf='sandbox = false\nfilter-syscalls = false\nmax-jobs = 1\ncores = 0\n'
+if ! [[ $cores =~ ^[0-9]+$ ]]; then
+  echo "--cores takes a whole number" >&2
+  exit 2
+fi
+nix_conf="sandbox = false\nfilter-syscalls = false\nmax-jobs = 1\ncores = $cores\n"
 check_cmd=":"
 if [[ $check -eq 1 ]]; then
   check_cmd="nix-build --check /src/nix"

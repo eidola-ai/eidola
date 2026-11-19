@@ -2,7 +2,7 @@
 
 use crate::tokenizer::{
     CONFIG_FILE, GENERATION_CONFIG_FILE, PINNED_DEEPSEEK_V4_1_TOKENIZER_SHA256,
-    PINNED_TOKENIZER_SHA256,
+    PINNED_QWEN3_8_TOKENIZER_SHA256, PINNED_TOKENIZER_SHA256,
 };
 
 /// A model architecture's prompt and output format. The caller picks it from
@@ -16,6 +16,10 @@ pub enum ChatFormat {
     /// DeepSeek-V4.1: the prompt encoder and DSML tool calls of
     /// [`crate::deepseek`].
     DeepSeekV4_1,
+    /// Qwen3.8 (27B, text only): the model's Jinja template
+    /// ([`crate::qwen::ChatTemplate`]) and `<tool_call>` markup with each tag
+    /// on its own line.
+    Qwen3_8,
 }
 
 impl ChatFormat {
@@ -23,7 +27,7 @@ impl ChatFormat {
     /// (`eos_token_id`).
     pub fn eos_config_file(self) -> &'static str {
         match self {
-            ChatFormat::MimoV2_6 => GENERATION_CONFIG_FILE,
+            ChatFormat::MimoV2_6 | ChatFormat::Qwen3_8 => GENERATION_CONFIG_FILE,
             ChatFormat::DeepSeekV4_1 => CONFIG_FILE,
         }
     }
@@ -33,6 +37,7 @@ impl ChatFormat {
         match self {
             ChatFormat::MimoV2_6 => PINNED_TOKENIZER_SHA256,
             ChatFormat::DeepSeekV4_1 => PINNED_DEEPSEEK_V4_1_TOKENIZER_SHA256,
+            ChatFormat::Qwen3_8 => PINNED_QWEN3_8_TOKENIZER_SHA256,
         }
     }
 }

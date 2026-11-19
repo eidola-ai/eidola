@@ -68,7 +68,9 @@ pub const KV_TILE: u32 = 64;
 
 /// Global layers' keys are split at absolute multiples of this many
 /// positions, each chunk a work item, and merged in chunk order. Fixed: a
-/// row's reduction may not depend on the step.
+/// row's reduction may not depend on the step. MiMo's split; a plan made
+/// with [`HostPlan::with_split_keys`] (Qwen3.8's) may split at another
+/// multiple of [`KV_TILE`], fixed for its executor in the same way.
 pub const SPLIT_KEYS: u32 = 1024;
 
 /// CTAs per KV head a captured split launch walks its device-sized work list
@@ -316,13 +318,19 @@ pub struct AttnRequest {
 /// run (query rows × GQA group size) is `packed`: FlashInfer's rule. Only
 /// speed depends on it.
 pub fn tile_for(packed: u64) -> u32 {
-    if packed <= 16 {
+    tile_for_max(packed, 128)
+}
+
+/// [`tile_for`] for an image whose largest query tile is `max_tile` (64 or 128).
+pub fn tile_for_max(packed: u64, max_tile: u32) -> u32 {
+    let tile = if packed <= 16 {
         16
     } else if packed <= 64 {
         64
     } else {
         128
-    }
+    };
+    tile.min(max_tile)
 }
 
 /// One launch's work list as the host derives it, before upload: FlashInfer's
@@ -418,6 +426,8 @@ pub struct HostPlan {
     pub(crate) page_size: u32,
     pub(crate) tile: u32,
     pub(crate) reduction: Reduction,
+    /// A split's keys a chunk ([`SPLIT_KEYS`] unless the plan names another).
+    pub(crate) split_keys: u32,
     /// Query rows the requests cover.
     pub(crate) q_rows: u32,
     pub(crate) max_page: Option<u32>,
@@ -457,6 +467,54 @@ impl HostPlan {
         reduction: Reduction,
         partial_rows: u32,
     ) -> Result<HostPlan> {
+        HostPlan::with_max_tile(
+            requests,
+            group_size,
+            page_size,
+            reduction,
+            partial_rows,
+            128,
+        )
+    }
+
+    /// [`HostPlan::new`] for an image whose largest query tile is `max_tile`.
+    pub fn with_max_tile(
+        requests: &[AttnRequest],
+        group_size: u32,
+        page_size: u32,
+        reduction: Reduction,
+        partial_rows: u32,
+        max_tile: u32,
+    ) -> Result<HostPlan> {
+        HostPlan::with_split_keys(
+            requests,
+            group_size,
+            page_size,
+            reduction,
+            partial_rows,
+            max_tile,
+            SPLIT_KEYS,
+        )
+    }
+
+    /// [`HostPlan::with_max_tile`] splitting global keys at multiples of
+    /// `split_keys` (a positive multiple of [`KV_TILE`]) rather than
+    /// [`SPLIT_KEYS`]: a row at position `p` then merges chunks `0 ..= p /
+    /// split_keys`, and the kernel reads the chunk from the pass's word.
+    pub fn with_split_keys(
+        requests: &[AttnRequest],
+        group_size: u32,
+        page_size: u32,
+        reduction: Reduction,
+        partial_rows: u32,
+        max_tile: u32,
+        split_keys: u32,
+    ) -> Result<HostPlan> {
+        if split_keys == 0 || !split_keys.is_multiple_of(KV_TILE) {
+            return Err(CudaError::new(format!(
+                "attention plan: a split of {split_keys} keys is not a multiple of {KV_TILE}"
+            )));
+        }
         let bad =
             |r: &AttnRequest, why: &str| CudaError::new(format!("attention request {r:?}: {why}"));
         let int = |x: u64| i32::try_from(x).ok();
@@ -515,12 +573,13 @@ impl HostPlan {
             .map(|r| r.qo_len as u64 * group_size as u64)
             .max()
             .unwrap_or(1);
-        let tile = tile_for(packed);
+        let tile = tile_for_max(packed, max_tile);
         let mut plan = HostPlan {
             group_size,
             page_size,
             tile,
             reduction,
+            split_keys,
             q_rows: u32::try_from(q_end).expect("checked: fits i32"),
             max_page,
             passes: Vec::new(),
@@ -530,7 +589,7 @@ impl HostPlan {
         // query tile then never straddles a KV-tile boundary, so no row
         // iterates over a KV tile past its own last one (see the module
         // docs). A split's pieces also go in passes whose partial rows fit
-        // the scratch; a cut at every 64 keys is a cut at every 1,024 too.
+        // the scratch; a cut at every 64 keys is a cut at every chunk too.
         let split = reduction.is_split();
         let mut pass: Vec<Piece> = Vec::new();
         let mut partials = 0u64;
@@ -543,7 +602,7 @@ impl HostPlan {
                 // Partial rows a query of this block writes (a split's
                 // chunks; none when anchored).
                 let chunks = if split {
-                    u64::from(a / SPLIT_KEYS + 1)
+                    u64::from(a / split_keys + 1)
                 } else {
                     0
                 };
@@ -629,7 +688,7 @@ impl HostPlan {
             p.q_indptr.push(int(q_end, "Q rows")?);
             p.q_rows.end = u32::try_from(q_end).expect("checked: fits i32");
             let chunks = if split {
-                u64::from(piece.kv_len.div_ceil(SPLIT_KEYS))
+                u64::from(piece.kv_len.div_ceil(self.split_keys))
             } else {
                 1
             };
@@ -664,6 +723,11 @@ impl HostPlan {
 
     pub fn reduction(&self) -> Reduction {
         self.reduction
+    }
+
+    /// A split's keys a chunk: the word its passes give the kernel.
+    pub fn split_keys(&self) -> u32 {
+        self.split_keys
     }
 
     pub fn passes(&self) -> &[HostPass] {
@@ -729,9 +793,63 @@ impl PassCaps {
         max_pages: u32,
         max_model_len: u32,
     ) -> Result<PassCaps> {
+        PassCaps::with_max_tile(
+            reduction,
+            rows,
+            queries,
+            group_size,
+            page_size,
+            max_pages,
+            max_model_len,
+            128,
+        )
+    }
+
+    /// [`PassCaps::new`] for an image whose largest query tile is `max_tile`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_max_tile(
+        reduction: Reduction,
+        rows: u32,
+        queries: u32,
+        group_size: u32,
+        page_size: u32,
+        max_pages: u32,
+        max_model_len: u32,
+        max_tile: u32,
+    ) -> Result<PassCaps> {
+        PassCaps::with_split_keys(
+            reduction,
+            rows,
+            queries,
+            group_size,
+            page_size,
+            max_pages,
+            max_model_len,
+            max_tile,
+            SPLIT_KEYS,
+        )
+    }
+
+    /// [`PassCaps::with_max_tile`] for plans splitting at `split_keys`
+    /// ([`HostPlan::with_split_keys`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_split_keys(
+        reduction: Reduction,
+        rows: u32,
+        queries: u32,
+        group_size: u32,
+        page_size: u32,
+        max_pages: u32,
+        max_model_len: u32,
+        max_tile: u32,
+        split_keys: u32,
+    ) -> Result<PassCaps> {
+        if split_keys == 0 {
+            return Err(CudaError::new("attention reservation: a split of no keys"));
+        }
         let overflow =
             || CudaError::new(format!("attention reservation for {rows} rows overflows"));
-        let tile = tile_for(u64::from(queries) * u64::from(group_size));
+        let tile = tile_for_max(u64::from(queries) * u64::from(group_size), max_tile);
         let tiles = (u64::from(queries) * u64::from(group_size)).div_ceil(u64::from(tile));
         let rows64 = u64::from(rows);
         let fit = |x: u64| u32::try_from(x).ok().filter(|&v| i32::try_from(v).is_ok());
@@ -741,7 +859,7 @@ impl PassCaps {
         let requests = rows64 * pieces;
         let caps = match reduction {
             Reduction::Split => {
-                let chunks = u64::from(max_model_len.max(1)).div_ceil(u64::from(SPLIT_KEYS));
+                let chunks = u64::from(max_model_len.max(1)).div_ceil(u64::from(split_keys));
                 let work = requests * tiles * chunks;
                 let partials = rows64 * u64::from(queries) * chunks;
                 let work32 = fit(work).ok_or_else(overflow)?;
@@ -813,6 +931,8 @@ pub struct PaddedPass {
     pub indices: Vec<u32>,
     /// The work-item count the kernel reads.
     pub work_items: u32,
+    /// The first query row the pass's merge writes.
+    pub out_row: u32,
 }
 
 impl HostPlan {
@@ -820,10 +940,23 @@ impl HostPlan {
     /// one pass, no more requests, work items, pages or partial rows than the
     /// rung reserves, and exactly its merge rows. Refuses anything else.
     pub fn padded(&self, caps: &PassCaps) -> Result<PaddedPass> {
+        if self.passes.len() != 1 {
+            return Err(CudaError::new(format!(
+                "attention pass: {} passes for one launch",
+                self.passes.len()
+            )));
+        }
+        self.padded_pass(0, caps)
+    }
+
+    /// Pass `index` of this plan inside `caps`, as [`HostPlan::padded`] checks
+    /// it; its merge writes from query row [`PaddedPass::out_row`] on (the
+    /// pass's first row: 0 for a plan of one pass).
+    pub fn padded_pass(&self, index: usize, caps: &PassCaps) -> Result<PaddedPass> {
         let bad = |what: String| Err(CudaError::new(format!("attention pass: {what}")));
         let s = &caps.shape;
-        let [p] = self.passes.as_slice() else {
-            return bad(format!("{} passes for one launch", self.passes.len()));
+        let Some(p) = self.passes.get(index) else {
+            return bad(format!("no pass {index} of {}", self.passes.len()));
         };
         let shape = p.shape(self)?;
         if shape.tile != s.tile
@@ -838,7 +971,7 @@ impl HostPlan {
             || p.indices.len() > caps.pages as usize
             || shape.partial_rows > s.partial_rows
             || shape.merge_rows != s.merge_rows
-            || p.q_rows.start != 0
+            || (self.passes.len() == 1 && p.q_rows.start != 0)
         {
             return bad(format!(
                 "{shape:?} with {} pages past a reservation of {caps:?}",
@@ -867,6 +1000,7 @@ impl HostPlan {
             kv_tile_indices: words(&p.kv_tile_indices),
             indices: words(&p.indices),
             work_items: shape.grid,
+            out_row: p.q_rows.start,
         })
     }
 }

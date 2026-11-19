@@ -1,7 +1,9 @@
-//! Tool-call extraction from MiMo output.
-//!
-//! MiMo emits calls as compact XML after any visible content:
-//! `<tool_call><function=NAME><parameter=K>V</parameter>…</function></tool_call>`.
+//! Tool-call extraction from `<tool_call><function=…>` markup, which MiMo-V2.6
+//! and Qwen3.8 write after any visible content. MiMo's is compact
+//! ([`Markup::Compact`]):
+//! `<tool_call><function=NAME><parameter=K>V</parameter>…</function></tool_call>`;
+//! Qwen3.8's puts each tag on its own line and each value between newlines
+//! ([`Markup::Newlines`]).
 //!
 //! The block structure follows SGLang's MiMo detector (`detect_and_parse`):
 //!
@@ -10,7 +12,8 @@
 //!   opening one) is parsed: the first `<function=NAME>…</function>` inside
 //!   it names the call (`NAME` is everything up to the next `>`, trimmed of
 //!   whitespace), and each `<parameter=K>V</parameter>` inside that function
-//!   body is a parameter (`K` trimmed, `V` verbatim). A repeated parameter
+//!   body is a parameter (`K` trimmed, `V` verbatim but for its markup's
+//!   framing, [`Markup::value`]). A repeated parameter
 //!   keeps its first position and takes its last value. Values are typed by
 //!   the tool schema ([`crate::args`]).
 //! - A block naming an undeclared function is not a call: the block, and any
@@ -49,6 +52,32 @@ const FUNCTION_END: &str = "</function>";
 const PARAM_START: &str = "<parameter=";
 const PARAM_END: &str = "</parameter>";
 
+/// How a format lays out the markup around a parameter's value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Markup {
+    /// MiMo-V2.6's: the value is everything between `<parameter=K>` and
+    /// `</parameter>`.
+    #[default]
+    Compact,
+    /// Qwen3.8's: the template writes `<parameter=K>\nV\n</parameter>`, so one
+    /// newline at each end of the text is framing, not value (vLLM's
+    /// `qwen3_coder` parser reads it the same way).
+    Newlines,
+}
+
+impl Markup {
+    /// The value a parameter's text between its tags holds.
+    pub fn value(self, text: &str) -> &str {
+        match self {
+            Markup::Compact => text,
+            Markup::Newlines => {
+                let text = text.strip_prefix('\n').unwrap_or(text);
+                text.strip_suffix('\n').unwrap_or(text)
+            }
+        }
+    }
+}
+
 /// Whether the text between two blocks (or between a block and the end) is
 /// content under [`UnparsedText::Content`].
 fn gap_is_content(gap: &str, after_call: bool, before_call: bool) -> bool {
@@ -63,7 +92,7 @@ enum Block {
 }
 
 /// Parses the body between `<tool_call>` and `</tool_call>`.
-fn parse_block(body: &str, schemas: &ToolSchemas) -> Block {
+fn parse_block(body: &str, schemas: &ToolSchemas, markup: Markup) -> Block {
     let Some((name, function_body)) = find_function(body) else {
         return Block::Malformed;
     };
@@ -73,7 +102,7 @@ fn parse_block(body: &str, schemas: &ToolSchemas) -> Block {
     }
     let params = find_parameters(function_body).into_iter().map(|(k, v)| {
         let k = py_strip(k).to_string();
-        let value = schemas.convert(name, &k, v);
+        let value = schemas.convert(name, &k, markup.value(v));
         (k, value)
     });
     Block::Call {
@@ -130,8 +159,13 @@ fn find_parameters(body: &str) -> Vec<(&str, &str)> {
     out
 }
 
-/// Parses a complete output in one go.
+/// Parses a complete output in MiMo's compact markup in one go.
 pub fn parse_complete(text: &str, schemas: &ToolSchemas) -> ParsedToolCalls {
+    parse_complete_in(Markup::Compact, text, schemas)
+}
+
+/// Parses a complete output in one go.
+pub fn parse_complete_in(markup: Markup, text: &str, schemas: &ToolSchemas) -> ParsedToolCalls {
     let Some(first) = text.find(CALL_START) else {
         return ParsedToolCalls {
             content: text.to_string(),
@@ -155,7 +189,7 @@ pub fn parse_complete(text: &str, schemas: &ToolSchemas) -> ParsedToolCalls {
         };
         let end = body_start + e + CALL_END.len();
         let gap = &text[last_end..start];
-        match parse_block(&text[body_start..body_start + e], schemas) {
+        match parse_block(&text[body_start..body_start + e], schemas, markup) {
             Block::Call { name, arguments } => {
                 if !sglang && gap_is_content(gap, after_call, true) {
                     out.content.push_str(gap);
@@ -202,6 +236,7 @@ enum State {
 /// Streaming tool-call parser.
 pub struct ToolCallParser {
     schemas: ToolSchemas,
+    markup: Markup,
     ids: Box<dyn CallIdSource>,
     state: State,
     buf: String,
@@ -219,9 +254,19 @@ impl std::fmt::Debug for ToolCallParser {
 }
 
 impl ToolCallParser {
+    /// A parser of MiMo's compact markup.
     pub fn new(schemas: ToolSchemas, ids: impl CallIdSource + 'static) -> ToolCallParser {
+        ToolCallParser::in_markup(Markup::Compact, schemas, ids)
+    }
+
+    pub fn in_markup(
+        markup: Markup,
+        schemas: ToolSchemas,
+        ids: impl CallIdSource + 'static,
+    ) -> ToolCallParser {
         ToolCallParser {
             schemas,
+            markup,
             ids: Box::new(ids),
             state: State::Content,
             buf: String::new(),
@@ -279,7 +324,11 @@ impl ToolCallParser {
                     let body_end = scanned + e;
                     let end = body_end + CALL_END.len();
                     let gap = &buf[pos..start];
-                    match parse_block(&buf[start + CALL_START.len()..body_end], &self.schemas) {
+                    match parse_block(
+                        &buf[start + CALL_START.len()..body_end],
+                        &self.schemas,
+                        self.markup,
+                    ) {
                         Block::Call { name, arguments } => {
                             if !sglang && gap_is_content(gap, self.after_call, true) {
                                 delta.content.push_str(gap);

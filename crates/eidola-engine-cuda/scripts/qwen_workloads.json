@@ -1,0 +1,21 @@
+{
+  "B": {
+    "prompt_tokens": 1024,
+    "output_tokens": 256,
+    "temperature": 0.0,
+    "concurrency": [1, 8, 32, 64, 128],
+    "requests_per_concurrent": 2,
+    "requests_at_least": 4
+  },
+  "C": {
+    "turns": 7,
+    "turn_tokens": 1760,
+    "output_tokens": 256,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "concurrency": [1, 8, 32, 64, 128],
+    "conversations_per_concurrent": 1,
+    "conversations_at_least": 2
+  }
+}

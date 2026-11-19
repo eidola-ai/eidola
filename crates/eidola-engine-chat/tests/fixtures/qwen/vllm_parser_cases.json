@@ -1,0 +1,2671 @@
+{
+ "meta": {
+  "generator": "dev/qwen_gen_vllm_fixtures.py",
+  "vllm_commit": "4ba787ec9959e566d3b587a796dff07673324da5",
+  "files_sha256": {
+   "vllm/parser/engine/events.py": "fc094827b5444dd7ec986a430fc26615f0b1a5de4fcd132a4d4e210a4c1c552d",
+   "vllm/parser/engine/incremental_lexer.py": "2bc1c24768cba2e13420dd0802ff98a4a4f83e3b7337c8c3c0dc49f198eb0cc6",
+   "vllm/parser/engine/parser_engine_config.py": "5559a32c88ffe657c2301f449d1fdbd503e76f755111d34e8bb05e4d65a7405e",
+   "vllm/parser/engine/token_id_scanner.py": "5800a7db3ab9dd505f9f6dbdcdcda5b98a4c530e4417d2e0dfadc3b53a7c972e",
+   "vllm/parser/engine/streaming_parser_engine.py": "57cbafdc8586a33fb45b2a0e22dd04dd73ed8bb3c3fe71591d785d120e9f8a6e",
+   "vllm/parser/engine/parser_engine.py": "5bddf64c26e09f50810a4041bf3d082c3cf101cb729f5a0020129f8a9e33ec46",
+   "vllm/parser/qwen3.py": "629bdc9c5b4b4206b4c2d50e34e8c557061ed8091524a80bd62c6c4dc19ec5a4",
+   "vllm/tool_parsers/utils.py": "4ff79d1fd68d47b56eb038beb312d30c7a889811a33bc15ba6f18a67d39c8589"
+  },
+  "template_sha256": "af16f654968d47d09a6c604e00370b12dbc21f76456f59c9e98b82e84d9f6375",
+  "python": "3.12.12"
+ },
+ "cases": [
+  {
+   "name": "answer/on/no_tools/0_0",
+   "thinking": true,
+   "tools": null,
+   "output": "The user wants the weather.\n</think>\n\nHello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "The user wants the weather.\n",
+    "content": "\n\nHello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/0_0",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "The user wants the weather.\n</think>\n\nHello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "The user wants the weather.\n",
+    "content": "\n\nHello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/0_1",
+   "thinking": true,
+   "tools": null,
+   "output": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n</think>\n\nHello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n",
+    "content": "\n\nHello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/0_1",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n</think>\n\nHello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n",
+    "content": "\n\nHello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/0_2",
+   "thinking": true,
+   "tools": null,
+   "output": "思考：用户问天气。\n</think>\n\nHello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "思考：用户问天气。\n",
+    "content": "\n\nHello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/0_2",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "思考：用户问天气。\n</think>\n\nHello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "思考：用户问天气。\n",
+    "content": "\n\nHello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/0_3",
+   "thinking": true,
+   "tools": null,
+   "output": "Consider `x < y` and a <b>tag</b> & entities.\n</think>\n\nHello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Consider `x < y` and a <b>tag</b> & entities.\n",
+    "content": "\n\nHello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/0_3",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Consider `x < y` and a <b>tag</b> & entities.\n</think>\n\nHello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Consider `x < y` and a <b>tag</b> & entities.\n",
+    "content": "\n\nHello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/0_4",
+   "thinking": true,
+   "tools": null,
+   "output": "\n</think>\n\nHello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": "\n\nHello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/0_4",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "\n</think>\n\nHello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": "\n\nHello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/1_0",
+   "thinking": true,
+   "tools": null,
+   "output": "The user wants the weather.\n</think>\n\nParis is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "The user wants the weather.\n",
+    "content": "\n\nParis is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/1_0",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "The user wants the weather.\n</think>\n\nParis is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "The user wants the weather.\n",
+    "content": "\n\nParis is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/1_1",
+   "thinking": true,
+   "tools": null,
+   "output": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n</think>\n\nParis is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n",
+    "content": "\n\nParis is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/1_1",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n</think>\n\nParis is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n",
+    "content": "\n\nParis is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/1_2",
+   "thinking": true,
+   "tools": null,
+   "output": "思考：用户问天气。\n</think>\n\nParis is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "思考：用户问天气。\n",
+    "content": "\n\nParis is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/1_2",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "思考：用户问天气。\n</think>\n\nParis is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "思考：用户问天气。\n",
+    "content": "\n\nParis is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/1_3",
+   "thinking": true,
+   "tools": null,
+   "output": "Consider `x < y` and a <b>tag</b> & entities.\n</think>\n\nParis is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Consider `x < y` and a <b>tag</b> & entities.\n",
+    "content": "\n\nParis is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/1_3",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Consider `x < y` and a <b>tag</b> & entities.\n</think>\n\nParis is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Consider `x < y` and a <b>tag</b> & entities.\n",
+    "content": "\n\nParis is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/1_4",
+   "thinking": true,
+   "tools": null,
+   "output": "\n</think>\n\nParis is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": "\n\nParis is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/1_4",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "\n</think>\n\nParis is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": "\n\nParis is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/2_0",
+   "thinking": true,
+   "tools": null,
+   "output": "The user wants the weather.\n</think>\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "The user wants the weather.\n",
+    "content": "\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/2_0",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "The user wants the weather.\n</think>\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "The user wants the weather.\n",
+    "content": "\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/2_1",
+   "thinking": true,
+   "tools": null,
+   "output": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n</think>\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n",
+    "content": "\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/2_1",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n</think>\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n",
+    "content": "\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/2_2",
+   "thinking": true,
+   "tools": null,
+   "output": "思考：用户问天气。\n</think>\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "思考：用户问天气。\n",
+    "content": "\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/2_2",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "思考：用户问天气。\n</think>\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "思考：用户问天气。\n",
+    "content": "\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/2_3",
+   "thinking": true,
+   "tools": null,
+   "output": "Consider `x < y` and a <b>tag</b> & entities.\n</think>\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Consider `x < y` and a <b>tag</b> & entities.\n",
+    "content": "\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/2_3",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Consider `x < y` and a <b>tag</b> & entities.\n</think>\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Consider `x < y` and a <b>tag</b> & entities.\n",
+    "content": "\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/2_4",
+   "thinking": true,
+   "tools": null,
+   "output": "\n</think>\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": "\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/2_4",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "\n</think>\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": "\n\nHere is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/3_0",
+   "thinking": true,
+   "tools": null,
+   "output": "The user wants the weather.\n</think>\n\n多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "The user wants the weather.\n",
+    "content": "\n\n多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/3_0",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "The user wants the weather.\n</think>\n\n多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "The user wants the weather.\n",
+    "content": "\n\n多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/3_1",
+   "thinking": true,
+   "tools": null,
+   "output": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n</think>\n\n多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n",
+    "content": "\n\n多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/3_1",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n</think>\n\n多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n",
+    "content": "\n\n多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/3_2",
+   "thinking": true,
+   "tools": null,
+   "output": "思考：用户问天气。\n</think>\n\n多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "思考：用户问天气。\n",
+    "content": "\n\n多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/3_2",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "思考：用户问天气。\n</think>\n\n多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "思考：用户问天气。\n",
+    "content": "\n\n多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/3_3",
+   "thinking": true,
+   "tools": null,
+   "output": "Consider `x < y` and a <b>tag</b> & entities.\n</think>\n\n多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Consider `x < y` and a <b>tag</b> & entities.\n",
+    "content": "\n\n多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/3_3",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Consider `x < y` and a <b>tag</b> & entities.\n</think>\n\n多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Consider `x < y` and a <b>tag</b> & entities.\n",
+    "content": "\n\n多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/3_4",
+   "thinking": true,
+   "tools": null,
+   "output": "\n</think>\n\n多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": "\n\n多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/3_4",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "\n</think>\n\n多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": "\n\n多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/4_0",
+   "thinking": true,
+   "tools": null,
+   "output": "The user wants the weather.\n</think>\n\n",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "The user wants the weather.\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/4_0",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "The user wants the weather.\n</think>\n\n",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "The user wants the weather.\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/4_1",
+   "thinking": true,
+   "tools": null,
+   "output": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n</think>\n\n",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/4_1",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n</think>\n\n",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Step 1: parse.\nStep 2: answer.\n\n- bullet\n- bullet\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/4_2",
+   "thinking": true,
+   "tools": null,
+   "output": "思考：用户问天气。\n</think>\n\n",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "思考：用户问天气。\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/4_2",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "思考：用户问天气。\n</think>\n\n",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "思考：用户问天气。\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/4_3",
+   "thinking": true,
+   "tools": null,
+   "output": "Consider `x < y` and a <b>tag</b> & entities.\n</think>\n\n",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Consider `x < y` and a <b>tag</b> & entities.\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/4_3",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Consider `x < y` and a <b>tag</b> & entities.\n</think>\n\n",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Consider `x < y` and a <b>tag</b> & entities.\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/no_tools/4_4",
+   "thinking": true,
+   "tools": null,
+   "output": "\n</think>\n\n",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/on/tools/4_4",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "\n</think>\n\n",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "call/on/bare/0",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/0",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/1",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nSão Paulo\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"São Paulo\", \"days\": 3, \"unit\": \"celsius\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/1",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nSão Paulo\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"São Paulo\", \"days\": 3, \"unit\": \"celsius\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/2",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nline one\nline two\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"line one\\nline two\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/2",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nline one\nline two\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"line one\\nline two\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/3",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n  padded  \n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"  padded  \"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/3",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n  padded  \n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"  padded  \"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/4",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n<b>&amp;</b>\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"<b>&amp;</b>\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/4",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n<b>&amp;</b>\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"<b>&amp;</b>\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/5",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls -la && echo 'done' | grep -v x\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"ls -la && echo 'done' | grep -v x\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/5",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls -la && echo 'done' | grep -v x\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"ls -la && echo 'done' | grep -v x\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/6",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\nhello\nEOF\n\n</parameter>\n<parameter=timeout>\n2.5\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"cat <<EOF\\nhello\\nEOF\\n\", \"timeout\": 2.5}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/6",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\nhello\nEOF\n\n</parameter>\n<parameter=timeout>\n2.5\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"cat <<EOF\\nhello\\nEOF\\n\", \"timeout\": 2.5}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/7",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\necho 中文\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"echo 中文\", \"timeout\": 30}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/7",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=bash>\n<parameter=command>\necho 中文\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"echo 中文\", \"timeout\": 30}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/8",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=typed>\n<parameter=s>\nx\n</parameter>\n<parameter=i>\n-7\n</parameter>\n<parameter=n>\n0.125\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=o>\n{\"k\": [1, 2], \"z\": null}\n</parameter>\n<parameter=a>\n[1, \"two\", {\"x\": false}]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"x\", \"i\": -7, \"n\": 0.125, \"b\": true, \"o\": {\"k\": [1, 2], \"z\": null}, \"a\": [1, \"two\", {\"x\": false}]}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/8",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=typed>\n<parameter=s>\nx\n</parameter>\n<parameter=i>\n-7\n</parameter>\n<parameter=n>\n0.125\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=o>\n{\"k\": [1, 2], \"z\": null}\n</parameter>\n<parameter=a>\n[1, \"two\", {\"x\": false}]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"x\", \"i\": -7, \"n\": 0.125, \"b\": true, \"o\": {\"k\": [1, 2], \"z\": null}, \"a\": [1, \"two\", {\"x\": false}]}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/9",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=typed>\n<parameter=b>\nfalse\n</parameter>\n<parameter=o>\n{}\n</parameter>\n<parameter=a>\n[]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"b\": false, \"o\": {}, \"a\": []}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/9",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=typed>\n<parameter=b>\nfalse\n</parameter>\n<parameter=o>\n{}\n</parameter>\n<parameter=a>\n[]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"b\": false, \"o\": {}, \"a\": []}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/10",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=typed>\n<parameter=i>\n12345678901234567890\n</parameter>\n<parameter=n>\n1e-07\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"i\": 12345678901234567890, \"n\": 1e-07}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/10",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=typed>\n<parameter=i>\n12345678901234567890\n</parameter>\n<parameter=n>\n1e-07\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"i\": 12345678901234567890, \"n\": 1e-07}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/11",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=typed>\n<parameter=s>\n{\"looks\": \"like json\"}\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"{\\\"looks\\\": \\\"like json\\\"}\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/11",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=typed>\n<parameter=s>\n{\"looks\": \"like json\"}\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"{\\\"looks\\\": \\\"like json\\\"}\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/12",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=typed>\n<parameter=s>\n42\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"42\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/12",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=typed>\n<parameter=s>\n42\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"42\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/bare/13",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\n<tool_call>\n<function=typed>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/on/content/13",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Need a tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=typed>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Need a tool.\n",
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/0",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nline one\nline two\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"line one\\nline two\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/1",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nSão Paulo\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\n  padded  \n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"São Paulo\", \"days\": 3, \"unit\": \"celsius\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"  padded  \"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/2",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nline one\nline two\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\n<b>&amp;</b>\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"line one\\nline two\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"<b>&amp;</b>\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/3",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n  padded  \n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=bash>\n<parameter=command>\nls -la && echo 'done' | grep -v x\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"  padded  \"}"
+     ],
+     [
+      "bash",
+      "{\"command\": \"ls -la && echo 'done' | grep -v x\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/4",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n<b>&amp;</b>\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\nhello\nEOF\n\n</parameter>\n<parameter=timeout>\n2.5\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"<b>&amp;</b>\"}"
+     ],
+     [
+      "bash",
+      "{\"command\": \"cat <<EOF\\nhello\\nEOF\\n\", \"timeout\": 2.5}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/5",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls -la && echo 'done' | grep -v x\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=bash>\n<parameter=command>\necho 中文\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"ls -la && echo 'done' | grep -v x\"}"
+     ],
+     [
+      "bash",
+      "{\"command\": \"echo 中文\", \"timeout\": 30}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/6",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\nhello\nEOF\n\n</parameter>\n<parameter=timeout>\n2.5\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n<parameter=s>\nx\n</parameter>\n<parameter=i>\n-7\n</parameter>\n<parameter=n>\n0.125\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=o>\n{\"k\": [1, 2], \"z\": null}\n</parameter>\n<parameter=a>\n[1, \"two\", {\"x\": false}]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"cat <<EOF\\nhello\\nEOF\\n\", \"timeout\": 2.5}"
+     ],
+     [
+      "typed",
+      "{\"s\": \"x\", \"i\": -7, \"n\": 0.125, \"b\": true, \"o\": {\"k\": [1, 2], \"z\": null}, \"a\": [1, \"two\", {\"x\": false}]}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/7",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=bash>\n<parameter=command>\necho 中文\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n<parameter=b>\nfalse\n</parameter>\n<parameter=o>\n{}\n</parameter>\n<parameter=a>\n[]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"echo 中文\", \"timeout\": 30}"
+     ],
+     [
+      "typed",
+      "{\"b\": false, \"o\": {}, \"a\": []}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/8",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=typed>\n<parameter=s>\nx\n</parameter>\n<parameter=i>\n-7\n</parameter>\n<parameter=n>\n0.125\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=o>\n{\"k\": [1, 2], \"z\": null}\n</parameter>\n<parameter=a>\n[1, \"two\", {\"x\": false}]\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n<parameter=i>\n12345678901234567890\n</parameter>\n<parameter=n>\n1e-07\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"x\", \"i\": -7, \"n\": 0.125, \"b\": true, \"o\": {\"k\": [1, 2], \"z\": null}, \"a\": [1, \"two\", {\"x\": false}]}"
+     ],
+     [
+      "typed",
+      "{\"i\": 12345678901234567890, \"n\": 1e-07}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/9",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=typed>\n<parameter=b>\nfalse\n</parameter>\n<parameter=o>\n{}\n</parameter>\n<parameter=a>\n[]\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n<parameter=s>\n{\"looks\": \"like json\"}\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"b\": false, \"o\": {}, \"a\": []}"
+     ],
+     [
+      "typed",
+      "{\"s\": \"{\\\"looks\\\": \\\"like json\\\"}\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/10",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=typed>\n<parameter=i>\n12345678901234567890\n</parameter>\n<parameter=n>\n1e-07\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n<parameter=s>\n42\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"i\": 12345678901234567890, \"n\": 1e-07}"
+     ],
+     [
+      "typed",
+      "{\"s\": \"42\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/11",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Plan.\n</think>\n\nTwo calls.\n\n<tool_call>\n<function=typed>\n<parameter=s>\n{\"looks\": \"like json\"}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "Plan.\n",
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"{\\\"looks\\\": \\\"like json\\\"}\"}"
+     ],
+     [
+      "typed",
+      "{}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/on/three",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nSão Paulo\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nline one\nline two\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": "\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"São Paulo\", \"days\": 3, \"unit\": \"celsius\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"line one\\nline two\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "answer/off/no_tools/0_0",
+   "thinking": false,
+   "tools": null,
+   "output": "Hello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Hello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/off/tools/0_0",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Hello!",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Hello!",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/off/no_tools/1_0",
+   "thinking": false,
+   "tools": null,
+   "output": "Paris is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Paris is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/off/tools/1_0",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Paris is the capital of France.",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Paris is the capital of France.",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/off/no_tools/2_0",
+   "thinking": false,
+   "tools": null,
+   "output": "Here is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Here is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/off/tools/2_0",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Here is code:\n```python\ndef f():\n    return 1\n```",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Here is code:\n```python\ndef f():\n    return 1\n```",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/off/no_tools/3_0",
+   "thinking": false,
+   "tools": null,
+   "output": "多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/off/tools/3_0",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "多行\n回答 😀",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "多行\n回答 😀",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/off/no_tools/4_0",
+   "thinking": false,
+   "tools": null,
+   "output": "",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "answer/off/tools/4_0",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "call/off/bare/0",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/0",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/1",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=get_weather>\n<parameter=city>\nSão Paulo\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"São Paulo\", \"days\": 3, \"unit\": \"celsius\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/1",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nSão Paulo\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"São Paulo\", \"days\": 3, \"unit\": \"celsius\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/2",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=get_weather>\n<parameter=city>\nline one\nline two\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"line one\\nline two\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/2",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nline one\nline two\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"line one\\nline two\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/3",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=get_weather>\n<parameter=city>\n  padded  \n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"  padded  \"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/3",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n  padded  \n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"  padded  \"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/4",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=get_weather>\n<parameter=city>\n<b>&amp;</b>\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"<b>&amp;</b>\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/4",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n<b>&amp;</b>\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"<b>&amp;</b>\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/5",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=bash>\n<parameter=command>\nls -la && echo 'done' | grep -v x\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"ls -la && echo 'done' | grep -v x\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/5",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls -la && echo 'done' | grep -v x\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"ls -la && echo 'done' | grep -v x\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/6",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\nhello\nEOF\n\n</parameter>\n<parameter=timeout>\n2.5\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"cat <<EOF\\nhello\\nEOF\\n\", \"timeout\": 2.5}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/6",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\nhello\nEOF\n\n</parameter>\n<parameter=timeout>\n2.5\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"cat <<EOF\\nhello\\nEOF\\n\", \"timeout\": 2.5}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/7",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=bash>\n<parameter=command>\necho 中文\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"echo 中文\", \"timeout\": 30}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/7",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=bash>\n<parameter=command>\necho 中文\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"echo 中文\", \"timeout\": 30}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/8",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=typed>\n<parameter=s>\nx\n</parameter>\n<parameter=i>\n-7\n</parameter>\n<parameter=n>\n0.125\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=o>\n{\"k\": [1, 2], \"z\": null}\n</parameter>\n<parameter=a>\n[1, \"two\", {\"x\": false}]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"x\", \"i\": -7, \"n\": 0.125, \"b\": true, \"o\": {\"k\": [1, 2], \"z\": null}, \"a\": [1, \"two\", {\"x\": false}]}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/8",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=typed>\n<parameter=s>\nx\n</parameter>\n<parameter=i>\n-7\n</parameter>\n<parameter=n>\n0.125\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=o>\n{\"k\": [1, 2], \"z\": null}\n</parameter>\n<parameter=a>\n[1, \"two\", {\"x\": false}]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"x\", \"i\": -7, \"n\": 0.125, \"b\": true, \"o\": {\"k\": [1, 2], \"z\": null}, \"a\": [1, \"two\", {\"x\": false}]}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/9",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=typed>\n<parameter=b>\nfalse\n</parameter>\n<parameter=o>\n{}\n</parameter>\n<parameter=a>\n[]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"b\": false, \"o\": {}, \"a\": []}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/9",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=typed>\n<parameter=b>\nfalse\n</parameter>\n<parameter=o>\n{}\n</parameter>\n<parameter=a>\n[]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"b\": false, \"o\": {}, \"a\": []}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/10",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=typed>\n<parameter=i>\n12345678901234567890\n</parameter>\n<parameter=n>\n1e-07\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"i\": 12345678901234567890, \"n\": 1e-07}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/10",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=typed>\n<parameter=i>\n12345678901234567890\n</parameter>\n<parameter=n>\n1e-07\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"i\": 12345678901234567890, \"n\": 1e-07}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/11",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=typed>\n<parameter=s>\n{\"looks\": \"like json\"}\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"{\\\"looks\\\": \\\"like json\\\"}\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/11",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=typed>\n<parameter=s>\n{\"looks\": \"like json\"}\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"{\\\"looks\\\": \\\"like json\\\"}\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/12",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=typed>\n<parameter=s>\n42\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"42\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/12",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=typed>\n<parameter=s>\n42\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"42\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/bare/13",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=typed>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "call/off/content/13",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Let me check.\n\n<tool_call>\n<function=typed>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Let me check.",
+    "tool_calls": [
+     [
+      "typed",
+      "{}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/0",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nline one\nline two\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"line one\\nline two\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/1",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nSão Paulo\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\n  padded  \n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"São Paulo\", \"days\": 3, \"unit\": \"celsius\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"  padded  \"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/2",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nline one\nline two\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\n<b>&amp;</b>\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"line one\\nline two\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"<b>&amp;</b>\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/3",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n  padded  \n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=bash>\n<parameter=command>\nls -la && echo 'done' | grep -v x\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"  padded  \"}"
+     ],
+     [
+      "bash",
+      "{\"command\": \"ls -la && echo 'done' | grep -v x\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/4",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n<b>&amp;</b>\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\nhello\nEOF\n\n</parameter>\n<parameter=timeout>\n2.5\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"<b>&amp;</b>\"}"
+     ],
+     [
+      "bash",
+      "{\"command\": \"cat <<EOF\\nhello\\nEOF\\n\", \"timeout\": 2.5}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/5",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls -la && echo 'done' | grep -v x\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=bash>\n<parameter=command>\necho 中文\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"ls -la && echo 'done' | grep -v x\"}"
+     ],
+     [
+      "bash",
+      "{\"command\": \"echo 中文\", \"timeout\": 30}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/6",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\nhello\nEOF\n\n</parameter>\n<parameter=timeout>\n2.5\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n<parameter=s>\nx\n</parameter>\n<parameter=i>\n-7\n</parameter>\n<parameter=n>\n0.125\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=o>\n{\"k\": [1, 2], \"z\": null}\n</parameter>\n<parameter=a>\n[1, \"two\", {\"x\": false}]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"cat <<EOF\\nhello\\nEOF\\n\", \"timeout\": 2.5}"
+     ],
+     [
+      "typed",
+      "{\"s\": \"x\", \"i\": -7, \"n\": 0.125, \"b\": true, \"o\": {\"k\": [1, 2], \"z\": null}, \"a\": [1, \"two\", {\"x\": false}]}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/7",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=bash>\n<parameter=command>\necho 中文\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n<parameter=b>\nfalse\n</parameter>\n<parameter=o>\n{}\n</parameter>\n<parameter=a>\n[]\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "bash",
+      "{\"command\": \"echo 中文\", \"timeout\": 30}"
+     ],
+     [
+      "typed",
+      "{\"b\": false, \"o\": {}, \"a\": []}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/8",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=typed>\n<parameter=s>\nx\n</parameter>\n<parameter=i>\n-7\n</parameter>\n<parameter=n>\n0.125\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=o>\n{\"k\": [1, 2], \"z\": null}\n</parameter>\n<parameter=a>\n[1, \"two\", {\"x\": false}]\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n<parameter=i>\n12345678901234567890\n</parameter>\n<parameter=n>\n1e-07\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"x\", \"i\": -7, \"n\": 0.125, \"b\": true, \"o\": {\"k\": [1, 2], \"z\": null}, \"a\": [1, \"two\", {\"x\": false}]}"
+     ],
+     [
+      "typed",
+      "{\"i\": 12345678901234567890, \"n\": 1e-07}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/9",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=typed>\n<parameter=b>\nfalse\n</parameter>\n<parameter=o>\n{}\n</parameter>\n<parameter=a>\n[]\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n<parameter=s>\n{\"looks\": \"like json\"}\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"b\": false, \"o\": {}, \"a\": []}"
+     ],
+     [
+      "typed",
+      "{\"s\": \"{\\\"looks\\\": \\\"like json\\\"}\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/10",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=typed>\n<parameter=i>\n12345678901234567890\n</parameter>\n<parameter=n>\n1e-07\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n<parameter=s>\n42\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"i\": 12345678901234567890, \"n\": 1e-07}"
+     ],
+     [
+      "typed",
+      "{\"s\": \"42\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/11",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Two calls.\n\n<tool_call>\n<function=typed>\n<parameter=s>\n{\"looks\": \"like json\"}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=typed>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": "Two calls.",
+    "tool_calls": [
+     [
+      "typed",
+      "{\"s\": \"{\\\"looks\\\": \\\"like json\\\"}\"}"
+     ],
+     [
+      "typed",
+      "{}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "calls/off/three",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nSão Paulo\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nline one\nline two\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": true,
+   "vllm": {
+    "reasoning": null,
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"São Paulo\", \"days\": 3, \"unit\": \"celsius\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"line one\\nline two\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/truncated_reasoning",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "I am still thinking about",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "I am still thinking about",
+    "content": null,
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/truncated_partial_end_tag",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Thinking</thi",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "Thinking</thi",
+    "content": null,
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/truncated_after_end",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Done.\n</think>\n\n",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "Done.\n",
+    "content": "\n\n",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/truncated_content",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Done.\n</think>\n\nThe answer is",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "Done.\n",
+    "content": "\n\nThe answer is",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/truncated_in_call",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nPar",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/truncated_after_function",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/call_in_reasoning",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "I should call it.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "I should call it.\n\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/repeated_think_open",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<think>\nR\n</think>\n\nC",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "\nR\n",
+    "content": "\n\nC",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/think_open_mid_reasoning",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R1 <think> R2\n</think>\n\nC",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R1  R2\n",
+    "content": "\n\nC",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/repeated_think_end",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\nC </think> D",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": "\n\nC  D",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/no_reasoning_end",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "Just an answer.",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "Just an answer.",
+    "content": null,
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/function_without_tool_call",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/undeclared_function",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=nope>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "nope",
+      "{\"x\": \"1\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/missing_parameter_end",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\", \"days\": 2}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/compact_markup",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/spaced_names",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function= get_weather >\n<parameter= city >\nParis\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city \": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/text_after_call",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\nAnd some words after.",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/text_between_calls",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\nmiddle\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ],
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/prose_mentions_tag",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\nWrite <tool_call> to call a tool.",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": "\n\nWrite ",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/repeated_parameter",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nA\n</parameter>\n<parameter=city>\nB\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"B\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/string_null_for_integer",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nnull\n</parameter>\n<parameter=days>\nnull\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"null\", \"days\": null}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/float_for_integer",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nX\n</parameter>\n<parameter=days>\n4.0\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"X\", \"days\": 4.0}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/boolean_words",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=typed>\n<parameter=b>\nTrue\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "typed",
+      "{\"b\": true}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/undeclared_parameter",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nX\n</parameter>\n<parameter=extra>\n{\"a\": 1}\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"X\", \"extra\": \"{\\\"a\\\": 1}\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/value_two_newlines",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n\nX\n\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"\\nX\\n\"}"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "edge/empty_function_name",
+   "thinking": true,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "R\n</think>\n\n<tool_call>\n<function=>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/thinking_off_tags",
+   "thinking": false,
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"number\"}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"typed\", \"parameters\": {\"type\": \"object\", \"properties\": {\"s\": {\"type\": \"string\"}, \"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}}}}}]",
+   "output": "<think>\nx\n</think>\n\nAnswer",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": null,
+    "content": "<think>\nx\n\n\nAnswer",
+    "tool_calls": []
+   }
+  },
+  {
+   "name": "edge/no_tools_call_markup",
+   "thinking": true,
+   "tools": null,
+   "output": "R\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+   "well_formed": false,
+   "vllm": {
+    "reasoning": "R\n",
+    "content": null,
+    "tool_calls": [
+     [
+      "get_weather",
+      "{\"city\": \"Paris\"}"
+     ]
+    ]
+   }
+  }
+ ]
+}

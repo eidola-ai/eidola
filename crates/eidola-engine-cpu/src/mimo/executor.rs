@@ -15,8 +15,8 @@ use eidola_engine_model::mimo::weights::{AttentionWeights, FfnWeights};
 use eidola_engine_model::tensor::{Matrix, add_assign, linear, rms_norm_rows};
 use rayon::prelude::*;
 
-use crate::mimo::pool::{GroupLayout, Pool};
 use crate::page::Tag;
+use crate::pool::{GroupLayout, Pool};
 
 /// Which of the main model's hidden states feeds the MTP depths (every depth takes the
 /// main model's state, never another depth's output).
@@ -373,6 +373,7 @@ impl CpuExecutor {
             buckets: cfg.buckets.clone(),
             window_chain: None,
             token_history: 0,
+            state: None,
         };
         spec.validate().expect("valid model spec");
         let host_pools: Vec<Pool> = if cfg.host_blocks > 0 {
@@ -967,6 +968,7 @@ impl Executor for CpuExecutor {
                 Maintenance::Copy { group, src, dst } => {
                     self.pools[group as usize].copy(src, dst);
                 }
+                Maintenance::SaveState { .. } => panic!("a state saved for a model without state"),
                 Maintenance::ResetSlot { slot } => self.reset_slot(slot),
                 Maintenance::Encrypt {
                     group,

@@ -7,8 +7,9 @@
 //! * The **executor owns all device memory**: the physical KV pools (one per KV group, each
 //!   `num_blocks` blocks of `block_size` positions across all of the group's layers), the
 //!   persistent per-slot block tables, and per-slot model state (e.g. the hidden state an
-//!   MTP drafter continues from, a block drafter's target-layer taps, or the open entry
-//!   of a pooled group).
+//!   MTP drafter continues from, a block drafter's target-layer taps, the open entry
+//!   of a pooled group, or a recurrent state's tail), and the state pool of a model with
+//!   recurrent state.
 //! * The **host decides everything about allocation**: which physical block holds which
 //!   positions of which sequence, which state slot a sequence occupies, when a block is
 //!   zeroed, copied, or reused. The executor never allocates, frees, or reinterprets.
@@ -19,8 +20,8 @@
 //!
 //! 1. `maintenance`, in the order given ([`Maintenance::Copy`], [`Maintenance::Zero`],
 //!    [`Maintenance::ResetSlot`], [`Maintenance::Encrypt`], [`Maintenance::Decrypt`],
-//!    and the host tier's [`Maintenance::Demote`], [`Maintenance::Promote`] and
-//!    [`Maintenance::ZeroHost`]). Every operation on a block takes effect after the
+//!    the host tier's [`Maintenance::Demote`], [`Maintenance::Promote`] and
+//!    [`Maintenance::ZeroHost`], and a recurrent state's [`Maintenance::SaveState`]). Every operation on a block takes effect after the
 //!    operations listed before it that touch the same block (device or host) and before
 //!    those after it: every zero before any later write to that block, every demote's read
 //!    before the zero that follows it, every promote before the decrypt that follows it,
@@ -206,6 +207,49 @@
 //! covers; the host caches such blocks only as the windows attached at retained hit
 //! points, valid at every layer there, and a hit maps every window of its point.
 //!
+//! # Recurrent state
+//!
+//! A model with [`ModelSpec::state`](crate::spec::ModelSpec::state) has layers whose
+//! dependence on the past is a state of fixed size, the same at every position (a
+//! linear-attention recurrence and the last inputs of its short convolution). The state
+//! *at* position `t`, after positions `0 .. t` have run, is a function of those tokens
+//! alone: the recurrence is applied token by token in one fixed order, whatever the step,
+//! row or chunk, so its result does not depend on how the positions were split between
+//! rows.
+//!
+//! * **Buffers.** The executor keeps a pool of state buffers (ids `1..num_buffers`;
+//!   [`NULL_STATE`](crate::spec::NULL_STATE) reads as the state at 0 and is never
+//!   written) and, with a host tier, `host_buffers` buffers in host memory. A buffer
+//!   holds one image of the state at a block boundary, every state group's part, in an
+//!   order the executor documents. The host owns their allocation as it owns blocks.
+//!   Maintenance names the pool by `group ==`
+//!   [`ModelSpec::state_pool`](crate::spec::ModelSpec::state_pool): `Zero`, `Encrypt`,
+//!   `Decrypt`, `Demote`, `Promote` and `ZeroHost` act on a buffer's whole image as on a
+//!   block's. `Copy` and table updates never name it.
+//! * **Base and tail.** Each row names its base ([`StateRow`]): a buffer holding the
+//!   state at `base_len`, a block boundary at most the row's `context_len`. The executor
+//!   keeps per slot the inputs of the positions past the base that earlier rows of the
+//!   slot ran (its tail, at most `tail_positions` positions), and builds the state at
+//!   `context_len` by applying the recurrence to them in order from the base.
+//!   `ResetSlot` zeroes the tail.
+//! * **Writes.** For each [`StateWrite`] the executor stores the state at `len` into
+//!   `buffer` during the row. `len` is a block boundary past the base and within the
+//!   row's host tokens (`base_len < len <= context_len + num_tokens`): host tokens are
+//!   always committed. A write's buffer is no other row's base and no other write's
+//!   target; it is the row's own base only for the row's last write (the host names it so
+//!   only when nothing else holds the base). After the row the slot's base is its last
+//!   write's buffer, and its tail starts there.
+//! * **Drafts never reach a stored state.** A row's drafts run through the recurrence for
+//!   the verify's outputs only. Their inputs join the tail, and the next row (whose
+//!   `context_len` says how many were accepted) or a [`Maintenance::SaveState`] folds
+//!   exactly those that were.
+//! * **Released slots.** [`Maintenance::SaveState`] stores the state at a boundary the
+//!   slot's tail reaches into a buffer, for a sequence leaving its slot after accepted
+//!   drafts crossed that boundary; it is listed before the slot's `ResetSlot`.
+//!
+//! Every stored image of the state at a position is the same bytes, whichever path wrote
+//! it: a prefill row, a decode row, a fold, or `SaveState`.
+//!
 //! # Token history
 //!
 //! A model with [`ModelSpec::token_history`] `h > 0` reads the `h` token ids before a
@@ -293,7 +337,7 @@ pub enum Maintenance {
     /// physical block that stops holding live data (freed by a sequence or evicted from the
     /// prefix cache), before it can be handed to anyone else.
     Zero {
-        /// KV group index.
+        /// KV group index, or the state pool ([`ModelSpec::state_pool`]).
         group: u32,
         /// Block to scrub.
         block: u32,
@@ -309,7 +353,7 @@ pub enum Maintenance {
     /// zero with the ChaCha20 keystream of `kv_keys[key]` and `nonce`
     /// ([`crate::kv_cipher`]). Issued when a cached block becomes idle.
     Encrypt {
-        /// KV group index.
+        /// KV group index, or the state pool ([`ModelSpec::state_pool`]).
         group: u32,
         /// Block to encrypt.
         block: u32,
@@ -321,7 +365,7 @@ pub enum Maintenance {
     /// Decrypt `block` of `group` in place (the same keystream XOR as
     /// [`Maintenance::Encrypt`]). Issued before an idle block is mapped again.
     Decrypt {
-        /// KV group index.
+        /// KV group index, or the state pool ([`ModelSpec::state_pool`]).
         group: u32,
         /// Block to decrypt.
         block: u32,
@@ -334,7 +378,7 @@ pub enum Maintenance {
     /// block `host` of `group`'s host tier. The block is ciphertext. Issued when an idle
     /// entry is demoted under device pressure; its zero follows.
     Demote {
-        /// KV group index.
+        /// KV group index, or the state pool ([`ModelSpec::state_pool`]).
         group: u32,
         /// Device block to copy from.
         block: u32,
@@ -345,7 +389,7 @@ pub enum Maintenance {
     /// Issued when a prefix-cache hit needs a demoted block; a decrypt follows if a
     /// sequence maps it.
     Promote {
-        /// KV group index.
+        /// KV group index, or the state pool ([`ModelSpec::state_pool`]).
         group: u32,
         /// Host block to copy from.
         host: u32,
@@ -355,10 +399,23 @@ pub enum Maintenance {
     /// Overwrite every byte of host block `host` of `group` with zeros. Issued for every
     /// host block that stops holding an entry (promoted, evicted or expired).
     ZeroHost {
-        /// KV group index.
+        /// KV group index, or the state pool ([`ModelSpec::state_pool`]).
         group: u32,
         /// Host block to scrub.
         host: u32,
+    },
+    /// Store the state at `len` of the sequence in `slot` into state `buffer`, built from
+    /// the slot's base and tail (`len` a block boundary between the base and the positions
+    /// the slot's rows committed). Issued when a sequence leaves its slot after accepted
+    /// drafts crossed `len`, before the slot's [`Maintenance::ResetSlot`]. `buffer` may be
+    /// the slot's base when nothing else holds it.
+    SaveState {
+        /// The released sequence's slot.
+        slot: Slot,
+        /// The boundary whose state is stored.
+        len: u32,
+        /// The state buffer written.
+        buffer: u32,
     },
 }
 
@@ -398,8 +455,29 @@ pub struct SeqEntry {
     pub sampling: SamplingParams,
 }
 
-/// Per-row inputs only some models need, row-aligned with [`StepInput::seqs`]. Both are
-/// empty for a model with no window chain and no token history.
+/// A row's recurrent-state base (see *Recurrent state* in the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateRow {
+    /// The state buffer holding the state at `base_len`, or
+    /// [`NULL_STATE`](crate::spec::NULL_STATE) with `base_len` 0.
+    pub base: u32,
+    /// A block boundary, at most the row's `context_len`.
+    pub base_len: u32,
+}
+
+/// A state the executor stores during a row (see *Recurrent state* in the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateWrite {
+    /// The row, an index into [`StepInput::seqs`].
+    pub row: u32,
+    /// The block boundary whose state is stored, within the row's host tokens.
+    pub len: u32,
+    /// The state buffer written.
+    pub buffer: u32,
+}
+
+/// Per-row inputs only some models need, row-aligned with [`StepInput::seqs`]. Each is
+/// empty for a model without the feature it serves.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StepAux {
     /// Per row, where the window chain's top layer starts (see *Window chain* in the
@@ -411,6 +489,12 @@ pub struct StepAux {
     /// before `context_len`, oldest first, zero where that position is before the
     /// sequence's start.
     pub history_ids: Vec<u32>,
+    /// Per row, its recurrent-state base. Empty unless the model has
+    /// [`crate::spec::ModelSpec::state`].
+    pub state_rows: Vec<StateRow>,
+    /// The step's state writes, ordered by row and then by `len`. Empty unless the model
+    /// has [`crate::spec::ModelSpec::state`].
+    pub state_writes: Vec<StateWrite>,
 }
 
 /// Everything one step needs.
