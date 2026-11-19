@@ -2,6 +2,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use eidola_billing::BillingError;
+use eidola_billing::env::Env;
 use eidola_billing::service::BillingService;
 use eidola_billing::store::{RefundOperation, RefundRequest, Store};
 use eidola_billing::stripe::StripeClient;
@@ -139,6 +140,13 @@ impl Refund {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let env = match Env::from_process() {
+        Ok(env) => env,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
     let _ = rustls_rustcrypto::provider().install_default();
     if matches!(
         cli.command,
@@ -148,8 +156,9 @@ async fn main() {
             .with_max_level(tracing::Level::INFO)
             .with_writer(std::io::stderr)
             .init();
+        tracing::info!("environment variable prefix: {:?}", env.prefix());
     }
-    match run(cli).await {
+    match run(cli, &env).await {
         Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()),
         Err(error) => {
             eprintln!("{error}");
@@ -158,14 +167,14 @@ async fn main() {
     }
 }
 
-async fn run(cli: Cli) -> Result<Value, BillingError> {
+async fn run(cli: Cli, env: &Env) -> Result<Value, BillingError> {
     if matches!(cli.command, Command::NewOperation) {
         return Ok(json!({ "operation": Uuid::new_v4() }));
     }
     // Credentials belong to the environment/workload, never argv or output.
-    let database_url = required_env("DATABASE_URL")?;
-    let password = std::env::var("DATABASE_PASSWORD").ok();
-    let cert = std::env::var("DATABASE_SSL_CERT").ok();
+    let database_url = required_env(env, "DATABASE_URL")?;
+    let password = env.var("DATABASE_PASSWORD");
+    let cert = env.var("DATABASE_SSL_CERT");
     let pool = eidola_billing::connection::create_pool(
         &database_url,
         password.as_deref(),
@@ -175,7 +184,7 @@ async fn run(cli: Cli) -> Result<Value, BillingError> {
     let store = Store::new(pool.clone());
     match &cli.command {
         Command::ServeWebhooks { bind } => {
-            let secret = required_env("STRIPE_WEBHOOK_SECRET")?;
+            let secret = required_env(env, "STRIPE_WEBHOOK_SECRET")?;
             let shutdown = eidola_billing_cli::runtime::shutdown_signal()?;
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
@@ -195,7 +204,10 @@ async fn run(cli: Cli) -> Result<Value, BillingError> {
         }
         _ => {}
     }
-    let service = BillingService::new(pool, StripeClient::new(required_env("STRIPE_API_KEY")?));
+    let service = BillingService::new(
+        pool,
+        StripeClient::new(required_env(env, "STRIPE_API_KEY")?),
+    );
     match cli.command {
         Command::Work {
             batch_size,
@@ -296,11 +308,10 @@ fn unix(time: std::time::SystemTime) -> Option<u64> {
         .map(|t| t.as_secs())
 }
 
-fn required_env(name: &str) -> Result<String, BillingError> {
-    std::env::var(name)
-        .ok()
+fn required_env(env: &Env, name: &str) -> Result<String, BillingError> {
+    env.var(name)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| BillingError::Invalid(format!("{name} is required")))
+        .ok_or_else(|| BillingError::Invalid(format!("{} is required", env.name(name))))
 }
 
 #[cfg(test)]

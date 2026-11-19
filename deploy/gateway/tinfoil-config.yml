@@ -16,6 +16,9 @@
 # Those services are trusted as their operator is, whatever they are
 # configured with, so no value of theirs is measured, and one release can
 # be deployed against another set of them, a staging one, unchanged.
+# Secrets are organisation-scoped and reach a container by their own names,
+# so each component's carry its prefix: `EIDOLA_ENV_PREFIX` names it, and the
+# gateway reads every variable under it.
 #
 # `cvm-version` pins the platform release manifest inline; that manifest
 # names the SEV-SNP IGVM image, whose launch digest measure-enclave
@@ -45,14 +48,16 @@ containers:
     networks:
       - egress
     secrets:
-      - CREDENTIAL_MASTER_KEY
-      - DATABASE_URL
-      - OTEL_EXPORTER_OTLP_ENDPOINT
-      - OTEL_EXPORTER_OTLP_HEADERS
-      - STRIPE_API_KEY
-      - TERMS_FEED_BASE_URL
+      - GATEWAY_CREDENTIAL_MASTER_KEY
+      - GATEWAY_DATABASE_URL
+      - GATEWAY_ENGINE_TOKEN
+      - GATEWAY_OTEL_EXPORTER_OTLP_ENDPOINT
+      - GATEWAY_OTEL_EXPORTER_OTLP_HEADERS
+      - GATEWAY_STRIPE_API_KEY
+      - GATEWAY_TERMS_FEED_BASE_URL
     env:
-      - BIND_ADDR: "0.0.0.0:8080"
+      - EIDOLA_ENV_PREFIX: "GATEWAY_"
+      - GATEWAY_BIND_ADDR: "0.0.0.0:8080"
 
 shim:
   upstream-port: 8080
