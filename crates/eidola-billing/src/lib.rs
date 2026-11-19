@@ -4,6 +4,7 @@
 //! Database transactions own credit effects; Stripe observations reconcile them.
 
 pub mod connection;
+pub mod env;
 pub mod error;
 pub mod service;
 pub mod store;

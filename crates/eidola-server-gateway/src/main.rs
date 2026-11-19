@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
+use eidola_billing::env::Env;
 use eidola_server_gateway::AppState;
 use eidola_server_gateway::backend::Catalog;
 use eidola_server_gateway::credentials;
@@ -42,67 +43,71 @@ struct Config {
 }
 
 impl Config {
-    async fn load() -> Result<Self, String> {
-        let bind_addr = std::env::var("BIND_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:8443".to_string())
+    async fn load(env: &Env) -> Result<Self, String> {
+        let bind_addr = env
+            .var("BIND_ADDR")
+            .unwrap_or_else(|| "127.0.0.1:8443".to_string())
             .parse()
-            .map_err(|e| format!("invalid BIND_ADDR: {}", e))?;
+            .map_err(|e| format!("invalid {}: {}", env.name("BIND_ADDR"), e))?;
 
-        let database_url = std::env::var("DATABASE_URL")
-            .map_err(|_| "DATABASE_URL environment variable is required")?;
+        let database_url = env.var("DATABASE_URL").ok_or_else(|| {
+            format!(
+                "{} environment variable is required",
+                env.name("DATABASE_URL")
+            )
+        })?;
 
-        let database_password = std::env::var("DATABASE_PASSWORD")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let database_password = env.var("DATABASE_PASSWORD").filter(|s| !s.is_empty());
 
-        let database_ssl_cert = std::env::var("DATABASE_SSL_CERT")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let database_ssl_cert = env.var("DATABASE_SSL_CERT").filter(|s| !s.is_empty());
 
-        let stripe_api_key = std::env::var("STRIPE_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let stripe_api_key = env.var("STRIPE_API_KEY").filter(|s| !s.is_empty());
 
-        // Read for measurement verification only — the OTLP exporter
-        // consumes this straight from the environment. Grafana routes by
-        // these auth headers to a tenant, so leaving the hash unverified
-        // would let a different telemetry destination be injected without
-        // a measurement change (privacy-guarantees.md §7.4).
-        let otel_exporter_otlp_headers = std::env::var("OTEL_EXPORTER_OTLP_HEADERS")
-            .ok()
+        // Read here for measurement verification; `telemetry::init` reads it
+        // too, to configure the exporter. Grafana routes by these auth
+        // headers to a tenant, so leaving the hash unverified would let a
+        // different telemetry destination be injected without a measurement
+        // change (privacy-guarantees.md §7.4).
+        let otel_exporter_otlp_headers = env
+            .var("OTEL_EXPORTER_OTLP_HEADERS")
             .filter(|s| !s.is_empty());
 
         // The gateway's token for Eidola's inference nodes: a secret, measured
         // by its Argon2id hash like the others when `ENGINE_TOKEN_HASH` is set.
         // Absent, the gateway starts without an engine router (see `main`).
-        let engine_token = std::env::var("ENGINE_TOKEN").ok().filter(|s| !s.is_empty());
+        let engine_token = env.var("ENGINE_TOKEN").filter(|s| !s.is_empty());
 
-        let credential_master_key_hex = std::env::var("CREDENTIAL_MASTER_KEY")
-            .map_err(|_| "CREDENTIAL_MASTER_KEY environment variable is required")?;
+        let master_key_var = env.name("CREDENTIAL_MASTER_KEY");
+        let credential_master_key_hex = env
+            .var("CREDENTIAL_MASTER_KEY")
+            .ok_or_else(|| format!("{master_key_var} environment variable is required"))?;
         // The hex error is discarded, not interpolated: its Display quotes
         // the offending character — a byte of the configured master key.
         let key_bytes = hex::decode(&credential_master_key_hex)
-            .map_err(|_| "invalid CREDENTIAL_MASTER_KEY hex".to_string())?;
-        let credential_master_key: [u8; 32] = key_bytes.try_into().map_err(|_| {
-            "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string()
-        })?;
+            .map_err(|_| format!("invalid {master_key_var} hex"))?;
+        let credential_master_key: [u8; 32] = key_bytes
+            .try_into()
+            .map_err(|_| format!("{master_key_var} must be exactly 32 bytes (64 hex chars)"))?;
 
         // Verify measured secret hashes: for each *_HASH env var that is set
         // (in a deployment's config, and so in its measurement), the runtime
         // secret must match it.
-        verify_measured_secrets(&[
-            ("CREDENTIAL_MASTER_KEY", &credential_master_key_hex),
-            (
-                "DATABASE_PASSWORD",
-                database_password.as_deref().unwrap_or(""),
-            ),
-            ("STRIPE_API_KEY", stripe_api_key.as_deref().unwrap_or("")),
-            (
-                "OTEL_EXPORTER_OTLP_HEADERS",
-                otel_exporter_otlp_headers.as_deref().unwrap_or(""),
-            ),
-            ("ENGINE_TOKEN", engine_token.as_deref().unwrap_or("")),
-        ])?;
+        verify_measured_secrets(
+            env,
+            &[
+                ("CREDENTIAL_MASTER_KEY", &credential_master_key_hex),
+                (
+                    "DATABASE_PASSWORD",
+                    database_password.as_deref().unwrap_or(""),
+                ),
+                ("STRIPE_API_KEY", stripe_api_key.as_deref().unwrap_or("")),
+                (
+                    "OTEL_EXPORTER_OTLP_HEADERS",
+                    otel_exporter_otlp_headers.as_deref().unwrap_or(""),
+                ),
+                ("ENGINE_TOKEN", engine_token.as_deref().unwrap_or("")),
+            ],
+        )?;
 
         // Terms-acceptance gate. Two independent sources feed the shared
         // `required_document` table (both through the same monotonic
@@ -120,8 +125,8 @@ impl Config {
         //    seeded once at startup.
         //
         // Neither set = gate disabled.
-        let terms_feed_base_url = std::env::var("TERMS_FEED_BASE_URL")
-            .ok()
+        let terms_feed_base_url = env
+            .var("TERMS_FEED_BASE_URL")
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches('/').to_string());
 
@@ -130,8 +135,9 @@ impl Config {
         // ticker, or a poll with no sleep between passes), so it is refused
         // here instead.
         let terms_refresh =
-            eidola_server_gateway::helpers::refresh_secs_from_env("TERMS_REFRESH_SECS", 600)?;
+            eidola_server_gateway::helpers::refresh_secs_from_env(env, "TERMS_REFRESH_SECS", 600)?;
         let engine_placement_refresh = eidola_server_gateway::helpers::refresh_secs_from_env(
+            env,
             "ENGINE_PLACEMENT_REFRESH_SECS",
             30,
         )?;
@@ -153,26 +159,30 @@ impl Config {
                 "https://www.eidola.ai/privacy/",
             ),
         ] {
-            let Some(sha256) = std::env::var(hash_var).ok().filter(|s| !s.is_empty()) else {
+            let Some(sha256) = env.var(hash_var).filter(|s| !s.is_empty()) else {
                 continue;
             };
             if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(format!("{hash_var} must be 64 hex chars (a SHA-256)"));
+                return Err(format!(
+                    "{} must be 64 hex chars (a SHA-256)",
+                    env.name(hash_var)
+                ));
             }
-            let version = std::env::var(version_var)
-                .ok()
+            let version = env
+                .var(version_var)
                 .filter(|s| !s.is_empty())
                 .map(|s| {
-                    s.parse::<i64>()
-                        .map_err(|_| format!("{version_var} must be a positive integer"))
+                    s.parse::<i64>().map_err(|_| {
+                        format!("{} must be a positive integer", env.name(version_var))
+                    })
                 })
                 .transpose()?
                 .unwrap_or(1);
             if version < 1 {
-                return Err(format!("{version_var} must be >= 1"));
+                return Err(format!("{} must be >= 1", env.name(version_var)));
             }
-            let url = std::env::var(url_var)
-                .ok()
+            let url = env
+                .var(url_var)
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| default_url.to_string());
             terms_seed.push(eidola_server_gateway::db::RequiredDocumentRow {
@@ -201,26 +211,28 @@ impl Config {
 
 /// Verify that runtime secrets match their measured hashes.
 ///
-/// For each `(name, value)` pair, checks if `{name}_HASH` is set as an env var.
-/// If present, verifies the Argon2id hash matches `value`. If absent, the secret
-/// is not measured and no check is performed.
+/// For each `(name, value)` pair, checks if `{name}_HASH` is set as an env var
+/// (under the environment's prefix, like `name` itself). If present, verifies
+/// the Argon2id hash matches `value`. If absent, the secret is not measured and
+/// no check is performed.
 ///
 /// A `_HASH` env var committed in a deployment's `tinfoil-config.yml` is part
 /// of the enclave measurement, and binds the secret injected beside it to that
 /// measurement without exposing its plaintext. The gateway's own config
 /// measures none: every secret it names reaches a service trusted as its
 /// operator is, so binding its value would hold the operator to nothing.
-fn verify_measured_secrets(secrets: &[(&str, &str)]) -> Result<(), String> {
+fn verify_measured_secrets(env: &Env, secrets: &[(&str, &str)]) -> Result<(), String> {
     use argon2::PasswordVerifier;
 
     for (name, value) in secrets {
         if value.is_empty() {
             continue;
         }
-        let hash_var = format!("{name}_HASH");
-        let Ok(expected_hash) = std::env::var(&hash_var) else {
+        let Some(expected_hash) = env.var(&format!("{name}_HASH")) else {
             continue;
         };
+        let name = env.name(name);
+        let hash_var = format!("{name}_HASH");
         if expected_hash.is_empty() {
             continue;
         }
@@ -250,11 +262,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider())
         .expect("failed to install rustls crypto provider");
 
+    // Every variable below is read under this prefix, so it is read first:
+    // nothing, not even logging, is configured before it.
+    let env = match Env::from_process() {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("Configuration error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // Initialize logging + optional OpenTelemetry (when OTEL_EXPORTER_OTLP_ENDPOINT is set).
-    let otel_guard = telemetry::init();
+    let otel_guard = telemetry::init(&env);
+    info!("Environment variable prefix: {:?}", env.prefix());
 
     // Load configuration
-    let config = Config::load().await.map_err(|e| {
+    let config = Config::load(&env).await.map_err(|e| {
         error!("Configuration error: {}", e);
         e
     })?;
@@ -276,7 +299,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let stripe = config.stripe_api_key.map(StripeClient::new);
     if stripe.is_none() {
         warn!(
-            "STRIPE_API_KEY not set — Stripe checkout, subscription and portal endpoints will return 503"
+            "{} not set — Stripe checkout, subscription and portal endpoints will return 503",
+            env.name("STRIPE_API_KEY")
         );
     }
 
@@ -342,9 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The catalog, priced. `PRICING_OVERRIDES` is keyed by weights hash, and
     // an override that names no served model, or does not fit its pricing,
     // refuses the boot rather than being ignored.
-    let pricing_overrides = std::env::var("PRICING_OVERRIDES")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let pricing_overrides = env.var("PRICING_OVERRIDES").filter(|s| !s.is_empty());
     let catalog = Catalog::new(pricing_overrides.as_deref()).map_err(|e| {
         error!("{e}");
         e

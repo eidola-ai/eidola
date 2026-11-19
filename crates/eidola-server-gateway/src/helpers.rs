@@ -124,9 +124,13 @@ pub fn parse_refresh_secs(
     }
 }
 
-/// [`parse_refresh_secs`] over the process environment.
-pub fn refresh_secs_from_env(var: &str, default_secs: u64) -> Result<Duration, String> {
-    parse_refresh_secs(var, std::env::var(var).ok().as_deref(), default_secs)
+/// [`parse_refresh_secs`] over the process environment, under its prefix.
+pub fn refresh_secs_from_env(
+    env: &eidola_billing::env::Env,
+    var: &str,
+    default_secs: u64,
+) -> Result<Duration, String> {
+    parse_refresh_secs(&env.name(var), env.var(var).as_deref(), default_secs)
 }
 
 // ---------------------------------------------------------------------------
