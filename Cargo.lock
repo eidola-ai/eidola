@@ -8402,7 +8402,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
- "chrono",
  "clap",
  "cryptoki",
  "der 0.7.10",
@@ -8419,6 +8418,7 @@ dependencies = [
  "sha2 0.11.0",
  "spki 0.7.3",
  "tempfile",
+ "time",
  "x509-cert 0.2.5",
  "zip",
 ]
