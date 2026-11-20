@@ -151,7 +151,7 @@ Results, all under `$OUT` (default `~/eidola-gpu/out`):
 - `goldens/spread/`, `goldens/prefix/`, `goldens/full/`: the `reference-*.safetensors` made there and the `engram-rows.safetensors` they were made with;
 - `logs/<step>.log` and `summary.txt`.
 
-`TORCH_INDEX` defaults to PyTorch's CUDA 13 wheel index and `TORCH_VERSION` to 2.10.0; set them if the machine's driver needs another build. `setup` fails if PyTorch does not see the GPU.
+`TORCH_INDEX` defaults to PyTorch's CUDA 13 wheel index and `TORCH_VERSION` to 2.13.0, the version the CPU tooling is locked to; set them if the machine's driver needs another build (the recorded B300 run used 2.10.0, so `TORCH_VERSION=2.10.0` repeats it). `setup` fails if PyTorch does not see the GPU.
 
 ### What the probes answer
 

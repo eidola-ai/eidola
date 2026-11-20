@@ -23,7 +23,7 @@
 #   SPREAD_DIR   the 12-layer truncation, pre-fetched or to fetch into  (default $WORK/spread)
 #   PREFIX_DIR   the whole-layers-0-3 truncation, likewise              (default $WORK/prefix)
 #   TORCH_INDEX  the PyTorch wheel index for this machine's CUDA        (default .../whl/cu130)
-#   TORCH_VERSION                                                        (default 2.10.0)
+#   TORCH_VERSION                                                        (default 2.13.0, the CPU lock's)
 #   SPREAD_TOKENS  tokens of the 12-layer run                            (default 256, as measured locally)
 #   FULL_DIR     the whole checkpoint as published (about 510 GB)       (default $WORK/full)
 #   FULL_TOKENS  tokens of the whole-model runs, 0 for the whole text   (default 0)
@@ -41,7 +41,7 @@ OUT="${OUT:-$WORK/out}"
 SPREAD_DIR="${SPREAD_DIR:-$WORK/spread}"
 PREFIX_DIR="${PREFIX_DIR:-$WORK/prefix}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
-TORCH_VERSION="${TORCH_VERSION:-2.10.0}"
+TORCH_VERSION="${TORCH_VERSION:-2.13.0}"
 SPREAD_TOKENS="${SPREAD_TOKENS:-256}"
 FULL_DIR="${FULL_DIR:-$WORK/full}"
 FULL_TOKENS="${FULL_TOKENS:-0}"
