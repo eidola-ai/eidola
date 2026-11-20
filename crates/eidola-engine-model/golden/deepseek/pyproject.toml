@@ -7,7 +7,7 @@ dependencies = [
     "numpy==2.3.4",
     "sympy==1.14.0",
     "tokenizers==0.22.1",
-    "torch==2.10.0",
+    "torch==2.13.0",
 ]
 
 [tool.uv]
