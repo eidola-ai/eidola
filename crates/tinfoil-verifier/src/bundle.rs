@@ -747,6 +747,7 @@ fn decode_reference_values(entries: &[CollateralEntry]) -> Result<Option<[u8; 32
             decode_runtime_collateral(entry)?;
         } else if format == COLLATERAL_ARTIFACT_FRESHNESS_V1_FORMAT
             || id == COLLATERAL_ID_RUNTIME_FRESHNESS
+            || id == COLLATERAL_ID_PLATFORM_FRESHNESS
         {
             if (id != COLLATERAL_ID_RUNTIME_FRESHNESS && id != COLLATERAL_ID_PLATFORM_FRESHNESS)
                 || format != COLLATERAL_ARTIFACT_FRESHNESS_V1_FORMAT
@@ -1234,6 +1235,19 @@ mod tests {
             let mut doc = gateway_document();
             mutate(entry_mut(&mut doc, id));
             refused(&doc, needle);
+        }
+        // Each reserved freshness ID goes with exactly its format and role:
+        // under another format, even one nobody reads, it is refused rather
+        // than passed through as an unknown entry.
+        for id in ["runtime-freshness", "platform-freshness"] {
+            let mut doc = gateway_document();
+            let entry = entry_mut(&mut doc, id);
+            entry["format"] = "https://example.com/collateral/unknown/v1".into();
+            entry["data"] = serde_json::json!({});
+            refused(&doc, "conflicting artifact freshness");
+            let mut doc = gateway_document();
+            entry_mut(&mut doc, id)["role"] = "endorsement".into();
+            refused(&doc, "conflicting artifact freshness");
         }
     }
 
