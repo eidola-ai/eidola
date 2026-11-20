@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # compile-igvm.sh <cvmc> <kernel> <initrd> <roothash-file-or-hex> <outdir> <artifact_version>
-# Same cvmc invocation as image/release-igvm.sh at v0.15.3-rc.1.
+# Same cvmc invocation as image/release-igvm.sh at v0.15.4-rc.2.
 set -Eeuo pipefail
 cvmc="$1" kernel="$2" initrd="$3" root="$4" out="$5" ver="$6"
 [ -f "$root" ] && root="$(tr -d '\n' < "$root")"
