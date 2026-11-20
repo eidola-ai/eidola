@@ -4,7 +4,7 @@
   "schema_version": 2,
   "sev_snp": {
     "guest_policy": "0x30133",
-    "host_data": "2f3299a2da4aa193cae28bcfad110972da9445ae431edc881f0566dcb4b26833",
+    "host_data": "aa718d5425d9269e1186399efd67385bc0a7d083152569d331297e60a987c278",
     "measurement": "cea56f9f4f8440ae96e6e6528a7571f4179a062e7a0919b1021c98dd3bc9f44eeeda321568407130745f80057533c015"
   }
 }

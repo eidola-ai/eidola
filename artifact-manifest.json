@@ -1,25 +1,25 @@
 {
   "artifacts": {
     "eidola-cli": {
-      "digest": "sha256:087301406593b7c8524e71ea556aa70e56a3563945b2b5f1d340b0450c3f8bb6",
+      "digest": "sha256:63bc31bae8a9c96d04bcae625b3009bc5aa002853ed7c4394cbd41097e2238cd",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "archiveSha256": "sha256:2a0c6565de940a4021a7e25904557f96607ad561936cf9c415009e2b5b00418e",
-      "narHash": "sha256-e8DXIssTLvjW0G0xL0fpaqNCfNYn16E9hjWYpFH2EJ4=",
+      "archiveSha256": "sha256:2283dc840d62f16cd60736f05cd18682fed879cd410c97b8ef4f63366d9f9ba5",
+      "narHash": "sha256-Nh+JgkVbK4+C5p/p8SnxzJ4Rs7DIYrhRkHlwgg7SkzM=",
       "platform": "darwin/universal",
       "type": "nix"
     },
     "eidola-gui-linux-amd64": {
-      "archiveSha256": "sha256:6db77aa76a295e5d9e6a5bd60c3f1bf3b79d216ee8917164a7e20426d2ae2254",
-      "narHash": "sha256-pLkaLe0sOS8U265ztOzQjSLiXtXwt8rldJMLIt/EMQk=",
+      "archiveSha256": "sha256:5bf90243ce20a8a1f1c131c147e4e0fbd3a42e14220200892ad4219f9ca722c5",
+      "narHash": "sha256-gcDAkNHiRj+cBk39SEtlkMQmvqDyrX/FcTSkD8W3ayM=",
       "platform": "linux/amd64",
       "type": "nix"
     },
     "eidola-gui-macos-universal": {
-      "archiveSha256": "sha256:67b383320b6a0ca0077192812e3eeee14d47f144462b342ba02fcd878d3a20d7",
-      "narHash": "sha256-+UdzB24Km9lzhOj2hSWqGbekYLg+KFzLQ6XRJRdlH3g=",
+      "archiveSha256": "sha256:38483617d6d50e0b4bca49243befd8a5e581755c123d88c8b93f65dd202e5209",
+      "narHash": "sha256-exv2jdzDwUDO2UvR+n6T+FXmW/oryu5IXlzH8oAeNkQ=",
       "platform": "darwin/universal",
       "type": "nix"
     },
@@ -29,18 +29,18 @@
       "type": "oci"
     },
     "eidola-server": {
-      "digest": "sha256:e26a4724df1d81f9fbe6fae0a744fa8b8539543f0006aef6cf59241276fd508a",
+      "digest": "sha256:dd11534dcd967638fc2facca17c833ad30ee4e6fcc298b8b8109cdfe71f4a7df",
       "platform": "linux/amd64",
       "type": "oci"
     }
   },
   "enclave": {
-    "cvm_version": "0.15.3-rc.1@sha256:ddd2e76a629df1bd4ec507441a387ac5db010ebc1bda3e372756e095df8692eb",
-    "igvm_sha256": "8fe54c46ceb111b7cc41f12f60bd479211870c7bc5186c8566d71f286ad0d5ac",
+    "cvm_version": "0.15.4-rc.2@sha256:689c945f62d8f8507d5051dfdc97abc019e7ea5c9cc153557fe8b6850db45dc2",
+    "igvm_sha256": "112501c5b3fa891cf05c96841903b000bd012bfa13cdc780692ce8f625470216",
     "sev_snp": {
       "guest_policy": "0x30133",
-      "host_data": "dc125f21a5d1d73b5621890fde1cf183eb6cccf5cf6f5a762846cdba15cbd5bb",
-      "measurement": "d712705df47368b82a283ba74501c5cf807f5a099c67906a5e1d861037514b9efe382024d4eb6245bb8c9877c7fe6858"
+      "host_data": "aa718d5425d9269e1186399efd67385bc0a7d083152569d331297e60a987c278",
+      "measurement": "cea56f9f4f8440ae96e6e6528a7571f4179a062e7a0919b1021c98dd3bc9f44eeeda321568407130745f80057533c015"
     }
   },
   "schema_version": 2
