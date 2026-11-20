@@ -831,7 +831,7 @@ jobs:
         # fails it with "data object length 94456 exceeds maximum (65535)".
         # Move the pin only with a macOS build of `.#eidola-cli-macos-universal`
         # under the sandbox.
-        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
         with:
           install_url: https://releases.nixos.org/nix/nix-2.32.4/install
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
@@ -964,7 +964,7 @@ jobs:
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
-        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           extra_nix_config: |
@@ -1061,7 +1061,7 @@ jobs:
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
-        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           extra_nix_config: |
