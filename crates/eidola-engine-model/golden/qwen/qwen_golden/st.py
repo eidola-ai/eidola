@@ -54,8 +54,9 @@ def read_header(path: Path) -> tuple[dict, int]:
 def read_file(path: Path) -> dict[str, Entry]:
     """Every tensor of one file, backed by a read-only memory map."""
     header, base = read_header(path)
-    f = open(path, "rb")
-    view = memoryview(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ))
+    # The map outlives the file handle, and every Entry is a view of the map.
+    with open(path, "rb") as f:
+        view = memoryview(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ))
     out = {}
     for name, meta in header.items():
         if name == "__metadata__":
