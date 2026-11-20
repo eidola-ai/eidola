@@ -38,17 +38,9 @@ const DELTA_CRL_INDICATOR_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("
 const ISSUING_DISTRIBUTION_POINT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.28");
 const CERTIFICATE_ISSUER_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.29");
 
-/// Verify a document-carried, AMD-authenticated CRL and reject any listed
-/// chain serial.
-pub(crate) fn check_revocation(
-    crl_der: &[u8],
-    ark: &Certificate,
-    serials: &[&[u8]],
-) -> Result<(), Error> {
-    check_revocation_at(crl_der, ark, serials, unix_now()?)
-}
-
-fn check_revocation_at(
+/// Verify a document-carried, AMD-authenticated CRL at `now` (Unix seconds)
+/// and reject any listed chain serial.
+pub(crate) fn check_revocation_at(
     crl_der: &[u8],
     ark: &Certificate,
     serials: &[&[u8]],

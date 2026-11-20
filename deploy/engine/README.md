@@ -16,12 +16,12 @@ Every deployment committed here must be pinned in `releases/trust/engine-enclave
 
 ## The image: platform release manifests
 
-A pin's MRTD is the measurement of the platform image its config's `cvm-version` names. The release manifest that `cvm-version` pins by hash is vendored verbatim at `releases/trust/cvm-releases/v<tag>/tinfoil-inference-v<version>-manifest.json`, where `<version>` is the config's (`0.15.3-rc.1+gpu`) and `<tag>` the release it belongs to (`0.15.3-rc.1`). Every gateway build requires the manifest to be there, to hash to the config's pin, to describe that release, to state a launch with no measured boot (format 1, zero RTMRs), and to state exactly the pin's MRTD; anything else fails the build, naming the deployment. `measure-engine-enclaves` reads the same file by the same rule and checks that the image it names measures to it, and the `main` branch's artifacts workflow reruns that measurement from the published image on every run.
+A pin's MRTD is the measurement of the platform image its config's `cvm-version` names. The release manifest that `cvm-version` pins by hash is vendored verbatim at `releases/trust/cvm-releases/v<tag>/tinfoil-inference-v<version>-manifest.json`, where `<version>` is the config's (`0.15.4-rc.2+gpu`) and `<tag>` the release it belongs to (`0.15.4-rc.2`). Every gateway build requires the manifest to be there, to hash to the config's pin, to describe that release, to state a launch with no measured boot (format 1, zero RTMRs), and to state exactly the pin's MRTD; anything else fails the build, naming the deployment. `measure-engine-enclaves` reads the same file by the same rule and checks that the image it names measures to it, and the `main` branch's artifacts workflow reruns that measurement from the published image on every run.
 
 Choosing a release for a deployment (a new `cvm-version`) therefore vendors its manifest. It is a release asset of `tinfoilsh/cvmimage`; download it into an empty directory and compare its hash with the pin before copying it in (the build compares it again):
 
 ```bash
-V=0.15.3-rc.1 F="tinfoil-inference-v$V+gpu-manifest.json"
+V=0.15.4-rc.2 F="tinfoil-inference-v$V+gpu-manifest.json"
 curl -sfL -A curl/8 -o "$F" "https://github.com/tinfoilsh/cvmimage/releases/download/v$V/tinfoil-inference-v$V%2Bgpu-manifest.json"
 shasum -a 256 "$F"   # must equal the @sha256: in cvm-version
 mkdir -p releases/trust/cvm-releases/v$V && cp "$F" releases/trust/cvm-releases/v$V/

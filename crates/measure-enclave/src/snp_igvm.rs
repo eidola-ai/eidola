@@ -792,6 +792,18 @@ mod tests {
             "605c0b29196443fe02c3fc9b6c0bf4efda8948dc93d32a1bbcb25da1f969eda6\
              ddbdd08d9e5358c9a9bf57f2b0c0ab98",
         ),
+        (
+            "tinfoil-snp-v0.15.4-rc.2.igvm",
+            "112501c5b3fa891cf05c96841903b000bd012bfa13cdc780692ce8f625470216",
+            "cea56f9f4f8440ae96e6e6528a7571f4179a062e7a0919b1021c98dd3bc9f44e\
+             eeda321568407130745f80057533c015",
+        ),
+        (
+            "tinfoil-snp-v0.15.4-rc.2+gpu.igvm",
+            "c29b3fa99cea7d6fa03a6e757a371363b31a5487bb23059189d9c1f5a5699a6b",
+            "49ed764e8e395b236936837fe5244553806d552afb74f75ccee145d42aa7f2f0\
+             0b87d336e7bd0dd036afd854abc35df0",
+        ),
     ];
 
     /// Known answers against published releases: set `SNP_IGVM_DIR` to a

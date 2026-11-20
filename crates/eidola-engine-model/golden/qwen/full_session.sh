@@ -25,7 +25,7 @@
 #   OUT           results                                           (default $WORK/out)
 #   DEVICE        cpu or cuda                                       (default cpu)
 #   TORCH_INDEX   PyTorch wheel index for this machine's CUDA        (default .../whl/cu130)
-#   TORCH_VERSION                                                    (default 2.10.0)
+#   TORCH_VERSION                                                    (default 2.13.0, the CPU lock's)
 #   DRY_RUN       1 prints the commands and runs none
 set -euo pipefail
 
@@ -36,7 +36,7 @@ CKPT="${CKPT:-$WORK/checkpoint}"
 OUT="${OUT:-$WORK/out}"
 DEVICE="${DEVICE:-cpu}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
-TORCH_VERSION="${TORCH_VERSION:-2.10.0}"
+TORCH_VERSION="${TORCH_VERSION:-2.13.0}"
 DRY_RUN="${DRY_RUN:-0}"
 GPU_PY="$WORK/venv-gpu/bin/python"
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"

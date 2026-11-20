@@ -3,14 +3,14 @@
     "2a94a85c36b9d4d29ef733142091f88853fcce4d9f3ca4a1725dbfabab7f1dec": [
       {
         "config": "deploy/engine/mimo-v2.6-flash/b300x1/tinfoil-config.yml",
-        "config_sha256": "8652022bf241b7fbdd4885b5584e0da3c00597969b7b13b0ea288d0cd4711b59",
-        "cvm_version": "0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f",
+        "config_sha256": "fde1d9f96fa9f20e8cf375e9315719b9c21018e164aa010faaa10178a55570dd",
+        "cvm_version": "0.15.4-rc.2+gpu@sha256:de67844398b970d5bbddd9ab42f7cded933b49d268ca0b7f8e86861b2e1f2094",
         "pin": {
           "expected_gpus": 1,
           "platform": {
             "tdx": {
-              "mrconfigid": "8652022bf241b7fbdd4885b5584e0da3c00597969b7b13b0ea288d0cd4711b5900000000000000000000000000000000",
-              "mrtd": "bf582997bf2145f275db3bc2542d703fdd889c85927b3ee199138298f863631711f41b37d8d347d5aee18036ff02c16c",
+              "mrconfigid": "fde1d9f96fa9f20e8cf375e9315719b9c21018e164aa010faaa10178a55570dd00000000000000000000000000000000",
+              "mrtd": "5d4ccd0da195adf465c058a101a9c1330550a6b0bb18461a4dd3d124bfcb07326a7217bb2957f07c9b0f3641eb784de5",
               "policy": {
                 "cached_keys": "true",
                 "dynamic_platform": "true",
@@ -45,14 +45,14 @@
     "4fc667ee21b46b0f7127370ea42c8766988e62433a7737b7eb434f77b93035e1": [
       {
         "config": "deploy/engine/qwen3.8-27b/b200x1/tinfoil-config.yml",
-        "config_sha256": "aafaf52cb2a5bc01c850c60ee356b080b9c738d9692c2642a9344466c140b036",
-        "cvm_version": "0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f",
+        "config_sha256": "0b9e5ffacc58ce6464cbd3d38429409f03dbcbaff377ad113a24e637402d927b",
+        "cvm_version": "0.15.4-rc.2+gpu@sha256:de67844398b970d5bbddd9ab42f7cded933b49d268ca0b7f8e86861b2e1f2094",
         "pin": {
           "expected_gpus": 1,
           "platform": {
             "tdx": {
-              "mrconfigid": "aafaf52cb2a5bc01c850c60ee356b080b9c738d9692c2642a9344466c140b03600000000000000000000000000000000",
-              "mrtd": "bf582997bf2145f275db3bc2542d703fdd889c85927b3ee199138298f863631711f41b37d8d347d5aee18036ff02c16c",
+              "mrconfigid": "0b9e5ffacc58ce6464cbd3d38429409f03dbcbaff377ad113a24e637402d927b00000000000000000000000000000000",
+              "mrtd": "5d4ccd0da195adf465c058a101a9c1330550a6b0bb18461a4dd3d124bfcb07326a7217bb2957f07c9b0f3641eb784de5",
               "policy": {
                 "cached_keys": "true",
                 "dynamic_platform": "true",

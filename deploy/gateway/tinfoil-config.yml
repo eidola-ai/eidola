@@ -27,11 +27,11 @@
 # After building, run `just update-manifest` to stamp in the current digests
 # and recompute the enclave record.
 
-# Platform release 0.15.3-rc.1 was rebuilt from source on 2026-11-11 and every
+# Platform release 0.15.4-rc.2 was rebuilt from source on 2026-11-20 and every
 # published file was byte-identical (docs/contributing/
 # rebuilding-platform-images.md). Rebuild again, and update this note, when
 # the version below changes.
-cvm-version: 0.15.3-rc.1@sha256:ddd2e76a629df1bd4ec507441a387ac5db010ebc1bda3e372756e095df8692eb
+cvm-version: 0.15.4-rc.2@sha256:689c945f62d8f8507d5051dfdc97abc019e7ea5c9cc153557fe8b6850db45dc2
 cpus: 2
 memory: 8192
 

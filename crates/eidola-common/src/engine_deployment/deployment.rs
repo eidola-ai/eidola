@@ -1146,7 +1146,7 @@ shim:
         assert_eq!(d.architecture, Architecture::MimoV26Flash);
         assert_eq!(
             d.cvm_version,
-            "0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f"
+            "0.15.4-rc.2+gpu@sha256:de67844398b970d5bbddd9ab42f7cded933b49d268ca0b7f8e86861b2e1f2094"
         );
         assert_eq!(d.env.prefix(), "ENGINE_");
         let m = &d.measured;

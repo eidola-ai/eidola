@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use crate::apple_verify;
@@ -343,7 +342,7 @@ pub fn run(args: Args) -> Result<()> {
         eprintln!();
     }
 
-    let attested_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let attested_at = rfc3339_seconds_utc(time::OffsetDateTime::now_utc())?;
 
     // Build the bare attestation skeleton. We splice in attestant_statement
     // + claims after the engineer affirms them.
@@ -838,8 +837,26 @@ fn asset_url(assets: &[GhAsset], name: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("expected asset `{name}` not found on release"))
 }
 
+/// `t` in UTC as RFC 3339 to whole seconds, with a `Z` offset
+/// (`2026-11-20T09:41:07Z`): the form `attested_at` is written in.
+fn rfc3339_seconds_utc(t: time::OffsetDateTime) -> Result<String> {
+    let t = t.to_offset(time::UtcOffset::UTC).replace_nanosecond(0)?;
+    Ok(t.format(&time::format_description::well_known::Rfc3339)?)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attested_at_is_rfc3339_whole_seconds_in_utc() {
+        let t = time::OffsetDateTime::from_unix_timestamp_nanos(1_795_000_000_123_456_789)
+            .unwrap()
+            .to_offset(time::UtcOffset::from_hms(-8, 0, 0).unwrap());
+        assert_eq!(
+            super::rfc3339_seconds_utc(t).unwrap(),
+            "2026-11-18T11:06:40Z"
+        );
+    }
+
     use super::*;
 
     #[test]

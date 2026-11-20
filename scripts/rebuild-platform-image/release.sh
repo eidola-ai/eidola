@@ -12,6 +12,6 @@ tools=$(nix-build --no-out-link -I . -E '
 export PATH="$tools/bin:$PATH"
 jq --version
 rm -rf /out/release
-bash image/release-igvm.sh v0.15.3-rc.1 /out/release result-shipping-image result-variants-gpu-shipping-image result-cvm-compiler/bin/cvmc
-cd /out/release && sha256sum -c /pub/tinfoil-inference-v0.15.3-rc.1-checksums.sha256
-cmp tinfoil-inference-v0.15.3-rc.1-checksums.sha256 /pub/tinfoil-inference-v0.15.3-rc.1-checksums.sha256 && echo "checksums file byte-identical"
+bash image/release-igvm.sh v0.15.4-rc.2 /out/release result-shipping-image result-variants-gpu-shipping-image result-cvm-compiler/bin/cvmc
+cd /out/release && sha256sum -c /pub/tinfoil-inference-v0.15.4-rc.2-checksums.sha256
+cmp tinfoil-inference-v0.15.4-rc.2-checksums.sha256 /pub/tinfoil-inference-v0.15.4-rc.2-checksums.sha256 && echo "checksums file byte-identical"
