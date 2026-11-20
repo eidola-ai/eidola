@@ -23,7 +23,12 @@
 # what one B200 holds beside the weights and the CUDA executor's reserve, the
 # state pool growing with the seats (eidola-common's
 # `qwen_fits_one_b200_at_its_whole_context`).
-cvm-version: 0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f
+#
+# Platform release 0.15.4-rc.2+gpu was rebuilt from source on 2026-11-20 and every
+# published file was byte-identical (docs/contributing/
+# rebuilding-platform-images.md). Rebuild again, and update this note, when
+# the version below changes.
+cvm-version: 0.15.4-rc.2+gpu@sha256:de67844398b970d5bbddd9ab42f7cded933b49d268ca0b7f8e86861b2e1f2094
 cpus: 24
 memory: 196608
 gpus: 1
