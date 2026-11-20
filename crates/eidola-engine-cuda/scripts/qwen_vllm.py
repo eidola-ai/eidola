@@ -34,7 +34,8 @@ NAME = "eidola-qwen-vllm"
 BASE = "http://127.0.0.1:8000"
 MTP = '{"method":"mtp","num_speculative_tokens":3}'
 # The workloads, shared with `examples/qwen_whole.rs`.
-WORKLOADS = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen_workloads.json")))
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen_workloads.json")) as workloads:
+    WORKLOADS = json.load(workloads)
 
 
 def requests_at(c):
@@ -98,7 +99,7 @@ def cmd_serve(ckpt, log, mtp):
                     print("serving")
                     return
         except OSError:
-            pass
+            pass  # not answering yet; try again
     subprocess.run(f"docker logs {NAME} > {log} 2>&1", shell=True)
     tail = subprocess.run(["tail", "-40", log], capture_output=True, text=True).stdout
     subprocess.run(["docker", "rm", "-f", NAME], capture_output=True)
@@ -193,7 +194,8 @@ def cmd_bench(out, mtp):
         rows.append(row("C", c, res, time.time() - t0, before, mtp))
         rows[-1]["conversations"] = len(convs)
         print(json.dumps(rows[-1]), flush=True)
-    json.dump(rows, open(out, "w"), indent=1)
+    with open(out, "w") as f:
+        json.dump(rows, f, indent=1)
 
 
 # Token tensors' element formats: the health check writes I32.
@@ -228,7 +230,8 @@ def cmd_generate(health, out):
                                      "ignore_eos": True, "return_token_ids": True})
         choice = r["choices"][0]
         res[name] = {"text": choice.get("text"), "token_ids": choice.get("token_ids")}
-    json.dump(res, open(out, "w"), indent=1)
+    with open(out, "w") as f:
+        json.dump(res, f, indent=1)
     print(json.dumps({k: (v["token_ids"] or [])[:16] for k, v in res.items()}))
 
 

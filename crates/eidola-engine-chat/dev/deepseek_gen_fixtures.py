@@ -45,6 +45,7 @@ import gzip
 import hashlib
 import importlib.util
 import json
+import math
 import pathlib
 import random
 import shutil
@@ -798,7 +799,7 @@ def is_strict_json(text):
 
     def finite(value):
         if isinstance(value, float):
-            return value == value and abs(value) != float("inf")
+            return math.isfinite(value)
         if isinstance(value, list):
             return all(finite(v) for v in value)
         if isinstance(value, dict):

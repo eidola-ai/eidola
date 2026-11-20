@@ -1,35 +1,35 @@
 {
   "artifacts": {
     "eidola-cli": {
-      "digest": "sha256:6d6c4236a48c98a76460d0c1bd9ee56af7e4f57f6db2ba4674f3e498a8ecee04",
+      "digest": "sha256:087301406593b7c8524e71ea556aa70e56a3563945b2b5f1d340b0450c3f8bb6",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "archiveSha256": "sha256:78e5689a5142bde74d8462614da345e3d28319da88d5d150b9fd465e52695159",
-      "narHash": "sha256-jMD0yI1Pprc2VQR56BcgdP5KcLYEmy/X4GX97Au7w0g=",
+      "archiveSha256": "sha256:2a0c6565de940a4021a7e25904557f96607ad561936cf9c415009e2b5b00418e",
+      "narHash": "sha256-e8DXIssTLvjW0G0xL0fpaqNCfNYn16E9hjWYpFH2EJ4=",
       "platform": "darwin/universal",
       "type": "nix"
     },
     "eidola-gui-linux-amd64": {
-      "archiveSha256": "sha256:1d847118371d7af9cb53da2720dff3f91ae800df0fcd04f661629116c02f3419",
-      "narHash": "sha256-RaARqRadTwSKMGjbCHlsdb3i58kEF1tU4G40L/4hTr0=",
+      "archiveSha256": "sha256:6db77aa76a295e5d9e6a5bd60c3f1bf3b79d216ee8917164a7e20426d2ae2254",
+      "narHash": "sha256-pLkaLe0sOS8U265ztOzQjSLiXtXwt8rldJMLIt/EMQk=",
       "platform": "linux/amd64",
       "type": "nix"
     },
     "eidola-gui-macos-universal": {
-      "archiveSha256": "sha256:644027e58b8b1515a45ae8cb9629e85f8475917bc17f75f29ad6d4028469b4e3",
-      "narHash": "sha256-V8MsLgSFBadj0VdOMXmxofELPa1Tn5mfEWaxu0KvSDc=",
+      "archiveSha256": "sha256:67b383320b6a0ca0077192812e3eeee14d47f144462b342ba02fcd878d3a20d7",
+      "narHash": "sha256-+UdzB24Km9lzhOj2hSWqGbekYLg+KFzLQ6XRJRdlH3g=",
       "platform": "darwin/universal",
       "type": "nix"
     },
     "eidola-postgres": {
-      "digest": "sha256:f1fc8fc87f534e8f2462d58fb303bfc41b8e42d92109f7088d96612a6441afa4",
+      "digest": "sha256:e2b9ada82120680d6de504e83573f8f88f82a8594ba8ae5c6f5b762bc9cf6ba5",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-server": {
-      "digest": "sha256:872b93f17a7e4c0e5673278c324c48a86d0fa797d974cb3bf125f459e1cd1145",
+      "digest": "sha256:e26a4724df1d81f9fbe6fae0a744fa8b8539543f0006aef6cf59241276fd508a",
       "platform": "linux/amd64",
       "type": "oci"
     }
@@ -39,7 +39,7 @@
     "igvm_sha256": "8fe54c46ceb111b7cc41f12f60bd479211870c7bc5186c8566d71f286ad0d5ac",
     "sev_snp": {
       "guest_policy": "0x30133",
-      "host_data": "009180bb9482544f0dbbe1da624ff5ea077acdd7d10c31e0b58a91d4f5f60655",
+      "host_data": "dc125f21a5d1d73b5621890fde1cf183eb6cccf5cf6f5a762846cdba15cbd5bb",
       "measurement": "d712705df47368b82a283ba74501c5cf807f5a099c67906a5e1d861037514b9efe382024d4eb6245bb8c9877c7fe6858"
     }
   },
