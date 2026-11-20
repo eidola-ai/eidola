@@ -1,0 +1,65 @@
+# Tinfoil Container configuration for eidola-server-gateway.
+#
+# The SHA-256 of this file is the HOST_DATA of every SEV-SNP report the
+# enclave produces: the host passes it at launch, and the guest refuses to
+# boot unless it hashes the config it was given to that value. Clients pin
+# it beside the launch digest of the release image `cvm-version` names, so
+# any change here — image digest, a variable, the secrets' names, resource
+# allocation — is a different server identity.
+#
+# What this file says is what a client can hold the gateway to without
+# trusting the operator: the code it runs and how that code is set up.
+# Everything that only says which of the operator's services the gateway
+# uses (the database, Stripe, telemetry, the website its legal documents
+# are published on), and the key that encrypts issuer keys at rest, is a
+# secret: named here, its value supplied at deployment and never committed.
+# Those services are trusted as their operator is, whatever they are
+# configured with, so no value of theirs is measured, and one release can
+# be deployed against another set of them, a staging one, unchanged.
+# Secrets are organisation-scoped and reach a container by their own names,
+# so each component's carry its prefix: `EIDOLA_ENV_PREFIX` names it, and the
+# gateway reads every variable under it.
+#
+# `cvm-version` pins the platform release manifest inline; that manifest
+# names the SEV-SNP IGVM image, whose launch digest measure-enclave
+# recomputes. The image digest below must match artifact-manifest.json (the
+# gateway image is recorded there under its artifact key, `eidola-server`).
+# After building, run `just update-manifest` to stamp in the current digests
+# and recompute the enclave record.
+
+# Platform release 0.15.3-rc.1 was rebuilt from source on 2026-11-11 and every
+# published file was byte-identical (docs/contributing/
+# rebuilding-platform-images.md). Rebuild again, and update this note, when
+# the version below changes.
+cvm-version: 0.15.3-rc.1@sha256:ddd2e76a629df1bd4ec507441a387ac5db010ebc1bda3e372756e095df8692eb
+cpus: 2
+memory: 8192
+
+# A container attached to no network has none: the gateway reaches its
+# database, Stripe, its telemetry endpoint and the engine nodes (whose
+# placement is operator data, not known here) over this one.
+networks:
+  egress:
+    egress: open
+
+containers:
+  - name: "eidola-server-gateway"
+    image: "ghcr.io/eidola-ai/eidola-server-gateway@sha256:e26a4724df1d81f9fbe6fae0a744fa8b8539543f0006aef6cf59241276fd508a"
+    networks:
+      - egress
+    secrets:
+      - GATEWAY_CREDENTIAL_MASTER_KEY
+      - GATEWAY_DATABASE_URL
+      - GATEWAY_ENGINE_TOKEN
+      - GATEWAY_OTEL_EXPORTER_OTLP_ENDPOINT
+      - GATEWAY_OTEL_EXPORTER_OTLP_HEADERS
+      - GATEWAY_STRIPE_API_KEY
+      - GATEWAY_TERMS_FEED_BASE_URL
+    env:
+      - EIDOLA_ENV_PREFIX: "GATEWAY_"
+      - GATEWAY_BIND_ADDR: "0.0.0.0:8080"
+
+shim:
+  upstream-port: 8080
+  paths:
+    - /*

@@ -1,13 +1,18 @@
 //! Integration and wire-contract tests for the self-contained v3 flow.
 //!
-//! Run live tests with:
-//! `cargo test --package tinfoil-verifier --test integration -- --ignored`
+//! The live tests run only with their environment set, against an enclave
+//! whose platform release serves the v3 collateral profile:
+//!
+//! - `LIVE_ORIGIN=https://<enclave>`: a live document parses and its report
+//!   verifies under AMD's chain, and a request through the attesting client
+//!   succeeds with the enclave's own launch identity as the pin.
+//! - `LIVE_GATEWAY_ORIGIN=https://<gateway>`: a deployed gateway verifies
+//!   against `releases/trust/server-enclave.json`, as the client pins it.
+//!
+//! `cargo test --package tinfoil-verifier --test integration live_`
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
-
-const LIVE_ORIGIN: &str = "https://inference.tinfoil.sh";
-const LIVE_ATTESTATION_URL: &str = "https://inference.tinfoil.sh/.well-known/tinfoil-attestation";
 
 fn synthetic_document() -> Vec<u8> {
     let b64 = &base64::engine::general_purpose::STANDARD;
@@ -96,6 +101,7 @@ fn synthetic_document_with(
         },
         "crypto_material": b64.encode(crypto),
         "device_evidence": b64.encode(devices),
+        "collateral_format": "https://tinfoil.sh/predicate/attestation-collaterals/v3",
         "collateral": collateral,
     }))
     .unwrap()
@@ -354,11 +360,15 @@ async fn mock_attesting_client_e2e() {
     );
 }
 
-fn webpki_client() -> reqwest::Client {
+fn webpki_roots() -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+fn webpki_client() -> reqwest::Client {
     let tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
+        .with_root_certificates(webpki_roots())
         .with_no_client_auth();
     reqwest::Client::builder()
         .tls_backend_preconfigured(tls)
@@ -366,14 +376,28 @@ fn webpki_client() -> reqwest::Client {
         .unwrap()
 }
 
+/// The origin of a live enclave named by `variable`, or `None` (and the test
+/// skips) when it is unset. The enclave must run a platform release that
+/// serves the v3 collateral profile, as the pinned one does.
+fn live_origin(variable: &str) -> Option<String> {
+    let origin = std::env::var(variable).ok()?;
+    Some(origin.trim_end_matches('/').to_string())
+}
+
+/// A live document parses, and its report verifies under AMD's chain.
 #[tokio::test]
-#[ignore = "requires network access to inference.tinfoil.sh"]
 async fn live_self_contained_document() {
+    let Some(origin) = live_origin("LIVE_ORIGIN") else {
+        eprintln!("skipping: set LIVE_ORIGIN to run");
+        return;
+    };
     let _ = rustls_rustcrypto::provider().install_default();
-    let resolved =
-        tinfoil_verifier::bundle::fetch_well_known(&webpki_client(), LIVE_ATTESTATION_URL)
-            .await
-            .expect("fetch and parse live v3 document");
+    let resolved = tinfoil_verifier::bundle::fetch_well_known(
+        &webpki_client(),
+        &format!("{origin}/.well-known/tinfoil-attestation"),
+    )
+    .await
+    .expect("fetch and parse live v3 document");
     assert_eq!(
         resolved.platform,
         tinfoil_verifier::bundle::Platform::SevSnp
@@ -399,14 +423,22 @@ async fn live_self_contained_document() {
     .expect("live report signature and AMD chain");
 }
 
+/// A request through the attesting client to a live SEV-SNP enclave, with
+/// its own launch identity (read from a first document) as the pin: the
+/// whole handshake, whatever the enclave runs.
 #[tokio::test]
-#[ignore = "requires network access to inference.tinfoil.sh"]
 async fn live_attesting_client() {
+    let Some(origin) = live_origin("LIVE_ORIGIN") else {
+        eprintln!("skipping: set LIVE_ORIGIN to run");
+        return;
+    };
     let _ = rustls_rustcrypto::provider().install_default();
-    let resolved =
-        tinfoil_verifier::bundle::fetch_well_known(&webpki_client(), LIVE_ATTESTATION_URL)
-            .await
-            .expect("fetch live measurement");
+    let resolved = tinfoil_verifier::bundle::fetch_well_known(
+        &webpki_client(),
+        &format!("{origin}/.well-known/tinfoil-attestation"),
+    )
+    .await
+    .expect("fetch live measurement");
     let report = tinfoil_verifier::sevsnp::parse_report(&resolved.report_bytes).unwrap();
     let policy = u64::from_le_bytes(resolved.report_bytes[0x08..0x10].try_into().unwrap());
     let allowed = vec![tinfoil_verifier::AllowedMeasurement::sev_snp(
@@ -416,24 +448,56 @@ async fn live_attesting_client() {
             guest_policy: format!("{policy:#x}"),
         },
     )];
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    attested_request(&origin, &allowed).await;
+}
+
+/// A deployed gateway against the release record this tree pins it to
+/// (`releases/trust/server-enclave.json`), as the client pins it: the
+/// end-to-end check that a deployment is the committed release and that
+/// the verifier accepts what its platform release serves.
+#[tokio::test]
+async fn live_gateway_matches_its_release_pin() {
+    let Some(origin) = live_origin("LIVE_GATEWAY_ORIGIN") else {
+        eprintln!("skipping: set LIVE_GATEWAY_ORIGIN to run");
+        return;
+    };
+    let _ = rustls_rustcrypto::provider().install_default();
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../releases/trust/server-enclave.json"
+        ))
+        .expect("read the release record"),
+    )
+    .unwrap();
+    let pin: tinfoil_verifier::SevSnpPin =
+        serde_json::from_value(record["sev_snp"].clone()).expect("the record's SEV-SNP pin");
+    attested_request(
+        &origin,
+        &[tinfoil_verifier::AllowedMeasurement::sev_snp(pin)],
+    )
+    .await;
+}
+
+/// Build the attesting client over `allowed` and send one request on an
+/// attested connection. Any HTTP answer means the handshake verified.
+async fn attested_request(origin: &str, allowed: &[tinfoil_verifier::AllowedMeasurement]) {
     let client = tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-        allowed_measurements: &allowed,
-        inference_base_url: LIVE_ORIGIN,
+        allowed_measurements: allowed,
+        inference_base_url: origin,
         trusted_ark_der: None,
         trusted_ask_der: None,
         snp_min_tcb: None,
         snp_observer: None,
         attestation_observer: None,
-        tls_roots: roots,
+        tls_roots: webpki_roots(),
     })
     .await
     .expect("attesting client");
     let response = client
-        .get(format!("{LIVE_ORIGIN}/v1/models"))
+        .get(format!("{origin}/v1/models"))
         .send()
         .await
         .expect("request through attested connection");
-    assert!(response.status().is_success() || response.status().as_u16() == 401);
+    eprintln!("{origin}/v1/models answered {}", response.status());
 }

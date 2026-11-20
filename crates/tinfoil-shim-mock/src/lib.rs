@@ -276,6 +276,10 @@ impl FreshBuilder {
             },
             "crypto_material": b64.encode(crypto_material),
             "device_evidence": b64.encode(device_evidence),
+            // The collateral profile the pinned platform release serves. The
+            // mock carries only the CPU endorsements, not the release's
+            // reference values, which the verifier does not consult.
+            "collateral_format": "https://tinfoil.sh/predicate/attestation-collaterals/v3",
             "collateral": [
                 {
                     "id": "cpu-endorsement",
