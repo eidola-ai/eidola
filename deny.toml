@@ -90,45 +90,26 @@ ignore = [
     #"a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
 
-    # rsa: Marvin timing side channel, no fixed release exists. Every use of
-    # the crate in this graph is signature *verification* (public-key
-    # operations) — rustls-rustcrypto TLS signatures and sev ARK→ASK / CRL
-    # verification — while the side channel requires observing RSA
-    # private-key operations, which no Eidola binary performs via this crate.
-    { id = "RUSTSEC-2023-0071", reason = "rsa is verification-only in this graph; Marvin requires RSA private-key operations, and no fixed release exists" },
-
-    # rustls-webpki 0.102.8 (the five IDs below): resolved only because
-    # rustls-rustcrypto 0.0.2-alpha pins ^0.102, and that crate imports
-    # nothing from it but the `alg_id` DER constants (its src/verify/*.rs) —
-    # webpki's chain-building, CRL, and name-constraint code, where these
-    # advisories live (RUSTSEC-2026-0382 is path building accepting the
-    # distrusted emSign intermediates), is never invoked from the 0.102.8
-    # copy. All real WebPKI verification — the clients' OS-root chains and
-    # the gateway's and billing's webpki-roots chains — runs on rustls's own
-    # rustls-webpki 0.103.17, which is patched against all five. These are
-    # ignored by ID, so they would also hide a 0.103 regression: the lockfile
-    # is what keeps 0.103 at a patched release. Drop these when
-    # rustls-rustcrypto releases against webpki >=0.103.16.
-    { id = "RUSTSEC-2026-0049", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.17" },
-    { id = "RUSTSEC-2026-0098", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.17" },
-    { id = "RUSTSEC-2026-0099", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.17" },
-    { id = "RUSTSEC-2026-0104", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.17" },
-    { id = "RUSTSEC-2026-0382", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto) and never builds a path; all path building runs on patched 0.103.17" },
+    # rsa 0.9: Marvin timing side channel, fixed only in the 0.10 line, which
+    # the TLS provider (rustls-rustcrypto) uses. 0.9 is still reached through
+    # `sev` (whose newest release still requires it) and the crates that
+    # share its types: sev ARK→ASK and tinfoil-verifier's CRL verification,
+    # both signature *verification* (public-key operations), while the side
+    # channel requires observing RSA private-key operations, which no Eidola
+    # binary performs via 0.9. Drop this when `sev` moves to rsa 0.10.
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 is verification-only in this graph (sev and its CRL check); Marvin requires RSA private-key operations; the TLS provider is on the fixed 0.10" },
 
     # crypto-bigint 0.5.5: secret-dependent branches in arithmetic meant to
     # be constant-time; fixed only in the 0.7 line (>=0.7.6, locked at a
     # patched 0.7 release), with no 0.5 release. 0.5.5 is reached through
-    # elliptic-curve 0.13 (p256/p384 0.13, ecdsa 0.16), which ships in the
-    # clients, the gateway and the billing CLI. Every app-core, sev and
-    # tinfoil-verifier use of those curves is signature verification, on
-    # public values. The one secret-scalar use in a shipped binary is
-    # rustls-rustcrypto's P-256/P-384 ECDHE in TLS client handshakes:
-    # ephemeral, single-use scalars, and only when the peer declines the
-    # preferred X25519 (curve25519-dalek, not crypto-bigint). ECDSA signing
-    # with these curves happens only in tinfoil-shim-mock, a dev tool. Drop
-    # this when rustls-rustcrypto, sev and app-core's p256/p384 move to
-    # elliptic-curve 0.14.
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 (no 0.5 fix) secret use in shipped binaries is only ephemeral P-256/P-384 ECDHE when X25519 is declined; the 0.7 copy is patched" },
+    # elliptic-curve 0.13 (p256/p384 0.13, ecdsa 0.16): `sev`, and app-core's
+    # and tinfoil-verifier's p256/p384, all of it signature verification on
+    # public values. The TLS provider's ECDHE runs on elliptic-curve 0.14
+    # (the patched 0.7 line), so no shipped binary puts a secret scalar
+    # through 0.5.5; ECDSA signing with these curves happens only in
+    # tinfoil-shim-mock, a dev tool. Drop this when sev and app-core's
+    # p256/p384 move to elliptic-curve 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 (no 0.5 fix) is verification-only in shipped binaries; TLS ECDHE runs on the patched 0.7 copy" },
 
     # unsafe-libyaml: unmaintained (archived upstream), no replacement
     # release. eidola-common reads its event stream directly, behind the
