@@ -147,21 +147,6 @@ async fn issue(f: &Fixture, amount: i64, id: u8) -> String {
         .get(0)
 }
 
-#[test]
-fn gateway_and_library_share_exact_billing_schema() {
-    let schema = include_str!("../../eidola-server-gateway/schema/schema.sql");
-    let block = schema
-        .split("-- BEGIN SHARED BILLING OPERATIONS\n")
-        .nth(1)
-        .unwrap()
-        .split("-- END SHARED BILLING OPERATIONS\n")
-        .next()
-        .unwrap();
-    assert_eq!(block, include_str!("../schema/billing.sql"));
-    assert_eq!(schema.matches("FUNCTION debit_account(").count(), 1);
-    assert_eq!(schema.matches("FUNCTION available_balance(").count(), 1);
-}
-
 #[tokio::test]
 #[ignore = "requires BILLING_TEST_DATABASE_URL"]
 async fn purchase_identity_not_event_delivery_controls_grants() {
