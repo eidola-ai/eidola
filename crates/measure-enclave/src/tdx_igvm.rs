@@ -611,6 +611,18 @@ pub(crate) mod tests {
             "bf582997bf2145f275db3bc2542d703fdd889c85927b3ee199138298f8636317\
              11f41b37d8d347d5aee18036ff02c16c",
         ),
+        (
+            "tinfoil-tdx-v0.15.4-rc.2.igvm",
+            "460aae05ee9d877d6a0a21e17520085fbb44e048d08dd905058081761362bfc5",
+            "e3d165d38d1504e0b34155bd9a55637bd01147c4b3f28af658a954b12440965d\
+             1414c80dc602fc0dd1ae7fc0ae21017d",
+        ),
+        (
+            "tinfoil-tdx-v0.15.4-rc.2+gpu.igvm",
+            "9286ab924473ed6cad59bd7e22dd7833adb93034bb0e8886c1318c66ba8a61f2",
+            "5d4ccd0da195adf465c058a101a9c1330550a6b0bb18461a4dd3d124bfcb0732\
+             6a7217bb2957f07c9b0f3641eb784de5",
+        ),
     ];
 
     /// Known answers against published releases: set `TDX_IGVM_DIR` to a

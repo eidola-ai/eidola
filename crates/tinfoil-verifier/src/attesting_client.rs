@@ -368,6 +368,18 @@ impl AttestationCheck {
         peer_spki: &[u8; 32],
         sent_nonce: &[u8; bundle::NONCE_LEN],
     ) -> Result<(), Error> {
+        self.verify_at(resolved, peer_spki, sent_nonce, sevsnp_crl::unix_now()?)
+    }
+
+    /// [`Self::verify`] with the vendor collateral's validity windows
+    /// checked at `now` (Unix seconds).
+    fn verify_at(
+        &self,
+        resolved: &bundle::ResolvedAttestation,
+        peer_spki: &[u8; 32],
+        sent_nonce: &[u8; bundle::NONCE_LEN],
+        now: u64,
+    ) -> Result<(), Error> {
         // These envelope checks are not authentication by themselves. The
         // platform path must prove the signed report carries the same
         // recomputed REPORT_DATA before the document is trusted.
@@ -389,11 +401,8 @@ impl AttestationCheck {
         }
 
         match resolved.platform {
-            Platform::SevSnp => self.verify_snp(resolved, peer_spki, &candidates),
-            Platform::Tdx => {
-                let now = sevsnp_crl::unix_now()?;
-                self.verify_tdx(resolved, peer_spki, &candidates, now)
-            }
+            Platform::SevSnp => self.verify_snp(resolved, peer_spki, &candidates, now),
+            Platform::Tdx => self.verify_tdx(resolved, peer_spki, &candidates, now),
         }
     }
 
@@ -443,11 +452,14 @@ impl AttestationCheck {
         Ok(())
     }
 
+    /// Authenticate an SEV-SNP report with the document's AMD collateral,
+    /// its CRL checked at `now`, then appraise it against the pinned entries.
     fn verify_snp(
         &self,
         resolved: &bundle::ResolvedAttestation,
         peer_spki: &[u8; 32],
         candidates: &[&CompiledPin],
+        now: u64,
     ) -> Result<(), Error> {
         let report = sevsnp::parse_report(&resolved.report_bytes)?;
 
@@ -511,7 +523,7 @@ impl AttestationCheck {
             .map_err(|e| Error::CertParse(format!("failed to parse ARK DER: {e}")))?;
         let vcek_serial = sevsnp::cert_serial_from_der(vcek_der)?;
         let ask_serial = sevsnp::cert_serial_from_der(carried_ask_der)?;
-        sevsnp_crl::check_revocation(crl_der, &ark_x509, &[&vcek_serial, &ask_serial])?;
+        sevsnp_crl::check_revocation_at(crl_der, &ark_x509, &[&vcek_serial, &ask_serial], now)?;
 
         // Apply the operator-configured TCB policy. The observer fires
         // *before* we propagate the policy result so consumers see the
@@ -526,6 +538,7 @@ impl AttestationCheck {
         let policy = sevsnp::raw_policy(&resolved.report_bytes)?;
         let (observed, matching) =
             appraise_snp_launch(candidates, &report.measurement, &report.host_data, policy)?;
+        check_carried_config(resolved, &report.host_data, &[])?;
         let pcr_digest = format!("{}:{}", observed.measurement, observed.host_data);
         let matched = MatchedMeasurement::SevSnp(observed);
 
@@ -619,6 +632,8 @@ impl AttestationCheck {
         first_passing(matching.clone(), |(_, tdx_pin)| {
             tdx::appraise(quote, tdx_pin)
         })?;
+        let (config_hash, tail) = quote.report.mr_config_id.split_at(32);
+        check_carried_config(resolved, config_hash, tail)?;
         self.verify_report_data_binding(resolved, &quote.report.report_data)?;
         // The device requirement is read only now that REPORT_DATA has
         // authenticated the device evidence section.
@@ -701,6 +716,31 @@ fn appraise_snp_launch<'a>(
         sevsnp::check_guest_policy(policy, snp.guest_policy)
     })?;
     Ok((observed, matching))
+}
+
+/// Hold the config bytes a `tinfoil-config` collateral entry carries, if it
+/// carries any, to the config hash of the authenticated report: SEV-SNP's
+/// HOST_DATA, or the first 32 bytes of TDX's MRCONFIGID with the rest
+/// (`tail`) zero. The entry is unauthenticated collateral, so this does not
+/// make its bytes trusted beyond that hash; it refuses a document whose
+/// carried config is not the one the launch was bound to.
+fn check_carried_config(
+    resolved: &bundle::ResolvedAttestation,
+    config_hash: &[u8],
+    tail: &[u8],
+) -> Result<(), Error> {
+    let Some(carried) = resolved.config_sha256 else {
+        return Ok(());
+    };
+    if carried[..] != *config_hash || tail.iter().any(|&b| b != 0) {
+        return Err(Error::Bundle(format!(
+            "tinfoil-config collateral hashes to {}, not the report's config hash {}{}",
+            hex::encode(carried),
+            hex::encode(config_hash),
+            hex::encode(tail),
+        )));
+    }
+    Ok(())
 }
 
 /// Apply a matched entry's device-evidence requirement. Only called after
@@ -958,6 +998,7 @@ mod tests {
             crl_der: None,
             intel_pcs: Some(fixture_responses()),
             device_evidence: vec![],
+            config_sha256: None,
         }
     }
 
@@ -1007,6 +1048,7 @@ mod tests {
             },
             "crypto_material": "",
             "device_evidence": "",
+            "collateral_format": bundle::COLLATERAL_V3_FORMAT,
             "collateral": [],
         }))
         .unwrap();
@@ -1109,6 +1151,201 @@ mod tests {
         overridden.trusted_ask_der = Some(genoa.1.clone());
         past_the_chain(verify(&overridden, &turin_report, &genoa));
         at_the_chain(verify(&overridden, &turin_report, &turin));
+    }
+
+    /// The gateway's attestation document as a deployment of it served it
+    /// (`tests/fixtures/tinfoil-gateway/`, provenance in its README).
+    const GATEWAY_DOCUMENT: &[u8] =
+        include_bytes!("../tests/fixtures/tinfoil-gateway/document.json");
+
+    /// What was recorded beside the document when it was captured: the
+    /// platform release it was served under, the nonce it was asked for, the
+    /// time (inside the validity window of the AMD CRL it carries), and the
+    /// launch identity it was served with. The fixture is pinned to this
+    /// record, never to the tree's current release pin, so bumping the
+    /// gateway's release or config moves no fixture.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GatewayCapture {
+        release: String,
+        release_manifest_sha256: String,
+        nonce: String,
+        captured_at: u64,
+        sev_snp: crate::SevSnpPin,
+    }
+
+    fn gateway_capture() -> GatewayCapture {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/tinfoil-gateway/expected.json"
+        ))
+        .unwrap()
+    }
+
+    fn gateway_pin() -> crate::SevSnpPin {
+        gateway_capture().sev_snp
+    }
+
+    /// The recorded launch identity is the one the recorded release states
+    /// and the one the recorded config hashes to, all from bytes in the
+    /// fixture, and the release is one this tree measured: the runtime
+    /// entry of the document carries the release manifest, which must be
+    /// the recorded release, hash to the recorded manifest pin, and state
+    /// the recorded launch digest; and the recorded release is one
+    /// `docs/contributing/rebuilding-platform-images.md` records rebuilding.
+    #[test]
+    fn the_gateway_capture_record_is_the_release_it_names() {
+        use base64::Engine as _;
+        let capture = gateway_capture();
+        let doc: serde_json::Value = serde_json::from_slice(GATEWAY_DOCUMENT).unwrap();
+        let runtime = doc["collateral"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "runtime")
+            .expect("a runtime entry");
+        assert_eq!(runtime["data"]["tag"], capture.release.as_str());
+        assert_eq!(
+            runtime["data"]["digest"],
+            capture.release_manifest_sha256.as_str()
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(runtime["data"]["manifest_base64"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["version"], capture.release.as_str());
+        assert_eq!(
+            manifest["igvm"]["snp_launch"]["measurement"],
+            capture.sev_snp.measurement.as_str()
+        );
+        assert_eq!(
+            capture.sev_snp.host_data,
+            crate::SevSnpPin::host_data_for_config(include_bytes!(
+                "../tests/fixtures/tinfoil-gateway/tinfoil-config.yml"
+            ))
+        );
+        assert_eq!(doc["challenge"]["nonce"], capture.nonce.as_str());
+        // The rebuild record's table of rebuilt releases has a row per
+        // release: `| <release> | <date> | <CPU manifest SHA-256> | …`.
+        let rebuilds = include_str!("../../../docs/contributing/rebuilding-platform-images.md");
+        let row = rebuilds
+            .lines()
+            .find(|line| line.starts_with(&format!("| {} |", capture.release)))
+            .unwrap_or_else(|| panic!("{} is not a rebuilt release", capture.release));
+        assert!(
+            row.contains(&format!("`{}`", capture.release_manifest_sha256)),
+            "{row}"
+        );
+    }
+
+    /// The SPKI hash of the TLS certificate the deployment presented.
+    fn gateway_peer_spki() -> [u8; 32] {
+        let leaf = pem::parse(include_str!(
+            "../tests/fixtures/tinfoil-gateway/tls-leaf.pem"
+        ))
+        .unwrap();
+        sevsnp::sha256_spki_from_der(leaf.contents()).unwrap()
+    }
+
+    fn gateway_nonce() -> [u8; 32] {
+        hex::decode(gateway_capture().nonce)
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    /// A real document from the gateway's platform release, through the
+    /// handshake verifier end to end but for the network: strict parsing of
+    /// the whole envelope (its `collateral_format` and v3 reference-values
+    /// entries included), the TLS key against the certificate the
+    /// deployment presented, the report under AMD's chain and CRL, the
+    /// launch identity recorded with the capture, and `REPORT_DATA`.
+    #[test]
+    fn a_captured_gateway_document_verifies_against_its_recorded_launch() {
+        let check = check(&[AllowedMeasurement::sev_snp(gateway_pin())]);
+        let doc = check.parse_document(GATEWAY_DOCUMENT).expect("parses");
+        assert_eq!(doc.platform, Platform::SevSnp);
+        assert_eq!(doc.config_sha256, None);
+        check
+            .verify_at(
+                &doc,
+                &gateway_peer_spki(),
+                &gateway_nonce(),
+                gateway_capture().captured_at,
+            )
+            .expect("the captured document verifies against its pin");
+
+        // Another deployment's config on the same release is not ours.
+        let mut other = gateway_pin();
+        other.host_data = crate::SevSnpPin::host_data_for_config(b"another config");
+        let err = super::tests::check(&[AllowedMeasurement::sev_snp(other)])
+            .verify_at(
+                &doc,
+                &gateway_peer_spki(),
+                &gateway_nonce(),
+                gateway_capture().captured_at,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::MeasurementMismatch { .. }), "{err}");
+    }
+
+    /// The captured document with a `tinfoil-config` entry added to its
+    /// collateral. Collateral is outside `REPORT_DATA`, so the document still
+    /// authenticates; whether it is accepted turns on the config's hash.
+    fn gateway_document_carrying(entry: serde_json::Value) -> Vec<u8> {
+        let mut doc: serde_json::Value = serde_json::from_slice(GATEWAY_DOCUMENT).unwrap();
+        doc["collateral"].as_array_mut().unwrap().push(entry);
+        serde_json::to_vec(&doc).unwrap()
+    }
+
+    #[test]
+    fn a_carried_config_must_be_the_one_the_launch_was_bound_to() {
+        use base64::Engine as _;
+        let b64 = &base64::engine::general_purpose::STANDARD;
+        let check = check(&[AllowedMeasurement::sev_snp(gateway_pin())]);
+        let verify = |config: &[u8]| {
+            let raw = gateway_document_carrying(serde_json::json!({
+                "id": "tinfoil-config",
+                "role": "reference-values",
+                "format": bundle::COLLATERAL_CONFIG_V1_FORMAT,
+                "data": {"config_base64": b64.encode(config)},
+            }));
+            let doc = check.parse_document(&raw)?;
+            check.verify_at(
+                &doc,
+                &gateway_peer_spki(),
+                &gateway_nonce(),
+                gateway_capture().captured_at,
+            )
+        };
+        verify(include_bytes!(
+            "../tests/fixtures/tinfoil-gateway/tinfoil-config.yml"
+        ))
+        .expect("the config HOST_DATA names");
+        let err = verify(b"another config").unwrap_err();
+        assert!(
+            matches!(&err, Error::Bundle(m) if m.contains("tinfoil-config")),
+            "{err}"
+        );
+    }
+
+    /// On TDX the carried config is held to MRCONFIGID: its SHA-256 followed
+    /// by sixteen zero bytes.
+    #[test]
+    fn a_carried_config_is_held_to_mrconfigid_on_tdx() {
+        let mut check = check(&[AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin())]);
+        check.allowed_measurements[0].expected_gpus = None;
+        let mut doc = resolved(Platform::Tdx, b"quote".to_vec());
+        let quote = bound_quote(&doc);
+        doc.config_sha256 = Some(sha2::Sha256::digest(b"config").into());
+        accept(&check, &doc, &quote).expect("the pinned config");
+        doc.config_sha256 = Some(sha2::Sha256::digest(b"another config").into());
+        let err = accept(&check, &doc, &quote).unwrap_err();
+        assert!(
+            matches!(&err, Error::Bundle(m) if m.contains("tinfoil-config")),
+            "{err}"
+        );
     }
 
     fn snp_candidates(pins: &[AllowedMeasurement]) -> Vec<CompiledPin> {
