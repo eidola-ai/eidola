@@ -39,7 +39,7 @@ serde_json = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Loads the kernels' host-compiled bodies in the executor's host tests; already in the
 # graph through `cudarc`.
-libloading = "0.8"
+libloading = "0.9"
 # Raises the soft memory-lock limit for the reference executor's host-tier pools in the
 # executor's tests; already in the graph through `eidola-engine-cpu`.
 rustix = { version = "1", features = ["process"] }
