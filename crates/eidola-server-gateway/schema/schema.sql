@@ -694,9 +694,11 @@ COMMENT ON FUNCTION prune_expired_issuances(INTERVAL) IS
     'debits, so a retry arriving after pruning is refused rather than debited '
     'again. Returns the number of rows pruned.';
 
--- BEGIN SHARED BILLING OPERATIONS
--- Billing operations. This block is embedded verbatim in the gateway baseline.
--- All state here belongs to the linked account surface, never to ACT spends.
+-- ---------------------------------------------------------------------------
+-- Billing operations
+-- ---------------------------------------------------------------------------
+-- Called by eidola-billing (store.rs), which the gateway, the billing worker,
+-- the webhook receiver and the support CLI all link. All state here belongs to the linked account surface, never to ACT spends.
 -- Producers can remain on their stable ingress contract while billing executors
 -- change. An incompatible executor rollout must quiesce the previous executors
 -- before changing execution_version; these are admission checks, not migrations.
@@ -1063,6 +1065,5 @@ BEGIN
     END LOOP;
 END;
 $$;
--- END SHARED BILLING OPERATIONS
 
 COMMIT;
