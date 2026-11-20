@@ -96,7 +96,7 @@ def _constants(path: Path) -> dict:
         try:
             out[node.targets[0].id] = value(node.value)
         except (ValueError, TypeError, SyntaxError):
-            pass
+            pass  # not a literal constant; leave it out
     return out
 
 
@@ -291,7 +291,7 @@ def wait_healthy(url: str, seconds: float, alive=None) -> float:
             if status == 200:
                 return time.time() - began
         except (OSError, urllib.error.URLError):
-            pass
+            pass  # not answering yet; try again
         time.sleep(2)
     raise SystemExit(f"{url} did not answer within {seconds:.0f} s")
 
