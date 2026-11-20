@@ -1,0 +1,11 @@
+{
+  "release": "v0.15.3-rc.1",
+  "release_manifest_sha256": "ddd2e76a629df1bd4ec507441a387ac5db010ebc1bda3e372756e095df8692eb",
+  "nonce": "2ff46a4e19df1d202e305e91a1059de1605d3dae9e17ee8f88f89a40348cc270",
+  "captured_at": 1795192347,
+  "sev_snp": {
+    "measurement": "d712705df47368b82a283ba74501c5cf807f5a099c67906a5e1d861037514b9efe382024d4eb6245bb8c9877c7fe6858",
+    "host_data": "dc125f21a5d1d73b5621890fde1cf183eb6cccf5cf6f5a762846cdba15cbd5bb",
+    "guest_policy": "0x30133"
+  }
+}

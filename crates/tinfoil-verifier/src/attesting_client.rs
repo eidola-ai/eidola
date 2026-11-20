@@ -1154,26 +1154,89 @@ mod tests {
     }
 
     /// The gateway's attestation document as a deployment of it served it
-    /// (`tests/fixtures/tinfoil-gateway/`, provenance in its README), the
-    /// nonce it was asked for, and the time it was captured, which is inside
-    /// the validity window of the AMD CRL it carries.
+    /// (`tests/fixtures/tinfoil-gateway/`, provenance in its README).
     const GATEWAY_DOCUMENT: &[u8] =
         include_bytes!("../tests/fixtures/tinfoil-gateway/document.json");
-    const GATEWAY_NONCE: &str = "2ff46a4e19df1d202e305e91a1059de1605d3dae9e17ee8f88f89a40348cc270";
-    const GATEWAY_CAPTURED_AT: u64 = 1_795_192_347;
 
-    /// The release record the document was served under: the gateway's
-    /// SEV-SNP pin as `releases/trust/server-enclave.json` held it at capture.
+    /// What was recorded beside the document when it was captured: the
+    /// platform release it was served under, the nonce it was asked for, the
+    /// time (inside the validity window of the AMD CRL it carries), and the
+    /// launch identity it was served with. The fixture is pinned to this
+    /// record, never to the tree's current release pin, so bumping the
+    /// gateway's release or config moves no fixture.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GatewayCapture {
+        release: String,
+        release_manifest_sha256: String,
+        nonce: String,
+        captured_at: u64,
+        sev_snp: crate::SevSnpPin,
+    }
+
+    fn gateway_capture() -> GatewayCapture {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/tinfoil-gateway/expected.json"
+        ))
+        .unwrap()
+    }
+
     fn gateway_pin() -> crate::SevSnpPin {
-        crate::SevSnpPin {
-            measurement: "d712705df47368b82a283ba74501c5cf807f5a099c67906a\
-                          5e1d861037514b9efe382024d4eb6245bb8c9877c7fe6858"
-                .to_string(),
-            host_data: crate::SevSnpPin::host_data_for_config(include_bytes!(
+        gateway_capture().sev_snp
+    }
+
+    /// The recorded launch identity is the one the recorded release states
+    /// and the one the recorded config hashes to, all from bytes in the
+    /// fixture, and the release is one this tree measured: the runtime
+    /// entry of the document carries the release manifest, which must be
+    /// the recorded release, hash to the recorded manifest pin, and state
+    /// the recorded launch digest; and the recorded release is one
+    /// `docs/contributing/rebuilding-platform-images.md` records rebuilding.
+    #[test]
+    fn the_gateway_capture_record_is_the_release_it_names() {
+        use base64::Engine as _;
+        let capture = gateway_capture();
+        let doc: serde_json::Value = serde_json::from_slice(GATEWAY_DOCUMENT).unwrap();
+        let runtime = doc["collateral"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "runtime")
+            .expect("a runtime entry");
+        assert_eq!(runtime["data"]["tag"], capture.release.as_str());
+        assert_eq!(
+            runtime["data"]["digest"],
+            capture.release_manifest_sha256.as_str()
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(runtime["data"]["manifest_base64"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["version"], capture.release.as_str());
+        assert_eq!(
+            manifest["igvm"]["snp_launch"]["measurement"],
+            capture.sev_snp.measurement.as_str()
+        );
+        assert_eq!(
+            capture.sev_snp.host_data,
+            crate::SevSnpPin::host_data_for_config(include_bytes!(
                 "../tests/fixtures/tinfoil-gateway/tinfoil-config.yml"
-            )),
-            guest_policy: "0x30133".to_string(),
-        }
+            ))
+        );
+        assert_eq!(doc["challenge"]["nonce"], capture.nonce.as_str());
+        // The rebuild record's table of rebuilt releases has a row per
+        // release: `| <release> | <date> | <CPU manifest SHA-256> | …`.
+        let rebuilds = include_str!("../../../docs/contributing/rebuilding-platform-images.md");
+        let row = rebuilds
+            .lines()
+            .find(|line| line.starts_with(&format!("| {} |", capture.release)))
+            .unwrap_or_else(|| panic!("{} is not a rebuilt release", capture.release));
+        assert!(
+            row.contains(&format!("`{}`", capture.release_manifest_sha256)),
+            "{row}"
+        );
     }
 
     /// The SPKI hash of the TLS certificate the deployment presented.
@@ -1186,7 +1249,10 @@ mod tests {
     }
 
     fn gateway_nonce() -> [u8; 32] {
-        hex::decode(GATEWAY_NONCE).unwrap().try_into().unwrap()
+        hex::decode(gateway_capture().nonce)
+            .unwrap()
+            .try_into()
+            .unwrap()
     }
 
     /// A real document from the gateway's platform release, through the
@@ -1194,9 +1260,9 @@ mod tests {
     /// the whole envelope (its `collateral_format` and v3 reference-values
     /// entries included), the TLS key against the certificate the
     /// deployment presented, the report under AMD's chain and CRL, the
-    /// release pin, and `REPORT_DATA`.
+    /// launch identity recorded with the capture, and `REPORT_DATA`.
     #[test]
-    fn a_captured_gateway_document_verifies_against_its_release_pin() {
+    fn a_captured_gateway_document_verifies_against_its_recorded_launch() {
         let check = check(&[AllowedMeasurement::sev_snp(gateway_pin())]);
         let doc = check.parse_document(GATEWAY_DOCUMENT).expect("parses");
         assert_eq!(doc.platform, Platform::SevSnp);
@@ -1206,7 +1272,7 @@ mod tests {
                 &doc,
                 &gateway_peer_spki(),
                 &gateway_nonce(),
-                GATEWAY_CAPTURED_AT,
+                gateway_capture().captured_at,
             )
             .expect("the captured document verifies against its pin");
 
@@ -1218,7 +1284,7 @@ mod tests {
                 &doc,
                 &gateway_peer_spki(),
                 &gateway_nonce(),
-                GATEWAY_CAPTURED_AT,
+                gateway_capture().captured_at,
             )
             .unwrap_err();
         assert!(matches!(err, Error::MeasurementMismatch { .. }), "{err}");
@@ -1250,7 +1316,7 @@ mod tests {
                 &doc,
                 &gateway_peer_spki(),
                 &gateway_nonce(),
-                GATEWAY_CAPTURED_AT,
+                gateway_capture().captured_at,
             )
         };
         verify(include_bytes!(
