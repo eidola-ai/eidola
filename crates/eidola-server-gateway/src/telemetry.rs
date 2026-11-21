@@ -14,7 +14,8 @@
 //! - `RUST_LOG` — the log filter
 //!
 //! Everything else the SDK would read from the environment by itself is set
-//! explicitly ([`OtlpConfig`]).
+//! explicitly ([`eidola_telemetry::OtlpConfig`], which builds the exporters
+//! this module's providers send through).
 //!
 //! # Spans are recorded everywhere and exported only on request
 //!
@@ -33,18 +34,15 @@
 //! acceptable — write `#[instrument(skip_all)]` and add fields explicitly, or
 //! do not instrument.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use eidola_common::env::Env;
+use eidola_telemetry::OtlpConfig;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::{Link, SpanKind, TraceContextExt, TraceId, TracerProvider as _};
-use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SamplingDecision, SamplingResult, ShouldSample, SpanProcessor};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -184,7 +182,8 @@ impl OtelGuard {
 ///
 /// Returns the OTel guard if `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 pub fn init(env: &Env) -> Option<OtelGuard> {
-    let otel = OtlpConfig::read(|name| env.var(name)).map(init_otel_providers);
+    let otel =
+        OtlpConfig::read(|name| env.var(name), "eidola-server-gateway").map(init_otel_providers);
 
     let fmt_layer = tracing_subscriber::fmt::layer();
 
@@ -215,11 +214,7 @@ pub fn init(env: &Env) -> Option<OtelGuard> {
 /// The event and span filter: `EnvFilter::from_default_env`, over the
 /// prefixed `RUST_LOG`, with this crate at `info` and `hyper` at `warn`.
 fn log_filter(rust_log: &str) -> EnvFilter {
-    EnvFilter::builder()
-        .with_default_directive(LevelFilter::ERROR.into())
-        .parse_lossy(rust_log)
-        .add_directive("eidola_server_gateway=info".parse().unwrap())
-        .add_directive("hyper=warn".parse().unwrap())
+    eidola_telemetry::log_filter(rust_log, &["eidola_server_gateway=info", "hyper=warn"])
 }
 
 /// The OTel trace layer exactly as production runs it.
@@ -246,151 +241,18 @@ where
         .with_context_activation(false)
 }
 
-/// Everything the OTLP exporters, the SDK's processors and the resource are
-/// built from, read by us under the environment's prefix and handed over
-/// explicitly.
-///
-/// Left to themselves, the exporter and SDK builders read the bare `OTEL_*`
-/// names: the endpoint, protocol, timeout and temporality, the batch
-/// processors' sizes and delays, the metric export interval, span limits, the
-/// sampler, and the resource's `OTEL_SERVICE_NAME` and
-/// `OTEL_RESOURCE_ATTRIBUTES`. Each is set explicitly in
-/// [`init_otel_providers`], which overrides the variable, so no unprefixed
-/// value configures any of them. Compression is not settable to "none", and
-/// needs no setting: the exporter is built without its gzip and zstd
-/// features, so it ignores a compression variable, with a warning.
-///
-/// One read cannot be closed from outside: the HTTP exporter merges the
-/// headers in the bare `OTEL_EXPORTER_OTLP_HEADERS` (or
-/// `OTEL_EXPORTER_OTLP_<SIGNAL>_HEADERS`) over the headers it is given, with
-/// no setting to stop it. A container receives only the variables its
-/// measured config names, so a bare name reaches it only if the config
-/// declares one.
-struct OtlpConfig {
-    /// The base endpoint; each signal's path is appended to it.
-    endpoint: String,
-    /// `OTEL_EXPORTER_OTLP_HEADERS` as `key=value` pairs, values still
-    /// percent-encoded: `with_headers` decodes them, as the exporter decodes
-    /// the variable.
-    headers: HashMap<String, String>,
-    service_name: String,
-    /// Per signal: traces, metrics, logs.
-    timeouts: [Duration; 3],
-}
-
-impl OtlpConfig {
-    /// The configuration `lookup` describes, or `None` when it names no
-    /// endpoint. `lookup` answers for one variable name, already prefixed.
-    fn read(lookup: impl Fn(&str) -> Option<String>) -> Option<Self> {
-        let endpoint =
-            lookup(opentelemetry_otlp::OTEL_EXPORTER_OTLP_ENDPOINT).filter(|s| !s.is_empty())?;
-        let headers = lookup(opentelemetry_otlp::OTEL_EXPORTER_OTLP_HEADERS)
-            .map(|raw| otlp_headers(&raw))
-            .unwrap_or_default();
-        let service_name = lookup("OTEL_SERVICE_NAME")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "eidola-server-gateway".to_string());
-        let timeouts = [
-            opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
-            opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
-            opentelemetry_otlp::OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
-        ]
-        .map(|signal_var| otlp_timeout(signal_var, &lookup));
-        Some(Self {
-            endpoint,
-            headers,
-            service_name,
-            timeouts,
-        })
-    }
-
-    /// One signal's URL: the base endpoint with the signal's path appended,
-    /// as the exporter appends it to `OTEL_EXPORTER_OTLP_ENDPOINT` (a
-    /// programmatic endpoint is taken as the whole URL).
-    fn signal_endpoint(&self, path: &str) -> String {
-        match self.endpoint.strip_suffix('/') {
-            Some(base) => format!("{base}{path}"),
-            None => format!("{}{path}", self.endpoint),
-        }
-    }
-}
-
-/// `key=value` pairs, comma-separated, as the exporter splits its headers
-/// variable: whitespace trimmed, empty keys and values skipped.
-fn otlp_headers(raw: &str) -> HashMap<String, String> {
-    raw.split_terminator(',')
-        .filter_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            let (key, value) = (key.trim(), value.trim());
-            (!key.is_empty() && !value.is_empty()).then(|| (key.to_string(), value.to_string()))
-        })
-        .collect()
-}
-
-/// The HTTP clients the OTLP exporters send through, one per signal.
-///
-/// Left to itself the exporter builds a default `reqwest` 0.13 client, which
-/// verifies against the platform trust store — and the server runs `FROM
-/// scratch` with none, so that client cannot be built and an HTTPS collector
-/// (Grafana Cloud in production) is unreachable. These clients carry the
-/// bundled Mozilla roots every other outbound client here uses
-/// ([`crate::tls_config`]). A client handed to the exporter does not get the
-/// exporter's timeout, so each one carries its signal's ([`otlp_timeout`]),
-/// and none reads a proxy from the environment. Built on their own thread, as
-/// the exporter builds its default, because a blocking client must not be
-/// constructed inside the tokio runtime `main` runs in.
-struct OtlpHttpClients {
-    traces: reqwest::blocking::Client,
-    metrics: reqwest::blocking::Client,
-    logs: reqwest::blocking::Client,
-}
-
-fn otlp_http_clients(timeouts: [Duration; 3]) -> OtlpHttpClients {
-    std::thread::spawn(move || {
-        let [traces, metrics, logs] = timeouts.map(|timeout| {
-            reqwest::blocking::Client::builder()
-                .tls_backend_preconfigured(crate::tls_config())
-                .no_proxy()
-                .timeout(timeout)
-                .build()
-                .expect("failed to build OTLP HTTP client")
-        });
-        OtlpHttpClients {
-            traces,
-            metrics,
-            logs,
-        }
-    })
-    .join()
-    .expect("OTLP HTTP client thread panicked")
-}
-
-/// The timeout the OTLP exporter would resolve for one signal: the signal's
-/// variable, else `OTEL_EXPORTER_OTLP_TIMEOUT`, else the 10 s default —
-/// milliseconds, and an unparsable value is skipped. The exporter's resolver
-/// is private and reads the bare names, so this mirrors it over `lookup`.
-fn otlp_timeout(signal_var: &str, lookup: impl Fn(&str) -> Option<String>) -> Duration {
-    [signal_var, opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT]
-        .into_iter()
-        .find_map(|name| lookup(name)?.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
-}
-
 /// Create OTel providers for traces, metrics, and logs via OTLP/HTTP.
+///
+/// The OTLP exporters send through clients carrying the bundled Mozilla roots
+/// every other outbound client here uses ([`crate::tls_config`]); the image
+/// has no system trust store for the exporter's default client to read.
 fn init_otel_providers(config: OtlpConfig) -> OtelGuard {
-    let http_clients = otlp_http_clients(config.timeouts);
-    let [traces_timeout, metrics_timeout, logs_timeout] = config.timeouts;
-
-    // Built empty, not from `Resource::builder()`, whose detectors read
-    // `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`; the SDK's own
-    // attributes (`telemetry.sdk.*`) read nothing.
-    let resource = Resource::builder_empty()
-        .with_detector(Box::new(
-            opentelemetry_sdk::resource::TelemetryResourceDetector,
-        ))
-        .with_service_name(config.service_name.clone())
-        .build();
+    let timeouts = config.timeouts();
+    let [traces_client, metrics_client, logs_client] = eidola_telemetry::otlp_http_clients(
+        crate::tls_config(),
+        [timeouts.traces, timeouts.metrics, timeouts.logs],
+    );
+    let resource = config.resource([]);
 
     // --- Traces ---
     // Two processors, and which one a span reaches is decided by its sampled
@@ -399,89 +261,20 @@ fn init_otel_providers(config: OtlpConfig) -> OtelGuard {
     // batching, and `ClientDirectedSampler` marks a trace sampled only for a
     // request that asked to be traced, so the export path stays empty for
     // ordinary traffic.
-    let trace_exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(config.signal_endpoint("/v1/traces"))
-        .with_timeout(traces_timeout)
-        .with_headers(config.headers.clone())
-        .with_http_client(http_clients.traces)
-        .build()
-        .expect("failed to create OTLP trace exporter");
-
-    // The batch configuration's defaults read `OTEL_BSP_*`; each field that
-    // takes effect is set back to the SDK's default here.
-    let trace_batch = opentelemetry_sdk::trace::BatchSpanProcessor::builder(trace_exporter)
-        .with_batch_config(
-            opentelemetry_sdk::trace::BatchConfigBuilder::default()
-                .with_max_queue_size(opentelemetry_sdk::trace::OTEL_BSP_MAX_QUEUE_SIZE_DEFAULT)
-                .with_scheduled_delay(opentelemetry_sdk::trace::OTEL_BSP_SCHEDULE_DELAY_DEFAULT)
-                .with_max_export_batch_size(
-                    opentelemetry_sdk::trace::OTEL_BSP_MAX_EXPORT_BATCH_SIZE_DEFAULT,
-                )
-                .build(),
-        )
-        .build();
-
     let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_resource(resource.clone())
         .with_sampler(ClientDirectedSampler)
         .with_span_limits(opentelemetry_sdk::trace::SpanLimits::default())
         .with_span_processor(AggregatingSpanProcessor)
-        .with_span_processor(trace_batch)
+        .with_span_processor(config.span_batch_processor(traces_client))
         .build();
 
     // --- Metrics ---
-    let metrics_exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(config.signal_endpoint("/v1/metrics"))
-        .with_timeout(metrics_timeout)
-        .with_headers(config.headers.clone())
-        .with_http_client(http_clients.metrics)
-        .with_temporality(opentelemetry_sdk::metrics::Temporality::Cumulative)
-        .build()
-        .expect("failed to create OTLP metrics exporter");
-
-    let meter_reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metrics_exporter)
-        .with_interval(opentelemetry_sdk::metrics::OTEL_METRIC_EXPORT_INTERVAL_DEFAULT)
-        .build();
-
-    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-        .with_resource(resource.clone())
-        .with_reader(meter_reader)
-        .build();
-
+    let meter_provider = config.meter_provider(resource.clone(), metrics_client);
     opentelemetry::global::set_meter_provider(meter_provider.clone());
 
     // --- Logs ---
-    let log_exporter = opentelemetry_otlp::LogExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(config.signal_endpoint("/v1/logs"))
-        .with_timeout(logs_timeout)
-        .with_headers(config.headers)
-        .with_http_client(http_clients.logs)
-        .build()
-        .expect("failed to create OTLP log exporter");
-
-    // As for spans: the defaults read `OTEL_BLRP_*`, so each field is set.
-    let log_batch = opentelemetry_sdk::logs::BatchLogProcessor::builder(log_exporter)
-        .with_batch_config(
-            opentelemetry_sdk::logs::BatchConfigBuilder::default()
-                .with_max_queue_size(opentelemetry_sdk::logs::OTEL_BLRP_MAX_QUEUE_SIZE_DEFAULT)
-                .with_scheduled_delay(opentelemetry_sdk::logs::OTEL_BLRP_SCHEDULE_DELAY_DEFAULT)
-                .with_max_export_batch_size(
-                    opentelemetry_sdk::logs::OTEL_BLRP_MAX_EXPORT_BATCH_SIZE_DEFAULT,
-                )
-                .build(),
-        )
-        .build();
-
-    let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
-        .with_resource(resource)
-        .with_log_processor(log_batch)
-        .build();
+    let logger_provider = config.logger_provider(resource, logs_client);
 
     OtelGuard {
         tracer_provider,
@@ -1143,124 +936,6 @@ mod tests {
                 "`{tracked}` is tracked but no span has that name"
             );
         }
-    }
-
-    /// The supplied OTLP clients carry the timeout the exporter would have
-    /// resolved itself: signal variable over the general one over 10 s, in
-    /// milliseconds, skipping a value that does not parse.
-    #[test]
-    fn otlp_timeout_resolves_like_the_exporter() {
-        use opentelemetry_otlp::{
-            OTEL_EXPORTER_OTLP_TIMEOUT, OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT,
-            OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
-        };
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| {
-                pairs
-                    .iter()
-                    .find(|(k, _)| *k == name)
-                    .map(|(_, v)| v.to_string())
-            }
-        };
-        let signal = OTEL_EXPORTER_OTLP_TRACES_TIMEOUT;
-        assert_eq!(
-            otlp_timeout(signal, env(&[])),
-            OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT
-        );
-        assert_eq!(
-            otlp_timeout(signal, env(&[(OTEL_EXPORTER_OTLP_TIMEOUT, "2500")])),
-            Duration::from_millis(2500)
-        );
-        assert_eq!(
-            otlp_timeout(
-                signal,
-                env(&[
-                    (OTEL_EXPORTER_OTLP_TRACES_TIMEOUT, "3000"),
-                    (OTEL_EXPORTER_OTLP_TIMEOUT, "2500")
-                ])
-            ),
-            Duration::from_millis(3000)
-        );
-        assert_eq!(
-            otlp_timeout(
-                signal,
-                env(&[
-                    (OTEL_EXPORTER_OTLP_TRACES_TIMEOUT, "soon"),
-                    (OTEL_EXPORTER_OTLP_TIMEOUT, "2500")
-                ])
-            ),
-            Duration::from_millis(2500)
-        );
-    }
-
-    fn vars(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
-        move |name: &str| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| v.to_string())
-        }
-    }
-
-    /// Telemetry is off without an endpoint, and an empty one is none: an
-    /// empty endpoint handed to the exporter would make it read the bare
-    /// variable instead.
-    #[test]
-    fn otlp_needs_a_non_empty_endpoint() {
-        assert!(OtlpConfig::read(vars(&[])).is_none());
-        assert!(OtlpConfig::read(vars(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "")])).is_none());
-    }
-
-    /// The values we read are the ones the exporters get: each signal's path
-    /// appended to the endpoint as the exporter appends it, the headers split
-    /// as it splits them, and the service name defaulted.
-    #[test]
-    fn otlp_config_is_read_from_the_lookup_alone() {
-        let config = OtlpConfig::read(vars(&[
-            (
-                "OTEL_EXPORTER_OTLP_ENDPOINT",
-                "https://collector.example/otlp",
-            ),
-            (
-                "OTEL_EXPORTER_OTLP_HEADERS",
-                " Authorization = Basic%20abc , empty=, =novalue,X-Scope=tenant",
-            ),
-            ("OTEL_EXPORTER_OTLP_TIMEOUT", "2500"),
-            ("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "4000"),
-        ]))
-        .expect("an endpoint enables telemetry");
-        assert_eq!(
-            config.signal_endpoint("/v1/traces"),
-            "https://collector.example/otlp/v1/traces"
-        );
-        assert_eq!(
-            config.headers,
-            HashMap::from([
-                ("Authorization".to_string(), "Basic%20abc".to_string()),
-                ("X-Scope".to_string(), "tenant".to_string()),
-            ])
-        );
-        assert_eq!(config.service_name, "eidola-server-gateway");
-        assert_eq!(
-            config.timeouts,
-            [
-                Duration::from_millis(2500),
-                Duration::from_millis(2500),
-                Duration::from_millis(4000)
-            ]
-        );
-
-        let config = OtlpConfig::read(vars(&[
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example/"),
-            ("OTEL_SERVICE_NAME", "staging-gateway"),
-        ]))
-        .unwrap();
-        assert_eq!(
-            config.signal_endpoint("/v1/logs"),
-            "https://collector.example/v1/logs"
-        );
-        assert_eq!(config.service_name, "staging-gateway");
-        assert!(config.headers.is_empty());
     }
 
     /// With no parent — the shape of every ordinary request — the decision
