@@ -2377,13 +2377,18 @@ fn node_snapshot(
     }
 }
 
-fn node_gauges_of(router: &EngineRouter, model: &str) -> node_telemetry::ModelGauges {
-    router
-        .node_gauges()
+/// The levels the router reports for `model`'s one placed upstream.
+fn node_levels_of(
+    router: &EngineRouter,
+    model: &str,
+) -> Option<eidola_common::engine_protocol::telemetry::NodeGauges> {
+    let reports: Vec<_> = router
+        .node_reports()
         .into_iter()
-        .find(|(m, _)| m == model)
-        .map(|(_, g)| g)
-        .expect("every pinned model is listed")
+        .filter(|r| r.model == model)
+        .collect();
+    assert_eq!(reports.len(), 1, "{model} has one placed upstream");
+    reports.into_iter().next().unwrap().gauges
 }
 
 /// The probe reads a node's telemetry snapshot from its info answer and
@@ -2402,25 +2407,22 @@ async fn the_probe_reads_a_nodes_snapshot_and_decides_nothing_by_it() {
     // No snapshot: verified and taking traffic, with nothing reported.
     router.probe_due().await;
     assert!(router.send(&request(MODEL_A, None, true)).await.is_ok());
-    assert_eq!(
-        node_gauges_of(&router, MODEL_A),
-        node_telemetry::ModelGauges::default()
-    );
+    assert_eq!(node_levels_of(&router, MODEL_A), None);
 
-    // A snapshot: its levels are the model's, and no other model's.
+    // A snapshot: its levels are its upstream's, and no other's.
     a.set_telemetry(Some(node_snapshot(1, 10, 2).to_value()));
     router.probe_due().await;
-    let gauges = node_gauges_of(&router, MODEL_A);
-    assert_eq!(gauges.reporting, 1);
-    assert_eq!(gauges.sequences_running, 2);
-    assert_eq!(gauges.pools, node_snapshot(1, 10, 2).gauges.pools);
     assert_eq!(
-        node_gauges_of(&router, MODEL_B),
-        node_telemetry::ModelGauges::default()
+        node_levels_of(&router, MODEL_A),
+        Some(node_snapshot(1, 10, 2).gauges)
     );
+    assert_eq!(node_levels_of(&router, MODEL_B), None);
     a.set_telemetry(Some(node_snapshot(1, 25, 0).to_value()));
     router.probe_due().await;
-    assert_eq!(node_gauges_of(&router, MODEL_A).sequences_running, 0);
+    assert_eq!(
+        node_levels_of(&router, MODEL_A).map(|g| g.sequences_running),
+        Some(0)
+    );
 
     // A snapshot that does not parse: still taking traffic, nothing reported.
     let mut extra = node_snapshot(1, 30, 1).to_value();
@@ -2428,13 +2430,106 @@ async fn the_probe_reads_a_nodes_snapshot_and_decides_nothing_by_it() {
     a.set_telemetry(Some(extra));
     router.probe_due().await;
     assert!(router.send(&request(MODEL_A, None, true)).await.is_ok());
-    assert_eq!(node_gauges_of(&router, MODEL_A).reporting, 0);
+    assert_eq!(node_levels_of(&router, MODEL_A), None);
 
     // A failed probe: no levels until one passes.
     a.set_telemetry(Some(node_snapshot(1, 40, 1).to_value()));
     router.probe_due().await;
-    assert_eq!(node_gauges_of(&router, MODEL_A).reporting, 1);
+    assert!(node_levels_of(&router, MODEL_A).is_some());
     a.state.healthy.store(false, Ordering::Relaxed);
     router.probe_due().await;
-    assert_eq!(node_gauges_of(&router, MODEL_A).reporting, 0);
+    assert_eq!(node_levels_of(&router, MODEL_A), None);
+}
+
+/// Two nodes of one model export separate series, each labelled by the
+/// model, its deployment and its own node id, and no attribute carries an
+/// upstream's URL. A model with no placed upstream exports no node series.
+#[tokio::test]
+async fn two_nodes_of_one_model_report_apart_without_their_urls() {
+    let one = engine(Identity::of(MODEL_A)).await;
+    let two = engine(Identity::of(MODEL_A)).await;
+    let router = router_for(&[&one, &two], models());
+    router
+        .apply_placement(&[
+            one.row(MODEL_A, DEPLOYMENT_A),
+            two.row(MODEL_A, DEPLOYMENT_A),
+        ])
+        .await;
+    one.set_telemetry(Some(node_snapshot(1, 10, 1).to_value()));
+    two.set_telemetry(Some(node_snapshot(2, 10, 3).to_value()));
+    router.probe_due().await;
+
+    let reports = router.node_reports();
+    assert_eq!(reports.len(), 2);
+    assert!(reports.iter().all(|r| r.model == MODEL_A));
+    for (engine, running) in [(&one, 1), (&two, 3)] {
+        let upstream = upstream(&router, MODEL_A, &engine.base_url);
+        let node = node_telemetry::node_id(&upstream.base_url);
+        assert_eq!(
+            upstream.labels,
+            node_telemetry::NodeLabels {
+                deployment: DEPLOYMENT_A[..16].to_string(),
+                node: node.clone(),
+            }
+        );
+        let report = reports.iter().find(|r| r.labels.node == node).unwrap();
+        assert_eq!(
+            report.gauges.as_ref().map(|g| g.sequences_running),
+            Some(running)
+        );
+    }
+    assert_ne!(reports[0].labels.node, reports[1].labels.node);
+
+    let observations = node_telemetry::gauge_observations(&reports);
+    let running: Vec<(String, u64)> = observations
+        .iter()
+        .filter(|o| {
+            o.instrument == "engine.node.sequences"
+                && o.attributes
+                    .contains(&opentelemetry::KeyValue::new("state", "running"))
+        })
+        .map(|o| {
+            let keys: Vec<&str> = o.attributes.iter().map(|kv| kv.key.as_str()).collect();
+            assert_eq!(keys, ["model", "deployment", "node", "state"]);
+            assert_eq!(o.attributes[0].value.to_string(), MODEL_A);
+            assert_eq!(o.attributes[1].value.to_string(), &DEPLOYMENT_A[..16]);
+            (o.attributes[2].value.to_string(), o.value)
+        })
+        .collect();
+    assert_eq!(running.len(), 2);
+    for (engine, value) in [(&one, 1), (&two, 3)] {
+        let node = node_telemetry::node_id(&upstream(&router, MODEL_A, &engine.base_url).base_url);
+        assert!(running.contains(&(node, value)));
+    }
+
+    // The counters a probe adds carry the same labels.
+    let mut adds = Vec::new();
+    for report in &reports {
+        adds.extend(node_telemetry::counter_adds(
+            MODEL_A,
+            &report.labels,
+            &node_telemetry::Reading::Absent,
+            None,
+        ));
+    }
+    let attributes = observations
+        .iter()
+        .flat_map(|o| &o.attributes)
+        .chain(adds.iter().flat_map(|a| &a.attributes));
+    for kv in attributes {
+        let value = kv.value.to_string();
+        for engine in [&one, &two] {
+            let authority = engine.base_url.trim_start_matches("https://");
+            let port = authority.rsplit(':').next().unwrap();
+            assert!(
+                !value.contains("127.0.0.1") && !value.contains("https") && value != port,
+                "{}={value} carries an upstream's URL",
+                kv.key
+            );
+        }
+    }
+    assert!(!observations.iter().any(|o| {
+        o.attributes
+            .contains(&opentelemetry::KeyValue::new("model", MODEL_B))
+    }));
 }

@@ -80,7 +80,7 @@ pub mod subset;
 
 use breaker::Breaker;
 pub use breaker::BreakerConfig;
-use node_telemetry::{ModelGauges, NodeState, Reading};
+use node_telemetry::{NodeLabels, NodeReport, NodeState, Reading};
 use placement::PlacementSource;
 
 /// The provider name an engine-served response carries in its privacy
@@ -92,6 +92,9 @@ pub struct EngineModel {
     pinned: PinnedModel,
     /// The config hash of every accepted deployment.
     deployments: Vec<String>,
+    /// Each accepted deployment's `deployment` metric label, in the order of
+    /// `deployments` ([`node_telemetry::deployment_label`]).
+    deployment_labels: Vec<String>,
     /// Every accepted deployment's pin: what each upstream's client attests
     /// against.
     pins: Vec<AllowedMeasurement>,
@@ -110,6 +113,12 @@ impl EngineModel {
                 Ok(Self {
                     pinned: *pinned,
                     deployments: accepted.iter().map(|d| d.config_sha256.clone()).collect(),
+                    deployment_labels: accepted
+                        .iter()
+                        .map(|d| {
+                            node_telemetry::deployment_label(Some(&d.config), &d.config_sha256)
+                        })
+                        .collect(),
                     pins: accepted.into_iter().map(|d| d.pin).collect(),
                 })
             })
@@ -125,8 +134,25 @@ impl EngineModel {
         Self {
             pinned,
             deployments: deployments.iter().map(|(d, _)| d.clone()).collect(),
+            deployment_labels: deployments
+                .iter()
+                .map(|(d, _)| node_telemetry::deployment_label(None, d))
+                .collect(),
             pins: deployments.into_iter().map(|(_, p)| p).collect(),
         }
+    }
+
+    /// The `deployment` metric label of the accepted deployment whose config
+    /// hashes to `config_sha256`.
+    fn deployment_label(&self, config_sha256: &str) -> String {
+        self.deployments
+            .iter()
+            .zip(&self.deployment_labels)
+            .find(|(d, _)| *d == config_sha256)
+            .map_or_else(
+                || node_telemetry::deployment_label(None, config_sha256),
+                |(_, label)| label.clone(),
+            )
     }
 }
 
@@ -263,13 +289,20 @@ pub struct Upstream {
     in_flight: AtomicUsize,
     breaker: std::sync::Mutex<Breaker>,
     probing: AtomicBool,
+    /// What its `engine.node.*` series are labelled by, besides the model.
+    labels: NodeLabels,
     /// What its telemetry snapshots have left behind.
     node: std::sync::Mutex<NodeState>,
 }
 
 impl Upstream {
-    fn new(placement: placement::Placement, client: reqwest::Client) -> Self {
+    fn new(
+        placement: placement::Placement,
+        deployment_label: String,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
+            labels: NodeLabels::new(deployment_label, &placement.base_url),
             base_url: placement.base_url,
             deployment: placement.deployment,
             client,
@@ -293,6 +326,7 @@ impl Upstream {
                 deployment: String::new(),
                 base_url: base_url.to_string(),
             },
+            String::new(),
             reqwest::Client::new(),
         )
     }
@@ -544,7 +578,8 @@ impl EngineRouter {
                             upstream = %placement.base_url,
                             "engine placement: new upstream, probing before traffic"
                         );
-                        list.push(Arc::new(Upstream::new(placement, client)));
+                        let label = model.deployment_label(&placement.deployment);
+                        list.push(Arc::new(Upstream::new(placement, label, client)));
                     }
                     Err(e) => warn!(
                         model = %model_id,
@@ -585,22 +620,19 @@ impl EngineRouter {
             .collect()
     }
 
-    /// Each pinned model's node levels, summed over its upstreams whose last
-    /// probe read a snapshot, for the `engine.node.*` gauges. Every pinned
-    /// model is listed, with zeros when none reported.
-    pub(crate) fn node_gauges(&self) -> Vec<(String, ModelGauges)> {
+    /// Every placed upstream's labels and last levels, for the
+    /// `engine.node.*` gauges: levels while its last probe read a snapshot,
+    /// none otherwise. A model with no placed upstream has none here.
+    pub(crate) fn node_reports(&self) -> Vec<NodeReport> {
         let snapshot = self.inner.upstreams.load();
-        self.inner
-            .models
-            .keys()
-            .map(|model| {
-                let mut sums = ModelGauges::default();
-                for upstream in snapshot.get(model).map(Vec::as_slice).unwrap_or_default() {
-                    if let Some(gauges) = upstream.node().gauges() {
-                        sums.add(gauges);
-                    }
-                }
-                (model.clone(), sums)
+        snapshot
+            .iter()
+            .flat_map(|(model, upstreams)| {
+                upstreams.iter().map(move |upstream| NodeReport {
+                    model: model.clone(),
+                    labels: upstream.labels.clone(),
+                    gauges: upstream.node().gauges().cloned(),
+                })
             })
             .collect()
     }
@@ -725,7 +757,12 @@ impl EngineRouter {
                 None
             }
         };
-        node_telemetry::record(model.pinned.id(), &reading, growth.as_ref());
+        node_telemetry::record(
+            model.pinned.id(),
+            &upstream.labels,
+            &reading,
+            growth.as_ref(),
+        );
         Ok(())
     }
 
