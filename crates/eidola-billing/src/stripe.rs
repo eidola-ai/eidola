@@ -577,7 +577,7 @@ impl StripeClient {
             .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
-            return Err(stripe_error(&body));
+            return Err(stripe_error(status, &body));
         }
 
         let customer: Customer = serde_json::from_slice(&body).map_err(|e| {
@@ -691,7 +691,7 @@ impl StripeClient {
             .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
-            return Err(stripe_error(&body));
+            return Err(stripe_error(status, &body));
         }
 
         serde_json::from_slice(&body).map_err(|e| {
@@ -726,7 +726,7 @@ impl StripeClient {
             .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
-            return Err(stripe_error(&body));
+            return Err(stripe_error(status, &body));
         }
 
         serde_json::from_slice(&body)
@@ -751,7 +751,7 @@ impl StripeClient {
             .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
-            return Err(stripe_error(&body));
+            return Err(stripe_error(status, &body));
         }
 
         serde_json::from_slice(&body)
@@ -781,7 +781,7 @@ impl StripeClient {
             .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
-            return Err(stripe_error(&body));
+            return Err(stripe_error(status, &body));
         }
 
         let charge: StripeChargeCustomer = serde_json::from_slice(&body).map_err(|e| {
@@ -880,7 +880,7 @@ impl StripeClient {
             .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
-            return Err(stripe_error(&body));
+            return Err(stripe_error(status, &body));
         }
 
         let session: CheckoutSession = serde_json::from_slice(&body).map_err(|e| {
@@ -927,7 +927,7 @@ impl StripeClient {
             .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
-            return Err(stripe_error(&body));
+            return Err(stripe_error(status, &body));
         }
 
         let session: PortalSession = serde_json::from_slice(&body).map_err(|e| {
@@ -963,12 +963,13 @@ impl StripeClient {
             if matches!(status.as_u16(), 401 | 403 | 404)
                 || (status.as_u16() == 400 && invalid_request)
             {
+                report_rejected_key(status);
                 return Err(ServerError::ProviderRejected(format!(
                     "stripe HTTP {}",
                     status.as_u16()
                 )));
             }
-            return Err(stripe_error(&body));
+            return Err(stripe_error(status, &body));
         }
         serde_json::from_slice(&body)
             .map_err(|e| ServerError::Parse(format!("stripe: {}", parse_error_summary(&e))))
@@ -1655,14 +1656,39 @@ fn dispute_snapshot(dispute: StripeDispute) -> Result<DisputeSnapshot, ServerErr
     })
 }
 
-/// Parse a Stripe error response body into a ServerError.
+/// Whether Stripe has rejected this process's API key yet.
+static KEY_REJECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says once per process, at `error`, that Stripe rejected the API key, when
+/// `status` is 401 or 403: every Stripe call fails until the key is fixed,
+/// and each failure alone reads as a provider error. Returns whether it
+/// logged.
+fn report_rejected_key(status: reqwest::StatusCode) -> bool {
+    if !matches!(status.as_u16(), 401 | 403)
+        || KEY_REJECTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return false;
+    }
+    tracing::error!(
+        status = status.as_u16(),
+        "Stripe rejected the API key (HTTP {}): a key for the wrong mode, a revoked key, \
+         or a restricted key missing a permission",
+        status.as_u16()
+    );
+    true
+}
+
+/// Parse a Stripe error response into a ServerError.
 ///
 /// The body is Stripe-authored: its `message` is free text that can quote
 /// ids and customer-facing detail, and this error's `Display` reaches the
-/// logs — so only the fixed-list resolution of Stripe's `type` classifier
-/// is carried, never the raw body. Operators diagnose the specifics in
-/// the Stripe dashboard, which holds the authoritative request log anyway.
-fn stripe_error(body: &[u8]) -> ServerError {
+/// logs — so only the HTTP status, a bounded set, and the fixed-list
+/// resolution of Stripe's `type` classifier are carried, never the raw
+/// body. Operators diagnose the specifics in the Stripe dashboard, which
+/// holds the authoritative request log anyway.
+fn stripe_error(status: reqwest::StatusCode, body: &[u8]) -> ServerError {
+    report_rejected_key(status);
+    let status = status.as_u16();
     const STRIPE_ERROR_TYPES: &[&str] = &[
         "api_error",
         "card_error",
@@ -1677,15 +1703,50 @@ fn stripe_error(body: &[u8]) -> ServerError {
                 .as_deref()
                 .and_then(|t| STRIPE_ERROR_TYPES.iter().copied().find(|known| *known == t))
                 .unwrap_or("other");
-            ServerError::Network(format!("stripe error: {label}"))
+            ServerError::Network(format!("stripe error (HTTP {status}): {label}"))
         }
-        Err(_) => ServerError::Network("stripe error: unparseable error body".to_string()),
+        Err(_) => ServerError::Network(format!(
+            "stripe error (HTTP {status}): unparseable error body"
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Stripe error carries its HTTP status and the classifier from the
+    /// fixed list, never the body's free text.
+    #[test]
+    fn a_stripe_error_carries_its_status_and_never_the_body() {
+        let body = br#"{"error":{"type":"card_error","message":"cus_123 was declined"}}"#;
+        let logged = stripe_error(reqwest::StatusCode::PAYMENT_REQUIRED, body).to_string();
+        assert_eq!(
+            logged,
+            "billing network: stripe error (HTTP 402): card_error"
+        );
+        let logged = stripe_error(reqwest::StatusCode::BAD_GATEWAY, b"<html>").to_string();
+        assert_eq!(
+            logged,
+            "billing network: stripe error (HTTP 502): unparseable error body"
+        );
+        let body = br#"{"error":{"type":"cus_123","message":"x"}}"#;
+        let logged = stripe_error(reqwest::StatusCode::BAD_REQUEST, body).to_string();
+        assert!(!logged.contains("cus_123"), "{logged}");
+    }
+
+    /// A rejected key is reported once per process, and only for 401 or 403.
+    #[test]
+    fn a_rejected_key_is_reported_once() {
+        assert!(!report_rejected_key(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!report_rejected_key(reqwest::StatusCode::NOT_FOUND));
+        report_rejected_key(reqwest::StatusCode::UNAUTHORIZED);
+        assert!(KEY_REJECTED.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!report_rejected_key(reqwest::StatusCode::FORBIDDEN));
+        assert!(!report_rejected_key(reqwest::StatusCode::UNAUTHORIZED));
+    }
 
     fn sub(status: &str) -> Subscription {
         Subscription {

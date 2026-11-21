@@ -55,7 +55,7 @@ use futures_util::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HeaderMap};
 use tinfoil_verifier::AllowedMeasurement;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{error, info, warn};
 
 use crate::backend::{BackendMeta, BackendStreamEvent, TeeType};
 use crate::db::EnginePlacementRow;
@@ -388,7 +388,12 @@ struct Inner {
     factory: ClientFactory,
     config: RouterConfig,
     rotation: AtomicUsize,
-    placement: tokio::sync::Mutex<()>,
+    /// Serializes placement, and holds what the operator has been told
+    /// about it.
+    placement: tokio::sync::Mutex<placement::PlacementReport>,
+    /// The last refresh's rows by reason, for the `engine.placement.rows`
+    /// gauge, which is read outside the placement lock.
+    placement_rows: std::sync::Mutex<Vec<(&'static str, u64)>>,
 }
 
 /// Where a request goes and what it carries.
@@ -452,7 +457,8 @@ impl EngineRouter {
                 factory,
                 config,
                 rotation: AtomicUsize::new(0),
-                placement: tokio::sync::Mutex::new(()),
+                placement: tokio::sync::Mutex::new(placement::PlacementReport::default()),
+                placement_rows: std::sync::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -461,19 +467,42 @@ impl EngineRouter {
     /// known (same model, base URL and deployment) is kept with its client,
     /// pooled connections and health; a new one gets a fresh client and takes
     /// no traffic until a probe passes.
+    ///
+    /// The operator is told what changed, once per change: a row skipped,
+    /// with its reason (`warn`), and a pinned model left with no usable row
+    /// (`error`, since every request for it is then refused), or given one
+    /// again. Rows by reason are the `engine.placement.rows` gauge.
     pub async fn apply_placement(&self, rows: &[EnginePlacementRow]) {
-        let _serial = self.inner.placement.lock().await;
+        let mut report = self.inner.placement.lock().await;
         let (usable, skipped) = placement::admissible(rows, |model| {
             self.inner
                 .models
                 .get(model)
                 .map(|m| m.deployments.as_slice())
         });
-        if !skipped.is_empty() {
-            debug!(
-                skipped = skipped.len(),
-                "engine placement: rows not usable by this gateway"
+        let changes = report.update(&usable, &skipped, self.inner.models.keys());
+        *self
+            .inner
+            .placement_rows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = report.rows();
+        for row in changes.newly_skipped {
+            warn!(
+                model = %operator_text(&row.model),
+                deployment = %operator_text(&row.deployment),
+                reason = row.reason.label(),
+                "engine placement: row not used: {}",
+                row.reason.reason()
             );
+        }
+        for model in changes.newly_unplaced {
+            error!(
+                model = %model,
+                "engine placement: no usable row for a pinned model; every request for it is refused"
+            );
+        }
+        for model in changes.placed_again {
+            info!(model = %model, "engine placement: pinned model has a usable row again");
         }
         let current = self.inner.upstreams.load_full();
         let mut next: BTreeMap<String, Vec<Arc<Upstream>>> = BTreeMap::new();
@@ -516,6 +545,17 @@ impl EngineRouter {
             next.insert(model_id, list);
         }
         self.inner.upstreams.store(Arc::new(next));
+    }
+
+    /// The last placement refresh's rows by `reason` (`usable`, `disabled`,
+    /// `unpinned_model`, `unpinned_deployment`, `invalid_url`, `duplicate`),
+    /// for the `engine.placement.rows` gauge; empty before the first.
+    pub fn placement_rows(&self) -> Vec<(&'static str, u64)> {
+        self.inner
+            .placement_rows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Each pinned model's upstreams as `(model, routable, unroutable)`, for
@@ -873,6 +913,17 @@ impl EngineRouter {
 /// The refusal when no engine could take a request.
 fn no_engine() -> ServerError {
     ServerError::ServiceUnavailable("no engine is available for this model".to_string())
+}
+
+/// Text the placement table holds, for an operator log line: the table is
+/// outside the enclave and may hold anything, so a value is escaped and cut
+/// to the length of a config hash.
+fn operator_text(text: &str) -> String {
+    let mut out: String = text.chars().take(64).flat_map(char::escape_debug).collect();
+    if text.chars().nth(64).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 /// An error and its sources, for an operator log line. Engine URLs and

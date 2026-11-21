@@ -862,8 +862,21 @@ pub mod metrics {
 
     /// Register the observable gauges read from the engine router at each
     /// export: `engine.upstreams{model, state=routable|unroutable}`, every
-    /// pinned model reported, with zeros when it has no upstream.
+    /// pinned model reported, with zeros when it has no upstream; and
+    /// `engine.placement.rows{reason=usable|disabled|unpinned_model|
+    /// unpinned_deployment|invalid_url|duplicate}`, the last placement
+    /// refresh's rows.
     pub fn register_engine_router(router: crate::engine_router::EngineRouter) {
+        let placement = router.clone();
+        meter()
+            .u64_observable_gauge("engine.placement.rows")
+            .with_description("Engine placement rows at the last refresh, by reason")
+            .with_callback(move |gauge| {
+                for (reason, rows) in placement.placement_rows() {
+                    gauge.observe(rows, &[KeyValue::new("reason", reason)]);
+                }
+            })
+            .build();
         meter()
             .u64_observable_gauge("engine.upstreams")
             .with_description("Engine upstreams known to this gateway, by model and state")
@@ -910,6 +923,17 @@ pub mod metrics {
             .with_callback(move |gauge| gauge.observe(pool.status().waiting as u64, &[]))
             .build();
     }
+
+    /// Terms-feed polls, by `document` (the fixed list in `terms_feed`) and
+    /// `outcome`: `recorded` (a new version), `unchanged`, `conflict` (a
+    /// published version's bytes changed without a new version),
+    /// `record_failed` (the database write failed) or `fetch_failed`.
+    pub static TERMS_FEED_POLLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("terms.feed.polls")
+            .with_description("Terms-feed polls per document, by outcome")
+            .build()
+    });
 
     /// Signed clock drift between the server and the database, in
     /// seconds. Positive values mean the database is ahead of the

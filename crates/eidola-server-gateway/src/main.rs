@@ -368,6 +368,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             base_url,
             config.terms_refresh,
         );
+    } else if config.terms_seed.is_empty() {
+        // Nothing will ever turn the gate on in this process. Off is a
+        // deployment's choice, but an unset secret looks the same, so it is
+        // said once, at startup.
+        match eidola_server_gateway::db::get_required_documents(&state.db_pool).await {
+            Ok(required) if required.is_empty() => warn!(
+                "terms gate is off: neither {} nor a terms seed is set, and no required \
+                 document is on record, so accounts are never asked to accept terms",
+                env.name("TERMS_FEED_BASE_URL")
+            ),
+            Ok(_) => {}
+            Err(e) => warn!("terms gate: reading the required documents failed: {e}"),
+        }
     }
 
     // Provision issuer keys on boot and start periodic rotation task.

@@ -4,7 +4,7 @@ This crate owns the account billing behavior used by the gateway and the private
 
 ## Boundaries
 
-- `stripe.rs` owns the pinned provider transport and normalized observations. A webhook is a wakeup, not an instruction to credit or debit its payload.
+- `stripe.rs` owns the pinned provider transport and normalized observations. A webhook is a wakeup, not an instruction to credit or debit its payload. A provider error carries its HTTP status and Stripe's error type resolved against a fixed list, never the body's free text (`stripe_error`); a 401 or 403 also logs once per process that Stripe rejected the API key.
 - `service.rs` owns provider reads and the durable prepare → submit → observe workflow. The CLI connects directly to PostgreSQL and Stripe with its caller's credentials. The gateway requests account-scoped reconciliation through the database and reads its durable status; it never executes repair workflows.
 - `store.rs` owns transactions and `schema/billing.sql` owns allocation functions. The latter is embedded verbatim between the shared-billing markers in the gateway's fresh baseline, `../eidola-server-gateway/schema/schema.sql`. `gateway_and_library_share_exact_billing_schema` checks the copies and that there is exactly one debit and balance function. Update both copies together. There is no historical-data migration requirement for this pre-production baseline; do not add a lossy backfill or a compatibility mutation path.
 
