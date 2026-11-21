@@ -960,3 +960,103 @@ async fn dispute_received_before_purchase_is_attached_before_grant_becomes_visib
         .get(0);
     assert_eq!(pending, 0);
 }
+
+/// A commit reports what it changed for the worker's counters: a purchase
+/// the first time it is recorded, a refund status when it is new or changed,
+/// a dispute when it opens and when it closes. Reapplying the same snapshot
+/// reports nothing.
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn a_commit_reports_only_what_it_changed() {
+    let f = fixture().await;
+    let p = purchase(&f, "purchase", 1000, 100);
+    let mut d = dispute(&p, 40, "needs_response");
+    let mut r = RefundObservation {
+        id: format!("re_{}", Uuid::new_v4()),
+        charge_id: p.charge_id.clone().unwrap(),
+        amount_minor: 10,
+        currency: "usd".into(),
+        status: "pending".into(),
+        operation_id: None,
+    };
+    let applied = f
+        .store
+        .apply_observations(
+            f.account,
+            std::slice::from_ref(&p),
+            std::slice::from_ref(&r),
+            std::slice::from_ref(&d),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.purchases.len(), 1);
+    assert_eq!(applied.purchases[0].paid_minor, 100);
+    assert_eq!(applied.refunds, vec![("pending", false)]);
+    assert_eq!(applied.disputes, vec!["opened"]);
+
+    let applied = f
+        .store
+        .apply_observations(
+            f.account,
+            std::slice::from_ref(&p),
+            std::slice::from_ref(&r),
+            std::slice::from_ref(&d),
+        )
+        .await
+        .unwrap();
+    assert!(applied.purchases.is_empty());
+    assert!(applied.refunds.is_empty());
+    assert!(applied.disputes.is_empty());
+
+    r.status = "succeeded".into();
+    d.status = "lost".into();
+    let applied = f
+        .store
+        .apply_observations(f.account, &[], &[r], &[d])
+        .await
+        .unwrap();
+    assert_eq!(applied.refunds, vec![("succeeded", false)]);
+    assert_eq!(applied.disputes, vec!["lost"]);
+}
+
+/// The backlog is read in aggregate across the whole inbox and refund
+/// operations.
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn the_backlog_is_read_in_aggregate() {
+    let f = fixture().await;
+    assert!(
+        f.store
+            .enqueue_event("evt_backlog", "v1.refund.updated", "re_backlog")
+            .await
+            .unwrap()
+    );
+    let p = purchase(&f, "purchase", 1000, 100);
+    f.store.record_purchase(&p).await.unwrap();
+    f.store
+        .prepare_refund(&refund(&f, &p, 100, None))
+        .await
+        .unwrap();
+    let backlog = f.store.backlog().await.unwrap();
+    let work = |kind: &str| {
+        backlog
+            .work
+            .iter()
+            .find(|(k, ..)| k == kind)
+            .map(|(_, pending, failing, age)| (*pending, *failing, *age))
+    };
+    let (pending, failing, age) = work("v1.refund.updated").unwrap();
+    assert_eq!((pending, failing), (1, 0));
+    assert!(age >= 0.0);
+    assert_eq!(work("billing.refund.resume").unwrap().0, 1);
+    assert_eq!(
+        backlog
+            .refunds
+            .iter()
+            .find(|(state, ..)| state == "prepared")
+            .map(|(_, count, _)| *count),
+        Some(1)
+    );
+    assert_eq!(backlog.jobs_needing_review, 0);
+    assert!(backlog.unmatched.is_empty());
+}

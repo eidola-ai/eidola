@@ -5,6 +5,7 @@ use eidola_billing::BillingError;
 use eidola_billing::service::BillingService;
 use eidola_billing::store::{RefundOperation, RefundRequest, Store};
 use eidola_billing::stripe::StripeClient;
+use eidola_billing_cli::telemetry::{self, Role};
 use eidola_common::env::Env;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -148,20 +149,35 @@ async fn main() {
         }
     };
     let _ = rustls_rustcrypto::provider().install_default();
-    if matches!(
-        cli.command,
-        Command::ServeWebhooks { .. } | Command::Work { .. }
-    ) {
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(std::io::stderr)
-            .init();
+    // Only the long-running roles log and export telemetry; a support
+    // command prints its JSON and exports nothing.
+    let role = match cli.command {
+        Command::ServeWebhooks { .. } => Some(Role::Receiver),
+        Command::Work { .. } => Some(Role::Worker),
+        _ => None,
+    };
+    let otel = role.and_then(|role| {
+        let otel = telemetry::init(&env, role);
         tracing::info!("environment variable prefix: {:?}", env.prefix());
+        otel
+    });
+    let result = run(cli, &env).await;
+    if let (Some(role), Err(error)) = (role, &result) {
+        tracing::error!(
+            role = role.name(),
+            "billing {} stopped: {error}",
+            role.name()
+        );
     }
-    match run(cli, &env).await {
+    if let Some(otel) = otel {
+        otel.shutdown();
+    }
+    match result {
         Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()),
         Err(error) => {
-            eprintln!("{error}");
+            if role.is_none() {
+                eprintln!("{error}");
+            }
             std::process::exit(1);
         }
     }

@@ -283,6 +283,10 @@ pub struct PurchaseSnapshot {
     pub expires_at: SystemTime,
     pub purchased_at: SystemTime,
     pub kind: String,
+    /// A subscription's later period (`billing_reason: subscription_cycle`),
+    /// as opposed to a one-time purchase or a subscription's first period.
+    /// Stored nowhere; it only classifies the sale for metrics.
+    pub renewal: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -560,21 +564,16 @@ impl StripeClient {
 
     /// Create a Stripe customer linked to an account.
     pub async fn create_customer(&self, account_id: Uuid) -> Result<String, ServerError> {
-        let response = self
-            .client
-            .post(format!("{}/customers", self.base_url))
-            .bearer_auth(&self.api_key)
-            .header("Idempotency-Key", format!("eidola-customer-{account_id}"))
-            .form(&[("metadata[account_id]", account_id.to_string())])
-            .send()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
-
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
+        let (status, body) = self
+            .send(
+                "customers.create",
+                self.client
+                    .post(format!("{}/customers", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .header("Idempotency-Key", format!("eidola-customer-{account_id}"))
+                    .form(&[("metadata[account_id]", account_id.to_string())]),
+            )
+            .await?;
 
         if !status.is_success() {
             return Err(stripe_error(status, &body));
@@ -675,20 +674,15 @@ impl StripeClient {
             query.push(("starting_after", cursor));
         }
 
-        let response = self
-            .client
-            .get(format!("{}/subscriptions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .query(&query)
-            .send()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
-
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
+        let (status, body) = self
+            .send(
+                "subscriptions.list",
+                self.client
+                    .get(format!("{}/subscriptions", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .query(&query),
+            )
+            .await?;
 
         if !status.is_success() {
             return Err(stripe_error(status, &body));
@@ -702,6 +696,7 @@ impl StripeClient {
     /// List active prices with expanded product info.
     pub async fn list_prices(&self) -> Result<Vec<StripePrice>, ServerError> {
         self.list_all(
+            "prices.list",
             "/prices",
             &[("active", "true"), ("expand[]", "data.product")],
         )
@@ -711,19 +706,14 @@ impl StripeClient {
     /// Fetch a single price to determine its type (recurring vs one-time).
     pub async fn get_price(&self, price_id: &str) -> Result<StripePriceMinimal, ServerError> {
         validate_id(price_id)?;
-        let response = self
-            .client
-            .get(format!("{}/prices/{}", self.base_url, price_id))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
-
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
+        let (status, body) = self
+            .send(
+                "prices.retrieve",
+                self.client
+                    .get(format!("{}/prices/{}", self.base_url, price_id))
+                    .bearer_auth(&self.api_key),
+            )
+            .await?;
 
         if !status.is_success() {
             return Err(stripe_error(status, &body));
@@ -736,19 +726,14 @@ impl StripeClient {
     /// Fetch a single product by ID.
     pub async fn get_product(&self, product_id: &str) -> Result<StripeProduct, ServerError> {
         validate_id(product_id)?;
-        let response = self
-            .client
-            .get(format!("{}/products/{}", self.base_url, product_id))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
-
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
+        let (status, body) = self
+            .send(
+                "products.retrieve",
+                self.client
+                    .get(format!("{}/products/{}", self.base_url, product_id))
+                    .bearer_auth(&self.api_key),
+            )
+            .await?;
 
         if !status.is_success() {
             return Err(stripe_error(status, &body));
@@ -766,19 +751,14 @@ impl StripeClient {
         charge_id: &str,
     ) -> Result<Option<String>, ServerError> {
         validate_id(charge_id)?;
-        let response = self
-            .client
-            .get(format!("{}/charges/{}", self.base_url, charge_id))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
-
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
+        let (status, body) = self
+            .send(
+                "charges.retrieve",
+                self.client
+                    .get(format!("{}/charges/{}", self.base_url, charge_id))
+                    .bearer_auth(&self.api_key),
+            )
+            .await?;
 
         if !status.is_success() {
             return Err(stripe_error(status, &body));
@@ -864,20 +844,15 @@ impl StripeClient {
             form.push((key, desc));
         }
 
-        let response = self
-            .client
-            .post(format!("{}/checkout/sessions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .form(&form)
-            .send()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
-
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
+        let (status, body) = self
+            .send(
+                "checkout_sessions.create",
+                self.client
+                    .post(format!("{}/checkout/sessions", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .form(&form),
+            )
+            .await?;
 
         if !status.is_success() {
             return Err(stripe_error(status, &body));
@@ -899,6 +874,7 @@ impl StripeClient {
     ) -> Result<Vec<CheckoutLineItem>, ServerError> {
         validate_id(session_id)?;
         self.list_all(
+            "checkout_line_items.list",
             &format!("/checkout/sessions/{session_id}/line_items"),
             &[("expand[]", "data.price")],
         )
@@ -911,20 +887,15 @@ impl StripeClient {
         customer_id: &str,
         return_url: &str,
     ) -> Result<String, ServerError> {
-        let response = self
-            .client
-            .post(format!("{}/billing_portal/sessions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .form(&[("customer", customer_id), ("return_url", return_url)])
-            .send()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
-
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
+        let (status, body) = self
+            .send(
+                "billing_portal_sessions.create",
+                self.client
+                    .post(format!("{}/billing_portal/sessions", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .form(&[("customer", customer_id), ("return_url", return_url)]),
+            )
+            .await?;
 
         if !status.is_success() {
             return Err(stripe_error(status, &body));
@@ -939,19 +910,56 @@ impl StripeClient {
 }
 
 impl StripeClient {
+    /// Send one request, counted and timed under `operation` (a fixed name
+    /// from [`STRIPE_OPERATIONS`]), and read its whole body. A 401 or 403 is
+    /// reported once per operation ([`report_rejected_key`]).
+    async fn send(
+        &self,
+        operation: &'static str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>), ServerError> {
+        let started = std::time::Instant::now();
+        let result = async {
+            let response = request.send().await?;
+            let status = response.status();
+            let body = response.bytes().await?;
+            Ok::<_, reqwest::Error>((status, body.to_vec()))
+        }
+        .await;
+        let elapsed = started.elapsed();
+        match &result {
+            Ok((status, body)) => {
+                let error_type = if status.is_success() {
+                    "none"
+                } else {
+                    stripe_error_type(body)
+                };
+                crate::metrics::stripe_request(
+                    operation,
+                    status_label(*status),
+                    error_type,
+                    elapsed,
+                );
+                report_rejected_key(operation, *status);
+            }
+            Err(error) => {
+                let status = if error.is_timeout() {
+                    "timeout"
+                } else {
+                    "network"
+                };
+                crate::metrics::stripe_request(operation, status, "none", elapsed);
+            }
+        }
+        result.map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))
+    }
+
     async fn response<T: serde::de::DeserializeOwned>(
         &self,
+        operation: &'static str,
         request: reqwest::RequestBuilder,
     ) -> Result<T, ServerError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
+        let (status, body) = self.send(operation, request).await?;
         if !status.is_success() {
             // Only an explicit provider rejection can settle a write as
             // rejected. Timeouts, 409/429 and 5xx leave its outcome unknown.
@@ -963,7 +971,6 @@ impl StripeClient {
             if matches!(status.as_u16(), 401 | 403 | 404)
                 || (status.as_u16() == 400 && invalid_request)
             {
-                report_rejected_key(status);
                 return Err(ServerError::ProviderRejected(format!(
                     "stripe HTTP {}",
                     status.as_u16()
@@ -975,8 +982,13 @@ impl StripeClient {
             .map_err(|e| ServerError::Parse(format!("stripe: {}", parse_error_summary(&e))))
     }
 
-    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ServerError> {
+    async fn get<T: serde::de::DeserializeOwned>(
+        &self,
+        operation: &'static str,
+        path: &str,
+    ) -> Result<T, ServerError> {
         self.response(
+            operation,
             self.client
                 .get(format!("{}{}", self.base_url, path))
                 .bearer_auth(&self.api_key),
@@ -988,6 +1000,7 @@ impl StripeClient {
     /// pages and the safety bound never become a partial authoritative answer.
     async fn list_all<T: serde::de::DeserializeOwned + ObjectId>(
         &self,
+        operation: &'static str,
         path: &str,
         filters: &[(&str, &str)],
     ) -> Result<Vec<T>, ServerError> {
@@ -1002,6 +1015,7 @@ impl StripeClient {
             }
             let page: ListResponse<T> = self
                 .response(
+                    operation,
                     self.client
                         .get(format!("{}{}", self.base_url, path))
                         .bearer_auth(&self.api_key)
@@ -1034,6 +1048,7 @@ impl StripeClient {
     pub async fn get_price_expanded(&self, id: &str) -> Result<StripePrice, ServerError> {
         validate_id(id)?;
         self.response(
+            "prices.retrieve",
             self.client
                 .get(format!("{}/prices/{id}", self.base_url))
                 .bearer_auth(&self.api_key)
@@ -1044,22 +1059,32 @@ impl StripeClient {
 
     pub async fn get_checkout(&self, id: &str) -> Result<PaidCheckout, ServerError> {
         validate_id(id)?;
-        self.get(&format!("/checkout/sessions/{id}")).await
+        self.get(
+            "checkout_sessions.retrieve",
+            &format!("/checkout/sessions/{id}"),
+        )
+        .await
     }
 
     pub async fn get_invoice(&self, id: &str) -> Result<PaidInvoice, ServerError> {
         validate_id(id)?;
-        self.get(&format!("/invoices/{id}")).await
+        self.get("invoices.retrieve", &format!("/invoices/{id}"))
+            .await
     }
 
     pub async fn get_charge(&self, id: &str) -> Result<StripeCharge, ServerError> {
         validate_id(id)?;
-        self.get(&format!("/charges/{id}")).await
+        self.get("charges.retrieve", &format!("/charges/{id}"))
+            .await
     }
 
     pub async fn get_payment_intent(&self, id: &str) -> Result<StripePaymentIntent, ServerError> {
         validate_id(id)?;
-        self.get(&format!("/payment_intents/{id}")).await
+        self.get(
+            "payment_intents.retrieve",
+            &format!("/payment_intents/{id}"),
+        )
+        .await
     }
 
     pub async fn list_paid_checkouts(
@@ -1069,6 +1094,7 @@ impl StripeClient {
         validate_id(customer)?;
         Ok(self
             .list_all::<PaidCheckout>(
+                "checkout_sessions.list",
                 "/checkout/sessions",
                 &[("customer", customer), ("status", "complete")],
             )
@@ -1086,8 +1112,12 @@ impl StripeClient {
         customer: &str,
     ) -> Result<Vec<PaidInvoice>, ServerError> {
         validate_id(customer)?;
-        self.list_all("/invoices", &[("customer", customer), ("status", "paid")])
-            .await
+        self.list_all(
+            "invoices.list",
+            "/invoices",
+            &[("customer", customer), ("status", "paid")],
+        )
+        .await
     }
 
     pub async fn list_invoice_payments(
@@ -1096,6 +1126,7 @@ impl StripeClient {
     ) -> Result<Vec<InvoicePayment>, ServerError> {
         validate_id(invoice)?;
         self.list_all(
+            "invoice_payments.list",
             "/invoice_payments",
             &[("invoice", invoice), ("status", "paid")],
         )
@@ -1108,6 +1139,7 @@ impl StripeClient {
     ) -> Result<Vec<Subscription>, ServerError> {
         validate_id(customer)?;
         self.list_all(
+            "subscriptions.list",
             "/subscriptions",
             &[("customer", customer), ("status", "all")],
         )
@@ -1116,7 +1148,7 @@ impl StripeClient {
 
     pub async fn list_refunds(&self, charge: &str) -> Result<Vec<RefundSnapshot>, ServerError> {
         validate_id(charge)?;
-        self.list_all::<StripeRefund>("/refunds", &[("charge", charge)])
+        self.list_all::<StripeRefund>("refunds.list", "/refunds", &[("charge", charge)])
             .await?
             .into_iter()
             .map(|refund| {
@@ -1130,7 +1162,7 @@ impl StripeClient {
 
     pub async fn list_disputes(&self, charge: &str) -> Result<Vec<DisputeSnapshot>, ServerError> {
         validate_id(charge)?;
-        self.list_all::<StripeDispute>("/disputes", &[("charge", charge)])
+        self.list_all::<StripeDispute>("disputes.list", "/disputes", &[("charge", charge)])
             .await?
             .into_iter()
             .map(|dispute| {
@@ -1159,6 +1191,7 @@ impl StripeClient {
         let operation = operation_id.to_string();
         let refund: StripeRefund = self
             .response(
+                "refunds.create",
                 self.client
                     .post(format!("{}/refunds", self.base_url))
                     .bearer_auth(&self.api_key)
@@ -1186,6 +1219,7 @@ impl StripeClient {
         // on it. Do not prorate or generate another invoice during closure.
         let _: serde_json::Value = self
             .response(
+                "subscriptions.cancel",
                 self.client
                     .delete(format!("{}/subscriptions/{id}", self.base_url))
                     .bearer_auth(&self.api_key)
@@ -1217,11 +1251,15 @@ impl StripeClient {
                 .customer
                 .map(|v| v.as_str().to_owned()),
             "refund" => {
-                let refund: StripeRefund = self.get(&format!("/refunds/{id}")).await?;
+                let refund: StripeRefund = self
+                    .get("refunds.retrieve", &format!("/refunds/{id}"))
+                    .await?;
                 self.get_charge_customer(refund.charge.as_str()).await?
             }
             "dispute" => {
-                let dispute: StripeDispute = self.get(&format!("/disputes/{id}")).await?;
+                let dispute: StripeDispute = self
+                    .get("disputes.retrieve", &format!("/disputes/{id}"))
+                    .await?;
                 self.get_charge_customer(dispute.charge.as_str()).await?
             }
             _ => {
@@ -1241,8 +1279,9 @@ impl StripeClient {
     ) -> Result<AccountSnapshot, ServerError> {
         validate_id(customer)?;
         let mut snapshot = AccountSnapshot::default();
-        let charges: Vec<StripeCharge> =
-            self.list_all("/charges", &[("customer", customer)]).await?;
+        let charges: Vec<StripeCharge> = self
+            .list_all("charges.list", "/charges", &[("customer", customer)])
+            .await?;
         let mut charge_map = HashMap::new();
         for charge in charges {
             if charge.customer.as_ref().map(StripeId::as_str) != Some(customer) {
@@ -1435,6 +1474,7 @@ impl StripeClient {
             expires_at,
             purchased_at,
             kind: "purchase".into(),
+            renewal: false,
         })
     }
 
@@ -1467,8 +1507,12 @@ impl StripeClient {
             .ok_or_else(|| review("subscription_snapshot_missing"))?;
         let (credits, price) = grant_terms(&subscription.metadata, "billing_period")?;
         let lines = if invoice.lines.has_more {
-            self.list_all::<InvoiceLine>(&format!("/invoices/{}/lines", invoice.id), &[])
-                .await?
+            self.list_all::<InvoiceLine>(
+                "invoice_lines.list",
+                &format!("/invoices/{}/lines", invoice.id),
+                &[],
+            )
+            .await?
         } else {
             invoice.lines.data
         };
@@ -1536,6 +1580,7 @@ impl StripeClient {
                 .await?;
             (Some(charge.id.clone()), Some(intent.to_owned()))
         };
+        let renewal = invoice.billing_reason.as_deref() == Some("subscription_cycle");
         Ok(PurchaseSnapshot {
             id: invoice.id.clone(),
             charge_id,
@@ -1547,6 +1592,7 @@ impl StripeClient {
             expires_at,
             purchased_at,
             kind: "subscription_renewal".into(),
+            renewal,
         })
     }
 }
@@ -1656,26 +1702,99 @@ fn dispute_snapshot(dispute: StripeDispute) -> Result<DisputeSnapshot, ServerErr
     })
 }
 
-/// Whether Stripe has rejected this process's API key yet.
-static KEY_REJECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Every `operation` a Stripe request is counted under: the API resource and
+/// verb, which is also how a restricted key's permissions are named. A
+/// request names its operation as a literal at its call site;
+/// `every_stripe_operation_is_listed` holds this list to those literals.
+pub const STRIPE_OPERATIONS: &[&str] = &[
+    "billing_portal_sessions.create",
+    "charges.list",
+    "charges.retrieve",
+    "checkout_line_items.list",
+    "checkout_sessions.create",
+    "checkout_sessions.list",
+    "checkout_sessions.retrieve",
+    "customers.create",
+    "disputes.list",
+    "disputes.retrieve",
+    "invoice_lines.list",
+    "invoice_payments.list",
+    "invoices.list",
+    "invoices.retrieve",
+    "payment_intents.retrieve",
+    "prices.list",
+    "prices.retrieve",
+    "products.retrieve",
+    "refunds.create",
+    "refunds.list",
+    "refunds.retrieve",
+    "subscriptions.cancel",
+    "subscriptions.list",
+];
 
-/// Says once per process, at `error`, that Stripe rejected the API key, when
-/// `status` is 401 or 403: every Stripe call fails until the key is fixed,
-/// and each failure alone reads as a provider error. Returns whether it
-/// logged.
-fn report_rejected_key(status: reqwest::StatusCode) -> bool {
+/// The operations Stripe has refused with 401 or 403 in this process.
+static REJECTED_OPERATIONS: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Says once per operation per process, at `error`, that Stripe refused the
+/// API key for `operation`, when `status` is 401 or 403: every such call
+/// fails until the key is fixed, and each failure alone reads as a provider
+/// error. Naming the operation identifies the permission a restricted key
+/// lacks. Returns whether it logged.
+fn report_rejected_key(operation: &'static str, status: reqwest::StatusCode) -> bool {
     if !matches!(status.as_u16(), 401 | 403)
-        || KEY_REJECTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        || !REJECTED_OPERATIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(operation)
     {
         return false;
     }
     tracing::error!(
+        operation,
         status = status.as_u16(),
-        "Stripe rejected the API key (HTTP {}): a key for the wrong mode, a revoked key, \
-         or a restricted key missing a permission",
+        "Stripe refused the API key for {operation} (HTTP {}): a key for the wrong mode, \
+         a revoked key, or a restricted key without this permission",
         status.as_u16()
     );
     true
+}
+
+/// The `status` label of a Stripe response: the code itself for the ones an
+/// operator acts on, else its class.
+fn status_label(status: reqwest::StatusCode) -> &'static str {
+    const NAMED: &[&str] = &["400", "401", "402", "403", "404", "409", "429"];
+    let code = status.as_u16().to_string();
+    if let Some(named) = NAMED.iter().copied().find(|named| *named == code) {
+        return named;
+    }
+    match status.as_u16() {
+        200..=299 => "2xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    }
+}
+
+/// Stripe's `type` classifier of an error body, resolved against the fixed
+/// list: one of its known types, `other` for a type not on the list, or
+/// `unparseable` for a body that is not a Stripe error.
+fn stripe_error_type(body: &[u8]) -> &'static str {
+    const STRIPE_ERROR_TYPES: &[&str] = &[
+        "api_error",
+        "card_error",
+        "idempotency_error",
+        "invalid_request_error",
+    ];
+    match serde_json::from_slice::<StripeErrorResponse>(body) {
+        Ok(err) => err
+            .error
+            .error_type
+            .as_deref()
+            .and_then(|t| STRIPE_ERROR_TYPES.iter().copied().find(|known| *known == t))
+            .unwrap_or("other"),
+        Err(_) => "unparseable",
+    }
 }
 
 /// Parse a Stripe error response into a ServerError.
@@ -1687,27 +1806,12 @@ fn report_rejected_key(status: reqwest::StatusCode) -> bool {
 /// body. Operators diagnose the specifics in the Stripe dashboard, which
 /// holds the authoritative request log anyway.
 fn stripe_error(status: reqwest::StatusCode, body: &[u8]) -> ServerError {
-    report_rejected_key(status);
     let status = status.as_u16();
-    const STRIPE_ERROR_TYPES: &[&str] = &[
-        "api_error",
-        "card_error",
-        "idempotency_error",
-        "invalid_request_error",
-    ];
-    match serde_json::from_slice::<StripeErrorResponse>(body) {
-        Ok(err) => {
-            let label = err
-                .error
-                .error_type
-                .as_deref()
-                .and_then(|t| STRIPE_ERROR_TYPES.iter().copied().find(|known| *known == t))
-                .unwrap_or("other");
-            ServerError::Network(format!("stripe error (HTTP {status}): {label}"))
-        }
-        Err(_) => ServerError::Network(format!(
+    match stripe_error_type(body) {
+        "unparseable" => ServerError::Network(format!(
             "stripe error (HTTP {status}): unparseable error body"
         )),
+        label => ServerError::Network(format!("stripe error (HTTP {status}): {label}")),
     }
 }
 
@@ -1735,17 +1839,81 @@ mod tests {
         assert!(!logged.contains("cus_123"), "{logged}");
     }
 
-    /// A rejected key is reported once per process, and only for 401 or 403.
+    /// A rejected key is reported once per operation, and only for 401 or
+    /// 403.
     #[test]
-    fn a_rejected_key_is_reported_once() {
+    fn a_rejected_key_is_reported_once_per_operation() {
         assert!(!report_rejected_key(
+            "refunds.create",
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         ));
-        assert!(!report_rejected_key(reqwest::StatusCode::NOT_FOUND));
-        report_rejected_key(reqwest::StatusCode::UNAUTHORIZED);
-        assert!(KEY_REJECTED.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(!report_rejected_key(reqwest::StatusCode::FORBIDDEN));
-        assert!(!report_rejected_key(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!report_rejected_key(
+            "refunds.create",
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        report_rejected_key("refunds.create", reqwest::StatusCode::UNAUTHORIZED);
+        assert!(
+            REJECTED_OPERATIONS
+                .lock()
+                .unwrap()
+                .contains("refunds.create")
+        );
+        assert!(!report_rejected_key(
+            "refunds.create",
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        assert!(!report_rejected_key(
+            "refunds.create",
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(report_rejected_key(
+            "subscriptions.cancel",
+            reqwest::StatusCode::FORBIDDEN
+        ));
+    }
+
+    /// The labels of a Stripe response come from fixed sets, whatever the
+    /// status or body.
+    #[test]
+    fn stripe_response_labels_are_fixed() {
+        assert_eq!(status_label(reqwest::StatusCode::OK), "2xx");
+        assert_eq!(status_label(reqwest::StatusCode::TOO_MANY_REQUESTS), "429");
+        assert_eq!(status_label(reqwest::StatusCode::IM_A_TEAPOT), "4xx");
+        assert_eq!(status_label(reqwest::StatusCode::BAD_GATEWAY), "5xx");
+        assert_eq!(
+            stripe_error_type(br#"{"error":{"type":"card_error"}}"#),
+            "card_error"
+        );
+        assert_eq!(
+            stripe_error_type(br#"{"error":{"type":"cus_123"}}"#),
+            "other"
+        );
+        assert_eq!(stripe_error_type(b"<html>"), "unparseable");
+    }
+
+    /// Every operation a request names is listed, and every listed one is
+    /// named by a request: the list is the label's whole domain.
+    #[test]
+    fn every_stripe_operation_is_listed() {
+        let source = include_str!("stripe.rs");
+        let source = &source[..source.find("#[cfg(test)]").unwrap()];
+        // Everything but the list itself.
+        let list_start = source.find("pub const STRIPE_OPERATIONS").unwrap();
+        let list_end = list_start + source[list_start..].find("];").unwrap();
+        let calls = [&source[..list_start], &source[list_end..]].concat();
+        let mut named = std::collections::BTreeSet::new();
+        for literal in calls.split('"').skip(1).step_by(2) {
+            if let Some((resource, verb)) = literal.split_once('.')
+                && matches!(verb, "create" | "list" | "retrieve" | "cancel")
+                && resource
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_')
+            {
+                named.insert(literal);
+            }
+        }
+        let listed: std::collections::BTreeSet<_> = STRIPE_OPERATIONS.iter().copied().collect();
+        assert_eq!(named, listed);
     }
 
     fn sub(status: &str) -> Subscription {

@@ -32,6 +32,42 @@ impl std::fmt::Display for BillingError {
 
 impl std::error::Error for BillingError {}
 
+/// The database names no billing protocol (`billing_protocol` is empty).
+pub(crate) const PROTOCOL_UNCONFIGURED: &str = "billing protocol is not configured";
+/// The database's billing protocol is not the one this build speaks.
+pub(crate) const PROTOCOL_INCOMPATIBLE: &str = "billing protocol is incompatible";
+
+impl BillingError {
+    /// Why the database's billing protocol refused this process, when that is
+    /// what this error is: `not_configured` or `incompatible`.
+    pub fn protocol_refusal(&self) -> Option<&'static str> {
+        match self {
+            Self::ServiceUnavailable(message) if message == PROTOCOL_UNCONFIGURED => {
+                Some("not_configured")
+            }
+            Self::ServiceUnavailable(message) if message == PROTOCOL_INCOMPATIBLE => {
+                Some("incompatible")
+            }
+            _ => None,
+        }
+    }
+
+    /// A fixed name for this error's kind, for a label or a log line.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "invalid",
+            Self::Conflict(_) => "conflict",
+            Self::NotFound(_) => "not_found",
+            Self::RequiresReview(_) => "requires_review",
+            Self::Database(_) => "database_unavailable",
+            Self::Network(_) => "provider_unavailable",
+            Self::Parse(_) => "parse",
+            Self::ServiceUnavailable(_) => "provider_unavailable",
+            Self::ProviderRejected(_) => "provider_rejected",
+        }
+    }
+}
+
 impl From<tokio_postgres::Error> for BillingError {
     fn from(error: tokio_postgres::Error) -> Self {
         // PostgreSQL's diagnostic detail can contain account IDs and row values.

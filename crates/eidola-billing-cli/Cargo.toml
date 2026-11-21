@@ -24,6 +24,12 @@ rustls-rustcrypto = "0.1.0-pre.0"
 axum = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# OTLP metrics and logs for the receiver and worker (`telemetry`); the
+# exporters and providers are built by `eidola-telemetry`.
+eidola-telemetry = { path = "../eidola-telemetry" }
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-appender-tracing = "0.33"
 
 [dev-dependencies]
 deadpool-postgres = "0.14"
