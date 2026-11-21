@@ -1,7 +1,7 @@
 //! The wire contract between Eidola's clients, its gateway, and its inference
 //! nodes (`eidola-server-engine`) that every side must spell identically.
 //!
-//! Seven things live here:
+//! Eight things live here:
 //!
 //! - **The prefix-cache key** a client may send as the request body's
 //!   `cache_key` member: [`CACHE_KEY_BYTES`] bytes, encoded as unpadded
@@ -41,10 +41,16 @@
 //!   is written as frames of one size on a fixed tick, through
 //!   `stream_shape`'s framer, and read back by its reader; every other one
 //!   is padded to `stream_shape::body_bucket`.
+//! - **A node's operational snapshot** ([`telemetry`]): the aggregate counts
+//!   and levels a node reports in its `/v1/engine/info` answer, which the
+//!   gateway reads when it probes the node and exports for it, since a node
+//!   has no egress of its own.
 //!
 //! The key is secret material on every side: a holder never logs it, prints
 //! it redacted, and scrubs it when done. Nothing here holds one; this module
 //! only states the shape, so it needs no secret-handling dependency.
+
+pub mod telemetry;
 
 /// Length of a decoded prefix-cache key, in bytes.
 pub const CACHE_KEY_BYTES: usize = 32;

@@ -3,7 +3,7 @@
 //! | Route | Auth | Purpose |
 //! |---|---|---|
 //! | `POST /v1/chat/completions` | gateway token + weights hash | the strict chat subset, answered as a stream |
-//! | `GET /v1/engine/info` | gateway token | model id, weights hash, build, executor, device |
+//! | `GET /v1/engine/info` | gateway token | model id, weights hash, build, executor, device, telemetry snapshot |
 //! | `GET /healthz` | none | content-free liveness/readiness |
 //!
 //! A chat request is refused, in this order and before anything is admitted: a missing
@@ -35,6 +35,7 @@
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use axum::Router;
@@ -45,6 +46,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use eidola_common::engine_protocol::DeclaredPrefixRefusal;
 use eidola_common::engine_protocol::STREAM_CADENCE;
+use eidola_common::engine_protocol::telemetry::{
+    BOOT_ID_BYTES, INFO_TELEMETRY_MEMBER, MAX_POOLS, NodeCounters, NodeGauges, NodeTelemetry,
+    PoolOccupancy, quantize_prefix_tokens,
+};
 use eidola_common::stream_shape::{Framer, StreamEvent, pad_body};
 use eidola_engine::engine::{FinishReason, SubmitError};
 use eidola_engine::secret::SaltDeriver;
@@ -96,6 +101,24 @@ pub struct AppState {
     pub admission: Arc<Admission>,
     /// The read bound: requests whose body is being read or parsed (module docs).
     pub reading: Arc<Admission>,
+    /// Random per process: the telemetry snapshot's `boot_id`.
+    pub boot_id: [u8; BOOT_ID_BYTES],
+    /// Requests refused `overloaded` (no read or admission slot free), since boot.
+    pub overloaded: AtomicU64,
+}
+
+impl AppState {
+    /// A fresh `boot_id`.
+    pub fn new_boot_id() -> [u8; BOOT_ID_BYTES] {
+        let mut id = [0u8; BOOT_ID_BYTES];
+        getrandom::fill(&mut id).expect("operating-system randomness unavailable");
+        id
+    }
+
+    fn refuse_overloaded(&self) -> ApiError {
+        self.overloaded.fetch_add(1, Ordering::Relaxed);
+        ApiError::Overloaded
+    }
 }
 
 /// The most event bytes a streamed response holds waiting for frames before it stops
@@ -205,6 +228,56 @@ pub fn build_info() -> Value {
     })
 }
 
+/// The node's telemetry snapshot (`eidola_common::engine_protocol::telemetry`): the
+/// engine thread's counters as last published, the node's own count of `overloaded`
+/// refusals, and the pools as last recounted, with the prefix cache's token counts and
+/// the pools' occupancy coarsened as the contract states. Nothing in it is per request
+/// (`AGENTS.md` → Telemetry).
+pub fn telemetry(state: &AppState) -> NodeTelemetry {
+    let s = state.engine.stats();
+    NodeTelemetry {
+        boot_id: state.boot_id,
+        counters: NodeCounters {
+            requests_accepted: s.submitted,
+            requests_finished: s.finished,
+            requests_cancelled: s.cancelled,
+            requests_cut_off: s.cut_off,
+            requests_rejected: s.rejected,
+            requests_prefix_refused: s.prefix_refused,
+            requests_overloaded: state.overloaded.load(Ordering::Relaxed),
+            steps: s.forward_steps,
+            step_micros: s.step_micros,
+            step_rows: s.step_rows,
+            prefill_tokens: s.prefill_tokens,
+            generated_tokens: s.generated_tokens,
+            drafted_tokens: s.drafted,
+            accepted_drafts: s.accepted_drafts,
+            preemptions: s.preemptions,
+            prefix_lookups: s.admissions,
+            prefix_hit_tokens: quantize_prefix_tokens(s.prefix_hit_tokens),
+            prefix_miss_tokens: quantize_prefix_tokens(s.prefix_miss_tokens),
+            cache_device_evictions: s.device_evictions,
+            cache_host_evictions: s.host_evictions,
+            cache_demoted_blocks: s.demoted_blocks,
+            cache_promoted_blocks: s.promoted_blocks,
+        },
+        gauges: NodeGauges {
+            sequences_waiting: s.waiting,
+            sequences_running: s.running,
+            // No architecture has more pools than the contract carries.
+            pools: state
+                .engine
+                .pools()
+                .iter()
+                .take(MAX_POOLS)
+                .map(|p| {
+                    PoolOccupancy::quantized(p.total, p.in_use, p.idle, p.host_total, p.host_used)
+                })
+                .collect(),
+        },
+    }
+}
+
 async fn engine_info(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(json!({
         "model": state.model_id,
@@ -219,6 +292,7 @@ async fn engine_info(State(state): State<Arc<AppState>>) -> Response {
             "sm_count": d.sm_count,
             "memory_bytes": d.memory_bytes,
         })),
+        INFO_TELEMETRY_MEMBER: telemetry(&state).to_value(),
     }))
     .into_response()
 }
@@ -250,13 +324,19 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
     // the bodies and parses outside admission are bounded too.
     // `Overloaded` only where nothing has been admitted: a gateway sends it to another
     // node (`eidola_common::engine_protocol::refused_before_admission`).
-    let reading = state.reading.try_acquire().ok_or(ApiError::Overloaded)?;
+    let reading = state
+        .reading
+        .try_acquire()
+        .ok_or_else(|| state.refuse_overloaded())?;
     let body = axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES)
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
     let req = api::parse_request(&body, &state.model_id)?;
     drop(body);
-    let permit = state.admission.try_acquire().ok_or(ApiError::Overloaded)?;
+    let permit = state
+        .admission
+        .try_acquire()
+        .ok_or_else(|| state.refuse_overloaded())?;
     drop(reading);
 
     let id = state.engine.next_id();

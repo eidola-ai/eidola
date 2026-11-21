@@ -692,6 +692,8 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         engine: engine.clone(),
         admission: admission.clone(),
         reading,
+        boot_id: AppState::new_boot_id(),
+        overloaded: Default::default(),
     });
     Ok(Node {
         router: http::router(state),

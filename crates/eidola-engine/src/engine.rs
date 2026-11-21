@@ -226,6 +226,21 @@ pub struct Stats {
     pub accepted: u64,
     /// Requests refused at first admission for a short prefix-cache hit.
     pub prefix_refusals: u64,
+    /// Steps that ran at least one sequence.
+    pub forward_steps: u64,
+    /// Sequences those steps ran, summed over the steps.
+    pub step_rows: u64,
+    /// Positions computed by rows that were not decoding: prompts' uncached parts, and
+    /// a preempted sequence's recomputation.
+    pub prefill_tokens: u64,
+    /// Tokens generated.
+    pub generated_tokens: u64,
+    /// Requests admitted for the first time (each with one prefix-cache lookup).
+    pub admissions: u64,
+    /// Prompt positions those admissions found in the prefix cache.
+    pub prefix_hit_tokens: u64,
+    /// Prompt positions they did not.
+    pub prefix_miss_tokens: u64,
 }
 
 /// The host engine over one executor.
@@ -327,6 +342,16 @@ impl<E: Executor> Engine<E> {
     /// Requests not yet finished.
     pub fn unfinished(&self) -> usize {
         self.seqs.len()
+    }
+
+    /// Requests waiting for a seat (never admitted, or preempted).
+    pub fn waiting(&self) -> usize {
+        self.waiting.len()
+    }
+
+    /// Requests running.
+    pub fn running(&self) -> usize {
+        self.running.len()
     }
 
     /// Idle-KV keys the engine holds: one per unfinished request (a waiting one included),
@@ -605,6 +630,10 @@ impl<E: Executor> Engine<E> {
                 let seq = self.seqs.get_mut(&id).expect("waiting sequence");
                 if seq.cached_prompt_tokens.is_none() {
                     seq.cached_prompt_tokens = Some(cached);
+                    self.stats.admissions += 1;
+                    self.stats.prefix_hit_tokens += u64::from(cached);
+                    self.stats.prefix_miss_tokens +=
+                        u64::from(seq.req.prompt.len() as u32 - cached);
                 }
                 self.waiting.remove(&arrival);
                 self.running.insert(arrival, id);
@@ -844,6 +873,8 @@ impl<E: Executor> Engine<E> {
         };
         let out = self.exec.execute(&step)?;
         self.stats.steps += 1;
+        self.stats.forward_steps += 1;
+        self.stats.step_rows += u64::from(rows);
         // A padded logit row has no token: an executor that returns one has broken the
         // seam contract, and nothing it produced in this step is committed.
         let limit = self.spec.sampleable_vocab_size;
@@ -865,6 +896,14 @@ impl<E: Executor> Engine<E> {
             }
             let id = p.id;
             let seq = self.seqs.get_mut(&id).expect("planned sequence");
+            // A decode row feeds the last generated token; every other row computes
+            // prompt positions (or recomputes a preempted sequence's).
+            let decoding = e.num_tokens == 1
+                && seq.generated > 0
+                && e.context_len + 1 == seq.tokens.len() as u32;
+            if !decoding {
+                self.stats.prefill_tokens += u64::from(e.num_tokens);
+            }
             let mut emitted = Vec::new();
             let mut finish = None;
             for &t in &produced {
@@ -882,6 +921,7 @@ impl<E: Executor> Engine<E> {
                     break;
                 }
             }
+            self.stats.generated_tokens += emitted.len() as u64;
             // KV is valid for the host tokens plus the accepted drafts.
             let accepted_drafts = produced.len().saturating_sub(1) as u32;
             let mut computed = e.context_len + e.num_tokens;

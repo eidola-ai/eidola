@@ -147,6 +147,8 @@ async fn a_stalled_step_ends_the_stream_with_an_error_and_exits() {
         engine: handle.clone(),
         admission: admission.clone(),
         reading: Admission::new(4),
+        boot_id: AppState::new_boot_id(),
+        overloaded: Default::default(),
     });
     let node = common::TestNode::serve(eidola_server_engine::Node {
         router: http::router(state),
