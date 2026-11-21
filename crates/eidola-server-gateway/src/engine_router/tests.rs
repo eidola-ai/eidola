@@ -1190,6 +1190,40 @@ async fn failures_open_an_engine_and_a_probe_restores_it() {
     assert_eq!(served_by(&refs, &before), home);
 }
 
+/// A request no engine can take fails its `engine.chat_stream` span, which
+/// the aggregator reads as `outcome=error`, and writes no log record. Every
+/// pinned model is reported to the upstream gauge, with no upstreams.
+#[test]
+fn a_request_no_engine_takes_is_an_error_span_and_no_log_line() {
+    let router = EngineRouter::new(
+        models(),
+        EngineToken::new(TOKEN.into()).unwrap(),
+        attesting_client_factory(AttestationRoots {
+            tls_roots: rustls::RootCertStore::empty(),
+            trusted_ark_der: None,
+            trusted_ask_der: None,
+        }),
+        fast_config(),
+    );
+    assert_eq!(
+        router.upstream_states(),
+        vec![(MODEL_A.to_string(), 0, 0), (MODEL_B.to_string(), 0, 0)]
+    );
+    let captured = crate::telemetry::capture::capture(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(router.send_stream(&request(MODEL_A, None, true)));
+        assert!(matches!(result, Err(ServerError::ServiceUnavailable(_))));
+    });
+    assert_eq!(
+        captured.spans,
+        vec![("engine.chat_stream".to_string(), "error")]
+    );
+    assert_eq!(captured.logs, 0, "a refused dispatch wrote a log record");
+}
+
 /// An engine that could not have run the request passes it on within the
 /// same request: at capacity (not counted against its health), or gone.
 #[tokio::test]

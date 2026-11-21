@@ -218,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         error!("Database pool error: {}", e);
         e
     })?;
+    telemetry::metrics::register_db_pool(db_pool.clone());
 
     // Create Stripe client (optional)
     let stripe = config.stripe_api_key.map(StripeClient::new);
@@ -282,6 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             info!("Reading engine placement and probing engines...");
             router.refresh(source.as_ref()).await;
             router.spawn(source);
+            telemetry::metrics::register_engine_router(router.clone());
             Some(router)
         }
         _ => None,

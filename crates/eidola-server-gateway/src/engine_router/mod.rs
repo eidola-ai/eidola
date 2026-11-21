@@ -346,12 +346,21 @@ impl InFlight {
         }
     }
 
-    /// The upstream failed this request.
+    /// The upstream failed this request. If that opened its breaker, the
+    /// operator is told once, for the change of state; the failures
+    /// themselves are counted, never logged.
     fn failed(&self, config: &BreakerConfig) {
         if let Some(admitted) = self.admitted {
-            self.upstream
+            let opened = self
+                .upstream
                 .breaker()
                 .on_failure(admitted, Instant::now(), config);
+            if opened {
+                warn!(
+                    upstream = %self.upstream.base_url,
+                    "engine upstream opened after failing requests; no traffic until a later probe passes"
+                );
+            }
         }
     }
 }
@@ -395,10 +404,33 @@ struct Plan<'a> {
 enum Attempt {
     /// A successful response, its body unread.
     Response(reqwest::Response),
-    /// The engine did not run the request; try the next.
-    Next,
+    /// The engine did not run the request; try the next. The label is the
+    /// attempt's `engine.dispatch.attempts` outcome.
+    Next(&'static str),
     /// The request failed in a way another engine would not change.
     Fail(ServerError),
+}
+
+impl Attempt {
+    /// The attempt's `engine.dispatch.attempts` outcome.
+    fn outcome(&self) -> &'static str {
+        match self {
+            Attempt::Response(_) => "response",
+            Attempt::Next(outcome) => outcome,
+            Attempt::Fail(_) => "refused",
+        }
+    }
+}
+
+/// Count one dispatch outcome for `model` (a pinned weights hash).
+fn count_dispatch(model: &str, outcome: &'static str) {
+    crate::telemetry::metrics::ENGINE_DISPATCH_ATTEMPTS.add(
+        1,
+        &[
+            opentelemetry::KeyValue::new("model", model.to_string()),
+            opentelemetry::KeyValue::new("outcome", outcome),
+        ],
+    );
 }
 
 impl EngineRouter {
@@ -484,6 +516,22 @@ impl EngineRouter {
             next.insert(model_id, list);
         }
         self.inner.upstreams.store(Arc::new(next));
+    }
+
+    /// Each pinned model's upstreams as `(model, routable, unroutable)`, for
+    /// the `engine.upstreams` gauge. Every pinned model is listed, with
+    /// zeros when placement gives it no upstream.
+    pub fn upstream_states(&self) -> Vec<(String, u64, u64)> {
+        let snapshot = self.inner.upstreams.load();
+        self.inner
+            .models
+            .keys()
+            .map(|model| {
+                let list = snapshot.get(model).map(Vec::as_slice).unwrap_or_default();
+                let routable = list.iter().filter(|u| u.routable()).count() as u64;
+                (model.clone(), routable, list.len() as u64 - routable)
+            })
+            .collect()
     }
 
     /// Read placement from `source` and apply it, then probe what is due. A
@@ -644,6 +692,7 @@ impl EngineRouter {
         };
         ranked.truncate(self.inner.config.request_attempts.max(1));
         if ranked.is_empty() {
+            count_dispatch(model.pinned.id(), "none_available");
             return Err(no_engine());
         }
         let headers = engine_request_headers(&self.inner.token, &model.pinned);
@@ -683,11 +732,7 @@ impl EngineRouter {
             // whatever the node had begun; nothing reached the client.
             Err(_) => {
                 in_flight.failed(config);
-                warn!(
-                    upstream = %upstream.base_url,
-                    "engine upstream sent no response headers in time"
-                );
-                return Attempt::Next;
+                return Attempt::Next("no_headers");
             }
         };
         let response = match sent {
@@ -697,14 +742,9 @@ impl EngineRouter {
             // Nothing reached the client and only a response's usage settles
             // a charge, so whatever the engine did, another may run it; the
             // cost of a repeat is the engine's compute, never the client's.
-            Err(e) => {
+            Err(_) => {
                 in_flight.failed(config);
-                warn!(
-                    upstream = %upstream.base_url,
-                    "engine upstream gave no response: {}",
-                    error_chain(&e)
-                );
-                return Attempt::Next;
+                return Attempt::Next("no_response");
             }
         };
         let status = response.status();
@@ -748,17 +788,19 @@ impl EngineRouter {
         match refused_before_admission(status.as_u16(), &error_type) {
             // The gateway's token, the pinned weights or the model are not
             // what this upstream serves: misconfigured; open it and move on.
+            // The operator is told once, when it opens.
             Some(PreAdmission::Misconfigured) => {
-                upstream.breaker().trip(Instant::now(), config);
-                warn!(
-                    upstream = %upstream.base_url,
-                    status = status.as_u16(),
-                    "engine upstream refused the gateway; opened"
-                );
-                Attempt::Next
+                if upstream.breaker().trip(Instant::now(), config) {
+                    warn!(
+                        upstream = %upstream.base_url,
+                        status = status.as_u16(),
+                        "engine upstream refused the gateway's token, weights or model; opened"
+                    );
+                }
+                Attempt::Next("misconfigured")
             }
             // At capacity is load, not ill health.
-            Some(PreAdmission::Overloaded) => Attempt::Next,
+            Some(PreAdmission::Overloaded) => Attempt::Next("overloaded"),
             None => {
                 if status.is_server_error() {
                     in_flight.failed(config);
@@ -774,9 +816,18 @@ impl EngineRouter {
 
     /// A request, as a stream: chunks as the engine sends them, then `Done`
     /// with the usage the engine reported. The body asks the engine for a
-    /// stream with its usage ([`engine_request_body`]).
-    #[tracing::instrument(skip_all, name = "engine.chat_stream", err)]
+    /// stream with its usage ([`engine_request_body`]). Every attempt is
+    /// counted by its outcome (`engine.dispatch.attempts`), and a request no
+    /// engine took as `none_available`.
+    #[tracing::instrument(skip_all, name = "engine.chat_stream", fields(otel.status_code))]
     pub async fn send_stream(
+        &self,
+        request: &ValidatedRequest,
+    ) -> Result<mpsc::Receiver<Result<BackendStreamEvent, ServerError>>, ServerError> {
+        crate::telemetry::span_result(self.dispatch(request).await)
+    }
+
+    async fn dispatch(
         &self,
         request: &ValidatedRequest,
     ) -> Result<mpsc::Receiver<Result<BackendStreamEvent, ServerError>>, ServerError> {
@@ -786,6 +837,7 @@ impl EngineRouter {
             headers,
             body,
         } = self.plan(request)?;
+        let model_id = model.pinned.id();
         for upstream in upstreams {
             // The plan's ranking is from before any attempt; whether this
             // upstream takes the request is decided now.
@@ -793,12 +845,13 @@ impl EngineRouter {
                 continue;
             };
             let limit = self.inner.config.stream_headers_limit;
-            let response = match self
+            let attempt = self
                 .attempt(&upstream, &in_flight, &headers, &body, limit)
-                .await
-            {
+                .await;
+            count_dispatch(model_id, attempt.outcome());
+            let response = match attempt {
                 Attempt::Response(response) => response,
-                Attempt::Next => continue,
+                Attempt::Next(_) => continue,
                 Attempt::Fail(e) => return Err(e),
             };
             let (tx, rx) = mpsc::channel(32);
@@ -812,6 +865,7 @@ impl EngineRouter {
             ));
             return Ok(rx);
         }
+        count_dispatch(model_id, "none_available");
         Err(no_engine())
     }
 }
@@ -841,7 +895,9 @@ fn error_chain(e: &reqwest::Error) -> String {
 /// the handler settles it as a failed stream: the node's `event: error` frame,
 /// an end without `[DONE]`, a broken connection, a chunk that does not parse,
 /// a block that is not UTF-8, or an event type the node does not send. Nothing
-/// is skipped. A stream that completes reports the engine's usage in `Done`.
+/// is skipped. Each failure is counted by its reason
+/// (`engine.stream.failures`), under `model`, the pinned weights hash. A
+/// stream that completes reports the engine's usage in `Done`.
 async fn relay_stream(
     response: reqwest::Response,
     in_flight: InFlight,
@@ -853,12 +909,19 @@ async fn relay_stream(
     let mut stream = std::pin::pin!(response.bytes_stream());
     let mut reader = StreamReader::new();
     let mut chat_id: Option<String> = None;
-    let mut backend_model = model;
     let mut usage = None;
-    let fail = |e: ServerError| -> Result<BackendStreamEvent, ServerError> {
+    let fail = |reason: &'static str, e: ServerError| -> Result<BackendStreamEvent, ServerError> {
+        crate::telemetry::metrics::ENGINE_STREAM_FAILURES.add(
+            1,
+            &[
+                opentelemetry::KeyValue::new("model", model.clone()),
+                opentelemetry::KeyValue::new("reason", reason),
+            ],
+        );
         in_flight.failed(&breaker);
         Err(e)
     };
+    let mut backend_model = model.clone();
     loop {
         // The handler dropping its receiver (the client went away, or the
         // request reached its deadline) ends the relay at once, even while
@@ -873,9 +936,10 @@ async fn relay_stream(
         let Ok(read) = read else {
             // Not even a padding frame: the node or the path to it stopped.
             let _ = tx
-                .send(fail(ServerError::Network(
-                    "the engine's stream went silent".to_string(),
-                )))
+                .send(fail(
+                    "silent",
+                    ServerError::Network("the engine's stream went silent".to_string()),
+                ))
                 .await;
             return;
         };
@@ -884,7 +948,10 @@ async fn relay_stream(
             Ok(bytes) => bytes,
             Err(e) => {
                 let _ = tx
-                    .send(fail(ServerError::Network(e.without_url().to_string())))
+                    .send(fail(
+                        "read",
+                        ServerError::Network(e.without_url().to_string()),
+                    ))
                     .await;
                 return;
             }
@@ -897,19 +964,17 @@ async fn relay_stream(
                 Ok(Some(event)) => event,
                 Ok(None) => break,
                 Err(unreadable) => {
+                    let (reason, message) = match unreadable {
+                        Unreadable::NotUtf8 => ("not_utf8", "the engine's stream was not UTF-8"),
+                        // Nothing else is in the node's stream: an event this
+                        // relay does not know ends it rather than being
+                        // passed over.
+                        Unreadable::UnknownEvent => {
+                            ("unknown_event", "the engine sent an unknown stream event")
+                        }
+                    };
                     let _ = tx
-                        .send(fail(ServerError::Parse(
-                            match unreadable {
-                                Unreadable::NotUtf8 => "the engine's stream was not UTF-8",
-                                // Nothing else is in the node's stream: an
-                                // event this relay does not know ends it
-                                // rather than being passed over.
-                                Unreadable::UnknownEvent => {
-                                    "the engine sent an unknown stream event"
-                                }
-                            }
-                            .to_string(),
-                        )))
+                        .send(fail(reason, ServerError::Parse(message.to_string())))
                         .await;
                     return;
                 }
@@ -922,11 +987,14 @@ async fn relay_stream(
                         Err(_) => ("unknown".to_string(), "the engine failed".to_string()),
                     };
                     let _ = tx
-                        .send(fail(ServerError::Backend {
-                            status: 502,
-                            error_type,
-                            message,
-                        }))
+                        .send(fail(
+                            "error_event",
+                            ServerError::Backend {
+                                status: 502,
+                                error_type,
+                                message,
+                            },
+                        ))
                         .await;
                     return;
                 }
@@ -979,17 +1047,19 @@ async fn relay_stream(
                 // `[DONE]` would bill it as complete.
                 Err(e) => {
                     let summary = crate::error::parse_error_summary(&e);
-                    warn!("an engine SSE chunk did not parse: {summary}");
-                    let _ = tx.send(fail(ServerError::Parse(summary))).await;
+                    let _ = tx
+                        .send(fail("unparsed_chunk", ServerError::Parse(summary)))
+                        .await;
                     return;
                 }
             }
         }
     }
     let _ = tx
-        .send(fail(ServerError::Network(
-            "the engine's stream ended before it completed".to_string(),
-        )))
+        .send(fail(
+            "incomplete",
+            ServerError::Network("the engine's stream ended before it completed".to_string()),
+        ))
         .await;
 }
 

@@ -114,16 +114,12 @@ impl SpanProcessor for AggregatingSpanProcessor {
             .end_time
             .duration_since(span.start_time)
             .unwrap_or_default();
-        let outcome = match span.status {
-            opentelemetry::trace::Status::Error { .. } => "error",
-            _ => "ok",
-        };
 
         metrics::SPAN_DURATION.record(
             duration.as_secs_f64(),
             &[
                 KeyValue::new("operation", operation),
-                KeyValue::new("outcome", outcome),
+                KeyValue::new("outcome", span_outcome(&span.status)),
             ],
         );
     }
@@ -135,6 +131,31 @@ impl SpanProcessor for AggregatingSpanProcessor {
     fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
         Ok(())
     }
+}
+
+/// The `outcome` label a finished span aggregates under: `error` when its
+/// status is an error, `ok` otherwise.
+fn span_outcome(status: &opentelemetry::trace::Status) -> &'static str {
+    match status {
+        opentelemetry::trace::Status::Error { .. } => "error",
+        _ => "ok",
+    }
+}
+
+/// Marks the current span failed when `result` is an error, and returns it.
+///
+/// This is how an instrumented function reports failure to the aggregator,
+/// which reads it as `outcome=error` on `operation.duration`. The span must
+/// declare the field (`fields(otel.status_code)` beside `skip_all`), since
+/// `tracing` records only declared fields. `#[instrument(err)]` would set the
+/// same status, by emitting an ERROR event: an exported log line for every
+/// failed call, timestamped, which is a per-request record whenever the
+/// failure is one. This sets the status and emits nothing.
+pub fn span_result<T, E>(result: Result<T, E>) -> Result<T, E> {
+    if result.is_err() {
+        tracing::Span::current().record("otel.status_code", "error");
+    }
+    result
 }
 
 /// Holds OTel providers so they can be shut down gracefully.
@@ -167,12 +188,7 @@ pub fn init(env: &Env) -> Option<OtelGuard> {
 
     let fmt_layer = tracing_subscriber::fmt::layer();
 
-    // `EnvFilter::from_default_env`, over the prefixed `RUST_LOG`.
-    let env_filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::ERROR.into())
-        .parse_lossy(env.var("RUST_LOG").unwrap_or_default())
-        .add_directive("eidola_server_gateway=info".parse().unwrap())
-        .add_directive("hyper=warn".parse().unwrap());
+    let env_filter = log_filter(&env.var("RUST_LOG").unwrap_or_default());
 
     let (otel_trace_layer, otel_log_layer) = match &otel {
         Some(guard) => {
@@ -194,6 +210,16 @@ pub fn init(env: &Env) -> Option<OtelGuard> {
         .init();
 
     otel
+}
+
+/// The event and span filter: `EnvFilter::from_default_env`, over the
+/// prefixed `RUST_LOG`, with this crate at `info` and `hyper` at `warn`.
+fn log_filter(rust_log: &str) -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(LevelFilter::ERROR.into())
+        .parse_lossy(rust_log)
+        .add_directive("eidola_server_gateway=info".parse().unwrap())
+        .add_directive("hyper=warn".parse().unwrap())
 }
 
 /// The OTel trace layer exactly as production runs it.
@@ -489,6 +515,7 @@ fn init_otel_providers(config: OtlpConfig) -> OtelGuard {
 /// default ladder is millisecond-scaled and every duration instrument here
 /// records seconds. See `SDK_DEFAULT_BUCKETS`.
 pub mod metrics {
+    use opentelemetry::KeyValue;
     use opentelemetry::metrics::{Counter, Gauge, Histogram};
     use std::sync::LazyLock;
 
@@ -529,25 +556,35 @@ pub mod metrics {
     /// from the name directly would let any future span — or any span whose
     /// name interpolates a value — create an unbounded set of time series.
     /// Resolving through a fixed list makes that impossible by construction
-    /// rather than by review.
-    ///
-    /// The root `http.request` span is deliberately absent: middleware records
-    /// that latency itself, with method, route and status attached, and
-    /// aggregating it here too would double-count it.
-    const TRACKED_SPANS: &[&str] = &[
+    /// rather than by review. Every span this crate opens is either here or
+    /// in [`UNTRACKED_SPANS`], which a test checks against the source.
+    pub(super) const TRACKED_SPANS: &[&str] = &[
+        "account.reconcile",
+        "account.reconcile_status",
+        "db.find_credential_issuance",
         "db.get_account",
         "db.get_available_balance",
         "db.get_issuer_key",
         "db.get_refund_token",
         "db.get_valid_issuer_keys",
-        "account.reconcile",
-        "account.reconcile_status",
+        "db.has_stripe_ledger_history",
+        "db.prune_expired_issuances",
+        "db.prune_expired_nullifiers",
+        "db.record_credential_issuance",
         "db.record_nullifiers",
         "db.replace_refund_token",
+        "db.resolve_issuance_off_current_key",
         "db.store_refund_token",
-        "upstream.chat",
-        "upstream.chat_stream",
+        "engine.chat_stream",
     ];
+
+    /// Spans the aggregator deliberately ignores, each with the reason.
+    pub(super) const UNTRACKED_SPANS: &[(&str, &str)] = &[(
+        "http.request",
+        "the root request span: middleware records its latency itself, with \
+         method, route and status attached, and aggregating it here too would \
+         double-count it",
+    )];
 
     /// Resolve a span name to its metric label, or `None` for a span the
     /// aggregator should ignore.
@@ -556,7 +593,10 @@ pub mod metrics {
     /// should be visible as *something* so it prompts a `TRACKED_SPANS` entry,
     /// but it must never mint a series of its own.
     pub(super) fn span_operation(name: &str) -> Option<&'static str> {
-        if name == "http.request" {
+        if UNTRACKED_SPANS
+            .iter()
+            .any(|(untracked, _)| *untracked == name)
+        {
             return None;
         }
         Some(
@@ -634,12 +674,17 @@ pub mod metrics {
     });
 
     /// Total chat completion requests reaching the handler (by model,
-    /// stream, status). `status` is `ok` (2xx response opened), `error` (a
-    /// refund-bearing error response built after the credential was
-    /// spent), or `rejected` (pre-flight refusal: a request not asking for
-    /// a stream, an invalid or duplicate credential). The `model` label
-    /// is always the catalog resolution of the requested id, with `other`
-    /// for anything unrecognized — never the caller's string.
+    /// stream, status, reason). `status` is `ok` (2xx response opened),
+    /// `error` (a refund-bearing error response built after the credential
+    /// was spent), or `rejected` (pre-flight refusal: a request not asking
+    /// for a stream, an invalid or duplicate credential). `reason` is `none`
+    /// for `ok`, and otherwise the refusal's fixed class
+    /// (`ServerError::label`): `bad_request`, `payment_required`,
+    /// `unavailable` (no engine took it), an engine's error type resolved
+    /// against the known list (`timeout` for the request's deadline), and
+    /// so on. The `model` label is always the catalog resolution of the
+    /// requested id, with `other` for anything unrecognized — never the
+    /// caller's string.
     pub static CHAT_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         meter()
             .u64_counter("chat.completion.requests")
@@ -718,6 +763,154 @@ pub mod metrics {
             .build()
     });
 
+    /// Attempts to hand a chat request to an engine, by `model` and
+    /// `outcome`: `response` (the engine answered with a stream),
+    /// `no_headers` (no response headers in time), `no_response` (no
+    /// attested connection, or one that closed under the request),
+    /// `misconfigured` (the engine refused the gateway's token, weights or
+    /// model; its breaker opens), `overloaded` (at capacity; the next engine
+    /// is tried), `refused` (any other answer, returned to the client), and
+    /// `none_available` (no engine was left to try, counted once per
+    /// request).
+    pub static ENGINE_DISPATCH_ATTEMPTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("engine.dispatch.attempts")
+            .with_description("Attempts to dispatch a chat request to an engine, by outcome")
+            .build()
+    });
+
+    /// Engine streams that failed after they opened, by `model` and
+    /// `reason`: `silent` (nothing for the idle limit), `read` (the
+    /// connection broke), `not_utf8`, `unknown_event`, `unparsed_chunk` (a
+    /// chunk this gateway cannot read), `error_event` (the node's own error
+    /// frame), or `incomplete` (the body ended without `[DONE]`). Each is
+    /// also counted against the engine's health.
+    pub static ENGINE_STREAM_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("engine.stream.failures")
+            .with_description("Engine streams that failed after opening, by reason")
+            .build()
+    });
+
+    /// Credential issuance requests, by `outcome`: `issued`, `replayed` (a
+    /// retry answered from the stored response), `insufficient` (balance),
+    /// `terms_required`, `key_retired`, `key_pending` (the named key is not
+    /// this gateway's issuing key yet), `closed` (the account is closing or
+    /// closed), `mismatch` (an idempotency key reused for another request),
+    /// `invalid` (a malformed request), or `failed` (anything else).
+    pub static CREDENTIAL_ISSUANCE: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("credentials.issuance")
+            .with_description("Credential issuance requests, by outcome")
+            .build()
+    });
+
+    /// Refunds settled for spent inputs, by `outcome`: `issued` (the refund
+    /// owed), `zero_fallback` (that refund could not be signed, and one
+    /// returning nothing was issued instead), or `failed` (not even that).
+    /// Any `zero_fallback` or `failed` is an incident.
+    pub static CREDENTIAL_REFUNDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("credentials.refunds")
+            .with_description("Refunds settled for spent inputs, by outcome")
+            .build()
+    });
+
+    /// Refunds that were issued but could not be stored for recovery. The
+    /// refund still reaches the client in its response; one whose response
+    /// is lost cannot be recovered.
+    pub static REFUND_STORE_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("credentials.refund_store.failures")
+            .with_description("Issued refunds that could not be stored for recovery")
+            .build()
+    });
+
+    /// Refund recoveries whose stored token did not open under the
+    /// presented refund key, answered as if nothing were stored.
+    pub static REFUND_RECOVERY_UNOPENED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("credentials.refund_recovery.unopened")
+            .with_description("Refund recoveries whose stored token did not open")
+            .build()
+    });
+
+    /// Request bodies refused before a handler ran, by `payload` (the
+    /// expected body type's name, fixed in code) and `class`: `too_large`,
+    /// `unreadable`, `read_timeout`, `no_permit` (no large-body permit
+    /// free), `too_deep`, `too_many_values`, `data`, `syntax`,
+    /// `missing_content_type`, `bytes` or `other`.
+    pub static BODY_REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("http.server.body.rejected")
+            .with_description("Request bodies refused before the handler ran, by class")
+            .build()
+    });
+
+    /// Count a refused request body. `payload` is a type name: its last
+    /// path segment is the label.
+    pub fn body_rejected(payload: &'static str, class: &'static str) {
+        let payload = payload.rsplit("::").next().unwrap_or(payload);
+        BODY_REJECTED.add(
+            1,
+            &[
+                KeyValue::new("payload", payload),
+                KeyValue::new("class", class),
+            ],
+        );
+    }
+
+    /// Register the observable gauges read from the engine router at each
+    /// export: `engine.upstreams{model, state=routable|unroutable}`, every
+    /// pinned model reported, with zeros when it has no upstream.
+    pub fn register_engine_router(router: crate::engine_router::EngineRouter) {
+        meter()
+            .u64_observable_gauge("engine.upstreams")
+            .with_description("Engine upstreams known to this gateway, by model and state")
+            .with_callback(move |gauge| {
+                for (model, routable, unroutable) in router.upstream_states() {
+                    gauge.observe(
+                        routable,
+                        &[
+                            KeyValue::new("model", model.clone()),
+                            KeyValue::new("state", "routable"),
+                        ],
+                    );
+                    gauge.observe(
+                        unroutable,
+                        &[
+                            KeyValue::new("model", model),
+                            KeyValue::new("state", "unroutable"),
+                        ],
+                    );
+                }
+            })
+            .build();
+    }
+
+    /// Register the observable gauges read from the database pool at each
+    /// export: `db.pool.connections{state=in_use|idle}` and
+    /// `db.pool.waiting`, the requests waiting for a connection.
+    pub fn register_db_pool(pool: deadpool_postgres::Pool) {
+        let connections = pool.clone();
+        meter()
+            .u64_observable_gauge("db.pool.connections")
+            .with_description("Database pool connections, by state")
+            .with_callback(move |gauge| {
+                let status = connections.status();
+                let idle = status.available as u64;
+                let in_use = status.size.saturating_sub(status.available) as u64;
+                gauge.observe(in_use, &[KeyValue::new("state", "in_use")]);
+                gauge.observe(idle, &[KeyValue::new("state", "idle")]);
+            })
+            .build();
+        meter()
+            .u64_observable_gauge("db.pool.waiting")
+            .with_description("Requests waiting for a database pool connection")
+            .with_callback(move |gauge| gauge.observe(pool.status().waiting as u64, &[]))
+            .build();
+    }
+
     /// Signed clock drift between the server and the database, in
     /// seconds. Positive values mean the database is ahead of the
     /// server; negative values mean the server is ahead of the
@@ -747,9 +940,186 @@ pub mod metrics {
     });
 }
 
+/// A tracing stack built like production's (the same filter, trace layer and
+/// log bridge), recording what reaches the vendor: each finished span's name
+/// and the `outcome` the aggregator would give it, and every log record.
+#[cfg(test)]
+pub(crate) mod capture {
+    use std::sync::{Arc, Mutex};
+
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::logs::InMemoryLogExporter;
+    use opentelemetry_sdk::trace::SpanProcessor;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Debug, Default, Clone)]
+    struct Spans(Arc<Mutex<Vec<(String, &'static str)>>>);
+
+    impl SpanProcessor for Spans {
+        fn on_start(
+            &self,
+            _span: &mut opentelemetry_sdk::trace::Span,
+            _cx: &opentelemetry::Context,
+        ) {
+        }
+
+        fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((span.name.to_string(), super::span_outcome(&span.status)));
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: std::time::Duration) -> OTelSdkResult {
+            Ok(())
+        }
+    }
+
+    /// What `run` sent toward the vendor.
+    pub(crate) struct Captured {
+        /// Each finished span: its name and aggregated `outcome`.
+        pub spans: Vec<(String, &'static str)>,
+        /// How many log records were emitted past the filter.
+        pub logs: usize,
+    }
+
+    /// Run `run` under the stack, on this thread.
+    pub(crate) fn capture(run: impl FnOnce()) -> Captured {
+        let spans = Spans::default();
+        let logs = InMemoryLogExporter::default();
+        let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+            .with_simple_exporter(logs.clone())
+            .build();
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_sampler(super::ClientDirectedSampler)
+            .with_span_processor(spans.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(super::log_filter(""))
+            .with(super::otel_trace_layer(
+                tracer_provider.tracer("eidola-server-gateway"),
+            ))
+            .with(
+                opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                    &logger_provider,
+                ),
+            );
+        tracing::subscriber::with_default(subscriber, run);
+        let logs = logs.get_emitted_logs().expect("reading emitted logs").len();
+        let spans = spans.0.lock().unwrap().clone();
+        Captured { spans, logs }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tracing::instrument(skip_all, name = "db.get_account", fields(otel.status_code))]
+    fn instrumented(fail: bool) -> Result<(), crate::error::ServerError> {
+        span_result(if fail {
+            Err(crate::error::ServerError::NotFound {
+                message: "account not found".to_string(),
+            })
+        } else {
+            Ok(())
+        })
+    }
+
+    /// A failed call aggregates as `outcome=error` without a log event:
+    /// `span_result` sets the span's status, which is what the aggregator
+    /// reads, and writes no record the vendor would receive.
+    #[test]
+    fn a_failed_call_is_an_error_outcome_and_no_log_line() {
+        let captured = capture::capture(|| {
+            let _ = instrumented(true);
+            let _ = instrumented(false);
+        });
+        assert_eq!(
+            captured.spans,
+            vec![
+                ("db.get_account".to_string(), "error"),
+                ("db.get_account".to_string(), "ok"),
+            ]
+        );
+        assert_eq!(captured.logs, 0, "a failed call wrote a log record");
+    }
+
+    /// Every span this crate opens is tracked by the aggregator or
+    /// deliberately left out of it, with a reason; every `#[instrument]`
+    /// names its span, skips its arguments, and reports failure through
+    /// `span_result` rather than `err`, which logs every failed call.
+    #[test]
+    fn every_span_in_the_crate_is_tracked_or_excluded() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    out.push((path.display().to_string(), text));
+                }
+            }
+        }
+        fn first_literal(text: &str) -> Option<&str> {
+            let rest = text.trim_start().strip_prefix('"')?;
+            rest.split_once('"').map(|(name, _)| name)
+        }
+
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let untracked: Vec<&str> = metrics::UNTRACKED_SPANS.iter().map(|(n, _)| *n).collect();
+        // Spelled in pieces, so this test's own source holds neither needle.
+        let attribute_needle = ["#[tracing", "::instrument("].concat();
+        let macro_needle = ["_span", "!("].concat();
+        let mut names = Vec::new();
+        for (path, text) in &files {
+            for (at, _) in text.match_indices(&attribute_needle) {
+                let attribute = &text[at..at + text[at..].find(")]").unwrap()];
+                assert!(attribute.contains("skip_all"), "{path}: {attribute}");
+                assert!(
+                    !attribute.contains(", err") && !attribute.contains("(err"),
+                    "{path}: {attribute} logs every failed call; use span_result"
+                );
+                let name = attribute
+                    .split_once("name = ")
+                    .and_then(|(_, rest)| first_literal(rest))
+                    .unwrap_or_else(|| panic!("{path}: {attribute} names no span"));
+                names.push(name.to_string());
+            }
+            for (at, mac) in text.match_indices(&macro_needle) {
+                if let Some(name) = first_literal(&text[at + mac.len()..]) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        assert!(
+            names.iter().any(|n| n == "engine.chat_stream"),
+            "the scan found the crate's spans"
+        );
+        for name in &names {
+            assert!(
+                metrics::TRACKED_SPANS.contains(&name.as_str())
+                    || untracked.contains(&name.as_str()),
+                "span `{name}` is neither tracked nor excluded"
+            );
+        }
+        for tracked in metrics::TRACKED_SPANS {
+            assert!(
+                names.iter().any(|n| n == tracked),
+                "`{tracked}` is tracked but no span has that name"
+            );
+        }
+    }
 
     /// The supplied OTLP clients carry the timeout the exporter would have
     /// resolved itself: signal variable over the general one over 10 s, in
