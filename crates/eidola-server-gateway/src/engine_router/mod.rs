@@ -21,7 +21,9 @@
 //!   traffic, and again periodically: `/healthz` must answer `ok` and
 //!   `/v1/engine/info` must report the pinned model id and weights hash on
 //!   `verified-readonly` storage. Every chat request also carries the pinned
-//!   hash, which the node checks before reading the body.
+//!   hash, which the node checks before reading the body. The info answer
+//!   also carries the node's telemetry snapshot, which `node_telemetry`
+//!   exports for it.
 //! - **Whether an engine is well** — `breaker`, local to this process.
 //! - **Which engine a request goes to** — `rendezvous`: the client's cache key
 //!   when it sent one (so a conversation stays on the engine holding its
@@ -71,12 +73,14 @@ use eidola_common::engine_protocol::{
 use eidola_common::stream_shape::{StreamEvent, StreamReader, Unreadable, unpadded};
 
 mod breaker;
+pub mod node_telemetry;
 pub mod placement;
 mod rendezvous;
 pub mod subset;
 
 use breaker::Breaker;
 pub use breaker::BreakerConfig;
+use node_telemetry::{ModelGauges, NodeState, Reading};
 use placement::PlacementSource;
 
 /// The provider name an engine-served response carries in its privacy
@@ -259,6 +263,8 @@ pub struct Upstream {
     in_flight: AtomicUsize,
     breaker: std::sync::Mutex<Breaker>,
     probing: AtomicBool,
+    /// What its telemetry snapshots have left behind.
+    node: std::sync::Mutex<NodeState>,
 }
 
 impl Upstream {
@@ -270,7 +276,12 @@ impl Upstream {
             in_flight: AtomicUsize::new(0),
             breaker: std::sync::Mutex::new(Breaker::new()),
             probing: AtomicBool::new(false),
+            node: std::sync::Mutex::new(NodeState::default()),
         }
+    }
+
+    fn node(&self) -> std::sync::MutexGuard<'_, NodeState> {
+        self.node.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// An upstream with a plain client, for tests of ranking.
@@ -574,6 +585,26 @@ impl EngineRouter {
             .collect()
     }
 
+    /// Each pinned model's node levels, summed over its upstreams whose last
+    /// probe read a snapshot, for the `engine.node.*` gauges. Every pinned
+    /// model is listed, with zeros when none reported.
+    pub(crate) fn node_gauges(&self) -> Vec<(String, ModelGauges)> {
+        let snapshot = self.inner.upstreams.load();
+        self.inner
+            .models
+            .keys()
+            .map(|model| {
+                let mut sums = ModelGauges::default();
+                for upstream in snapshot.get(model).map(Vec::as_slice).unwrap_or_default() {
+                    if let Some(gauges) = upstream.node().gauges() {
+                        sums.add(gauges);
+                    }
+                }
+                (model.clone(), sums)
+            })
+            .collect()
+    }
+
     /// Read placement from `source` and apply it, then probe what is due. A
     /// failed read keeps the current placement.
     pub async fn refresh(&self, source: &dyn PlacementSource) {
@@ -613,6 +644,9 @@ impl EngineRouter {
             Err(_) => Err("the probe timed out".to_string()),
         };
         let was_routable = upstream.routable();
+        if outcome.is_err() {
+            upstream.node().lapse();
+        }
         upstream
             .breaker()
             .on_probe(outcome.is_ok(), Instant::now(), &self.inner.config.breaker);
@@ -634,7 +668,9 @@ impl EngineRouter {
 
     /// `/healthz` answers `ok`, and `/v1/engine/info` reports the pinned model
     /// and weights on verified read-only storage. Both over the upstream's
-    /// attesting client, so the connection they use is attested too.
+    /// attesting client, so the connection they use is attested too. An info
+    /// answer that passes carries the node's telemetry snapshot, which is
+    /// exported ([`node_telemetry`]) and decides nothing here.
     async fn probe(&self, model: &EngineModel, upstream: &Upstream) -> Result<(), String> {
         let health = upstream
             .client
@@ -653,12 +689,6 @@ impl EngineRouter {
             return Err(format!("unhealthy ({status})"));
         }
 
-        #[derive(serde::Deserialize)]
-        struct Info {
-            model: String,
-            weights_sha256: String,
-            weights_storage: String,
-        }
         let response = upstream
             .client
             .get(upstream.url("/v1/engine/info"))
@@ -669,22 +699,33 @@ impl EngineRouter {
         if !response.status().is_success() {
             return Err(format!("engine info refused ({})", response.status()));
         }
-        let info: Info = response
+        let info: serde_json::Value = response
             .json()
             .await
             .map_err(|_| "engine info unreadable".to_string())?;
-        if info.model != model.pinned.id() {
+        let member = |name: &str| {
+            info.get(name)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "engine info unreadable".to_string())
+        };
+        if member("model")? != model.pinned.id() {
             return Err("it serves another model".to_string());
         }
-        if !info
-            .weights_sha256
-            .eq_ignore_ascii_case(model.pinned.weights().sha256)
-        {
+        if !member("weights_sha256")?.eq_ignore_ascii_case(model.pinned.weights().sha256) {
             return Err("it serves weights other than the pinned ones".to_string());
         }
-        if info.weights_storage != "verified-readonly" {
+        if member("weights_storage")? != "verified-readonly" {
             return Err("its weights are not on verified read-only storage".to_string());
         }
+        let reading = Reading::of(&info);
+        let growth = match &reading {
+            Reading::Read(snapshot) => Some(upstream.node().observe(snapshot.as_ref().clone())),
+            Reading::Absent | Reading::Unparsed => {
+                upstream.node().lapse();
+                None
+            }
+        };
+        node_telemetry::record(model.pinned.id(), &reading, growth.as_ref());
         Ok(())
     }
 

@@ -177,6 +177,9 @@ struct EngineState {
     release: tokio::sync::Notify,
     /// Held streams whose connection went away before they were released.
     abandoned: AtomicUsize,
+    /// The info answer's `telemetry` member; absent, as from a node built
+    /// before it, while `None`.
+    telemetry: Mutex<Option<serde_json::Value>>,
 }
 
 /// A fake engine behind its shim.
@@ -194,6 +197,10 @@ impl Engine {
 
     fn set_mode(&self, mode: Mode) {
         *self.state.mode.lock().unwrap() = mode;
+    }
+
+    fn set_telemetry(&self, telemetry: Option<serde_json::Value>) {
+        *self.state.telemetry.lock().unwrap() = telemetry;
     }
 
     fn row(&self, model: &str, deployment: &str) -> EnginePlacementRow {
@@ -246,6 +253,7 @@ async fn engine(identity: Identity) -> Engine {
         health_checks: AtomicUsize::new(0),
         release: tokio::sync::Notify::new(),
         abandoned: AtomicUsize::new(0),
+        telemetry: Mutex::new(None),
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -328,17 +336,18 @@ async fn info(State(state): State<Arc<EngineState>>, headers: HeaderMap) -> Resp
     if !authorized(&state, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error");
     }
-    padded_json(
-        StatusCode::OK,
-        serde_json::json!({
-            "model": state.model,
-            "weights_sha256": state.weights,
-            "weights_storage": state.storage,
-            "build": {"crate": "fake", "version": "0", "git_sha": null},
-            "executor": "cuda",
-            "device": null,
-        }),
-    )
+    let mut info = serde_json::json!({
+        "model": state.model,
+        "weights_sha256": state.weights,
+        "weights_storage": state.storage,
+        "build": {"crate": "fake", "version": "0", "git_sha": null},
+        "executor": "cuda",
+        "device": null,
+    });
+    if let Some(telemetry) = state.telemetry.lock().unwrap().clone() {
+        info["telemetry"] = telemetry;
+    }
+    padded_json(StatusCode::OK, info)
 }
 
 fn chunk(
@@ -2343,4 +2352,89 @@ async fn a_fallback_that_opened_while_the_request_waited_is_skipped() {
     assert_eq!(last.chats().len(), 1, "the one after it was still tried");
     stalled.state.release.notify_waiters();
     last.state.release.notify_waiters();
+}
+
+/// A node's telemetry snapshot, as one would report it.
+fn node_snapshot(
+    boot: u8,
+    steps: u64,
+    running: u64,
+) -> eidola_common::engine_protocol::telemetry::NodeTelemetry {
+    use eidola_common::engine_protocol::telemetry::{
+        BOOT_ID_BYTES, NodeCounters, NodeGauges, NodeTelemetry, PoolOccupancy,
+    };
+    NodeTelemetry {
+        boot_id: [boot; BOOT_ID_BYTES],
+        counters: NodeCounters {
+            steps,
+            ..NodeCounters::default()
+        },
+        gauges: NodeGauges {
+            sequences_waiting: 0,
+            sequences_running: running,
+            pools: vec![PoolOccupancy::quantized(1024, 40 * running, 100, 0, 0)],
+        },
+    }
+}
+
+fn node_gauges_of(router: &EngineRouter, model: &str) -> node_telemetry::ModelGauges {
+    router
+        .node_gauges()
+        .into_iter()
+        .find(|(m, _)| m == model)
+        .map(|(_, g)| g)
+        .expect("every pinned model is listed")
+}
+
+/// The probe reads a node's telemetry snapshot from its info answer and
+/// exports it, but decides nothing by it: a node with none (built before
+/// it) and a node whose snapshot does not parse take traffic all the same,
+/// and only report no levels. A probe that fails stops a node's levels.
+#[tokio::test]
+async fn the_probe_reads_a_nodes_snapshot_and_decides_nothing_by_it() {
+    let a = engine(Identity::of(MODEL_A)).await;
+    let b = engine(Identity::of(MODEL_B)).await;
+    let router = router_for(&[&a, &b], models());
+    router
+        .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A), b.row(MODEL_B, DEPLOYMENT_B)])
+        .await;
+
+    // No snapshot: verified and taking traffic, with nothing reported.
+    router.probe_due().await;
+    assert!(router.send(&request(MODEL_A, None, true)).await.is_ok());
+    assert_eq!(
+        node_gauges_of(&router, MODEL_A),
+        node_telemetry::ModelGauges::default()
+    );
+
+    // A snapshot: its levels are the model's, and no other model's.
+    a.set_telemetry(Some(node_snapshot(1, 10, 2).to_value()));
+    router.probe_due().await;
+    let gauges = node_gauges_of(&router, MODEL_A);
+    assert_eq!(gauges.reporting, 1);
+    assert_eq!(gauges.sequences_running, 2);
+    assert_eq!(gauges.pools, node_snapshot(1, 10, 2).gauges.pools);
+    assert_eq!(
+        node_gauges_of(&router, MODEL_B),
+        node_telemetry::ModelGauges::default()
+    );
+    a.set_telemetry(Some(node_snapshot(1, 25, 0).to_value()));
+    router.probe_due().await;
+    assert_eq!(node_gauges_of(&router, MODEL_A).sequences_running, 0);
+
+    // A snapshot that does not parse: still taking traffic, nothing reported.
+    let mut extra = node_snapshot(1, 30, 1).to_value();
+    extra["counters"]["request_ids"] = serde_json::json!([]);
+    a.set_telemetry(Some(extra));
+    router.probe_due().await;
+    assert!(router.send(&request(MODEL_A, None, true)).await.is_ok());
+    assert_eq!(node_gauges_of(&router, MODEL_A).reporting, 0);
+
+    // A failed probe: no levels until one passes.
+    a.set_telemetry(Some(node_snapshot(1, 40, 1).to_value()));
+    router.probe_due().await;
+    assert_eq!(node_gauges_of(&router, MODEL_A).reporting, 1);
+    a.state.healthy.store(false, Ordering::Relaxed);
+    router.probe_due().await;
+    assert_eq!(node_gauges_of(&router, MODEL_A).reporting, 0);
 }
