@@ -105,6 +105,11 @@ pub struct AppState {
     pub boot_id: [u8; BOOT_ID_BYTES],
     /// Requests refused `overloaded` (no read or admission slot free), since boot.
     pub overloaded: AtomicU64,
+    /// Requests answered with `engine_unavailable` or an internal error before any
+    /// stream opened, since boot.
+    pub failed: AtomicU64,
+    /// Streams that ended with an error event, since boot.
+    pub streams_failed: AtomicU64,
     /// The telemetry snapshot last published ([`TelemetryPublisher`]): what the info
     /// answer carries. `None` until the first, and the answer then has no snapshot.
     pub published: Mutex<Option<NodeTelemetry>>,
@@ -248,6 +253,8 @@ fn telemetry(state: &AppState) -> NodeTelemetry {
             requests_rejected: s.rejected,
             requests_prefix_refused: s.prefix_refused,
             requests_overloaded: state.overloaded.load(Ordering::Relaxed),
+            requests_failed: state.failed.load(Ordering::Relaxed),
+            streams_failed: state.streams_failed.load(Ordering::Relaxed),
             steps: s.forward_steps,
             step_micros: s.step_micros,
             step_rows: s.step_rows,
@@ -373,9 +380,15 @@ fn check_weights_header(state: &AppState, headers: &HeaderMap) -> Result<(), Api
 }
 
 async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    match chat(state, request).await {
+    match chat(state.clone(), request).await {
         Ok(r) => r,
-        Err(e) => e.into_response(),
+        Err(e) => {
+            // Counted, never logged: a line per request would be a record of it.
+            if matches!(e, ApiError::Unavailable | ApiError::Internal(_)) {
+                state.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            e.into_response()
+        }
     }
 }
 
@@ -458,7 +471,7 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
     let decoder =
         Decoder::new(state.model.clone(), output, stop, call_prefix).window_bound(window_bound);
     let run = Run {
-        _state: state,
+        state,
         guard,
         events,
         response,
@@ -505,8 +518,9 @@ struct ResponseMeta {
 
 /// One admitted request in flight.
 struct Run {
-    /// Held for the life of the request, so the node it runs in outlives it.
-    _state: Arc<AppState>,
+    /// Held for the life of the request, so the node it runs in outlives it; and
+    /// where a stream that fails is counted.
+    state: Arc<AppState>,
     guard: RequestGuard,
     events: mpsc::Receiver<Output>,
     response: ResponseMeta,
@@ -705,7 +719,11 @@ impl Events {
                 }
             }
             Polled::Failed(e) => {
-                tracing::warn!("stream ended early: {e}");
+                // Counted, never logged: a line per stream would be a record of it.
+                self.run
+                    .state
+                    .streams_failed
+                    .fetch_add(1, Ordering::Relaxed);
                 framer.push(&StreamEvent::Error(e.to_body().to_string()));
             }
         }

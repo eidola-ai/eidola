@@ -697,6 +697,8 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         reading,
         boot_id: AppState::new_boot_id(),
         overloaded: Default::default(),
+        failed: Default::default(),
+        streams_failed: Default::default(),
         published: Default::default(),
     });
     let telemetry = http::TelemetryPublisher::start(&state);

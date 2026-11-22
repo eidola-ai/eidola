@@ -293,6 +293,9 @@ pub struct Upstream {
     labels: NodeLabels,
     /// What its telemetry snapshots have left behind.
     node: std::sync::Mutex<NodeState>,
+    /// Why its last probe failed, while its probes fail: a failure is logged when it
+    /// starts or its reason changes, not on every probe.
+    probe_failure: std::sync::Mutex<Option<String>>,
 }
 
 impl Upstream {
@@ -310,6 +313,7 @@ impl Upstream {
             breaker: std::sync::Mutex::new(Breaker::new()),
             probing: AtomicBool::new(false),
             node: std::sync::Mutex::new(NodeState::default()),
+            probe_failure: std::sync::Mutex::new(None),
         }
     }
 
@@ -682,18 +686,32 @@ impl EngineRouter {
         upstream
             .breaker()
             .on_probe(outcome.is_ok(), Instant::now(), &self.inner.config.breaker);
+        // Each change is said once, with the labels its `engine.node.*` series carry.
+        let labels = &upstream.labels;
+        let previous_failure = {
+            let mut failure = upstream
+                .probe_failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *failure, outcome.as_ref().err().cloned())
+        };
         match outcome {
             Ok(()) if !was_routable => info!(
                 model = %model.pinned.id(),
+                deployment = %labels.deployment,
+                node = %labels.node,
                 upstream = %upstream.base_url,
                 "engine upstream verified; taking traffic"
             ),
             Ok(()) => {}
-            Err(reason) => warn!(
+            Err(reason) if previous_failure.as_deref() != Some(reason.as_str()) => warn!(
                 model = %model.pinned.id(),
+                deployment = %labels.deployment,
+                node = %labels.node,
                 upstream = %upstream.base_url,
                 "engine upstream failed its probe; no traffic until a later probe passes: {reason}"
             ),
+            Err(_) => {}
         }
         upstream.probing.store(false, Ordering::Release);
     }
@@ -751,7 +769,18 @@ impl EngineRouter {
         }
         let reading = Reading::of(&info);
         let growth = match &reading {
-            Reading::Read(snapshot) => Some(upstream.node().observe(snapshot.as_ref().clone())),
+            Reading::Read(snapshot) => {
+                let growth = upstream.node().observe(snapshot.as_ref().clone());
+                if growth.restarted {
+                    warn!(
+                        model = %model.pinned.id(),
+                        deployment = %upstream.labels.deployment,
+                        node = %upstream.labels.node,
+                        "engine node restarted since its last snapshot"
+                    );
+                }
+                Some(growth)
+            }
             Reading::Absent | Reading::Unparsed => {
                 upstream.node().lapse();
                 None

@@ -140,6 +140,12 @@ counters! {
     /// Requests the node refused before reading or admitting them because
     /// every read or admission slot was taken (`overloaded`).
     requests_overloaded,
+    /// Requests answered with a failure on the node's side, before any
+    /// stream opened: the engine not running, or an internal error.
+    requests_failed,
+    /// Streams that ended with an error event after they opened: the engine
+    /// stopped or failed under them.
+    streams_failed,
     /// Engine steps that ran at least one sequence.
     steps,
     /// Wall time of those steps, in microseconds.
@@ -411,6 +417,8 @@ mod tests {
                 "requests_rejected",
                 "requests_prefix_refused",
                 "requests_overloaded",
+                "requests_failed",
+                "streams_failed",
                 "steps",
                 "step_micros",
                 "step_rows",

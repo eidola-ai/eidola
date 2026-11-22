@@ -258,6 +258,16 @@ const COUNTER_EXPORTS: &[CounterExport] = &[
         "engine.node.requests",
         Some(("outcome", "overloaded")),
     ),
+    (
+        "requests_failed",
+        "engine.node.requests",
+        Some(("outcome", "failed")),
+    ),
+    (
+        "streams_failed",
+        "engine.node.requests",
+        Some(("outcome", "stream_failed")),
+    ),
     ("steps", "engine.node.steps", None),
     ("step_micros", "engine.node.step.time", None),
     ("step_rows", "engine.node.step.rows", None),

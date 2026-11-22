@@ -140,13 +140,9 @@ impl std::error::Error for ApiError {}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = self.status();
-        if status.is_server_error() {
-            tracing::warn!(status = status.as_u16(), "request failed: {self}");
-        } else {
-            tracing::debug!(status = status.as_u16(), "request refused: {self}");
-        }
-        (status, axum::Json(self.to_body())).into_response()
+        // Nothing is logged per request: the snapshot counts failures
+        // (`AppState::failed`, `streams_failed`) and refusals by kind.
+        (self.status(), axum::Json(self.to_body())).into_response()
     }
 }
 
