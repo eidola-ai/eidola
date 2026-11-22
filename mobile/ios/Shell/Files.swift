@@ -15,10 +15,16 @@ enum Durable {
         #endif
     }
 
-    /// Flushes the open file `path` to stable storage: `F_FULLFSYNC`, which plain `fsync` is
-    /// not on Apple platforms.
+    /// `F_FULLFSYNC`, falling back to `fsync` where a file system lacks it. On Apple platforms
+    /// `fsync` stops at the drive's write cache; `F_FULLFSYNC` also flushes that (fcntl(2)),
+    /// for a directory's entries as for a file's contents.
+    private static func flush(_ fd: Int32) -> Bool {
+        fcntl(fd, F_FULLFSYNC) != -1 || fsync(fd) != -1
+    }
+
+    /// Flushes the open file `path` to stable storage.
     static func file(_ fd: Int32, _ path: String) throws {
-        if fcntl(fd, F_FULLFSYNC) == -1 && fsync(fd) == -1 { throw ShellError.errno("sync") }
+        guard flush(fd) else { throw ShellError.errno("sync") }
         record(path)
     }
 
@@ -27,7 +33,7 @@ enum Durable {
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else { throw ShellError.errno("open directory") }
         defer { close(fd) }
-        if fsync(fd) == -1 { throw ShellError.errno("sync directory") }
+        guard flush(fd) else { throw ShellError.errno("sync directory") }
         record(path)
     }
 }

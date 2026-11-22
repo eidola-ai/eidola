@@ -145,7 +145,7 @@ A flat directory of files inside the app sandbox, owned by the app: its database
 | `files.remove` | `name` | `{}` | A missing file is not an error. Always durable. |
 | `files.list` | none | `{"names": [...]}` | Every file, sorted. |
 
-**Durability.** Every request is applied in full before its reply, so its effect survives the app being killed. Surviving the device losing power is a stronger promise, made only by the requests below, and only once they reply. To **flush** a file is to force its contents and length to stable storage (`F_FULLFSYNC` on iOS, where plain `fsync` does not reach it; `fsync` on Android); to flush a directory is to make the names in it durable.
+**Durability.** Every request is applied in full before its reply, so its effect survives the app being killed. Surviving the device losing power is a stronger promise, made only by the requests below, and only once they reply. To **flush** a file is to force its contents and length to stable storage; to flush a directory is to force its names there. iOS flushes both with `F_FULLFSYNC`, because plain `fsync` there stops at the drive's write cache; Android uses `fsync`.
 
 | Request | Durable once it replies |
 |---|---|

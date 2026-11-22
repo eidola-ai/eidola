@@ -46,7 +46,7 @@ The iOS check is a **local gate** (no macOS runner here): run `just mobile-ios-t
 - The bundle id is `ai.eidola.mobile` for the Release configuration (`--release`) and `ai.eidola.mobile.dev` for Debug, so a dev build installs beside a release one; the team is `7N2X49G865`, iOS 26 and later.
 - A document load is a main-frame navigation the navigation delegate allows; a fragment-only navigation is not one. The scheme handler then serves from the bundle selected for it.
 - A content rule list blocks every load outside the `eidola` scheme (and `data:`/`blob:`), so another origin is refused by the shell and not only by the CSP.
-- Durable means `F_FULLFSYNC` (plain `fsync` does not reach stable storage on Apple platforms) plus a directory `fsync`. Files are `completeUntilFirstUserAuthentication` and excluded from backup; the reasons are in the contract.
+- Durable means `F_FULLFSYNC` on the file and on its directory (plain `fsync` stops at the drive's write cache on Apple platforms; `F_FULLFSYNC` works on a directory fd on APFS). Files are `completeUntilFirstUserAuthentication` and excluded from backup; the reasons are in the contract.
 - Debug builds forward the page's console to the system log (subsystem `ai.eidola.shell`) and make the webview inspectable; Release builds do neither.
 - **The iOS shell cannot be reproducibly verified.** Apple re-signs and encrypts what the App Store distributes, so nobody can compare an installed binary with a build of this source. Its smallness is the mitigation: what it may do is this document and the contract, and it is short enough to read.
 
