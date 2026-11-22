@@ -65,6 +65,8 @@ object Shell {
 
     fun init(a: Activity) {
         if (::store.isInitialized) return
+        Durable.base = a.noBackupFilesDir
+        if (a.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) Durable.log = ArrayList()
         store = BundleStore(java.io.File(a.noBackupFilesDir, "bundles"), a.applicationContext.assets)
         files = Files(java.io.File(a.noBackupFilesDir, "files"))
     }
@@ -135,7 +137,9 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        // Cleared too, so a reply still pending is dropped rather than posted on a closed port.
         port?.close()
+        port = null
         web.destroy()
         bridgeThread.quitSafely()
         super.onDestroy()

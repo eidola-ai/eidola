@@ -1,17 +1,35 @@
 // The app's file directory (shell-contract.md → Files). Runs on the store queue.
 import Foundation
 
-/// Flushes `fd` to stable storage: `F_FULLFSYNC`, which plain `fsync` is not on Apple platforms.
-func fullSync(_ fd: Int32) throws {
-    if fcntl(fd, F_FULLFSYNC) == -1 && fsync(fd) == -1 { throw ShellError.errno("sync") }
-}
+/// Every flush the shell makes goes through here. Debug builds record each one (as a path
+/// relative to `base`) for the contract test page to check (`debug.syncLog`). Store queue only.
+enum Durable {
+    static var base = ""
+    #if DEBUG
+        static var log: [String] = []
+    #endif
 
-/// Flushes a directory's entries, so a created, renamed or removed name is durable.
-func syncDirectory(_ path: String) throws {
-    let fd = open(path, O_RDONLY)
-    guard fd >= 0 else { throw ShellError.errno("open directory") }
-    defer { close(fd) }
-    if fsync(fd) == -1 { throw ShellError.errno("sync directory") }
+    private static func record(_ path: String) {
+        #if DEBUG
+            log.append(path.hasPrefix(base + "/") ? String(path.dropFirst(base.count + 1)) : path)
+        #endif
+    }
+
+    /// Flushes the open file `path` to stable storage: `F_FULLFSYNC`, which plain `fsync` is
+    /// not on Apple platforms.
+    static func file(_ fd: Int32, _ path: String) throws {
+        if fcntl(fd, F_FULLFSYNC) == -1 && fsync(fd) == -1 { throw ShellError.errno("sync") }
+        record(path)
+    }
+
+    /// Flushes a directory's entries, so a created, renamed or removed name is durable.
+    static func directory(_ path: String) throws {
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { throw ShellError.errno("open directory") }
+        defer { close(fd) }
+        if fsync(fd) == -1 { throw ShellError.errno("sync directory") }
+        record(path)
+    }
 }
 
 /// Creates `url` as a private directory: excluded from backup, protected until first unlock.
@@ -79,24 +97,28 @@ final class Files {
             let fd = open(path, O_RDONLY)
             if fd >= 0 {
                 defer { close(fd) }
-                try fullSync(fd)
+                try Durable.file(fd, path)
             } else if errno != ENOENT {
                 throw ShellError.errno("open")
             }
-            try syncDirectory(dir)
+            try Durable.directory(dir)
             return [:]
         case "files.rename":
             let from = try path(p, "from")
             let to = try path(p, "to")
-            if rename(from, to) == -1 {
-                if errno == ENOENT { throw ShellError.notFound("no such file") }
-                throw ShellError.errno("rename")
+            // The contents first: a durable rename promises the file now named `to` is whole.
+            let fd = open(from, O_RDONLY)
+            guard fd >= 0 else {
+                throw errno == ENOENT ? ShellError.notFound("no such file") : ShellError.errno("open")
             }
-            try syncDirectory(dir)
+            defer { close(fd) }
+            try Durable.file(fd, from)
+            if rename(from, to) == -1 { throw ShellError.errno("rename") }
+            try Durable.directory(dir)
             return [:]
         case "files.remove":
             if unlink(try path(p)) == -1 && errno != ENOENT { throw ShellError.errno("remove") }
-            try syncDirectory(dir)
+            try Durable.directory(dir)
             return [:]
         case "files.list":
             let names = try FileManager.default.contentsOfDirectory(atPath: dir)
@@ -107,20 +129,17 @@ final class Files {
         }
     }
 
-    /// Opens (creating) `path` for writing, runs `body`, and with `sync` makes the result durable.
+    /// Opens (creating) `path` for writing, runs `body`, and with `sync` makes the result durable:
+    /// the contents, then the directory, whether or not this call created the name (an earlier
+    /// unsynced write may have).
     private func withFile(_ path: String, sync: Bool, _ body: (Int32) throws -> Int64) throws -> Int64 {
-        var fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-        let created = fd >= 0
-        if !created {
-            guard errno == EEXIST else { throw ShellError.errno("open") }
-            fd = open(path, O_WRONLY)
-            guard fd >= 0 else { throw ShellError.errno("open") }
-        }
+        let fd = open(path, O_WRONLY | O_CREAT, 0o600)
+        guard fd >= 0 else { throw ShellError.errno("open") }
         defer { close(fd) }
         let result = try body(fd)
         if sync {
-            try fullSync(fd)
-            if created { try syncDirectory(dir) }
+            try Durable.file(fd, path)
+            try Durable.directory(dir)
         }
         return result
     }

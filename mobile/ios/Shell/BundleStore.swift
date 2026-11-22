@@ -66,9 +66,9 @@ final class BundleStore {
         defer { close(fd) }
         let n = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
         guard n == data.count else { throw ShellError.errno("write state") }
-        try fullSync(fd)
+        try Durable.file(fd, tmp)
         guard rename(tmp, dir.appendingPathComponent("state.json").path) == 0 else { throw ShellError.errno("rename state") }
-        try syncDirectory(dir.path)
+        try Durable.directory(dir.path)
         state = s
     }
 
@@ -167,7 +167,9 @@ final class BundleStore {
         case "bundle.seal":
             let v = try version(p)
             guard isStaging(v) else { throw ShellError.state("not staging") }
+            // The version's files, its directories and its own name, before the state says sealed.
             try Self.syncTree(root(v))
+            try Durable.directory(versions.path)
             let d = try Self.digest(of: root(v))
             var s = state
             s.sealed[v] = d.digest
@@ -284,10 +286,17 @@ final class BundleStore {
     /// Makes every file and directory under `root` durable.
     static func syncTree(_ root: URL) throws {
         for p in try FileManager.default.subpathsOfDirectory(atPath: root.path) + [""] {
-            let fd = open(root.appendingPathComponent(p).path, O_RDONLY)
+            let path = root.appendingPathComponent(p).path
+            let fd = open(path, O_RDONLY)
             guard fd >= 0 else { throw ShellError.errno("open") }
             defer { close(fd) }
-            try fullSync(fd)
+            var st = stat()
+            guard fstat(fd, &st) == 0 else { throw ShellError.errno("stat") }
+            if st.st_mode & S_IFMT == S_IFDIR {
+                try Durable.directory(path)
+            } else {
+                try Durable.file(fd, path)
+            }
         }
     }
 }

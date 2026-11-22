@@ -57,6 +57,7 @@ final class ShellViewController: UIViewController, WKNavigationDelegate {
         """
 
     override func loadView() {
+        Durable.base = support.path
         let files = try! Files(dir: support.appendingPathComponent("files", isDirectory: true))
         let config = WKWebViewConfiguration()
         config.setURLSchemeHandler(SchemeHandler(store: store), forURLScheme: Origin.scheme)

@@ -135,6 +135,15 @@ final class Bridge: NSObject, WKScriptMessageHandlerWithReply {
                 "methods": Bridge.methods,
             ]))
         }
+        #if DEBUG
+            // A test hook, not part of the contract: the flushes made since the last call.
+            if method == "debug.syncLog" {
+                return store.queue.async {
+                    done(.success(["syncs": Durable.log]))
+                    Durable.log = []
+                }
+            }
+        #endif
         if method.hasPrefix("tcp.") { return pipe.handle(method, p, done) }
         let handler: ((String, Params) throws -> [String: Any])?
         if method.hasPrefix("files.") {

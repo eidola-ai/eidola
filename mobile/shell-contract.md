@@ -133,11 +133,24 @@ A flat directory of files inside the app sandbox, owned by the app: its database
 | `files.write` | `name`, `data`, exactly one of `offset` or `append: true`, `sync` (optional) | `{"size": n}`, the file's length after the write | Creates the file when missing. A write past the end extends the file; the gap reads as zeros. |
 | `files.truncate` | `name`, `size`, `sync` (optional) | `{}` | Sets the length, creating the file when missing. Growing it adds zeros. |
 | `files.sync` | `name` | `{}` | Makes the file's contents, length and existence durable. A missing file is not an error. |
-| `files.rename` | `from`, `to` | `{}` | Atomically replaces `to` with `from`. `not_found` when `from` is missing. Always durable. |
+| `files.rename` | `from`, `to` | `{}` | Atomically replaces `to` with `from`. `not_found` when `from` is missing. Always durable, contents included (see below). |
 | `files.remove` | `name` | `{}` | A missing file is not an error. Always durable. |
 | `files.list` | none | `{"names": [...]}` | Every file, sorted. |
 
-**Durability.** A request is applied in full before its reply; that alone survives the app being killed. It survives the device losing power only when it is durable: `files.sync`, `files.rename`, `files.remove`, and a write or truncate with `sync: true`, are durable once they reply. Durable means the shell flushed the file to stable storage (`F_FULLFSYNC` on iOS, `fsync` on Android) and, where the request created, renamed or removed a name, flushed the directory as well. `data` in one request is at most 8 MiB decoded.
+**Durability.** Every request is applied in full before its reply, so its effect survives the app being killed. Surviving the device losing power is a stronger promise, made only by the requests below, and only once they reply. To **flush** a file is to force its contents and length to stable storage (`F_FULLFSYNC` on iOS, where plain `fsync` does not reach it; `fsync` on Android); to flush a directory is to make the names in it durable.
+
+| Request | Durable once it replies |
+|---|---|
+| `files.write`, `files.truncate` with `sync: true` | The file's contents and length, and its name. The shell flushes the file, then the directory, whether or not this request created the name. |
+| `files.write`, `files.truncate` without `sync` | Nothing yet. A later `files.sync` (or a synced write) of the same file makes it durable. |
+| `files.sync` | The file's contents, length and name (the file, then the directory). A missing file: the directory only. |
+| `files.rename` | The file now named `to` holds `from`'s contents, and both names' changes. The shell flushes `from` before renaming it and the directory after, so an unsynced write followed by a rename is the whole atomic-replace idiom: no separate sync is needed. |
+| `files.remove` | The name's removal (the directory). |
+| `bundle.seal` | Every file and directory of the version, and the version's own name, before the state records it as sealed. |
+| `bundle.activate`, `bundle.confirm`, `bundle.remove` | The store's state (written to a temporary file, flushed, renamed over the old one, directory flushed). |
+| `bundle.begin`, `bundle.write` | Nothing: a version is durable only once sealed. |
+
+After a power loss, a file whose last change was not durable holds some earlier or partial state of it; the app's storage layer orders its writes and flushes so every such state reopens consistently. `data` in one request is at most 8 MiB decoded.
 
 ### Bundle store
 
@@ -149,7 +162,7 @@ A **version** name is 1 to 64 characters of `[A-Za-z0-9._-]`, not starting with 
 |---|---|---|---|
 | `bundle.begin` | `version` | `{}` | Starts staging `version`, empty. Restarts it when it is already staging. `invalid_state` when it is sealed (remove it first) or `embedded`. |
 | `bundle.write` | `version`, `path`, `offset`, `data` | `{}` | Writes into a staging version's file at `offset`, creating it. `invalid_state` unless `version` is staging. At most 8 MiB per request. |
-| `bundle.seal` | `version` | `{"digest": "…", "files": n, "bytes": n}` | Makes every file durable, computes the bundle's [digest](#bundle-digest) from the bytes on disk, and marks the version sealed and read-only. `invalid_state` unless staging. |
+| `bundle.seal` | `version` | `{"digest": "…", "files": n, "bytes": n}` | Makes the version durable (see Durability above), computes the bundle's [digest](#bundle-digest) from the bytes on disk, and marks the version sealed and read-only. `invalid_state` unless staging. |
 | `bundle.activate` | `version` | the state, as `bundle.state` | Makes a sealed version (or `embedded`) the one the next document load boots. Durable before the reply. Activation is **provisional**; see below. |
 | `bundle.confirm` | none | the state | Tells the shell the bundle now running booted. Confirms it when it is the active bundle on its trial; otherwise does nothing. |
 | `bundle.remove` | `version` | `{}` | Deletes a staging or sealed version. `invalid_state` for `embedded`, the active version, the previous confirmed version, and the version now being served. `not_found` when unknown. |

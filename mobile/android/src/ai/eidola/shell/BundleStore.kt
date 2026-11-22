@@ -64,10 +64,10 @@ class BundleStore(private val dir: File, private val assets: AssetManager) {
         val tmp = File(dir, "state.json.tmp")
         FileOutputStream(tmp).use {
             it.write(s.toJson().toString().toByteArray())
-            it.fd.sync()
+            Durable.file(it.fd, tmp)
         }
         if (!tmp.renameTo(File(dir, "state.json"))) throw ShellError.io("rename state")
-        syncDirectory(dir)
+        Durable.directory(dir)
         state = s
     }
 
@@ -149,9 +149,11 @@ class BundleStore(private val dir: File, private val assets: AssetManager) {
         "bundle.seal" -> {
             val v = version(p)
             if (!isStaging(v)) throw ShellError.state("not staging")
+            // The version's files, its directories and its own name, before the state says sealed.
             root(v).walkBottomUp().forEach { f ->
-                if (f.isFile) RandomAccessFile(f, "r").use { it.fd.sync() } else syncDirectory(f)
+                if (f.isFile) RandomAccessFile(f, "r").use { Durable.file(it.fd, f) } else Durable.directory(f)
             }
+            Durable.directory(versions)
             val (digest, files, bytes) = digest(v)
             persist(state.copy(sealed = state.sealed + (v to digest)))
             JSONObject().put("digest", digest).put("files", files).put("bytes", bytes)

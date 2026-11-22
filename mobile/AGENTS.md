@@ -32,6 +32,8 @@ The native apps the App Store and Play Store distribute. Each is a thin shell ar
 
 Both test runs start `tools/echo_server.py` on `127.0.0.1:7777` (the emulator reaches it as `10.0.2.2`). A full run takes about two minutes on either platform; the page phases through several document loads, so the bundle-store checks run against real reloads.
 
+Durability is checked through a test hook outside the contract: every flush either shell makes goes through one function (`Durable` in `Files.swift` and `Files.kt`), which in debug builds records it, and `debug.syncLog` returns and clears that record. The test page holds each file and bundle request to the contract's durability table with it; a release build answers `unknown_method` and the page skips those checks. Reverting any one of the flushes fails its check on both platforms.
+
 The iOS check is a **local gate** (no macOS runner here): run `just mobile-ios-test` before any change to `ios/`, `contract-test/` or the contract.
 
 ## iOS

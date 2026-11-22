@@ -258,6 +258,56 @@ async function checkFiles() {
   });
 }
 
+/** The flushes `fn` made, from the debug builds' recorder; null in a release build. */
+async function flushes(fn) {
+  try {
+    await call("debug.syncLog");
+  } catch (e) {
+    if (e.code === "unknown_method") return null;
+    throw e;
+  }
+  await fn();
+  return (await call("debug.syncLog")).syncs;
+}
+
+async function checkDurability() {
+  const d = "contract-d.txt";
+  const f = (name) => `files/${name}`;
+  await call("files.remove", { name: d });
+  await call("files.remove", { name: "contract-e.txt" });
+  const cases = [
+    ["an unsynced write flushes nothing", () => call("files.write", { name: d, offset: 0, data: B("x") }), []],
+    // The name was created by the unsynced write above, so this call did not create it.
+    ["a synced write flushes the file, then its directory", () => call("files.write", { name: d, append: true, data: B("y"), sync: true }), [f(d), "files"]],
+    ["a synced truncate flushes the file, then its directory", () => call("files.truncate", { name: d, size: 1, sync: true }), [f(d), "files"]],
+    ["sync flushes the file, then its directory", () => call("files.sync", { name: d }), [f(d), "files"]],
+    ["sync of a missing file flushes the directory", () => call("files.sync", { name: "contract-missing" }), ["files"]],
+    ["rename flushes the source's contents, then the directory", async () => {
+      await call("files.write", { name: "contract-e.txt", offset: 0, data: B("unsynced") });
+      await call("files.rename", { from: "contract-e.txt", to: d });
+    }, [f("contract-e.txt"), "files"]],
+    ["remove flushes the directory", () => call("files.remove", { name: d }), ["files"]],
+  ];
+  for (const [name, fn, want] of cases) {
+    await test(`durability: ${name}`, async () => {
+      const got = await flushes(fn);
+      if (got === null) return show("      (skipped: a release build records no flushes)");
+      eq(got, want, "flushes");
+    });
+  }
+  await test("durability: seal flushes the version, its name, then the state", async () => {
+    await call("bundle.begin", { version: "durable" });
+    await call("bundle.write", { version: "durable", path: "index.html", offset: 0, data: B("<p>") });
+    await call("bundle.write", { version: "durable", path: "a/b.txt", offset: 0, data: B("b") });
+    const got = await flushes(() => call("bundle.seal", { version: "durable" }));
+    await call("bundle.remove", { version: "durable" });
+    if (got === null) return show("      (skipped: a release build records no flushes)");
+    const v = "bundles/versions/durable";
+    eq([...got.slice(0, 4)].sort(), [`${v}`, `${v}/a`, `${v}/a/b.txt`, `${v}/index.html`], "the version's tree");
+    eq(got.slice(4), ["bundles/versions", "bundles/state.json.tmp", "bundles"], "then its name, then the state");
+  });
+}
+
 let nextSocket = 100;
 async function connectEcho() {
   // A device reaches the echo server over the LAN: `host:port` in this file, put there by hand.
@@ -398,6 +448,7 @@ async function phaseA(progress, platform) {
   await checkHello();
   await checkServing(platform);
   await checkFiles();
+  await checkDurability();
   await checkPipe();
   await test("bundle: refusals", async () => {
     await rejects(call("bundle.begin", { version: "embedded" }), "invalid_state");

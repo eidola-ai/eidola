@@ -102,6 +102,14 @@ class Bridge(
         id = o.opt("id") ?: JSONObject.NULL
         val method = o.opt("method") as? String ?: return done(null, ShellError.bad("method: missing"))
         val params = Params(o.optJSONObject("params") ?: JSONObject())
+        // A test hook in debuggable builds, not part of the contract: the flushes made since the last call.
+        if (method == "debug.syncLog" && Durable.log != null) {
+            return store.queue.execute {
+                val log = Durable.log!!
+                done(JSONObject().put("syncs", JSONArray(log.toList())), null)
+                log.clear()
+            }
+        }
         if (method !in METHODS) return done(null, ShellError("unknown_method", method))
         when {
             method == "shell.hello" -> done(

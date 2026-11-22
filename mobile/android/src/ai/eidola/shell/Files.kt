@@ -5,18 +5,40 @@ import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import java.io.File
+import java.io.FileDescriptor
 import java.io.FileInputStream
 import java.io.RandomAccessFile
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Flushes a directory's entries, so a created, renamed or removed name is durable. */
-fun syncDirectory(dir: File) {
-    val fd = Os.open(dir.path, OsConstants.O_RDONLY, 0)
-    try {
-        Os.fsync(fd)
-    } finally {
-        Os.close(fd)
+/**
+ * Every flush the shell makes goes through here. Debuggable builds record each one (as a path
+ * relative to `base`) for the contract test page to check (`debug.syncLog`). Store queue only.
+ */
+object Durable {
+    lateinit var base: File
+    /** Null unless the build is debuggable. */
+    var log: MutableList<String>? = null
+
+    private fun record(f: File) {
+        log?.add(f.relativeTo(base).invariantSeparatorsPath)
+    }
+
+    /** Flushes the open file `f` to stable storage. */
+    fun file(fd: FileDescriptor, f: File) {
+        fd.sync()
+        record(f)
+    }
+
+    /** Flushes a directory's entries, so a created, renamed or removed name is durable. */
+    fun directory(dir: File) {
+        val fd = Os.open(dir.path, OsConstants.O_RDONLY, 0)
+        try {
+            Os.fsync(fd)
+        } finally {
+            Os.close(fd)
+        }
+        record(dir)
     }
 }
 
@@ -56,41 +78,47 @@ class Files(private val dir: File) {
         }
         "files.sync" -> {
             val f = file(p)
-            if (f.exists()) FileInputStream(f).use { it.fd.sync() }
-            syncDirectory(dir)
+            if (f.exists()) FileInputStream(f).use { Durable.file(it.fd, f) }
+            Durable.directory(dir)
             JSONObject()
         }
         "files.rename" -> {
             val from = file(p, "from")
             val to = file(p, "to")
+            // The contents first: a durable rename promises the file now named `to` is whole.
+            if (!from.isFile) throw ShellError.notFound("no such file")
+            FileInputStream(from).use { Durable.file(it.fd, from) }
             try {
                 Os.rename(from.path, to.path)
             } catch (e: ErrnoException) {
                 if (e.errno == OsConstants.ENOENT) throw ShellError.notFound("no such file")
                 throw ShellError.io(e.toString())
             }
-            syncDirectory(dir)
+            Durable.directory(dir)
             JSONObject()
         }
         "files.remove" -> {
             val f = file(p)
             if (f.exists() && !f.delete()) throw ShellError.io("remove failed")
-            syncDirectory(dir)
+            Durable.directory(dir)
             JSONObject()
         }
         "files.list" -> JSONObject().put("names", JSONArray((dir.list() ?: arrayOf()).filter(Names::file).sorted()))
         else -> throw ShellError("unknown_method", method)
     }
 
-    /** Opens (creating) `f` for writing, runs `body`, and with `sync` makes the result durable. */
+    /**
+     * Opens (creating) `f` for writing, runs `body`, and with `sync` makes the result durable: the
+     * contents, then the directory, whether or not this call created the name (an earlier unsynced
+     * write may have).
+     */
     private fun withFile(f: File, sync: Boolean, body: (RandomAccessFile) -> Long): Long {
-        val created = !f.exists()
         val result = RandomAccessFile(f, "rw").use { raf ->
             val r = body(raf)
-            if (sync) raf.fd.sync()
+            if (sync) Durable.file(raf.fd, f)
             r
         }
-        if (sync && created) syncDirectory(dir)
+        if (sync) Durable.directory(dir)
         return result
     }
 }
