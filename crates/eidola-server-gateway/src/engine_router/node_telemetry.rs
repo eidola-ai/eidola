@@ -1,7 +1,6 @@
 //! What the gateway exports for the engine nodes it routes to.
 //!
-//! A node has no egress: its measured config allows the gateway's connection
-//! and nothing else. So its operational snapshot
+//! A node's operational snapshot
 //! (`eidola_common::engine_protocol::telemetry`) rides on the probe: the
 //! router reads it from the node's `/v1/engine/info` answer on each probe,
 //! over the attested, token-authenticated connection the probe already uses,

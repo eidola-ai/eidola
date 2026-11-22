@@ -537,9 +537,10 @@ pub const ENGINE_CONTAINER_NAME: &str = "eidola-server-engine";
 // restricted to the fields an engine deployment needs. Every struct refuses
 // unknown fields, so a field Tinfoil supports but we do not allow — a
 // container's `entrypoint` or `command` (another executable from the pinned
-// image), `volumes`, `devices`, `cap_add`, `privileged` (wider reach),
-// `networks` or `cvm-network` (egress, inbound ports), the shim's
-// `dummy-attestation` (no hardware evidence), a pack's `exec`, `emwp` or
+// image), `volumes`, `devices`, `cap_add`, `privileged` (wider reach), a
+// container's `ports` or the VM's `cvm-network` (inbound ports past the
+// shim), the shim's `dummy-attestation` (no hardware evidence), a pack's
+// `exec`, `emwp` or
 // `key-secret` — fails the parse. Field types follow Tinfoil's: an `int`
 // there is an integer here (a quoted number is refused, as yaml.v3 refuses
 // it), a `string` a string. Widening the allow-list means adding the typed
@@ -561,8 +562,22 @@ struct TinfoilConfig {
     /// The read-only model packs that carry the weights to verified storage.
     #[serde(default)]
     models: Vec<TinfoilModel>,
+    /// The networks a container may attach to, by name.
+    #[serde(default)]
+    networks: BTreeMap<String, TinfoilNetwork>,
     containers: Vec<TinfoilContainer>,
     shim: TinfoilShim,
+}
+
+/// `NetworkSpec` (types.go): its egress mode, and with `allowlist` the hosts
+/// it may reach. Tinfoil also reads a `null` entry, or one without `egress`,
+/// as `closed`; here the mode is stated.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TinfoilNetwork {
+    egress: String,
+    #[serde(default)]
+    allow: Vec<String>,
 }
 
 /// `ModelSpec` (types.go): its name, source (`repo`), the pack pinned by root
@@ -598,6 +613,9 @@ struct TinfoilContainer {
     runtime: Option<String>,
     #[serde(default)]
     gpus: Option<GpuSelection>,
+    /// The declared networks it attaches to.
+    #[serde(default)]
+    networks: Vec<String>,
 }
 
 /// A YAML string scalar, and only that: `true`, `16` or `0.5` unquoted are
@@ -667,6 +685,95 @@ fn is_environment_name(name: &str) -> bool {
             .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
 }
 
+/// The networks a config declares (validation.go `validateNetworkEntry`,
+/// and `validateConfigLimits` for the counts).
+fn check_networks(networks: &BTreeMap<String, TinfoilNetwork>) -> Result<(), String> {
+    if networks.len() > 32 {
+        return Err("networks exceeds limit 32".into());
+    }
+    for (name, network) in networks {
+        let named = name.len() <= 15
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !name.starts_with('-')
+            && !name.ends_with('-');
+        if name.is_empty() || name == SHIM_NETWORK_NAME || !named {
+            return Err(format!(
+                "networks.{name}: a network is named by 1 to 15 lowercase letters, digits and \
+                 inner hyphens, and not {SHIM_NETWORK_NAME:?}"
+            ));
+        }
+        if !["closed", "allowlist", "open"].contains(&network.egress.as_str()) {
+            return Err(format!(
+                "networks.{name}.egress: {:?} is not one of closed | allowlist | open",
+                network.egress
+            ));
+        }
+        if network.egress != "allowlist" && !network.allow.is_empty() {
+            return Err(format!(
+                "networks.{name}.allow: only valid when egress: allowlist"
+            ));
+        }
+        if network.allow.len() > 256 {
+            return Err(format!("networks.{name}.allow exceeds limit 256"));
+        }
+        if let Some(host) = network.allow.iter().find(|h| !is_allowed_host(h)) {
+            return Err(format!(
+                "networks.{name}.allow: {host:?} is not a DNS hostname (no wildcard, no IP \
+                 literal)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A container's attached networks (validation.go `validateNetwork`): each
+/// declared, listed once, not the shim's, and at most one with egress.
+fn check_attached_networks(
+    attached: &[String],
+    declared: &BTreeMap<String, TinfoilNetwork>,
+) -> Result<(), String> {
+    let mut with_egress = 0;
+    for (i, name) in attached.iter().enumerate() {
+        if attached[..i].contains(name) {
+            return Err(format!("network {name:?} is listed twice"));
+        }
+        if name == SHIM_NETWORK_NAME {
+            return Err(format!("network {name:?} is reserved"));
+        }
+        let Some(network) = declared.get(name) else {
+            return Err(format!("network {name:?} is not declared"));
+        };
+        if network.egress != "closed" {
+            with_egress += 1;
+        }
+    }
+    if with_egress > 1 {
+        return Err("networks: at most one attached network may have egress".into());
+    }
+    Ok(())
+}
+
+/// The shim's own network, which a config may neither declare nor attach.
+const SHIM_NETWORK_NAME: &str = "shim-net";
+
+/// An `allow` entry (validation.go `validateNetworkEntry`): an RFC 1123
+/// hostname of at most 253 bytes, each label 1 to 63 letters, digits and
+/// inner hyphens; never a wildcard or an IP literal.
+fn is_allowed_host(host: &str) -> bool {
+    host.len() <= 253
+        && host.parse::<std::net::IpAddr>().is_err()
+        && host.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
 impl EngineConfig {
     fn parse(bytes: &[u8], path: &str) -> Result<Self, String> {
         // decode.go: `len(data) > MaxConfigBytes` is refused before parsing.
@@ -699,6 +806,8 @@ impl EngineConfig {
         if !(1..=u64::from(u16::MAX)).contains(&config.shim.upstream_port) {
             return Err(format!("{path}: shim.upstream-port must be a port number"));
         }
+
+        check_networks(&config.networks).map_err(|e| format!("{path}: {e}"))?;
 
         let mut packs = Vec::new();
         for (i, model) in config.models.into_iter().enumerate() {
@@ -787,6 +896,8 @@ impl EngineConfig {
                 "{path}: the engine container's runtime must be nvidia"
             ));
         }
+        check_attached_networks(&engine.networks, &config.networks)
+            .map_err(|e| format!("{path}: the engine container's {e}"))?;
         let container_gpus = engine.gpus.map(|g| match g {
             GpuSelection::Count(n) => n.to_string(),
             GpuSelection::Selection(s) => s,

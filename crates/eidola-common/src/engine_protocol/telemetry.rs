@@ -1,11 +1,10 @@
 //! A node's operational snapshot: the `telemetry` member of its
 //! `GET /v1/engine/info` answer.
 //!
-//! A node has no egress of its own, so what an operator learns about how it
-//! runs reaches them through the gateway: the gateway reads this snapshot
-//! when it probes the node, over the same attested, token-authenticated
-//! connection, and exports it through its own telemetry, labelled by the
-//! model's weights hash. The node writes it with [`NodeTelemetry::to_value`]
+//! What an operator learns about how a node runs reaches them through the
+//! gateway: the gateway reads this snapshot when it probes the node, over
+//! the same attested, token-authenticated connection, and exports it through
+//! its own telemetry, labelled by the model's weights hash. The node writes it with [`NodeTelemetry::to_value`]
 //! and the gateway reads it with [`NodeTelemetry::from_value`], which refuses
 //! every other shape: an unknown member, a missing one, a value of another
 //! type, more pools than [`MAX_POOLS`], or an occupancy past its pool's size.

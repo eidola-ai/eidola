@@ -43,8 +43,7 @@
 //!   is padded to `stream_shape::body_bucket`.
 //! - **A node's operational snapshot** ([`telemetry`]): the aggregate counts
 //!   and levels a node reports in its `/v1/engine/info` answer, which the
-//!   gateway reads when it probes the node and exports for it, since a node
-//!   has no egress of its own.
+//!   gateway reads when it probes the node and exports.
 //!
 //! The key is secret material on every side: a holder never logs it, prints
 //! it redacted, and scrubs it when done. Nothing here holds one; this module
