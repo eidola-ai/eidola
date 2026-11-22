@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 use gpui::{
-    App, AppContext, Bounds, EntityId, Global, KeyBinding, Menu, MenuItem, OsAction,
-    PathPromptOptions, Pixels, PromptButton, PromptLevel, WeakEntity, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions, point, px, size,
+    App, AppContext, Bounds, EntityId, Global, Menu, MenuItem, OsAction, PathPromptOptions, Pixels,
+    PromptButton, PromptLevel, WeakEntity, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    point, px, size,
 };
 use gpui_component::Root;
 use gpui_kit_assets::Assets;
@@ -559,10 +559,10 @@ fn install_keybindings(cx: &mut App) {
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
-        KeyBinding::new("cmd-h", Hide, None),
-        KeyBinding::new("alt-cmd-h", HideOthers, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+        gpui::KeyBinding::new("cmd-h", Hide, None),
+        gpui::KeyBinding::new("alt-cmd-h", HideOthers, None),
+        gpui::KeyBinding::new("cmd-m", Minimize, None),
+        gpui::KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
     ]);
     // Motion, editing, clipboard, undo and the bold/italic toggles — the
     // editor's own keymap, exactly as Eidola installs it.
