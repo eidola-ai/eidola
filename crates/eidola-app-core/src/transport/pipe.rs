@@ -326,9 +326,9 @@ pub(super) struct PipeRequest {
 }
 
 impl PipeRequest {
-    /// A request for `url`, parsed as reqwest parses it.
-    pub(super) fn new(method: Method, url: &str) -> Result<Self, Error> {
-        let url = url::Url::parse(url).map_err(|e| Error::builder(format!("URL: {e}")))?;
+    /// A request for `url`, parsed as reqwest parses it, its userinfo
+    /// already split off (`super::split_userinfo`).
+    pub(super) fn new(method: Method, url: url::Url) -> Result<Self, Error> {
         if !matches!(url.scheme(), "http" | "https") {
             return Err(Error::builder(format!(
                 "URL scheme is not allowed: {}",

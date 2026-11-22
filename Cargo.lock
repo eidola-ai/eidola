@@ -2654,6 +2654,7 @@ dependencies = [
  "libc",
  "p256 0.13.2",
  "p384 0.13.1",
+ "percent-encoding",
  "rand_core 0.6.4",
  "regex",
  "reqwest",

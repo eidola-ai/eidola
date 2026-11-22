@@ -174,6 +174,40 @@ pub(crate) fn update_client(transport: &Transport) -> Result<Client, AppError> {
     }
 }
 
+/// A username and an optional password.
+type Credentials = (String, Option<String>);
+
+/// `url` without its userinfo, and the credentials it held: reqwest's rule
+/// (`extract_authority`), so both transports send the same head. Userinfo
+/// that is not UTF-8 once percent-decoded is left where it is, as reqwest
+/// leaves it; the host-socket transport never writes userinfo out.
+fn split_userinfo(url: &str) -> (Result<url::Url, url::ParseError>, Option<Credentials>) {
+    let mut parsed = match url::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(e) => return (Err(e), None),
+    };
+    let decode = |part: &str| {
+        percent_encoding::percent_decode_str(part)
+            .decode_utf8()
+            .ok()
+            .map(String::from)
+    };
+    if !parsed.has_authority() {
+        return (Ok(parsed), None);
+    }
+    let Some(username) = decode(parsed.username()) else {
+        return (Ok(parsed), None);
+    };
+    let password = parsed.password().and_then(decode);
+    if username.is_empty() && password.is_none() {
+        return (Ok(parsed), None);
+    }
+    // An authority always takes an empty userinfo.
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    (Ok(parsed), Some((username, password)))
+}
+
 /// The trust store a host-dialed TLS connection is checked against: the
 /// built-in roots, and the host's extras.
 fn roots_with(host: &HostNetwork) -> rustls::RootCertStore {
@@ -300,16 +334,33 @@ impl Client {
         self.request(Method::POST, url.as_ref())
     }
 
+    /// A request for `url`. Credentials in its userinfo are split off here,
+    /// for both transports, as reqwest splits them: percent-decoded into a
+    /// sensitive `Authorization: Basic` (appended first, so an explicit
+    /// `Authorization` is appended after it, as reqwest appends), and removed
+    /// from the URL, so neither transport writes them into the request target
+    /// or `Host`. A redirect to another origin drops them with the header.
     fn request(&self, method: Method, url: &str) -> RequestBuilder {
+        let (parsed, credentials) = split_userinfo(url);
         let kind = match &self.kind {
             #[cfg(not(target_family = "wasm"))]
-            ClientKind::Native(client) => BuilderKind::Native(client.request(method, url)),
+            ClientKind::Native(client) => BuilderKind::Native(match parsed {
+                Ok(parsed) => client.request(method, parsed),
+                // reqwest refuses it in its own words.
+                Err(_) => client.request(method, url),
+            }),
             ClientKind::Pipe(client) => BuilderKind::Pipe {
                 client: client.clone(),
-                request: pipe::PipeRequest::new(method, url),
+                request: parsed
+                    .map_err(|e| Error::builder(format!("URL: {e}")))
+                    .and_then(|parsed| pipe::PipeRequest::new(method, parsed)),
             },
         };
-        RequestBuilder { kind }
+        let builder = RequestBuilder { kind };
+        match credentials {
+            Some((username, password)) => builder.basic_auth(username, password),
+            None => builder,
+        }
     }
 
     /// Send a built request. A request built by another client is refused.

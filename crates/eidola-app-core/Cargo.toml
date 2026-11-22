@@ -53,6 +53,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # The URL parser `reqwest::Url` re-exports: the host-socket transport parses
 # a request's URL as the native client does.
 url = "2"
+# Decodes a URL's userinfo into credentials, as reqwest does (`transport`).
+percent-encoding = "2"
 futures-util = { version = "0.3", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.1.0-pre.0"

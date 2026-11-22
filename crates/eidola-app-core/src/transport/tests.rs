@@ -342,3 +342,83 @@ async fn errors_carry_no_url() {
         "{text}"
     );
 }
+
+/// Credentials in a URL's userinfo travel as reqwest sends them, over either
+/// transport: percent-decoded into `Authorization: Basic`, ahead of an
+/// explicit `Authorization` (both sent), and never in the request target or
+/// `Host`.
+#[tokio::test]
+async fn url_credentials_are_sent_as_reqwest_sends_them() {
+    use base64::Engine as _;
+
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let (port, seen) = server(vec![ok("{}")]).await;
+    let native = Client::native(native::plain_client(Some(USER_AGENT), Redirects::Refuse).unwrap());
+    for client in [native, pipe_client(Redirects::Refuse)] {
+        let response = client
+            .get(format!(
+                "http://us%40er:p%3Ass@127.0.0.1:{port}/v1/models?q=1"
+            ))
+            .header(header::AUTHORIZATION, "Bearer explicit")
+            .send()
+            .await
+            .expect("sent");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let seen = seen.lock().unwrap();
+    let basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("us@er:p:ss")
+    );
+    for request in seen.iter() {
+        let authorizations: Vec<&str> = request
+            .headers
+            .iter()
+            .filter(|(n, _)| n == "authorization")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(authorizations, [basic.as_str(), "Bearer explicit"]);
+        assert_eq!(request.path, "/v1/models?q=1");
+        assert_eq!(
+            request.header("host"),
+            Some(format!("127.0.0.1:{port}").as_str())
+        );
+    }
+    let mut heads: Vec<Vec<(String, String)>> = seen
+        .iter()
+        .map(|s| {
+            let mut h = s.headers.clone();
+            h.sort();
+            h
+        })
+        .collect();
+    assert_eq!(heads.pop(), heads.pop());
+}
+
+/// Credentials from a URL are dropped on a hop to another origin, like any
+/// `Authorization`, and kept on the same one.
+#[tokio::test]
+async fn url_credentials_do_not_follow_a_cross_origin_redirect() {
+    let (elsewhere, elsewhere_seen) = server(vec![ok("there")]).await;
+    let (port, seen) = server(vec![
+        redirect("302 Found", "/same".into()),
+        redirect("302 Found", format!("http://127.0.0.1:{elsewhere}/x")),
+    ])
+    .await;
+    let response = pipe_client(Redirects::Follow)
+        .get(format!("http://user:pass@127.0.0.1:{port}/a"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(body_text(response).await.unwrap(), "there");
+    let seen = seen.lock().unwrap();
+    assert!(seen[0].header("authorization").is_some());
+    assert_eq!(
+        seen[1].header("authorization"),
+        seen[0].header("authorization")
+    );
+    assert_eq!(
+        elsewhere_seen.lock().unwrap()[0].header("authorization"),
+        None
+    );
+}
