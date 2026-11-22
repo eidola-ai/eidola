@@ -112,6 +112,38 @@ pub struct RepairStatus {
     pub last_error: Option<String>,
 }
 
+/// What one committed set of observations changed, for the worker's
+/// counters ([`crate::metrics`]). Only a purchase's ID is kept, so the caller
+/// can classify its sale; it never becomes a label.
+#[derive(Debug, Default)]
+pub struct Applied {
+    /// Purchases recorded for the first time.
+    pub purchases: Vec<Purchase>,
+    /// Refunds whose provider status is new or changed: the status, and
+    /// whether the refund names one of our refund operations.
+    pub refunds: Vec<(&'static str, bool)>,
+    /// Dispute events: `opened` for a dispute recorded for the first time,
+    /// and the closing status (`won`, `lost` or `warning_closed`) when a
+    /// dispute reaches it.
+    pub disputes: Vec<&'static str>,
+}
+
+/// The durable backlog the worker reports as gauges, read in one pass.
+#[derive(Debug, Default)]
+pub struct Backlog {
+    /// Per inbox kind, exactly as stored: pending rows, those of them that
+    /// have failed at least once, and the oldest one's age in seconds since
+    /// the row was first received.
+    pub work: Vec<(String, u64, u64, f64)>,
+    /// Per open refund state: operations in it, and for `submitting` the
+    /// oldest first submission's age in seconds.
+    pub refunds: Vec<(String, u64, f64)>,
+    /// Unmatched provider observations awaiting review, per kind.
+    pub unmatched: Vec<(String, u64)>,
+    /// Pending inbox rows whose last failure needs review.
+    pub jobs_needing_review: u64,
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: Pool,
@@ -135,7 +167,7 @@ async fn check_protocol(c: &tokio_postgres::Client, ingress: bool) -> Result<(),
         .await
         .map_err(db)?
         .ok_or_else(|| {
-            BillingError::ServiceUnavailable("billing protocol is not configured".into())
+            BillingError::ServiceUnavailable(crate::error::PROTOCOL_UNCONFIGURED.into())
         })?;
     let supported = if ingress {
         INGRESS_PROTOCOL_VERSION
@@ -149,7 +181,7 @@ async fn check_protocol(c: &tokio_postgres::Client, ingress: bool) -> Result<(),
     });
     if actual != supported {
         return Err(BillingError::ServiceUnavailable(
-            "billing protocol is incompatible".into(),
+            crate::error::PROTOCOL_INCOMPATIBLE.into(),
         ));
     }
     Ok(())
@@ -290,7 +322,11 @@ fn validate_purchase(p: &Purchase) -> Result<(), BillingError> {
     Ok(())
 }
 
-async fn record_purchase(c: &impl GenericClient, p: &Purchase) -> Result<bool, BillingError> {
+async fn record_purchase(
+    c: &impl GenericClient,
+    p: &Purchase,
+    applied: &mut Applied,
+) -> Result<bool, BillingError> {
     validate_purchase(p)?;
     lock_account(c, p.account_id).await?;
     if let Some(existing) = c
@@ -349,6 +385,7 @@ async fn record_purchase(c: &impl GenericClient, p: &Purchase) -> Result<bool, B
                 status: d.get(4),
             },
             Some(p.account_id),
+            applied,
         )
         .await?;
     }
@@ -365,6 +402,7 @@ async fn record_purchase(c: &impl GenericClient, p: &Purchase) -> Result<bool, B
             .await
             .map_err(db)?;
     }
+    applied.purchases.push(p.clone());
     Ok(true)
 }
 
@@ -372,15 +410,29 @@ async fn observe_refund(
     c: &impl GenericClient,
     r: &RefundObservation,
     account: Option<Uuid>,
+    applied: &mut Applied,
 ) -> Result<(), BillingError> {
-    if r.id.is_empty()
-        || r.amount_minor <= 0
-        || !matches!(
-            r.status.as_str(),
-            "pending" | "requires_action" | "succeeded" | "failed" | "canceled"
-        )
-    {
+    let status = match r.status.as_str() {
+        "pending" => "pending",
+        "requires_action" => "requires_action",
+        "succeeded" => "succeeded",
+        "failed" => "failed",
+        "canceled" => "canceled",
+        _ => return Err(BillingError::Invalid("invalid refund observation".into())),
+    };
+    if r.id.is_empty() || r.amount_minor <= 0 {
         return Err(BillingError::Invalid("invalid refund observation".into()));
+    }
+    let prior_status: Option<String> = c
+        .query_opt(
+            "SELECT status FROM billing_refund_observation WHERE id=$1",
+            &[&r.id],
+        )
+        .await
+        .map_err(db)?
+        .map(|row| row.get(0));
+    if prior_status.as_deref() != Some(status) {
+        applied.refunds.push((status, r.operation_id.is_some()));
     }
     let purchase = c
         .query_opt(
@@ -539,6 +591,7 @@ async fn observe_dispute(
     c: &impl GenericClient,
     d: &DisputeObservation,
     account: Option<Uuid>,
+    applied: &mut Applied,
 ) -> Result<(), BillingError> {
     if d.id.is_empty()
         || d.amount_minor <= 0
@@ -592,9 +645,15 @@ async fn observe_dispute(
         ));
     }
     lock_account(c, p.account_id).await?;
+    let closing = match d.status.as_str() {
+        "won" => Some("won"),
+        "lost" => Some("lost"),
+        "warning_closed" => Some("warning_closed"),
+        _ => None,
+    };
     if let Some(old) = c
         .query_opt(
-            "SELECT purchase_id,amount_minor FROM billing_dispute WHERE id=$1",
+            "SELECT purchase_id,amount_minor,status FROM billing_dispute WHERE id=$1",
             &[&d.id],
         )
         .await
@@ -604,6 +663,9 @@ async fn observe_dispute(
             return Err(BillingError::RequiresReview(
                 "dispute identity changed".into(),
             ));
+        }
+        if old.get::<_, String>(2) != d.status {
+            applied.disputes.extend(closing);
         }
         c.execute(
             "UPDATE billing_dispute SET status=$2 WHERE id=$1",
@@ -616,6 +678,8 @@ async fn observe_dispute(
         c.execute("INSERT INTO billing_operation(id,account_id,kind,reason) VALUES($1,$2,'dispute','verified payment dispute')", &[&op,&p.account_id]).await.map_err(db)?;
         c.execute("INSERT INTO billing_dispute(id,purchase_id,operation_id,amount_minor,status) VALUES($1,$2,$3,$4,$5)",
             &[&d.id,&p.id,&op,&d.amount_minor,&d.status]).await.map_err(db)?;
+        applied.disputes.push("opened");
+        applied.disputes.extend(closing);
     }
     c.query_one("SELECT billing_refresh_charge($1)", &[&p.id])
         .await
@@ -661,7 +725,8 @@ async fn apply(
     purchases: &[Purchase],
     refunds: &[RefundObservation],
     disputes: &[DisputeObservation],
-) -> Result<(), BillingError> {
+) -> Result<Applied, BillingError> {
+    let mut applied = Applied::default();
     lock_account(c, account).await?;
     for p in purchases {
         if p.account_id != account {
@@ -669,15 +734,15 @@ async fn apply(
                 "purchase belongs to another account".into(),
             ));
         }
-        record_purchase(c, p).await?;
+        record_purchase(c, p, &mut applied).await?;
     }
     for r in refunds {
-        observe_refund(c, r, Some(account)).await?;
+        observe_refund(c, r, Some(account), &mut applied).await?;
     }
     for d in disputes {
-        observe_dispute(c, d, Some(account)).await?;
+        observe_dispute(c, d, Some(account), &mut applied).await?;
     }
-    Ok(())
+    Ok(applied)
 }
 
 impl Store {
@@ -758,7 +823,7 @@ impl Store {
     pub async fn record_purchase(&self, p: &Purchase) -> Result<bool, BillingError> {
         let mut c = self.client().await?;
         let tx = c.transaction().await.map_err(db)?;
-        let result = record_purchase(&tx, p).await?;
+        let result = record_purchase(&tx, p, &mut Applied::default()).await?;
         tx.commit().await.map_err(db)?;
         Ok(result)
     }
@@ -768,22 +833,23 @@ impl Store {
         purchases: &[Purchase],
         refunds: &[RefundObservation],
         disputes: &[DisputeObservation],
-    ) -> Result<(), BillingError> {
+    ) -> Result<Applied, BillingError> {
         let mut c = self.client().await?;
         let tx = c.transaction().await.map_err(db)?;
-        apply(&tx, account, purchases, refunds, disputes).await?;
-        tx.commit().await.map_err(db)
+        let applied = apply(&tx, account, purchases, refunds, disputes).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(applied)
     }
     pub async fn observe_refund(&self, r: &RefundObservation) -> Result<(), BillingError> {
         let mut c = self.client().await?;
         let tx = c.transaction().await.map_err(db)?;
-        observe_refund(&tx, r, None).await?;
+        observe_refund(&tx, r, None, &mut Applied::default()).await?;
         tx.commit().await.map_err(db)
     }
     pub async fn reconcile_dispute(&self, d: &DisputeObservation) -> Result<(), BillingError> {
         let mut c = self.client().await?;
         let tx = c.transaction().await.map_err(db)?;
-        observe_dispute(&tx, d, None).await?;
+        observe_dispute(&tx, d, None, &mut Applied::default()).await?;
         tx.commit().await.map_err(db)
     }
     pub async fn get_refund(&self, id: Uuid) -> Result<RefundOperation, BillingError> {
@@ -1104,7 +1170,8 @@ impl Store {
             .map(|r| r.get(0))
             .ok_or_else(|| BillingError::NotFound("account not found".into()))
     }
-    pub async fn begin_close(&self, account: Uuid) -> Result<(), BillingError> {
+    /// Whether this call moved the account out of `open`.
+    pub async fn begin_close(&self, account: Uuid) -> Result<bool, BillingError> {
         self.begin_close_with_reason(account, "account closure requested")
             .await
     }
@@ -1112,7 +1179,7 @@ impl Store {
         &self,
         account: Uuid,
         reason: &str,
-    ) -> Result<(), BillingError> {
+    ) -> Result<bool, BillingError> {
         if reason.trim().is_empty() {
             return Err(BillingError::Invalid("closure requires a reason".into()));
         }
@@ -1129,7 +1196,8 @@ impl Store {
             .map_err(db)?;
         }
         tx.execute("INSERT INTO billing_event(id,kind,object_id) VALUES($1,'billing.close.resume',$2) ON CONFLICT(id) DO NOTHING", &[&format!("local:close:{account}"),&account.to_string()]).await.map_err(db)?;
-        tx.commit().await.map_err(db)
+        tx.commit().await.map_err(db)?;
+        Ok(count > 0)
     }
     pub async fn list_refundable_purchases(
         &self,
@@ -1152,10 +1220,17 @@ impl Store {
         })
         .collect())
     }
-    pub async fn finalize_close(&self, account: Uuid) -> Result<(), BillingError> {
+    /// Whether this call moved the account from `closing` to `closed`.
+    pub async fn finalize_close(&self, account: Uuid) -> Result<bool, BillingError> {
         let mut c = self.client().await?;
         let tx = c.transaction().await.map_err(db)?;
         lock_account(&tx, account).await?;
+        let was_closing = tx
+            .query_one("SELECT billing_state FROM account WHERE id=$1", &[&account])
+            .await
+            .map_err(db)?
+            .get::<_, String>(0)
+            == "closing";
         let unsettled:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM billing_refund_operation r JOIN billing_operation o ON o.id=r.id \
             WHERE o.account_id=$1 AND r.state NOT IN ('succeeded','released','superseded')) OR EXISTS(SELECT 1 FROM billing_purchase p \
             JOIN account a ON a.id=p.account_id JOIN credit_ledger cl ON cl.purchase_id=p.id WHERE p.account_id=$1 \
@@ -1168,7 +1243,8 @@ impl Store {
         if tx.execute("UPDATE account SET billing_state='closed' WHERE id=$1 AND billing_state IN ('closing','closed')", &[&account]).await.map_err(db)?!=1 {
             return Err(BillingError::Conflict("account closure has not started".into()));
         }
-        tx.commit().await.map_err(db)
+        tx.commit().await.map_err(db)?;
+        Ok(was_closing)
     }
 
     pub async fn enqueue_event(
@@ -1297,6 +1373,74 @@ impl Store {
             event: row_pending_event(row),
             _permit: permit,
         }))
+    }
+    /// The whole durable backlog in aggregate: no row's identity leaves.
+    pub async fn backlog(&self) -> Result<Backlog, BillingError> {
+        let c = self.client().await?;
+        let work = c
+            .query(
+                "SELECT kind,COUNT(*)::BIGINT,COUNT(*) FILTER (WHERE attempts>0)::BIGINT, \
+                 EXTRACT(EPOCH FROM clock_timestamp()-MIN(received_at))::FLOAT8 \
+                 FROM billing_event WHERE completed_at IS NULL GROUP BY kind",
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get(0),
+                    r.get::<_, i64>(1).max(0) as u64,
+                    r.get::<_, i64>(2).max(0) as u64,
+                    r.get::<_, f64>(3).max(0.0),
+                )
+            })
+            .collect();
+        let refunds = c
+            .query(
+                "SELECT state,COUNT(*)::BIGINT, \
+                 COALESCE(EXTRACT(EPOCH FROM clock_timestamp()-MIN(submitted_at))::FLOAT8,0) \
+                 FROM billing_refund_operation \
+                 WHERE state IN ('prepared','submitting','pending','requires_action') GROUP BY state",
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get(0),
+                    r.get::<_, i64>(1).max(0) as u64,
+                    r.get::<_, f64>(2).max(0.0),
+                )
+            })
+            .collect();
+        let unmatched = c
+            .query(
+                "SELECT kind,COUNT(*)::BIGINT FROM billing_unmatched_observation GROUP BY kind",
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .into_iter()
+            .map(|r| (r.get(0), r.get::<_, i64>(1).max(0) as u64))
+            .collect();
+        let jobs_needing_review = c
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM billing_event WHERE completed_at IS NULL \
+                 AND last_error IN ('requires_review','unsupported_kind','unsupported_protocol')",
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .get::<_, i64>(0)
+            .max(0) as u64;
+        Ok(Backlog {
+            work,
+            refunds,
+            unmatched,
+            jobs_needing_review,
+        })
     }
     pub async fn review_issues(&self, account: Uuid) -> Result<Vec<ReviewIssue>, BillingError> {
         Ok(self.client().await?.query("SELECT kind,id,reason FROM billing_unmatched_observation WHERE account_id=$1 ORDER BY kind,id", &[&account]).await.map_err(db)?
@@ -1456,7 +1600,7 @@ impl ReconciliationGuard {
             .transaction()
             .await
             .map_err(db)?;
-        observe_refund(&tx, refund, Some(self.account)).await?;
+        observe_refund(&tx, refund, Some(self.account), &mut Applied::default()).await?;
         tx.commit().await.map_err(db)
     }
     /// Commit on the very connection holding the provider-read lock. Losing
@@ -1467,7 +1611,7 @@ impl ReconciliationGuard {
         purchases: &[Purchase],
         refunds: &[RefundObservation],
         disputes: &[DisputeObservation],
-    ) -> Result<(), BillingError> {
+    ) -> Result<Applied, BillingError> {
         if account != self.account {
             return Err(BillingError::Invalid(
                 "reconciliation account changed".into(),
@@ -1480,8 +1624,9 @@ impl ReconciliationGuard {
             .transaction()
             .await
             .map_err(db)?;
-        apply(&tx, account, purchases, refunds, disputes).await?;
-        tx.commit().await.map_err(db)
+        let applied = apply(&tx, account, purchases, refunds, disputes).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(applied)
     }
     pub async fn release(mut self) -> Result<(), BillingError> {
         if let Some(client) = self.client.take() {

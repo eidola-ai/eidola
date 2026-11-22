@@ -42,6 +42,13 @@ pub const BILLING_EVENT_TYPES: &[&str] = &[
     "v1.charge.dispute.funds_reinstated",
 ];
 
+/// The inbox's own job kinds, which no Stripe event type can name.
+pub const LOCAL_JOB_KINDS: &[&str] = &[
+    "billing.refund.resume",
+    "billing.close.resume",
+    "billing.account.reconcile",
+];
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ReconcileReport {
     pub purchases: usize,
@@ -87,7 +94,25 @@ impl BillingService {
         finish_locked(result, guard.release().await)
     }
 
+    /// One full read of an account's Stripe state and its application,
+    /// counted by outcome.
     async fn reconcile_locked(
+        &self,
+        account_id: Uuid,
+        guard: &mut ReconciliationGuard,
+        resume_work: bool,
+    ) -> Result<ReconcileReport, BillingError> {
+        let result = self
+            .reconcile_locked_uncounted(account_id, guard, resume_work)
+            .await;
+        crate::metrics::reconciliation(match &result {
+            Ok(_) => "ok",
+            Err(error) => error.class(),
+        });
+        result
+    }
+
+    async fn reconcile_locked_uncounted(
         &self,
         account_id: Uuid,
         guard: &mut ReconciliationGuard,
@@ -97,6 +122,12 @@ impl BillingService {
             return Ok(ReconcileReport::default());
         };
         let snapshot = self.stripe.fetch_account_snapshot(&customer).await?;
+        let renewals: std::collections::HashSet<String> = snapshot
+            .purchases
+            .iter()
+            .filter(|p| p.renewal)
+            .map(|p| p.id.clone())
+            .collect();
         let purchases: Vec<_> = snapshot
             .purchases
             .into_iter()
@@ -129,9 +160,10 @@ impl BillingService {
         // One commit prevents issuance between recognizing a purchase and
         // recognizing its already-known chargeback. Unknown financial graphs
         // fail closed; they must never become a grant with its debit omitted.
-        guard
+        let applied = guard
             .apply_observations(account_id, &purchases, &refunds, &disputes)
             .await?;
+        crate::metrics::applied(&applied, |id| renewals.contains(id));
         let mut report = ReconcileReport {
             purchases: purchases.len(),
             refunds: refunds.len(),
@@ -241,7 +273,7 @@ impl BillingService {
             ));
         }
         if let Some(refund) = matches.first() {
-            guard
+            let applied = guard
                 .apply_observations(
                     operation.account_id,
                     &[],
@@ -249,6 +281,7 @@ impl BillingService {
                     &[],
                 )
                 .await?;
+            crate::metrics::applied(&applied, |_| false);
             return self.store.get_refund(operation.id).await;
         }
         if operation.refund_id.is_some()
@@ -296,7 +329,7 @@ impl BillingService {
         .map_err(|_| BillingError::Network("refund submission outcome is unknown".into()))?;
         match response {
             Ok(refund) => {
-                guard
+                let applied = guard
                     .apply_observations(
                         operation.account_id,
                         &[],
@@ -304,6 +337,7 @@ impl BillingService {
                         &[],
                     )
                     .await?;
+                crate::metrics::applied(&applied, |_| false);
                 self.store.get_refund(operation.id).await
             }
             Err(error @ BillingError::ProviderRejected(_)) => {
@@ -320,6 +354,7 @@ impl BillingService {
                 // A rejected first submission has no earlier uncertain call.
                 // Its hold still remains until the operator chooses a remedy.
                 guard.mark_refund_rejected(operation.id).await?;
+                crate::metrics::refund_rejected();
                 Err(error)
             }
             Err(error) => Err(error),
@@ -421,9 +456,13 @@ impl BillingService {
         }
         let mut guard = self.store.lock_reconciliation(account_id).await?;
         let result = async {
-            self.store
+            if self
+                .store
                 .begin_close_with_reason(account_id, reason)
-                .await?;
+                .await?
+            {
+                crate::metrics::closure("requested");
+            }
             self.cancel_subscriptions_locked(account_id, &guard).await?;
             let mut report = self.reconcile_locked(account_id, &mut guard, true).await?;
             // Accounts with no payment relationship still close durably.
@@ -480,8 +519,8 @@ impl BillingService {
                 object_id: account_id.to_string(),
                 reason: "closure_awaiting_refund_settlement".into(),
             });
-        } else {
-            self.store.finalize_close(account_id).await?;
+        } else if self.store.finalize_close(account_id).await? {
+            crate::metrics::closure("closed");
         }
         Ok(())
     }
@@ -507,19 +546,21 @@ impl BillingService {
             let event = job.event().clone();
             report.processed += 1;
             if event.protocol_version != INGRESS_PROTOCOL_VERSION {
+                warn_unsupported_once(&UNSUPPORTED_PROTOCOL, "unsupported_protocol");
                 job.fail("unsupported_protocol").await?;
+                crate::metrics::job(&event.kind, event.attempts, "unsupported_protocol");
                 report.failed += 1;
                 report.review += 1;
                 continue;
             }
-            if !matches!(
-                event.kind.as_str(),
-                "billing.refund.resume" | "billing.close.resume" | "billing.account.reconcile"
-            ) && event_object_kind(&event.kind).is_none()
+            if !LOCAL_JOB_KINDS.contains(&event.kind.as_str())
+                && event_object_kind(&event.kind).is_none()
             {
                 // Older executors may encounter a newer producer's kind. It
                 // must remain visible and pending until a capable executor runs.
+                warn_unsupported_once(&UNSUPPORTED_KIND, "unsupported_kind");
                 job.fail("unsupported_kind").await?;
+                crate::metrics::job(&event.kind, event.attempts, "unsupported_kind");
                 report.failed += 1;
                 report.review += 1;
                 continue;
@@ -529,10 +570,12 @@ impl BillingService {
                     report.review += result.review.len();
                     job.complete((event.kind == "billing.account.reconcile").then_some(&result))
                         .await?;
+                    crate::metrics::job(&event.kind, event.attempts, "completed");
                     report.completed += 1;
                 }
                 Err(error) => {
-                    job.fail(failure_class(&error)).await?;
+                    job.fail(error.class()).await?;
+                    crate::metrics::job(&event.kind, event.attempts, error.class());
                     report.failed += 1;
                     if matches!(error, BillingError::RequiresReview(_)) {
                         report.review += 1;
@@ -650,18 +693,25 @@ pub fn event_object_kind(kind: &str) -> Option<&'static str> {
     }
 }
 
-fn failure_class(error: &BillingError) -> &'static str {
-    match error {
-        BillingError::Invalid(_) => "invalid",
-        BillingError::Conflict(_) => "conflict",
-        BillingError::NotFound(_) => "not_found",
-        BillingError::RequiresReview(_) => "requires_review",
-        BillingError::Database(_) => "database_unavailable",
-        BillingError::Network(_) => "provider_unavailable",
-        BillingError::Parse(_) => "parse",
-        BillingError::ServiceUnavailable(_) => "provider_unavailable",
-        BillingError::ProviderRejected(_) => "provider_rejected",
+static UNSUPPORTED_PROTOCOL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static UNSUPPORTED_KIND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says once per process that pending work was produced under an ingress
+/// protocol version (`unsupported_protocol`) or with a job kind
+/// (`unsupported_kind`) this executor cannot run. Such rows stay pending for
+/// a capable executor; until one runs, each claim fails them again. Returns
+/// whether it logged.
+fn warn_unsupported_once(seen: &std::sync::atomic::AtomicBool, condition: &'static str) -> bool {
+    if seen.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
     }
+    tracing::warn!(
+        condition,
+        "billing work this executor cannot run is pending ({condition}): it stays pending \
+         for review until an executor that supports it runs"
+    );
+    true
 }
 
 #[cfg(test)]

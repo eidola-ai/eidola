@@ -14,7 +14,8 @@
 //! - `RUST_LOG` — the log filter
 //!
 //! Everything else the SDK would read from the environment by itself is set
-//! explicitly ([`OtlpConfig`]).
+//! explicitly ([`eidola_telemetry::OtlpConfig`], which builds the exporters
+//! this module's providers send through).
 //!
 //! # Spans are recorded everywhere and exported only on request
 //!
@@ -33,18 +34,15 @@
 //! acceptable — write `#[instrument(skip_all)]` and add fields explicitly, or
 //! do not instrument.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use eidola_common::env::Env;
+use eidola_telemetry::OtlpConfig;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::{Link, SpanKind, TraceContextExt, TraceId, TracerProvider as _};
-use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SamplingDecision, SamplingResult, ShouldSample, SpanProcessor};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -114,16 +112,12 @@ impl SpanProcessor for AggregatingSpanProcessor {
             .end_time
             .duration_since(span.start_time)
             .unwrap_or_default();
-        let outcome = match span.status {
-            opentelemetry::trace::Status::Error { .. } => "error",
-            _ => "ok",
-        };
 
         metrics::SPAN_DURATION.record(
             duration.as_secs_f64(),
             &[
                 KeyValue::new("operation", operation),
-                KeyValue::new("outcome", outcome),
+                KeyValue::new("outcome", span_outcome(&span.status)),
             ],
         );
     }
@@ -135,6 +129,31 @@ impl SpanProcessor for AggregatingSpanProcessor {
     fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
         Ok(())
     }
+}
+
+/// The `outcome` label a finished span aggregates under: `error` when its
+/// status is an error, `ok` otherwise.
+fn span_outcome(status: &opentelemetry::trace::Status) -> &'static str {
+    match status {
+        opentelemetry::trace::Status::Error { .. } => "error",
+        _ => "ok",
+    }
+}
+
+/// Marks the current span failed when `result` is an error, and returns it.
+///
+/// This is how an instrumented function reports failure to the aggregator,
+/// which reads it as `outcome=error` on `operation.duration`. The span must
+/// declare the field (`fields(otel.status_code)` beside `skip_all`), since
+/// `tracing` records only declared fields. `#[instrument(err)]` would set the
+/// same status, by emitting an ERROR event: an exported log line for every
+/// failed call, timestamped, which is a per-request record whenever the
+/// failure is one. This sets the status and emits nothing.
+pub fn span_result<T, E>(result: Result<T, E>) -> Result<T, E> {
+    if result.is_err() {
+        tracing::Span::current().record("otel.status_code", "error");
+    }
+    result
 }
 
 /// Holds OTel providers so they can be shut down gracefully.
@@ -163,16 +182,12 @@ impl OtelGuard {
 ///
 /// Returns the OTel guard if `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 pub fn init(env: &Env) -> Option<OtelGuard> {
-    let otel = OtlpConfig::read(|name| env.var(name)).map(init_otel_providers);
+    let otel =
+        OtlpConfig::read(|name| env.var(name), "eidola-server-gateway").map(init_otel_providers);
 
     let fmt_layer = tracing_subscriber::fmt::layer();
 
-    // `EnvFilter::from_default_env`, over the prefixed `RUST_LOG`.
-    let env_filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::ERROR.into())
-        .parse_lossy(env.var("RUST_LOG").unwrap_or_default())
-        .add_directive("eidola_server_gateway=info".parse().unwrap())
-        .add_directive("hyper=warn".parse().unwrap());
+    let env_filter = log_filter(&env.var("RUST_LOG").unwrap_or_default());
 
     let (otel_trace_layer, otel_log_layer) = match &otel {
         Some(guard) => {
@@ -194,6 +209,12 @@ pub fn init(env: &Env) -> Option<OtelGuard> {
         .init();
 
     otel
+}
+
+/// The event and span filter: `EnvFilter::from_default_env`, over the
+/// prefixed `RUST_LOG`, with this crate at `info` and `hyper` at `warn`.
+fn log_filter(rust_log: &str) -> EnvFilter {
+    eidola_telemetry::log_filter(rust_log, &["eidola_server_gateway=info", "hyper=warn"])
 }
 
 /// The OTel trace layer exactly as production runs it.
@@ -220,151 +241,24 @@ where
         .with_context_activation(false)
 }
 
-/// Everything the OTLP exporters, the SDK's processors and the resource are
-/// built from, read by us under the environment's prefix and handed over
-/// explicitly.
-///
-/// Left to themselves, the exporter and SDK builders read the bare `OTEL_*`
-/// names: the endpoint, protocol, timeout and temporality, the batch
-/// processors' sizes and delays, the metric export interval, span limits, the
-/// sampler, and the resource's `OTEL_SERVICE_NAME` and
-/// `OTEL_RESOURCE_ATTRIBUTES`. Each is set explicitly in
-/// [`init_otel_providers`], which overrides the variable, so no unprefixed
-/// value configures any of them. Compression is not settable to "none", and
-/// needs no setting: the exporter is built without its gzip and zstd
-/// features, so it ignores a compression variable, with a warning.
-///
-/// One read cannot be closed from outside: the HTTP exporter merges the
-/// headers in the bare `OTEL_EXPORTER_OTLP_HEADERS` (or
-/// `OTEL_EXPORTER_OTLP_<SIGNAL>_HEADERS`) over the headers it is given, with
-/// no setting to stop it. A container receives only the variables its
-/// measured config names, so a bare name reaches it only if the config
-/// declares one.
-struct OtlpConfig {
-    /// The base endpoint; each signal's path is appended to it.
-    endpoint: String,
-    /// `OTEL_EXPORTER_OTLP_HEADERS` as `key=value` pairs, values still
-    /// percent-encoded: `with_headers` decodes them, as the exporter decodes
-    /// the variable.
-    headers: HashMap<String, String>,
-    service_name: String,
-    /// Per signal: traces, metrics, logs.
-    timeouts: [Duration; 3],
-}
-
-impl OtlpConfig {
-    /// The configuration `lookup` describes, or `None` when it names no
-    /// endpoint. `lookup` answers for one variable name, already prefixed.
-    fn read(lookup: impl Fn(&str) -> Option<String>) -> Option<Self> {
-        let endpoint =
-            lookup(opentelemetry_otlp::OTEL_EXPORTER_OTLP_ENDPOINT).filter(|s| !s.is_empty())?;
-        let headers = lookup(opentelemetry_otlp::OTEL_EXPORTER_OTLP_HEADERS)
-            .map(|raw| otlp_headers(&raw))
-            .unwrap_or_default();
-        let service_name = lookup("OTEL_SERVICE_NAME")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "eidola-server-gateway".to_string());
-        let timeouts = [
-            opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
-            opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
-            opentelemetry_otlp::OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
-        ]
-        .map(|signal_var| otlp_timeout(signal_var, &lookup));
-        Some(Self {
-            endpoint,
-            headers,
-            service_name,
-            timeouts,
-        })
-    }
-
-    /// One signal's URL: the base endpoint with the signal's path appended,
-    /// as the exporter appends it to `OTEL_EXPORTER_OTLP_ENDPOINT` (a
-    /// programmatic endpoint is taken as the whole URL).
-    fn signal_endpoint(&self, path: &str) -> String {
-        match self.endpoint.strip_suffix('/') {
-            Some(base) => format!("{base}{path}"),
-            None => format!("{}{path}", self.endpoint),
-        }
-    }
-}
-
-/// `key=value` pairs, comma-separated, as the exporter splits its headers
-/// variable: whitespace trimmed, empty keys and values skipped.
-fn otlp_headers(raw: &str) -> HashMap<String, String> {
-    raw.split_terminator(',')
-        .filter_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            let (key, value) = (key.trim(), value.trim());
-            (!key.is_empty() && !value.is_empty()).then(|| (key.to_string(), value.to_string()))
-        })
-        .collect()
-}
-
-/// The HTTP clients the OTLP exporters send through, one per signal.
-///
-/// Left to itself the exporter builds a default `reqwest` 0.13 client, which
-/// verifies against the platform trust store — and the server runs `FROM
-/// scratch` with none, so that client cannot be built and an HTTPS collector
-/// (Grafana Cloud in production) is unreachable. These clients carry the
-/// bundled Mozilla roots every other outbound client here uses
-/// ([`crate::tls_config`]). A client handed to the exporter does not get the
-/// exporter's timeout, so each one carries its signal's ([`otlp_timeout`]),
-/// and none reads a proxy from the environment. Built on their own thread, as
-/// the exporter builds its default, because a blocking client must not be
-/// constructed inside the tokio runtime `main` runs in.
-struct OtlpHttpClients {
-    traces: reqwest::blocking::Client,
-    metrics: reqwest::blocking::Client,
-    logs: reqwest::blocking::Client,
-}
-
-fn otlp_http_clients(timeouts: [Duration; 3]) -> OtlpHttpClients {
-    std::thread::spawn(move || {
-        let [traces, metrics, logs] = timeouts.map(|timeout| {
-            reqwest::blocking::Client::builder()
-                .tls_backend_preconfigured(crate::tls_config())
-                .no_proxy()
-                .timeout(timeout)
-                .build()
-                .expect("failed to build OTLP HTTP client")
-        });
-        OtlpHttpClients {
-            traces,
-            metrics,
-            logs,
-        }
-    })
-    .join()
-    .expect("OTLP HTTP client thread panicked")
-}
-
-/// The timeout the OTLP exporter would resolve for one signal: the signal's
-/// variable, else `OTEL_EXPORTER_OTLP_TIMEOUT`, else the 10 s default —
-/// milliseconds, and an unparsable value is skipped. The exporter's resolver
-/// is private and reads the bare names, so this mirrors it over `lookup`.
-fn otlp_timeout(signal_var: &str, lookup: impl Fn(&str) -> Option<String>) -> Duration {
-    [signal_var, opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT]
-        .into_iter()
-        .find_map(|name| lookup(name)?.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
-}
-
 /// Create OTel providers for traces, metrics, and logs via OTLP/HTTP.
+///
+/// The OTLP exporters send through clients carrying the bundled Mozilla roots
+/// every other outbound client here uses ([`crate::tls_config`]); the image
+/// has no system trust store for the exporter's default client to read.
 fn init_otel_providers(config: OtlpConfig) -> OtelGuard {
-    let http_clients = otlp_http_clients(config.timeouts);
-    let [traces_timeout, metrics_timeout, logs_timeout] = config.timeouts;
-
-    // Built empty, not from `Resource::builder()`, whose detectors read
-    // `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`; the SDK's own
-    // attributes (`telemetry.sdk.*`) read nothing.
-    let resource = Resource::builder_empty()
-        .with_detector(Box::new(
-            opentelemetry_sdk::resource::TelemetryResourceDetector,
-        ))
-        .with_service_name(config.service_name.clone())
-        .build();
+    let timeouts = config.timeouts();
+    let [traces_client, metrics_client, logs_client] = eidola_telemetry::otlp_http_clients(
+        crate::tls_config(),
+        [timeouts.traces, timeouts.metrics, timeouts.logs],
+    );
+    // Gateways run side by side during a cutover, and each re-exports the
+    // engine nodes' counters; the instance keeps their cumulative series
+    // apart. It names this process only.
+    let resource = config.resource([KeyValue::new(
+        "service.instance.id",
+        uuid::Uuid::new_v4().to_string(),
+    )]);
 
     // --- Traces ---
     // Two processors, and which one a span reaches is decided by its sampled
@@ -373,89 +267,20 @@ fn init_otel_providers(config: OtlpConfig) -> OtelGuard {
     // batching, and `ClientDirectedSampler` marks a trace sampled only for a
     // request that asked to be traced, so the export path stays empty for
     // ordinary traffic.
-    let trace_exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(config.signal_endpoint("/v1/traces"))
-        .with_timeout(traces_timeout)
-        .with_headers(config.headers.clone())
-        .with_http_client(http_clients.traces)
-        .build()
-        .expect("failed to create OTLP trace exporter");
-
-    // The batch configuration's defaults read `OTEL_BSP_*`; each field that
-    // takes effect is set back to the SDK's default here.
-    let trace_batch = opentelemetry_sdk::trace::BatchSpanProcessor::builder(trace_exporter)
-        .with_batch_config(
-            opentelemetry_sdk::trace::BatchConfigBuilder::default()
-                .with_max_queue_size(opentelemetry_sdk::trace::OTEL_BSP_MAX_QUEUE_SIZE_DEFAULT)
-                .with_scheduled_delay(opentelemetry_sdk::trace::OTEL_BSP_SCHEDULE_DELAY_DEFAULT)
-                .with_max_export_batch_size(
-                    opentelemetry_sdk::trace::OTEL_BSP_MAX_EXPORT_BATCH_SIZE_DEFAULT,
-                )
-                .build(),
-        )
-        .build();
-
     let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_resource(resource.clone())
         .with_sampler(ClientDirectedSampler)
         .with_span_limits(opentelemetry_sdk::trace::SpanLimits::default())
         .with_span_processor(AggregatingSpanProcessor)
-        .with_span_processor(trace_batch)
+        .with_span_processor(config.span_batch_processor(traces_client))
         .build();
 
     // --- Metrics ---
-    let metrics_exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(config.signal_endpoint("/v1/metrics"))
-        .with_timeout(metrics_timeout)
-        .with_headers(config.headers.clone())
-        .with_http_client(http_clients.metrics)
-        .with_temporality(opentelemetry_sdk::metrics::Temporality::Cumulative)
-        .build()
-        .expect("failed to create OTLP metrics exporter");
-
-    let meter_reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metrics_exporter)
-        .with_interval(opentelemetry_sdk::metrics::OTEL_METRIC_EXPORT_INTERVAL_DEFAULT)
-        .build();
-
-    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-        .with_resource(resource.clone())
-        .with_reader(meter_reader)
-        .build();
-
+    let meter_provider = config.meter_provider(resource.clone(), metrics_client);
     opentelemetry::global::set_meter_provider(meter_provider.clone());
 
     // --- Logs ---
-    let log_exporter = opentelemetry_otlp::LogExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(config.signal_endpoint("/v1/logs"))
-        .with_timeout(logs_timeout)
-        .with_headers(config.headers)
-        .with_http_client(http_clients.logs)
-        .build()
-        .expect("failed to create OTLP log exporter");
-
-    // As for spans: the defaults read `OTEL_BLRP_*`, so each field is set.
-    let log_batch = opentelemetry_sdk::logs::BatchLogProcessor::builder(log_exporter)
-        .with_batch_config(
-            opentelemetry_sdk::logs::BatchConfigBuilder::default()
-                .with_max_queue_size(opentelemetry_sdk::logs::OTEL_BLRP_MAX_QUEUE_SIZE_DEFAULT)
-                .with_scheduled_delay(opentelemetry_sdk::logs::OTEL_BLRP_SCHEDULE_DELAY_DEFAULT)
-                .with_max_export_batch_size(
-                    opentelemetry_sdk::logs::OTEL_BLRP_MAX_EXPORT_BATCH_SIZE_DEFAULT,
-                )
-                .build(),
-        )
-        .build();
-
-    let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
-        .with_resource(resource)
-        .with_log_processor(log_batch)
-        .build();
+    let logger_provider = config.logger_provider(resource, logs_client);
 
     OtelGuard {
         tracer_provider,
@@ -489,6 +314,7 @@ fn init_otel_providers(config: OtlpConfig) -> OtelGuard {
 /// default ladder is millisecond-scaled and every duration instrument here
 /// records seconds. See `SDK_DEFAULT_BUCKETS`.
 pub mod metrics {
+    use opentelemetry::KeyValue;
     use opentelemetry::metrics::{Counter, Gauge, Histogram};
     use std::sync::LazyLock;
 
@@ -529,25 +355,35 @@ pub mod metrics {
     /// from the name directly would let any future span — or any span whose
     /// name interpolates a value — create an unbounded set of time series.
     /// Resolving through a fixed list makes that impossible by construction
-    /// rather than by review.
-    ///
-    /// The root `http.request` span is deliberately absent: middleware records
-    /// that latency itself, with method, route and status attached, and
-    /// aggregating it here too would double-count it.
-    const TRACKED_SPANS: &[&str] = &[
+    /// rather than by review. Every span this crate opens is either here or
+    /// in [`UNTRACKED_SPANS`], which a test checks against the source.
+    pub(super) const TRACKED_SPANS: &[&str] = &[
+        "account.reconcile",
+        "account.reconcile_status",
+        "db.find_credential_issuance",
         "db.get_account",
         "db.get_available_balance",
         "db.get_issuer_key",
         "db.get_refund_token",
         "db.get_valid_issuer_keys",
-        "account.reconcile",
-        "account.reconcile_status",
+        "db.has_stripe_ledger_history",
+        "db.prune_expired_issuances",
+        "db.prune_expired_nullifiers",
+        "db.record_credential_issuance",
         "db.record_nullifiers",
         "db.replace_refund_token",
+        "db.resolve_issuance_off_current_key",
         "db.store_refund_token",
-        "upstream.chat",
-        "upstream.chat_stream",
+        "engine.chat_stream",
     ];
+
+    /// Spans the aggregator deliberately ignores, each with the reason.
+    pub(super) const UNTRACKED_SPANS: &[(&str, &str)] = &[(
+        "http.request",
+        "the root request span: middleware records its latency itself, with \
+         method, route and status attached, and aggregating it here too would \
+         double-count it",
+    )];
 
     /// Resolve a span name to its metric label, or `None` for a span the
     /// aggregator should ignore.
@@ -556,7 +392,10 @@ pub mod metrics {
     /// should be visible as *something* so it prompts a `TRACKED_SPANS` entry,
     /// but it must never mint a series of its own.
     pub(super) fn span_operation(name: &str) -> Option<&'static str> {
-        if name == "http.request" {
+        if UNTRACKED_SPANS
+            .iter()
+            .any(|(untracked, _)| *untracked == name)
+        {
             return None;
         }
         Some(
@@ -634,12 +473,17 @@ pub mod metrics {
     });
 
     /// Total chat completion requests reaching the handler (by model,
-    /// stream, status). `status` is `ok` (2xx response opened), `error` (a
-    /// refund-bearing error response built after the credential was
-    /// spent), or `rejected` (pre-flight refusal: a request not asking for
-    /// a stream, an invalid or duplicate credential). The `model` label
-    /// is always the catalog resolution of the requested id, with `other`
-    /// for anything unrecognized — never the caller's string.
+    /// stream, status, reason). `status` is `ok` (2xx response opened),
+    /// `error` (a refund-bearing error response built after the credential
+    /// was spent), or `rejected` (pre-flight refusal: a request not asking
+    /// for a stream, an invalid or duplicate credential). `reason` is `none`
+    /// for `ok`, and otherwise the refusal's fixed class
+    /// (`ServerError::label`): `bad_request`, `payment_required`,
+    /// `unavailable` (no engine took it), an engine's error type resolved
+    /// against the known list (`timeout` for the request's deadline), and
+    /// so on. The `model` label is always the catalog resolution of the
+    /// requested id, with `other` for anything unrecognized — never the
+    /// caller's string.
     pub static CHAT_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         meter()
             .u64_counter("chat.completion.requests")
@@ -718,6 +562,178 @@ pub mod metrics {
             .build()
     });
 
+    /// Attempts to hand a chat request to an engine, by `model` and
+    /// `outcome`: `response` (the engine answered with a stream),
+    /// `no_headers` (no response headers in time), `no_response` (no
+    /// attested connection, or one that closed under the request),
+    /// `misconfigured` (the engine refused the gateway's token, weights or
+    /// model; its breaker opens), `overloaded` (at capacity; the next engine
+    /// is tried), `refused` (any other answer, returned to the client), and
+    /// `none_available` (no engine was left to try, counted once per
+    /// request).
+    pub static ENGINE_DISPATCH_ATTEMPTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("engine.dispatch.attempts")
+            .with_description("Attempts to dispatch a chat request to an engine, by outcome")
+            .build()
+    });
+
+    /// Engine streams that failed after they opened, by `model` and
+    /// `reason`: `silent` (nothing for the idle limit), `read` (the
+    /// connection broke), `not_utf8`, `unknown_event`, `unparsed_chunk` (a
+    /// chunk this gateway cannot read), `error_event` (the node's own error
+    /// frame), or `incomplete` (the body ended without `[DONE]`). Each is
+    /// also counted against the engine's health.
+    pub static ENGINE_STREAM_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("engine.stream.failures")
+            .with_description("Engine streams that failed after opening, by reason")
+            .build()
+    });
+
+    /// Credential issuance requests, by `outcome`: `issued`, `replayed` (a
+    /// retry answered from the stored response), `insufficient` (balance),
+    /// `terms_required`, `key_retired`, `key_pending` (the named key is not
+    /// this gateway's issuing key yet), `closed` (the account is closing or
+    /// closed), `mismatch` (an idempotency key reused for another request),
+    /// `invalid` (a malformed request), or `failed` (anything else).
+    pub static CREDENTIAL_ISSUANCE: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("credentials.issuance")
+            .with_description("Credential issuance requests, by outcome")
+            .build()
+    });
+
+    /// Refunds settled for spent inputs, by `outcome`: `issued` (the refund
+    /// owed), `zero_fallback` (that refund could not be signed, and one
+    /// returning nothing was issued instead), or `failed` (not even that).
+    /// Any `zero_fallback` or `failed` is an incident.
+    pub static CREDENTIAL_REFUNDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("credentials.refunds")
+            .with_description("Refunds settled for spent inputs, by outcome")
+            .build()
+    });
+
+    /// Refunds that were issued but could not be stored for recovery. The
+    /// refund still reaches the client in its response; one whose response
+    /// is lost cannot be recovered.
+    pub static REFUND_STORE_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("credentials.refund_store.failures")
+            .with_description("Issued refunds that could not be stored for recovery")
+            .build()
+    });
+
+    /// Refund recoveries whose stored token did not open under the
+    /// presented refund key, answered as if nothing were stored.
+    pub static REFUND_RECOVERY_UNOPENED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("credentials.refund_recovery.unopened")
+            .with_description("Refund recoveries whose stored token did not open")
+            .build()
+    });
+
+    /// Request bodies refused before a handler ran, by `payload` (the
+    /// expected body type's name, fixed in code) and `class`: `too_large`,
+    /// `unreadable`, `read_timeout`, `no_permit` (no large-body permit
+    /// free), `too_deep`, `too_many_values`, `data`, `syntax`,
+    /// `missing_content_type`, `bytes` or `other`.
+    pub static BODY_REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("http.server.body.rejected")
+            .with_description("Request bodies refused before the handler ran, by class")
+            .build()
+    });
+
+    /// Count a refused request body. `payload` is a type name: its last
+    /// path segment is the label.
+    pub fn body_rejected(payload: &'static str, class: &'static str) {
+        let payload = payload.rsplit("::").next().unwrap_or(payload);
+        BODY_REJECTED.add(
+            1,
+            &[
+                KeyValue::new("payload", payload),
+                KeyValue::new("class", class),
+            ],
+        );
+    }
+
+    /// Register the observable gauges read from the engine router at each
+    /// export: `engine.upstreams{model, state=routable|unroutable}`, every
+    /// pinned model reported, with zeros when it has no upstream; and
+    /// `engine.placement.rows{reason=usable|disabled|unpinned_model|
+    /// unpinned_deployment|invalid_url|duplicate}`, the last placement
+    /// refresh's rows.
+    pub fn register_engine_router(router: crate::engine_router::EngineRouter) {
+        let placement = router.clone();
+        meter()
+            .u64_observable_gauge("engine.placement.rows")
+            .with_description("Engine placement rows at the last refresh, by reason")
+            .with_callback(move |gauge| {
+                for (reason, rows) in placement.placement_rows() {
+                    gauge.observe(rows, &[KeyValue::new("reason", reason)]);
+                }
+            })
+            .build();
+        meter()
+            .u64_observable_gauge("engine.upstreams")
+            .with_description("Engine upstreams known to this gateway, by model and state")
+            .with_callback(move |gauge| {
+                for (model, routable, unroutable) in router.upstream_states() {
+                    gauge.observe(
+                        routable,
+                        &[
+                            KeyValue::new("model", model.clone()),
+                            KeyValue::new("state", "routable"),
+                        ],
+                    );
+                    gauge.observe(
+                        unroutable,
+                        &[
+                            KeyValue::new("model", model),
+                            KeyValue::new("state", "unroutable"),
+                        ],
+                    );
+                }
+            })
+            .build();
+    }
+
+    /// Register the observable gauges read from the database pool at each
+    /// export: `db.pool.connections{state=in_use|idle}` and
+    /// `db.pool.waiting`, the requests waiting for a connection.
+    pub fn register_db_pool(pool: deadpool_postgres::Pool) {
+        let connections = pool.clone();
+        meter()
+            .u64_observable_gauge("db.pool.connections")
+            .with_description("Database pool connections, by state")
+            .with_callback(move |gauge| {
+                let status = connections.status();
+                let idle = status.available as u64;
+                let in_use = status.size.saturating_sub(status.available) as u64;
+                gauge.observe(in_use, &[KeyValue::new("state", "in_use")]);
+                gauge.observe(idle, &[KeyValue::new("state", "idle")]);
+            })
+            .build();
+        meter()
+            .u64_observable_gauge("db.pool.waiting")
+            .with_description("Requests waiting for a database pool connection")
+            .with_callback(move |gauge| gauge.observe(pool.status().waiting as u64, &[]))
+            .build();
+    }
+
+    /// Terms-feed polls, by `document` (the fixed list in `terms_feed`) and
+    /// `outcome`: `recorded` (a new version), `unchanged`, `conflict` (a
+    /// published version's bytes changed without a new version),
+    /// `record_failed` (the database write failed) or `fetch_failed`.
+    pub static TERMS_FEED_POLLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("terms.feed.polls")
+            .with_description("Terms-feed polls per document, by outcome")
+            .build()
+    });
+
     /// Signed clock drift between the server and the database, in
     /// seconds. Positive values mean the database is ahead of the
     /// server; negative values mean the server is ahead of the
@@ -747,126 +763,185 @@ pub mod metrics {
     });
 }
 
+/// A tracing stack built like production's (the same filter, trace layer and
+/// log bridge), recording what reaches the vendor: each finished span's name
+/// and the `outcome` the aggregator would give it, and every log record.
+#[cfg(test)]
+pub(crate) mod capture {
+    use std::sync::{Arc, Mutex};
+
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::logs::InMemoryLogExporter;
+    use opentelemetry_sdk::trace::SpanProcessor;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Debug, Default, Clone)]
+    struct Spans(Arc<Mutex<Vec<(String, &'static str)>>>);
+
+    impl SpanProcessor for Spans {
+        fn on_start(
+            &self,
+            _span: &mut opentelemetry_sdk::trace::Span,
+            _cx: &opentelemetry::Context,
+        ) {
+        }
+
+        fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((span.name.to_string(), super::span_outcome(&span.status)));
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: std::time::Duration) -> OTelSdkResult {
+            Ok(())
+        }
+    }
+
+    /// What `run` sent toward the vendor.
+    pub(crate) struct Captured {
+        /// Each finished span: its name and aggregated `outcome`.
+        pub spans: Vec<(String, &'static str)>,
+        /// How many log records were emitted past the filter.
+        pub logs: usize,
+    }
+
+    /// Run `run` under the stack, on this thread.
+    pub(crate) fn capture(run: impl FnOnce()) -> Captured {
+        let spans = Spans::default();
+        let logs = InMemoryLogExporter::default();
+        let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+            .with_simple_exporter(logs.clone())
+            .build();
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_sampler(super::ClientDirectedSampler)
+            .with_span_processor(spans.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(super::log_filter(""))
+            .with(super::otel_trace_layer(
+                tracer_provider.tracer("eidola-server-gateway"),
+            ))
+            .with(
+                opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                    &logger_provider,
+                ),
+            );
+        tracing::subscriber::with_default(subscriber, run);
+        let logs = logs.get_emitted_logs().expect("reading emitted logs").len();
+        let spans = spans.0.lock().unwrap().clone();
+        Captured { spans, logs }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The supplied OTLP clients carry the timeout the exporter would have
-    /// resolved itself: signal variable over the general one over 10 s, in
-    /// milliseconds, skipping a value that does not parse.
-    #[test]
-    fn otlp_timeout_resolves_like_the_exporter() {
-        use opentelemetry_otlp::{
-            OTEL_EXPORTER_OTLP_TIMEOUT, OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT,
-            OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
-        };
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| {
-                pairs
-                    .iter()
-                    .find(|(k, _)| *k == name)
-                    .map(|(_, v)| v.to_string())
-            }
-        };
-        let signal = OTEL_EXPORTER_OTLP_TRACES_TIMEOUT;
-        assert_eq!(
-            otlp_timeout(signal, env(&[])),
-            OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT
-        );
-        assert_eq!(
-            otlp_timeout(signal, env(&[(OTEL_EXPORTER_OTLP_TIMEOUT, "2500")])),
-            Duration::from_millis(2500)
-        );
-        assert_eq!(
-            otlp_timeout(
-                signal,
-                env(&[
-                    (OTEL_EXPORTER_OTLP_TRACES_TIMEOUT, "3000"),
-                    (OTEL_EXPORTER_OTLP_TIMEOUT, "2500")
-                ])
-            ),
-            Duration::from_millis(3000)
-        );
-        assert_eq!(
-            otlp_timeout(
-                signal,
-                env(&[
-                    (OTEL_EXPORTER_OTLP_TRACES_TIMEOUT, "soon"),
-                    (OTEL_EXPORTER_OTLP_TIMEOUT, "2500")
-                ])
-            ),
-            Duration::from_millis(2500)
-        );
+    #[tracing::instrument(skip_all, name = "db.get_account", fields(otel.status_code))]
+    fn instrumented(fail: bool) -> Result<(), crate::error::ServerError> {
+        span_result(if fail {
+            Err(crate::error::ServerError::NotFound {
+                message: "account not found".to_string(),
+            })
+        } else {
+            Ok(())
+        })
     }
 
-    fn vars(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
-        move |name: &str| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| v.to_string())
-        }
-    }
-
-    /// Telemetry is off without an endpoint, and an empty one is none: an
-    /// empty endpoint handed to the exporter would make it read the bare
-    /// variable instead.
+    /// A failed call aggregates as `outcome=error` without a log event:
+    /// `span_result` sets the span's status, which is what the aggregator
+    /// reads, and writes no record the vendor would receive.
     #[test]
-    fn otlp_needs_a_non_empty_endpoint() {
-        assert!(OtlpConfig::read(vars(&[])).is_none());
-        assert!(OtlpConfig::read(vars(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "")])).is_none());
-    }
-
-    /// The values we read are the ones the exporters get: each signal's path
-    /// appended to the endpoint as the exporter appends it, the headers split
-    /// as it splits them, and the service name defaulted.
-    #[test]
-    fn otlp_config_is_read_from_the_lookup_alone() {
-        let config = OtlpConfig::read(vars(&[
-            (
-                "OTEL_EXPORTER_OTLP_ENDPOINT",
-                "https://collector.example/otlp",
-            ),
-            (
-                "OTEL_EXPORTER_OTLP_HEADERS",
-                " Authorization = Basic%20abc , empty=, =novalue,X-Scope=tenant",
-            ),
-            ("OTEL_EXPORTER_OTLP_TIMEOUT", "2500"),
-            ("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "4000"),
-        ]))
-        .expect("an endpoint enables telemetry");
+    fn a_failed_call_is_an_error_outcome_and_no_log_line() {
+        let captured = capture::capture(|| {
+            let _ = instrumented(true);
+            let _ = instrumented(false);
+        });
         assert_eq!(
-            config.signal_endpoint("/v1/traces"),
-            "https://collector.example/otlp/v1/traces"
-        );
-        assert_eq!(
-            config.headers,
-            HashMap::from([
-                ("Authorization".to_string(), "Basic%20abc".to_string()),
-                ("X-Scope".to_string(), "tenant".to_string()),
-            ])
-        );
-        assert_eq!(config.service_name, "eidola-server-gateway");
-        assert_eq!(
-            config.timeouts,
-            [
-                Duration::from_millis(2500),
-                Duration::from_millis(2500),
-                Duration::from_millis(4000)
+            captured.spans,
+            vec![
+                ("db.get_account".to_string(), "error"),
+                ("db.get_account".to_string(), "ok"),
             ]
         );
+        assert_eq!(captured.logs, 0, "a failed call wrote a log record");
+    }
 
-        let config = OtlpConfig::read(vars(&[
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example/"),
-            ("OTEL_SERVICE_NAME", "staging-gateway"),
-        ]))
-        .unwrap();
-        assert_eq!(
-            config.signal_endpoint("/v1/logs"),
-            "https://collector.example/v1/logs"
+    /// Every span this crate opens is tracked by the aggregator or
+    /// deliberately left out of it, with a reason; every `#[instrument]`
+    /// names its span, skips its arguments, and reports failure through
+    /// `span_result` rather than `err`, which logs every failed call.
+    #[test]
+    fn every_span_in_the_crate_is_tracked_or_excluded() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    out.push((path.display().to_string(), text));
+                }
+            }
+        }
+        fn first_literal(text: &str) -> Option<&str> {
+            let rest = text.trim_start().strip_prefix('"')?;
+            rest.split_once('"').map(|(name, _)| name)
+        }
+
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
         );
-        assert_eq!(config.service_name, "staging-gateway");
-        assert!(config.headers.is_empty());
+        let untracked: Vec<&str> = metrics::UNTRACKED_SPANS.iter().map(|(n, _)| *n).collect();
+        // Spelled in pieces, so this test's own source holds neither needle.
+        let attribute_needle = ["#[tracing", "::instrument("].concat();
+        let macro_needle = ["_span", "!("].concat();
+        let mut names = Vec::new();
+        for (path, text) in &files {
+            for (at, _) in text.match_indices(&attribute_needle) {
+                let attribute = &text[at..at + text[at..].find(")]").unwrap()];
+                assert!(attribute.contains("skip_all"), "{path}: {attribute}");
+                assert!(
+                    !attribute.contains(", err") && !attribute.contains("(err"),
+                    "{path}: {attribute} logs every failed call; use span_result"
+                );
+                let name = attribute
+                    .split_once("name = ")
+                    .and_then(|(_, rest)| first_literal(rest))
+                    .unwrap_or_else(|| panic!("{path}: {attribute} names no span"));
+                names.push(name.to_string());
+            }
+            for (at, mac) in text.match_indices(&macro_needle) {
+                if let Some(name) = first_literal(&text[at + mac.len()..]) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        assert!(
+            names.iter().any(|n| n == "engine.chat_stream"),
+            "the scan found the crate's spans"
+        );
+        for name in &names {
+            assert!(
+                metrics::TRACKED_SPANS.contains(&name.as_str())
+                    || untracked.contains(&name.as_str()),
+                "span `{name}` is neither tracked nor excluded"
+            );
+        }
+        for tracked in metrics::TRACKED_SPANS {
+            assert!(
+                names.iter().any(|n| n == tracked),
+                "`{tracked}` is tracked but no span has that name"
+            );
+        }
     }
 
     /// With no parent — the shape of every ordinary request — the decision

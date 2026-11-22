@@ -39,12 +39,18 @@ models:
     mpk: "eb71be46ee520ce64401fb88b7d2b34ccb383bdaa8e56a85f9c7c1d31e9b8e14_30890057728_b9f97056-df6a-592f-a2a0-6e8998548668"
     schema: 1
 
+networks:
+  egress:
+    egress: open
+
 containers:
   - name: "eidola-server-engine"
     image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:116eac9f2c20df313006f9c21a9940bcf5a406c76a99a5c72ea8d0d955b6b13d"
     runtime: nvidia
     models: ["weights"]
     gpus: all
+    networks:
+      - egress
     secrets:
       - ENGINE_GATEWAY_TOKEN
     env:

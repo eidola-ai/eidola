@@ -127,6 +127,10 @@ pub fn pinned_model(model_id: &str) -> Option<&'static PinnedModel> {
 /// One accepted deployment of a pinned model: its identity and its pin.
 #[derive(Debug, Clone)]
 pub struct AcceptedDeployment {
+    /// The deployment's committed config, by its workspace path
+    /// (`deploy/engine/<name>/<variant>/tinfoil-config.yml`, which the build
+    /// holds pins to).
+    pub config: String,
     /// SHA-256 of the deployment's committed `tinfoil-config.yml` (lowercase
     /// hex): what placement data names a deployment by, and, on TDX, the
     /// launch's MRCONFIGID.
@@ -172,6 +176,7 @@ fn accepted_deployments_in(json: &str, model_id: &str) -> Result<Vec<AcceptedDep
         .filter(|(id, _)| id == model_id)
         .flat_map(|(_, deployments)| {
             deployments.into_iter().map(|d| AcceptedDeployment {
+                config: d.config,
                 config_sha256: d.config_sha256,
                 pin: d.pin,
             })

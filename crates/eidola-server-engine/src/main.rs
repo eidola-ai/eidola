@@ -51,6 +51,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         engine_stopped,
         admission: _,
         weights_hash: _,
+        telemetry: _,
     } = node;
     drop(engine);
     eidola_server_engine::run(

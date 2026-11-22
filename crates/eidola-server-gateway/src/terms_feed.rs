@@ -93,25 +93,45 @@ async fn resolve_document(
 pub async fn poll_once(pool: &Pool, client: &reqwest::Client, base_url: &str) {
     use db::RecordRequiredOutcome;
     for (document, source_path, page_path) in DOCUMENTS {
-        match resolve_document(client, base_url, document, source_path, page_path).await {
-            Ok(row) => match db::record_required_document(pool, &row).await {
-                Ok(RecordRequiredOutcome::Recorded) => info!(
-                    "terms feed: recorded {} version {} ({})",
-                    row.document, row.version, row.sha256
-                ),
-                Ok(RecordRequiredOutcome::AlreadyRecorded) => {}
-                Ok(RecordRequiredOutcome::HashConflict { stored_sha256 }) => warn!(
-                    "terms feed: published {} version {} has hash {} but version {} was \
+        let outcome =
+            match resolve_document(client, base_url, document, source_path, page_path).await {
+                Ok(row) => match db::record_required_document(pool, &row).await {
+                    Ok(RecordRequiredOutcome::Recorded) => {
+                        info!(
+                            "terms feed: recorded {} version {} ({})",
+                            row.document, row.version, row.sha256
+                        );
+                        "recorded"
+                    }
+                    Ok(RecordRequiredOutcome::AlreadyRecorded) => "unchanged",
+                    Ok(RecordRequiredOutcome::HashConflict { stored_sha256 }) => {
+                        warn!(
+                            "terms feed: published {} version {} has hash {} but version {} was \
                      recorded with hash {} — the document's bytes changed without a \
                      version increment (versioning-contract violation; CI should have \
                      caught this). Keeping the recorded hash; publish a new version to \
                      resolve.",
-                    row.document, row.version, row.sha256, row.version, stored_sha256
-                ),
-                Err(e) => warn!("terms feed: recording {} failed: {}", row.document, e),
-            },
-            Err(e) => warn!("terms feed: {}", e),
-        }
+                            row.document, row.version, row.sha256, row.version, stored_sha256
+                        );
+                        "conflict"
+                    }
+                    Err(e) => {
+                        warn!("terms feed: recording {} failed: {}", row.document, e);
+                        "record_failed"
+                    }
+                },
+                Err(e) => {
+                    warn!("terms feed: {}", e);
+                    "fetch_failed"
+                }
+            };
+        crate::telemetry::metrics::TERMS_FEED_POLLS.add(
+            1,
+            &[
+                opentelemetry::KeyValue::new("document", *document),
+                opentelemetry::KeyValue::new("outcome", outcome),
+            ],
+        );
     }
 }
 

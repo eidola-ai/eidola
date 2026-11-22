@@ -3,11 +3,14 @@
 
 use std::future::{Future, IntoFuture};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -18,12 +21,102 @@ use eidola_billing::webhook::{parse_event, verify_signature};
 use serde_json::json;
 use tokio::net::TcpListener;
 
+use crate::telemetry::metrics;
+
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const MAX_WEBHOOK_BYTES: usize = 2 * 1024 * 1024;
+/// How often the worker reads the backlog it reports as gauges.
+const BACKLOG_INTERVAL: Duration = Duration::from_secs(30);
+/// Consecutive deliveries failing one way, with none verified between, that
+/// read as misconfiguration rather than noise.
+const FAILING_STREAK: u32 = 5;
+
+/// The billing database as this process last found it, logged only when that
+/// changes: failing calls, refusing this build's protocol, or answering.
+pub(crate) struct DatabaseHealth(AtomicU8);
+
+const HEALTHY: u8 = 0;
+const FAILING: u8 = 1;
+const UNCONFIGURED: u8 = 2;
+const INCOMPATIBLE: u8 = 3;
+
+impl DatabaseHealth {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicU8::new(HEALTHY))
+    }
+
+    /// Record what one database call found, logging when the state changes.
+    /// Errors that say nothing about the database itself leave it as it was.
+    /// Returns whether it logged.
+    pub(crate) fn observe(&self, role: &str, result: Result<(), &BillingError>) -> bool {
+        let state = match result {
+            Ok(()) => HEALTHY,
+            Err(error) => match error.protocol_refusal() {
+                Some("not_configured") => UNCONFIGURED,
+                Some(_) => INCOMPATIBLE,
+                None if matches!(error, BillingError::Database(_)) => FAILING,
+                None => return false,
+            },
+        };
+        if self.0.swap(state, Ordering::Relaxed) == state {
+            return false;
+        }
+        match (state, result) {
+            (HEALTHY, _) => tracing::info!(role, "billing database is answering again"),
+            // The error is a fixed description or a SQLSTATE, never row data.
+            (FAILING, Err(error)) => tracing::error!(
+                role,
+                "billing database calls are failing ({error}); billing {role} work waits for it"
+            ),
+            (UNCONFIGURED, _) => tracing::error!(
+                role,
+                "billing database names no billing protocol (billing_protocol is empty); \
+                 billing {role} work is refused until it does"
+            ),
+            _ => tracing::error!(
+                role,
+                "billing database's protocol version is not this build's; billing {role} \
+                 work is refused until a compatible build runs"
+            ),
+        }
+        true
+    }
+}
+
+/// A run of one delivery failure with no verified delivery between, warned
+/// once when it reaches [`FAILING_STREAK`] and re-armed by a verified one.
+struct FailingStreak {
+    failures: AtomicU32,
+    warned: AtomicBool,
+}
+
+impl FailingStreak {
+    const fn new() -> Self {
+        Self {
+            failures: AtomicU32::new(0),
+            warned: AtomicBool::new(false),
+        }
+    }
+
+    /// Count a failure; returns true when this one completes the streak and
+    /// the condition has not been warned since the last verified delivery.
+    fn fail(&self) -> bool {
+        self.failures.fetch_add(1, Ordering::Relaxed) + 1 >= FAILING_STREAK
+            && !self.warned.swap(true, Ordering::Relaxed)
+    }
+
+    fn reset(&self) {
+        self.failures.store(0, Ordering::Relaxed);
+        self.warned.store(false, Ordering::Relaxed);
+    }
+}
 
 struct ReceiverState {
     store: Store,
     secret: String,
+    database: DatabaseHealth,
+    bad_signatures: FailingStreak,
+    stale_timestamps: FailingStreak,
 }
 
 /// The receiver has no provider API client and no account or operator routes.
@@ -36,12 +129,45 @@ pub fn webhook_router(store: Store, secret: String) -> Result<Router, BillingErr
     Ok(Router::new()
         .route("/v1/webhooks/stripe", post(stripe_webhook))
         .route("/healthz", get(receiver_health))
+        .route_layer(axum::middleware::from_fn(measure))
         .layer(DefaultBodyLimit::max(MAX_WEBHOOK_BYTES))
-        .with_state(Arc::new(ReceiverState { store, secret })))
+        .with_state(Arc::new(ReceiverState {
+            store,
+            secret,
+            database: DatabaseHealth::new(),
+            bad_signatures: FailingStreak::new(),
+            stale_timestamps: FailingStreak::new(),
+        })))
+}
+
+/// Time each routed request under its matched route, which is fixed in code.
+async fn measure(request: Request, next: Next) -> Response {
+    let method = match *request.method() {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        _ => "other",
+    };
+    let route = match request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+    {
+        Some("/v1/webhooks/stripe") => "/v1/webhooks/stripe",
+        Some("/healthz") => "/healthz",
+        _ => "other",
+    };
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    metrics::http_request(method, route, response.status().as_u16(), started.elapsed());
+    response
 }
 
 async fn receiver_health(State(state): State<Arc<ReceiverState>>) -> StatusCode {
-    match state.store.check_ingress_protocol().await {
+    let result = state.store.check_ingress_protocol().await;
+    state
+        .database
+        .observe("receiver", result.as_ref().map(|_| ()));
+    match result {
         Ok(()) => StatusCode::OK,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
@@ -50,30 +176,88 @@ async fn receiver_health(State(state): State<Arc<ReceiverState>>) -> StatusCode 
 async fn stripe_webhook(
     State(state): State<Arc<ReceiverState>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            let outcome = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                "too_large"
+            } else {
+                "unreadable"
+            };
+            metrics::webhook_delivery("unknown", outcome);
+            return rejection.into_response();
+        }
+    };
     let Some(signature) = headers
         .get("stripe-signature")
         .and_then(|value| value.to_str().ok())
     else {
+        metrics::webhook_delivery("unknown", "missing_signature");
         return receiver_error(StatusCode::BAD_REQUEST, "missing stripe-signature header");
     };
-    if verify_signature(signature, &body, &state.secret).is_err() {
+    if let Err(reason) = verify_signature(signature, &body, &state.secret) {
+        let outcome = match reason {
+            "stale timestamp" => "stale_timestamp",
+            "signature mismatch" | "invalid webhook secret" => "bad_signature",
+            _ => "malformed_signature",
+        };
+        metrics::webhook_delivery("unknown", outcome);
+        if outcome == "bad_signature" && state.bad_signatures.fail() {
+            tracing::warn!(
+                "the last {FAILING_STREAK} signed webhook deliveries all failed signature \
+                 verification: STRIPE_WEBHOOK_SECRET may not be this endpoint's signing secret"
+            );
+        }
+        if outcome == "stale_timestamp" && state.stale_timestamps.fail() {
+            tracing::warn!(
+                "the last {FAILING_STREAK} webhook deliveries were all signed more than five \
+                 minutes from this host's clock: check its time synchronization"
+            );
+        }
         return receiver_error(StatusCode::BAD_REQUEST, "invalid webhook signature");
     }
+    state.bad_signatures.reset();
+    state.stale_timestamps.reset();
     let event = match parse_event(&body) {
         Ok(Some(event)) => event,
-        Ok(None) => return StatusCode::OK.into_response(),
-        Err(reason) => return receiver_error(StatusCode::BAD_REQUEST, reason),
+        Ok(None) => {
+            metrics::webhook_delivery("unsupported", "unsupported_ack");
+            return StatusCode::OK.into_response();
+        }
+        Err(reason) => {
+            let outcome = if reason == "only thin events are accepted" {
+                "snapshot_refused"
+            } else {
+                "malformed"
+            };
+            metrics::webhook_delivery("unknown", outcome);
+            return receiver_error(StatusCode::BAD_REQUEST, reason);
+        }
     };
-    match state
+    let event_type = eidola_billing::metrics::job_type_label(&event.kind);
+    let result = state
         .store
         .enqueue_event(&event.id, &event.kind, &event.object_id)
-        .await
-    {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(_) => {
-            tracing::warn!("webhook was not persisted; delivery must retry");
+        .await;
+    state
+        .database
+        .observe("receiver", result.as_ref().map(|_| ()));
+    match result {
+        Ok(stored) => {
+            metrics::webhook_delivery(event_type, if stored { "stored" } else { "duplicate" });
+            StatusCode::OK.into_response()
+        }
+        Err(error) => {
+            let outcome = if error.protocol_refusal().is_some() {
+                "protocol_refused"
+            } else if matches!(error, BillingError::Conflict(_)) {
+                "conflict"
+            } else {
+                "db_failed"
+            };
+            metrics::webhook_delivery(event_type, outcome);
             receiver_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "could not persist billing event",
@@ -145,15 +329,39 @@ pub async fn work(
         () = &mut shutdown => return Ok(()),
         result = service.store().check_protocol() => result?,
     }
+    let backlog = tokio::spawn(report_backlog(service.store().clone()));
+    let database = DatabaseHealth::new();
     work_loop(
-        || service.drain_events(batch_size),
+        || {
+            let (service, database) = (&service, &database);
+            async move {
+                let report = service.drain_events(batch_size).await;
+                database.observe("worker", report.as_ref().map(|_| ()));
+                report
+            }
+        },
         batch_size,
         retry_interval,
         SHUTDOWN_GRACE,
         shutdown,
     )
     .await;
+    backlog.abort();
     Ok(())
+}
+
+/// Read the durable backlog on a timer and record it as gauges. Only the
+/// database is read; a failed read leaves the last values and is the drain
+/// loop's to report.
+async fn report_backlog(store: Store) {
+    let mut tick = tokio::time::interval(BACKLOG_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if let Ok(backlog) = store.backlog().await {
+            eidola_billing::metrics::backlog(&backlog);
+        }
+    }
 }
 
 async fn work_loop<D, F>(
@@ -185,23 +393,12 @@ async fn work_loop<D, F>(
             },
             result = &mut batch => result,
         };
+        // Jobs, failures and review items are counted where they happen
+        // (`eidola_billing::metrics`); the database's state is logged by the
+        // drain closure when it changes.
         let another_batch = match report {
-            Ok(report) => {
-                if report.failed > 0 {
-                    tracing::warn!(failed = report.failed, "billing work remains pending");
-                }
-                if report.review > 0 {
-                    tracing::warn!(
-                        review = report.review,
-                        "billing work requires support review"
-                    );
-                }
-                report.processed == batch_size as usize && report.failed == 0
-            }
-            Err(_) => {
-                tracing::warn!("billing inbox unavailable or incompatible; work remains pending");
-                false
-            }
+            Ok(report) => report.processed == batch_size as usize && report.failed == 0,
+            Err(_) => false,
         };
         if another_batch {
             tokio::task::yield_now().await;
@@ -243,7 +440,42 @@ pub fn shutdown_signal() -> Result<impl Future<Output = ()>, BillingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+
+    /// The database's state is logged when it changes and never while it
+    /// holds; an error that says nothing about the database changes nothing.
+    #[test]
+    fn database_health_logs_only_its_transitions() {
+        let health = DatabaseHealth::new();
+        let down = BillingError::Database("08006".into());
+        let refused = BillingError::ServiceUnavailable("billing protocol is incompatible".into());
+        let busy = BillingError::ServiceUnavailable("billing workers are busy".into());
+        assert!(!health.observe("worker", Ok(())));
+        assert!(health.observe("worker", Err(&down)));
+        assert!(!health.observe("worker", Err(&down)));
+        assert!(!health.observe("worker", Err(&busy)));
+        assert!(health.observe("worker", Err(&refused)));
+        assert!(!health.observe("worker", Err(&refused)));
+        assert!(health.observe("worker", Ok(())));
+        assert!(!health.observe("worker", Ok(())));
+    }
+
+    /// A failing streak warns once when it reaches its length, and again only
+    /// after a verified delivery has reset it.
+    #[test]
+    fn a_failing_streak_warns_once_until_reset() {
+        let streak = FailingStreak::new();
+        for _ in 1..FAILING_STREAK {
+            assert!(!streak.fail());
+        }
+        assert!(streak.fail());
+        assert!(!streak.fail());
+        streak.reset();
+        for _ in 1..FAILING_STREAK {
+            assert!(!streak.fail());
+        }
+        assert!(streak.fail());
+    }
 
     #[tokio::test]
     async fn worker_already_stopping_does_not_start_another_batch() {

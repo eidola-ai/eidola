@@ -2704,6 +2704,7 @@ dependencies = [
  "deadpool-postgres",
  "hex",
  "hmac 0.13.0",
+ "opentelemetry",
  "reqwest",
  "rustls",
  "rustls-pki-types",
@@ -2729,8 +2730,12 @@ dependencies = [
  "deadpool-postgres",
  "eidola-billing",
  "eidola-common",
+ "eidola-telemetry",
  "hex",
  "hmac 0.13.0",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry_sdk",
  "reqwest",
  "rustls-rustcrypto",
  "serde_json",
@@ -2940,12 +2945,12 @@ dependencies = [
  "deadpool-postgres",
  "eidola-billing",
  "eidola-common",
+ "eidola-telemetry",
  "futures-util",
  "hex",
  "hkdf 0.13.0",
  "opentelemetry",
  "opentelemetry-appender-tracing",
- "opentelemetry-otlp",
  "opentelemetry_sdk",
  "proptest",
  "rand_core 0.6.4",
@@ -2969,6 +2974,18 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "zeroize",
+]
+
+[[package]]
+name = "eidola-telemetry"
+version = "0.1.0"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest",
+ "rustls",
+ "tracing-subscriber",
 ]
 
 [[package]]

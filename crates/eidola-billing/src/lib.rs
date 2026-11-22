@@ -5,6 +5,7 @@
 
 pub mod connection;
 pub mod error;
+pub mod metrics;
 pub mod service;
 pub mod store;
 pub mod stripe;
