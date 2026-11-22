@@ -22,6 +22,10 @@ This repository contains several components under different licenses. This file 
 
 The split is deliberate. Eidola's privacy guarantees are properties of verifiable code, so the full applications are copyleft: a fork of the server or the apps must offer its users the same source access that Eidola's own trust chain depends on. The reusable pieces — the attestation verifier, enclave measurement, shared contract logic, the markdown editor widget, and the operational utilities — are permissively licensed so that auditors, researchers, and other projects can freely reuse and independently verify them.
 
+## Mobile shells
+
+The native iOS and Android shells (`mobile/`), with their contract, test page and tools, are licensed under [MIT](LICENSES/MIT.txt) OR [Apache-2.0](LICENSES/Apache-2.0.txt). They host the app bundle, which carries the licenses of the crates it is built from.
+
 ## Documentation and website
 
 The documentation (`docs/`) and website content (`www/`) are licensed under
@@ -34,7 +38,7 @@ The documentation (`docs/`) and website content (`www/`) are licensed under
 
 The Eidola name and the Eidola logo are trademarks of Eidola, Inc. The licenses above do not grant any right to use them. Forks must not present themselves as Eidola or as endorsed by Eidola, Inc.
 
-The logo is the hexagon-grid mark generated from [`brand/`](brand/); its derived assets are the macOS app icon (`crates/eidola-gui/Support/AppIcon.icns` and `Assets.car`), the website favicon and home-screen tile (`www/static/`), and the Linux themed icons (`releases/linux/icons/`). A fork should replace those files with its own identity.
+The logo is the hexagon-grid mark generated from [`brand/`](brand/); its derived assets are the macOS app icon (`crates/eidola-gui/Support/AppIcon.icns` and `Assets.car`), the website favicon and home-screen tile (`www/static/`), the Linux themed icons (`releases/linux/icons/`), and the mobile app icons (`mobile/ios/AppIcon.icon/`, `mobile/android/res/`). A fork should replace those files with its own identity.
 
 ## Other licensing
 

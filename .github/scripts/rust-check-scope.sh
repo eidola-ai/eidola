@@ -33,6 +33,9 @@ while IFS= read -r path; do
     scripts/dev-postgres-tls.sh)
       rust=true ;;
     *.md|.rumdl.toml) : ;;
+    # The native mobile shells build with their own tools, gated by
+    # mobile-shells.yml; nothing in them is cargo's.
+    mobile/*) : ;;
     .github/*|docs/*|www/*|scripts/*|*.sh|justfile) : ;;
     compose*.yaml|compose*.yml|Containerfile*|*.hcl|.dockerignore) : ;;
     flake.nix|flake.lock|*.swift-format) : ;;
