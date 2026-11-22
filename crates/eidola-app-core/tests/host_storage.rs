@@ -186,6 +186,9 @@ async fn open_image(
 /// A space as a reader sees it: id, title, and its messages as (role, text).
 type SpaceView = (String, Option<String>, Vec<(String, String)>);
 
+/// A host's files by name.
+type Files = BTreeMap<String, Vec<u8>>;
+
 /// What a reopened profile must still show.
 #[derive(Debug, PartialEq)]
 struct Visible {
@@ -297,6 +300,184 @@ fn a_flush_makes_the_config_durable_and_a_second_load_is_refused() {
     })
     .join()
     .unwrap();
+}
+
+/// [`MemHost`] whose writes wait while its gate is shut, as a slow or
+/// suspended host's would.
+struct GatedHost {
+    inner: Arc<MemHost>,
+    open: tokio::sync::watch::Receiver<bool>,
+}
+
+impl GatedHost {
+    fn after_gate<'a>(
+        &'a self,
+        call: HostFuture<'a, io::Result<()>>,
+    ) -> HostFuture<'a, io::Result<()>> {
+        let mut open = self.open.clone();
+        Box::pin(async move {
+            let _ = open.wait_for(|open| *open).await;
+            call.await
+        })
+    }
+}
+
+impl HostStorage for GatedHost {
+    fn read(&self, name: &str) -> HostFuture<'_, io::Result<Option<Vec<u8>>>> {
+        self.inner.read(name)
+    }
+    fn write_at(&self, name: &str, offset: u64, bytes: Vec<u8>) -> HostFuture<'_, io::Result<()>> {
+        self.after_gate(self.inner.write_at(name, offset, bytes))
+    }
+    fn truncate(&self, name: &str, len: u64) -> HostFuture<'_, io::Result<()>> {
+        self.after_gate(self.inner.truncate(name, len))
+    }
+    fn sync(&self, name: &str) -> HostFuture<'_, io::Result<()>> {
+        self.after_gate(self.inner.sync(name))
+    }
+    fn rename(&self, from: &str, to: &str) -> HostFuture<'_, io::Result<()>> {
+        self.after_gate(self.inner.rename(from, to))
+    }
+    fn remove(&self, name: &str) -> HostFuture<'_, io::Result<()>> {
+        self.after_gate(self.inner.remove(name))
+    }
+    fn list(&self) -> HostFuture<'_, io::Result<Vec<String>>> {
+        self.inner.list()
+    }
+}
+
+/// **No request leaves ahead of the commit it may rest on.** With the host
+/// holding every write, a post is committed (in memory) and a request is
+/// started: nothing reaches the server. Once the host lets the writes
+/// through, the request arrives, and the host's files at that moment
+/// already hold the post.
+#[test]
+fn a_request_waits_until_every_earlier_commit_is_durable_on_the_host() {
+    std::thread::spawn(|| {
+        let (gate, open) = tokio::sync::watch::channel(true);
+        let mem = MemHost::with_files(BTreeMap::new());
+        let host = Arc::new(GatedHost {
+            inner: mem.clone(),
+            open,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let profile = current_thread()
+            .block_on(HostProfile::load(dir.path().to_path_buf(), host))
+            .unwrap();
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let core = Arc::new(
+            AppCore::on_host_with_test_http_client(profile, reqwest::Client::new()).unwrap(),
+        );
+
+        // The server: the host's files as they stand when a request arrives.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let arrived: Arc<Mutex<Option<Files>>> = Arc::default();
+        {
+            let arrived = arrived.clone();
+            let mem = mem.clone();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let mut seen = arrived.lock().unwrap();
+                    if seen.is_none() {
+                        *seen = Some(mem.files());
+                    }
+                    drop(conn);
+                }
+            });
+        }
+        let rt = core.runtime();
+        with_account(&core);
+        rt.block_on(core.set_base_url(format!("http://127.0.0.1:{port}")))
+            .unwrap();
+        rt.block_on(core.flush_storage()).unwrap();
+
+        gate.send_replace(false);
+        rt.block_on(core.post("committed before the request".into(), None))
+            .expect("the post commits in memory");
+        let asking = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                let _ = core.runtime().block_on(core.account_balances());
+            })
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            arrived.lock().unwrap().is_none(),
+            "a request reached the server while the commit before it was not durable"
+        );
+
+        gate.send_replace(true);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let files = loop {
+            if let Some(files) = arrived.lock().unwrap().clone() {
+                break files;
+            }
+            assert!(Instant::now() < deadline, "the request never left");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        asking.join().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let found = current_thread().block_on(async {
+            let (_image, _stream, database) =
+                open_image(dir.path(), MemHost::with_files(files)).await.unwrap();
+            let conn = database.connect().unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT count(*) FROM content_block WHERE text_content = 'committed before the request'",
+                    (),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+        });
+        assert_eq!(found, 1, "the host held the post when the request arrived");
+    })
+    .join()
+    .unwrap();
+}
+
+/// **A core's requests wait on its own profile only.** Another profile open
+/// in the same process, whose stream never runs, holds pending writes for
+/// the whole test; this core's commit and request go through regardless.
+#[test]
+fn a_request_waits_on_its_own_profile_and_no_other() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stalled_dir = tempfile::tempdir().unwrap();
+        let (stalled, stalled_stream, stalled_db) = current_thread()
+            .block_on(open_image(
+                stalled_dir.path(),
+                MemHost::with_files(BTreeMap::new()),
+            ))
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile = current_thread()
+            .block_on(HostProfile::load(
+                dir.path().to_path_buf(),
+                MemHost::with_files(BTreeMap::new()),
+            ))
+            .unwrap();
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let core = AppCore::on_host_with_test_http_client(profile, reqwest::Client::new()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let rt = core.runtime();
+        with_account(&core);
+        rt.block_on(core.set_base_url(format!("http://127.0.0.1:{port}")))
+            .unwrap();
+        rt.block_on(core.post("a commit before the request".into(), None))
+            .unwrap();
+        std::thread::spawn(move || drop(listener.accept()));
+        let _ = rt.block_on(core.account_balances());
+        drop((stalled, stalled_stream, stalled_db));
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(Duration::from_secs(60))
+        .expect("a request waited on another profile's stream");
 }
 
 // ---------------------------------------------------------------------------

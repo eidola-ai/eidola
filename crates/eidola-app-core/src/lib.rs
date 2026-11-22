@@ -11847,6 +11847,17 @@ impl AppCore {
         transport: transport::Transport,
         #[cfg(feature = "test-support")] http_override: Option<crate::transport::Client>,
     ) -> Result<Self, AppError> {
+        // Every request this core sends waits on its own profile's barrier.
+        let durability = match &files {
+            storage::ProfileFiles::Host(image) => durability::Durability::host(image.clone()),
+            #[cfg(not(target_family = "wasm"))]
+            storage::ProfileFiles::Disk => durability::Durability::default(),
+        };
+        let transport = transport.with_durability(durability.clone());
+        #[cfg(feature = "test-support")]
+        let http_override = http_override.map(|client| client.with_durability(durability));
+        #[cfg(not(feature = "test-support"))]
+        let _ = durability;
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let runtime = rt::new_runtime().map_err(|e| AppError::Internal {
             message: format!("failed to create tokio runtime: {e}"),
