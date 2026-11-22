@@ -2,12 +2,15 @@
 package ai.eidola.shell
 
 import java.io.IOException
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONObject
 
 class Pipe {
@@ -18,6 +21,8 @@ class Pipe {
         @Volatile var shut = false
         @Volatile var eof = false
         val receiving = AtomicBoolean(false)
+        /** The pending connect's reply, taken by whichever answers first: the worker, the deadline, or a close. */
+        val connecting = AtomicReference<Done?>()
         /** Sends and the shutdown, in request order. */
         val writer: ExecutorService = Executors.newSingleThreadExecutor()
         val reader: ExecutorService = Executors.newSingleThreadExecutor()
@@ -25,6 +30,14 @@ class Pipe {
 
     private val sockets = ConcurrentHashMap<Long, Sock>()
     private val connector = Executors.newCachedThreadPool()
+    private val deadlines = Executors.newSingleThreadScheduledExecutor()
+
+    /** Answers the pending connect, once; false when something already did. */
+    private fun answer(s: Sock, result: JSONObject?, error: ShellError?): Boolean {
+        val d = s.connecting.getAndSet(null) ?: return false
+        d(result, error)
+        return true
+    }
 
     private fun sock(p: Params): Sock = sockets[p.long("socket")] ?: throw ShellError.notFound("no such socket")
 
@@ -39,19 +52,32 @@ class Pipe {
                 if (host.isEmpty() || port < 1 || port > 65535) throw ShellError.bad("host or port out of range")
                 val s = Sock()
                 if (sockets.putIfAbsent(id, s) != null) throw ShellError.state("socket id in use")
+                s.connecting.set(done)
+                // One deadline for the whole connect, name resolution included.
+                val giveUp = System.nanoTime() + CONNECT_DEADLINE_MS * 1_000_000
+                val timer = deadlines.schedule({
+                    if (answer(s, null, ShellError("connect_failed", "no connection within ${CONNECT_DEADLINE_MS / 1000} s"))) {
+                        sockets.remove(id, s)
+                        s.closed = true
+                        closeQuietly(s)
+                    }
+                }, CONNECT_DEADLINE_MS, TimeUnit.MILLISECONDS)
                 connector.execute {
                     try {
+                        // Blocks for as long as the resolver takes; the deadline and a close answer
+                        // without waiting for it, and a socket it returns too late is closed below.
+                        val address = InetAddress.getByName(host)
+                        val left = (giveUp - System.nanoTime()) / 1_000_000
+                        if (left <= 0 || s.connecting.get() == null) throw IOException("abandoned")
                         s.socket.tcpNoDelay = true
-                        s.socket.connect(InetSocketAddress(host, port.toInt()), 30_000)
+                        s.socket.connect(InetSocketAddress(address, port.toInt()), left.toInt())
                         s.connected = true
-                        done(JSONObject(), null)
+                        timer.cancel(false)
+                        if (!answer(s, JSONObject(), null)) closeQuietly(s)
                     } catch (e: Exception) {
-                        if (s.closed) {
-                            done(null, ShellError.closed)
-                        } else {
-                            sockets.remove(id, s)
-                            done(null, ShellError("connect_failed", e.toString()))
-                        }
+                        timer.cancel(false)
+                        if (answer(s, null, ShellError("connect_failed", e.toString()))) sockets.remove(id, s)
+                        closeQuietly(s)
                     }
                 }
             }
@@ -121,11 +147,20 @@ class Pipe {
     private fun close(id: Long) {
         val s = sockets.remove(id) ?: return
         s.closed = true
+        answer(s, null, ShellError.closed)
+        closeQuietly(s)
+    }
+
+    private fun closeQuietly(s: Sock) {
         try {
             s.socket.close()
         } catch (_: IOException) {
         }
         s.writer.shutdown()
         s.reader.shutdown()
+    }
+
+    companion object {
+        const val CONNECT_DEADLINE_MS = 30_000L
     }
 }

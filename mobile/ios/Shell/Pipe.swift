@@ -4,6 +4,7 @@ import Network
 
 final class Pipe {
     private let queue = DispatchQueue(label: "ai.eidola.shell.pipe")
+    static let connectDeadline: TimeInterval = 30
 
     private final class Socket {
         let conn: NWConnection
@@ -50,7 +51,7 @@ final class Pipe {
             else { throw ShellError.bad("host or port out of range") }
             let tcp = NWProtocolTCP.Options()
             tcp.noDelay = true
-            tcp.connectionTimeout = 30
+            tcp.connectionTimeout = Int(Self.connectDeadline)
             let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: NWParameters(tls: nil, tcp: tcp))
             let s = Socket(conn)
             s.connecting = done
@@ -76,6 +77,15 @@ final class Pipe {
                 }
             }
             conn.start(queue: queue)
+            // One deadline for the whole connect, name resolution included: NWConnection's own
+            // timeout covers the TCP handshake only.
+            queue.asyncAfter(deadline: .now() + Self.connectDeadline) { [weak self, weak s] in
+                guard let self, let s, let c = s.connecting else { return }
+                s.connecting = nil
+                c(.failure(ShellError(code: "connect_failed", message: "no connection within \(Int(Self.connectDeadline)) s")))
+                if self.sockets[id] === s { self.sockets[id] = nil }
+                s.conn.cancel()
+            }
         case "tcp.send":
             let (_, s) = try socket(p)
             let data = try p.bytes("data")

@@ -34,9 +34,9 @@ function show(text) {
 }
 async function test(name, fn) {
   try {
-    await fn();
-    results.push({ name, ok: true });
-    show(`ok    ${name}`);
+    const note = await fn();
+    results.push(typeof note === "string" ? { name, ok: true, note } : { name, ok: true });
+    show(`ok    ${name}${typeof note === "string" ? ` (${note})` : ""}`);
   } catch (e) {
     results.push({ name, ok: false, error: String(e?.message ?? e) });
     show(`FAIL  ${name}: ${e?.message ?? e}`);
@@ -353,6 +353,13 @@ async function receiveExactly(socket, n) {
 }
 
 async function checkPipe() {
+  // A connect that gets nowhere (TEST-NET-1 drops it), started now so its wait overlaps the
+  // rest: the shell must answer it within its 30 s deadline, resolution included.
+  const nowhereAt = performance.now();
+  const nowhere = call("tcp.connect", { socket: nextSocket++, host: "192.0.2.1", port: 9 }).then(
+    () => ({ code: "connected" }),
+    (e) => ({ code: e.code, ms: performance.now() - nowhereAt }),
+  );
   let echo = null;
   await test("tcp: connect to the echo server", async () => {
     echo = await connectEcho();
@@ -434,11 +441,23 @@ async function checkPipe() {
   });
   await test("tcp: refused connect is connect_failed", () =>
     rejects(call("tcp.connect", { socket: nextSocket++, host, port: port + 1 }), "connect_failed"));
-  await test("tcp: closing a pending connect fails it with closed", async () => {
+  await test("tcp: closing a pending connect answers it with closed, at once", async () => {
     const s = nextSocket++;
     const pending = call("tcp.connect", { socket: s, host: "192.0.2.1", port: 9 });
+    await sleep(200);
+    const closedAt = performance.now();
     await call("tcp.close", { socket: s });
     await rejects(pending, "closed");
+    const ms = performance.now() - closedAt;
+    ok(ms < 2000, `answered ${ms.toFixed(0)} ms after the close`);
+    return `${ms.toFixed(0)} ms`;
+  });
+  await test("tcp: a connect that gets nowhere fails within the deadline", async () => {
+    const r = await nowhere;
+    eq(r.code, "connect_failed", "code");
+    // Measured here, so it includes the time this page's event loop was busy with other checks.
+    ok(r.ms < 36000, `answered after ${r.ms.toFixed(0)} ms`);
+    return `${(r.ms / 1000).toFixed(1)} s`;
   });
   await test("tcp: bad parameters", async () => {
     await rejects(call("tcp.connect", { socket: nextSocket++, host, port: 0 }), "bad_request");
