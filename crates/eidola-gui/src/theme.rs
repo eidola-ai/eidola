@@ -798,6 +798,20 @@ const UI_FONT_SIZE: f32 = 14.;
 /// height. Applied at every `Input` site.
 pub const INPUT_PY: gpui::Rems = gpui::Rems(0.25);
 
+/// The label of a default-size (Medium) gpui-component `Button`, at the 1rem
+/// the app's buttons are designed at. The component sets a Medium button's
+/// content to 0.875rem, which a `text_base()` on the button cannot reach, so
+/// the label goes in as its own child instead of through `Button::label`.
+pub fn button_label(label: impl Into<SharedString>) -> impl gpui::IntoElement {
+    use gpui::{ParentElement as _, Styled as _};
+    gpui::div()
+        .min_w_0()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .text_base()
+        .child(label.into())
+}
+
 fn day_colors() -> ThemeConfigColors {
     let mut c = ThemeConfigColors::default();
 

@@ -386,11 +386,13 @@ mod perf {
                 cx.run_until_parked();
             }
             Mode::Selecting => {
-                // Press inside the body and drag to the bottom, leaving the
-                // drag active — the state a user is in after selecting text.
+                // Press on text above the payload and drag into it, leaving
+                // the drag active — the state a user is in after selecting
+                // text. (A press past a line's end, in a block's empty
+                // margin, starts no selection.)
                 cx.simulate_mouse_down(
                     handle,
-                    point(px(200.), px(300.)),
+                    point(px(120.), px(300.)),
                     MouseButton::Left,
                     Modifiers::default(),
                 );

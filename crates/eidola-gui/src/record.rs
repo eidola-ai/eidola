@@ -26,8 +26,8 @@ use eidola_app_core::{
 };
 use gpui::{
     AsyncApp, ClipboardItem, Context, Div, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div,
+    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, StyleRefinement,
+    Styled, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div,
     prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::{
@@ -1925,6 +1925,13 @@ fn raw_section(payload: &CachedPayload, cx: &Context<RecordView>) -> Div {
     // Default `TextViewStyle` assumes light mode; track the active
     // Circadian mode so the code-block ground stays dark at night.
     let is_dark = theme.mode.is_dark();
+    // The payload is one plain code ground: an even 12px inset, no frame, and
+    // gpui's default line height. gpui-component's own code block is framed,
+    // with a wider inset and a 1.6 line height.
+    let code_block = StyleRefinement::default()
+        .p_3()
+        .border_0()
+        .line_height(gpui::phi());
     let style = TextViewStyle {
         is_dark,
         highlight_theme: if is_dark {
@@ -1932,6 +1939,7 @@ fn raw_section(payload: &CachedPayload, cx: &Context<RecordView>) -> Div {
         } else {
             HighlightTheme::default_light().clone()
         },
+        code_block,
         ..TextViewStyle::default()
     };
     section = section.child(
@@ -1959,7 +1967,9 @@ fn raw_section(payload: &CachedPayload, cx: &Context<RecordView>) -> Div {
 // ---------------------------------------------------------------------------
 
 /// Wrap raw text in a markdown code fence long enough that the content can
-/// never close it (verbatim rendering, mono, selectable via TextView).
+/// never close it (verbatim rendering, mono, selectable via TextView). The
+/// fence names no language: gpui-component labels a code block with its
+/// language, and a payload is not code.
 fn fenced(text: &str) -> String {
     let mut longest = 0usize;
     let mut run = 0usize;
@@ -1972,7 +1982,7 @@ fn fenced(text: &str) -> String {
         }
     }
     let fence = "`".repeat((longest + 1).max(3));
-    format!("{fence}text\n{text}\n{fence}")
+    format!("{fence}\n{text}\n{fence}")
 }
 
 /// Cap text for inline rendering. Returns the (possibly truncated) text and
@@ -2128,10 +2138,10 @@ mod tests {
 
     #[test]
     fn fenced_grows_past_backtick_runs() {
-        assert!(fenced("plain").starts_with("```text\n"));
+        assert!(fenced("plain").starts_with("```\n"));
         let tricky = "a\n````\nb";
         let f = fenced(tricky);
-        assert!(f.starts_with("`````text\n"), "{f}");
+        assert!(f.starts_with("`````\n"), "{f}");
     }
 
     #[test]
