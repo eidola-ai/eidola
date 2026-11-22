@@ -83,7 +83,7 @@ impl WholeAnswer {
     /// as a blocking body: its refunds, when it carries them, are in it.
     pub(crate) async fn read(
         self,
-        response: reqwest::Response,
+        response: crate::transport::Response,
         ceiling: usize,
         backend_id: &str,
     ) -> Result<Answer, Box<AnswerFailure>> {
@@ -151,7 +151,7 @@ impl WholeAnswer {
 
 /// A body read whole, bounded as it arrives.
 async fn read_body(
-    response: reqwest::Response,
+    response: crate::transport::Response,
     ceiling: usize,
 ) -> Result<Answer, Box<AnswerFailure>> {
     match peer_read::read_bounded(response, ceiling).await {
@@ -216,7 +216,7 @@ pub(crate) struct EventsRead {
 /// assembled once from all of its `data:` fields ([`crate::sse_event_data`])
 /// and parsed once. An event that is not UTF-8 or not JSON is skipped.
 pub(crate) async fn read_events(
-    response: reqwest::Response,
+    response: crate::transport::Response,
     backend_id: &str,
     ceiling: usize,
     mut on_event: impl FnMut(&Value),

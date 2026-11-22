@@ -352,6 +352,16 @@ jobs:
         if: steps.scope.outputs.rust == 'true'
         run: cargo test
 
+      - name: Run the chat path over the host-socket transport
+        # The chat harness's cases again, with every request on the
+        # transport the mobile app uses (a host-dialed stream, HTTP/1.1 run
+        # in process) instead of reqwest. Same arguments as "Run tests" but
+        # the target, so it reruns an executable that step built.
+        if: steps.scope.outputs.rust == 'true'
+        env:
+          EIDOLA_TEST_TRANSPORT: pipe
+        run: cargo test --test chat_path
+
       - name: Test billing transactions and recovery with PostgreSQL
         if: steps.scope.outputs.rust == 'true'
         # Runs the test executables "Run tests" already built, rather than

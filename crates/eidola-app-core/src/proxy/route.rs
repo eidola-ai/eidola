@@ -132,7 +132,7 @@ impl RecordedBody {
 /// and what this app may hold to answer one caller are different numbers, and
 /// only the second bounds the process.
 async fn read_capped_body(
-    response: reqwest::Response,
+    response: crate::transport::Response,
 ) -> Result<CappedBody, crate::peer_read::ReadFailure> {
     crate::peer_read::read_bounded(response, MAX_RESPONSE_BYTES).await
 }
@@ -514,7 +514,7 @@ impl ProxyChatRequest {
 /// An opened, **recording** route: everything one HTTP call needs, plus the
 /// forensic identity of where it is going.
 struct ProxyRoute {
-    client: reqwest::Client,
+    client: crate::transport::Client,
     base_url: String,
     /// The model id the backend's own API expects.
     wire_model: String,
@@ -2127,7 +2127,7 @@ fn build_upstream_request(
     body: &Value,
     spend: Option<&crate::SpendPrep>,
     headers: &SentHeaders,
-) -> Result<reqwest::Request, AppError> {
+) -> Result<crate::transport::Request, AppError> {
     let sent = crate::body_with_spend(body, spend);
     let mut request = route
         .client
@@ -2143,13 +2143,13 @@ fn build_upstream_request(
     let out = request.headers_mut();
     out.clear();
     for (name, value) in headers.pairs() {
-        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+        let name = http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
             AppError::Config {
                 message: format!("`{name}` is not a usable header name"),
             }
         })?;
         let mut value =
-            reqwest::header::HeaderValue::from_str(value).map_err(|_| AppError::Config {
+            http::header::HeaderValue::from_str(value).map_err(|_| AppError::Config {
                 message: format!("`{name}` carries a value that cannot travel in a header"),
             })?;
         value.set_sensitive(is_secret_header(name.as_str()));
@@ -2775,7 +2775,7 @@ mod tests {
     }
 
     /// A one-shot loopback HTTP server answering with `body`. The reads this
-    /// module bounds happen on a `reqwest::Response`, so the only honest way to
+    /// module bounds happen on a `crate::transport::Response`, so the only honest way to
     /// hold the bound is against a real one.
     async fn serving_once(body: Vec<u8>) -> std::net::SocketAddr {
         use tokio::io::AsyncWriteExt;
@@ -2820,7 +2820,8 @@ mod tests {
     #[tokio::test]
     async fn a_blocking_answer_is_bounded_as_it_arrives() {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-        let client = reqwest::Client::builder().build().expect("client");
+        let client =
+            crate::transport::Client::from(reqwest::Client::builder().build().expect("client"));
 
         let addr = serving_once(vec![b'x'; MAX_RESPONSE_BYTES + 4096]).await;
         let response = client
@@ -3116,7 +3117,7 @@ mod tests {
 
     #[test]
     fn a_response_that_is_not_server_sent_events_is_not_taken_for_one() {
-        use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+        use http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
         let with = |value: &str| {
             let mut headers = HeaderMap::new();
@@ -3189,7 +3190,8 @@ mod tests {
         ProxyRoute {
             client: reqwest::Client::builder()
                 .build()
-                .expect("a client with no TLS work to do"),
+                .expect("a client with no TLS work to do")
+                .into(),
             base_url: base_url.to_string(),
             wire_model: "m".into(),
             canonical: "m".into(),

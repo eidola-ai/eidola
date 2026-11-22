@@ -657,14 +657,14 @@ impl CheckContext {
 /// before the round trip is a fact about a moment the user may have moved on
 /// from. See `Inner::run_update_check`.
 pub async fn check_for_update(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     ctx: &CheckContext,
     accepted: Option<&AcceptedClaims>,
 ) -> UpdateCheckResult {
     classify(check_outcome(client, ctx).await, accepted)
 }
 
-pub async fn check_outcome(client: &reqwest::Client, ctx: &CheckContext) -> CheckOutcome {
+pub async fn check_outcome(client: &crate::transport::Client, ctx: &CheckContext) -> CheckOutcome {
     let settled = CheckOutcome::Settled;
     let fetcher = updater::Fetcher::Network(client.clone());
 
