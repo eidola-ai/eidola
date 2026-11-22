@@ -20,6 +20,10 @@ The native apps the App Store and Play Store distribute. Each is a thin shell ar
 - **Both shells move together.** A behaviour lands in iOS and Android in the same change, with a test-page check, and both test runs pass.
 - **Nothing durable in webview storage.** iOS uses a non-persistent website data store; Android turns DOM storage off. Durable state goes through the file API.
 
+## Icons
+
+Both launcher icons are generated from `brand/` (`just update-brand`, macOS only) and committed: `ios/AppIcon.icon` (an Icon Composer document Xcode compiles) and `android/res/` (an adaptive icon whose foreground is also the themed-icon layer). Never edit them by hand; `brand/AGENTS.md` has the geometry and why each looks as it does.
+
 ## Building and testing
 
 | Recipe | Script | Does |
@@ -38,7 +42,7 @@ The iOS check is a **local gate** (no macOS runner here): run `just mobile-ios-t
 
 ## iOS
 
-- `EidolaShell.xcodeproj` is hand-written and lists its five Swift files explicitly; a new file goes into `project.pbxproj` by hand (a build phase entry, a file reference, a group child). The embedded bundle is the folder reference `build/bundle`, which `build.sh` fills, so build through the script.
+- `EidolaShell.xcodeproj` is hand-written and lists its five Swift files and `AppIcon.icon` explicitly; a new file goes into `project.pbxproj` by hand (a build phase entry, a file reference, a group child). The embedded bundle is the folder reference `build/bundle`, which `build.sh` fills, so build through the script.
 - The bundle id is `ai.eidola.mobile` for the Release configuration (`--release`) and `ai.eidola.mobile.dev` for Debug, so a dev build installs beside a release one; the team is `7N2X49G865`, iOS 26 and later.
 - A document load is a main-frame navigation the navigation delegate allows; a fragment-only navigation is not one. The scheme handler then serves from the bundle selected for it.
 - A content rule list blocks every load outside the `eidola` scheme (and `data:`/`blob:`), so another origin is refused by the shell and not only by the CSP.

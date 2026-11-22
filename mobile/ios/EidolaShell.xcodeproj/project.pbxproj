@@ -13,6 +13,7 @@
 		E1D0000000000000000000B4 /* Pipe.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F4 /* Pipe.swift */; };
 		E1D0000000000000000000B5 /* BundleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F5 /* BundleStore.swift */; };
 		E1D0000000000000000000B6 /* bundle in Resources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F7 /* bundle */; };
+		E1D0000000000000000000B8 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F9 /* AppIcon.icon */; };
 		E1D0000000000000000000B7 /* ContractUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F8 /* ContractUITests.swift */; };
 /* End PBXBuildFile section */
 
@@ -34,6 +35,7 @@
 		E1D0000000000000000000F5 /* BundleStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BundleStore.swift; sourceTree = "<group>"; };
 		E1D0000000000000000000F6 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		E1D0000000000000000000F7 /* bundle */ = {isa = PBXFileReference; lastKnownFileType = folder; name = bundle; path = build/bundle; sourceTree = SOURCE_ROOT; };
+		E1D0000000000000000000F9 /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 		E1D0000000000000000000F8 /* ContractUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContractUITests.swift; sourceTree = "<group>"; };
 		E1D0000000000000000000P1 /* EidolaShell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EidolaShell.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		E1D0000000000000000000P2 /* EidolaShellUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EidolaShellUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -63,6 +65,7 @@
 				E1D0000000000000000000G1 /* Shell */,
 				E1D0000000000000000000G2 /* UITests */,
 				E1D0000000000000000000F6 /* Info.plist */,
+				E1D0000000000000000000F9 /* AppIcon.icon */,
 				E1D0000000000000000000F7 /* bundle */,
 				E1D0000000000000000000G3 /* Products */,
 			);
@@ -173,6 +176,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				E1D0000000000000000000B8 /* AppIcon.icon in Resources */,
 				E1D0000000000000000000B6 /* bundle in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -196,7 +200,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				E1D0000000000000000000B7 /* ContractUITests.swift in Sources */,
+		E1D0000000000000000000B7 /* ContractUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -257,6 +261,7 @@
 		E1D000000000000000000AD1 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Info.plist;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.eidola.mobile.dev;
@@ -267,6 +272,7 @@
 		E1D000000000000000000AR1 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Info.plist;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.eidola.mobile;

@@ -45,14 +45,15 @@ final class ContractUITests: XCTestCase {
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let icon = springboard.icons["Eidola"]
         XCTAssertTrue(icon.waitForExistence(timeout: 10))
+        shot("2-home-screen")
         icon.press(forDuration: 1.5)
         let action = springboard.buttons["Bundle digest"]
         XCTAssertTrue(action.waitForExistence(timeout: 10))
-        shot("2-quick-action")
+        shot("3-quick-action")
         action.tap()
         let sheet = app.alerts["Running bundle"]
         XCTAssertTrue(sheet.waitForExistence(timeout: 10))
-        shot("3-bundle-sheet")
+        shot("4-bundle-sheet")
         let shown = sheet.staticTexts.allElementsBoundByIndex.map(\.label).joined(separator: "\n")
         XCTAssertTrue(shown.replacingOccurrences(of: "\n", with: "").contains(digest), shown)
         XCTAssertTrue(shown.contains("Version: embedded (confirmed)"), shown)
@@ -63,7 +64,7 @@ final class ContractUITests: XCTestCase {
         app.launch()
         let restart = text(app, prefix: "restart: ")
         XCTAssertTrue(restart.waitForExistence(timeout: 30))
-        shot("4-restart")
+        shot("5-restart")
         XCTAssertTrue(restart.label.hasPrefix("restart: PASS"), restart.label)
     }
 }

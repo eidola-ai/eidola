@@ -31,12 +31,18 @@ DIGEST="$(python3 "$HERE/../tools/bundle_digest.py" "$BUNDLE")"
 W="$OUT/stage"
 rm -rf "$W" && mkdir -p "$W/dex"
 
-# 1. The binary manifest. A debug build is debuggable and installs beside a release one, as
+# 1. The binary manifest and resources. A debug build is debuggable and installs beside a release one, as
 #    ai.eidola.mobile.dev; the release package is the manifest's own, ai.eidola.mobile.
 DEBUG_MODE=()
 [[ $VARIANT == debug ]] && DEBUG_MODE=(--debug-mode --rename-manifest-package ai.eidola.mobile.dev)
+#    The only resources are the launcher icon's, generated from brand/ (just update-brand).
+mkdir -p "$W/res"
+for f in $(cd "$HERE/res" && find . -type f | LC_ALL=C sort); do
+  "$BT/aapt2" compile -o "$W/res" "$HERE/res/$f"
+done
 "$BT/aapt2" link -o "$W/base.apk" --manifest "$HERE/AndroidManifest.xml" -I "$ANDROID_JAR" \
-  --min-sdk-version "$MIN_SDK" --target-sdk-version 36 --no-compress "${DEBUG_MODE[@]}"
+  --min-sdk-version "$MIN_SDK" --target-sdk-version 36 --no-compress "${DEBUG_MODE[@]}" \
+  $(find "$W/res" -name '*.flat' | LC_ALL=C sort)
 
 # 2. Kotlin to classes, against android.jar only (no JDK classes).
 "$KOTLIN_HOME/bin/kotlinc" -no-jdk -no-reflect -jvm-target 17 -cp "$ANDROID_JAR" -d "$W/classes.jar" \
