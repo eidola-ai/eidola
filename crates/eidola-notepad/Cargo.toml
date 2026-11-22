@@ -17,10 +17,10 @@ path = "src/main.rs"
 # The same exact pins as eidola-gui, so the workspace resolves one gpui (see
 # eidola-gui's AGENTS.md → gpui / gpui-component pinning). `runtime_shaders`
 # for the same reason eidola-gui carries it: no Metal toolchain at build time.
-gpui = { package = "gpui-pre", version = "=0.3.7" }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "runtime_shaders", "wayland"] }
-gpui-component = "=0.7.0"
-gpui-kit-assets = "=0.7.0"
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "runtime_shaders", "wayland"] }
+gpui-component = "=0.10.0"
+gpui-kit-assets = "=0.10.0"
 
 # The visuals are Eidola's by construction rather than by copy: the Circadian
 # theme, the Newsreader prose style, the title band and scroll indicator all
@@ -44,8 +44,8 @@ futures = "0.3"
 libc = "0.2"
 
 [dev-dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.7", features = ["test-support"] }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["test-support", "font-kit", "wayland"] }
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support", "font-kit", "wayland"] }
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 

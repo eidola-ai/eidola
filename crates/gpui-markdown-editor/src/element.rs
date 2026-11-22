@@ -18,7 +18,7 @@ use std::sync::Arc;
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, Corners, Edges, Element, ElementId, ElementInputHandler,
     Entity, FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, Style,
+    Pixels, Point, ScrollDelta, ScrollEvent, SharedString, Size, StrikethroughStyle, Style,
     TextRun, Window, WrappedLine, fill, point, px, quad, relative, size,
 };
 use smallvec::SmallVec;
@@ -3805,7 +3805,7 @@ impl Element for BlockElement {
             // Capture for the scroll-wheel listener.
             let editor = self.editor.clone();
             let block_index = self.block_index;
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
+            window.on_mouse_event(move |event: &ScrollEvent, phase, _window, cx| {
                 if !phase.bubble() {
                     return;
                 }

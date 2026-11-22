@@ -39,7 +39,7 @@ pub use editor::{
     EmbedChromeCounts, End, Enter, Home, Left, MarkdownEditor, MarkdownEditorState, Paste,
     PastePlain, Redo, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown, ShiftEnd,
     ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft, ShiftWordRight, Tab,
-    ToggleBold, ToggleItalic, Undo, Up, WordLeft, WordRight, init,
+    ToggleBold, ToggleItalic, Undo, Up, WordLeft, WordRight, init, secondary_key_binding,
 };
 pub use element::math_overlay_typesets;
 pub use embed::{EmbedMap, embed_marker, parse_embed_text};

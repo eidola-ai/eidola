@@ -28,6 +28,7 @@ use gpui::{
 };
 use gpui_component::Root;
 use gpui_kit_assets::Assets;
+use gpui_markdown_editor::secondary_key_binding;
 
 use crate::actions::*;
 use crate::document::{Contents, DocumentView};
@@ -545,16 +546,16 @@ fn open_about(cx: &mut App) {
 
 fn install_keybindings(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("secondary-n", NewDocument, None),
-        KeyBinding::new("secondary-o", Open, None),
-        KeyBinding::new("secondary-w", CloseWindow, None),
-        KeyBinding::new("secondary-s", Save, None),
-        KeyBinding::new("secondary-shift-s", SaveAs, None),
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("secondary-0", ActualSize, None),
-        KeyBinding::new("secondary-=", ZoomIn, None),
-        KeyBinding::new("secondary-+", ZoomIn, None),
-        KeyBinding::new("secondary--", ZoomOut, None),
+        secondary_key_binding("secondary-n", NewDocument, None, cx),
+        secondary_key_binding("secondary-o", Open, None, cx),
+        secondary_key_binding("secondary-w", CloseWindow, None, cx),
+        secondary_key_binding("secondary-s", Save, None, cx),
+        secondary_key_binding("secondary-shift-s", SaveAs, None, cx),
+        secondary_key_binding("secondary-q", Quit, None, cx),
+        secondary_key_binding("secondary-0", ActualSize, None, cx),
+        secondary_key_binding("secondary-=", ZoomIn, None, cx),
+        secondary_key_binding("secondary-+", ZoomIn, None, cx),
+        secondary_key_binding("secondary--", ZoomOut, None, cx),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([

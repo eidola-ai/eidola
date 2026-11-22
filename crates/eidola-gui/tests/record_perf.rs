@@ -68,7 +68,7 @@ mod perf {
     use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
     use eidola_gui::stores::{Stores, StoresStub};
     use gpui::{
-        AppContext, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TouchPhase,
+        AppContext, Modifiers, MouseButton, ScrollDelta, ScrollEvent, ScrollSource, TouchPhase,
         VisualTestAppContext, point, px, size,
     };
     use gpui_component::{Root, Theme, ThemeMode};
@@ -285,11 +285,12 @@ mod perf {
         for _ in 0..scroll_steps {
             cx.simulate_event(
                 handle,
-                ScrollWheelEvent {
+                ScrollEvent {
                     position: point(px(430.), px(400.)),
                     delta: ScrollDelta::Pixels(point(px(0.), px(-400.))),
                     modifiers: Modifiers::default(),
                     touch_phase: TouchPhase::Moved,
+                    source: ScrollSource::Pointer,
                 },
             );
         }
@@ -367,11 +368,12 @@ mod perf {
                 for _ in 0..10 {
                     cx.simulate_event(
                         handle,
-                        ScrollWheelEvent {
+                        ScrollEvent {
                             position: mid,
                             delta: ScrollDelta::Pixels(point(px(0.), px(-400.))),
                             modifiers: Modifiers::default(),
                             touch_phase: TouchPhase::Moved,
+                            source: ScrollSource::Pointer,
                         },
                     );
                 }
@@ -407,11 +409,12 @@ mod perf {
                 for _ in 0..6 {
                     cx.simulate_event(
                         handle,
-                        ScrollWheelEvent {
+                        ScrollEvent {
                             position: mid,
                             delta: ScrollDelta::Pixels(point(px(0.), px(-400.))),
                             modifiers: Modifiers::default(),
                             touch_phase: TouchPhase::Moved,
+                            source: ScrollSource::Pointer,
                         },
                     );
                 }
