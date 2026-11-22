@@ -5,6 +5,7 @@ package ai.eidola.shell
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
+import android.content.ActivityNotFoundException
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.ApplicationInfo
@@ -36,6 +37,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import java.io.ByteArrayInputStream
 import java.io.InputStream
+import org.json.JSONObject
 
 const val TAG = "EidolaShell"
 const val ORIGIN = "https://app.eidola.invalid"
@@ -86,7 +88,17 @@ class MainActivity : Activity() {
         val debuggable = applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
         WebView.setWebContentsDebuggingEnabled(debuggable)
         val version = packageManager.getPackageInfo(packageName, 0).versionName ?: "0"
-        bridge = Bridge(Shell.pipe, Shell.files, Shell.store, version)
+        bridge = Bridge(Shell.pipe, Shell.files, Shell.store, version) { uri, done ->
+            // The system browser, outside the app; never this WebView, never an in-app browser.
+            runOnUiThread {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE))
+                    done(JSONObject(), null)
+                } catch (e: ActivityNotFoundException) {
+                    done(null, ShellError.io("no app opens the URL"))
+                }
+            }
+        }
 
         web = WebView(this)
         web.settings.apply {

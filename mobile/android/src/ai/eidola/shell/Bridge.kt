@@ -1,12 +1,13 @@
 // The bridge: one JSON request in, one JSON reply out (shell-contract.md → The bridge).
 package ai.eidola.shell
 
+import android.net.Uri
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 
-const val CONTRACT_VERSION = 1
+const val CONTRACT_VERSION = 2
 
 class ShellError(val code: String, message: String) : Exception(message) {
     companion object {
@@ -72,12 +73,14 @@ class Bridge(
     private val files: Files,
     private val store: BundleStore,
     private val shellVersion: String,
+    /** Hands an https URL to the system browser. */
+    private val openExternal: (Uri, Done) -> Unit,
 ) {
     companion object {
         val METHODS = listOf(
             "bundle.activate", "bundle.begin", "bundle.confirm", "bundle.remove", "bundle.seal",
             "bundle.state", "bundle.write", "files.list", "files.read", "files.remove", "files.rename",
-            "files.sync", "files.truncate", "files.write", "shell.hello", "tcp.close", "tcp.connect",
+            "files.sync", "files.truncate", "files.write", "shell.hello", "shell.openExternal", "tcp.close", "tcp.connect",
             "tcp.receive", "tcp.send", "tcp.shutdown",
         )
     }
@@ -117,6 +120,7 @@ class Bridge(
                     .put("shell", shellVersion).put("methods", JSONArray(METHODS)),
                 null,
             )
+            method == "shell.openExternal" -> guard(done) { openExternal(externalUri(params), done) }
             method.startsWith("tcp.") -> guard(done) { pipe.handle(method, params, done) }
             // Files and the bundle store share one queue: requests apply one at a time, in order.
             else -> store.queue.execute {
@@ -125,6 +129,16 @@ class Bridge(
                 }
             }
         }
+    }
+
+    /** An absolute `https:` URL with a host, in printable ASCII; anything else is refused. */
+    private fun externalUri(p: Params): Uri {
+        val s = p.string("url")
+        val u = Uri.parse(s)
+        if (!s.all { it.code in 0x21..0x7e } || u.scheme?.lowercase() != "https" || u.host.isNullOrEmpty()) {
+            throw ShellError.bad("url: not an absolute https URL")
+        }
+        return u
     }
 
     private inline fun guard(done: Done, body: () -> Unit) {

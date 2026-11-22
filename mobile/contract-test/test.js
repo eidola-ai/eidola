@@ -111,15 +111,15 @@ async function save(progress) {
 // ---------------------------------------------------------------- phase A
 
 async function checkHello() {
-  await test("shell.hello: contract 1, platform, methods", async () => {
+  await test("shell.hello: contract 2, platform, methods", async () => {
     const h = await call("shell.hello");
-    eq(h.contract, 1, "contract");
+    eq(h.contract, 2, "contract");
     ok(h.platform === "ios" || h.platform === "android", `platform ${h.platform}`);
     ok(typeof h.shell === "string" && h.shell.length > 0, "shell version");
     const expected = [
       "bundle.activate", "bundle.begin", "bundle.confirm", "bundle.remove", "bundle.seal", "bundle.state",
       "bundle.write", "files.list", "files.read", "files.remove", "files.rename", "files.sync",
-      "files.truncate", "files.write", "shell.hello", "tcp.close", "tcp.connect", "tcp.receive", "tcp.send",
+      "files.truncate", "files.write", "shell.hello", "shell.openExternal", "tcp.close", "tcp.connect", "tcp.receive", "tcp.send",
       "tcp.shutdown",
     ];
     eq(h.methods, expected, "methods");
@@ -549,6 +549,23 @@ async function phaseE(progress) {
   await test("bundle: remove the rest", async () => {
     await call("bundle.remove", { version: "bad" });
     eq((await call("bundle.state")).versions, [], "versions");
+  });
+  await test("openExternal: refuses anything but an absolute https URL", async () => {
+    for (const url of [
+      "http://example.com/", "javascript:alert(1)", "data:text/html,x", "/relative", "example.com",
+      "https:///no-host", "https://exa mple.com/", "file:///etc/hosts", "eidola://app/", "",
+    ]) {
+      await rejects(call("shell.openExternal", { url }), "bad_request");
+    }
+    await rejects(call("shell.openExternal", {}), "bad_request");
+  });
+  // Last, because the system browser comes to the front (the harness brings this app back).
+  await test("openExternal: an https URL goes to the system browser; this page stays", async () => {
+    const here = location.href;
+    globalThis.contractMarker = true;
+    await call("shell.openExternal", { url: "https://example.com/" });
+    eq(location.href, here, "location");
+    ok(globalThis.contractMarker, "the same document");
   });
   progress.phase = "done";
 }

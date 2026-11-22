@@ -1,8 +1,9 @@
 // The bridge: one JSON request in, one JSON reply out (shell-contract.md → The bridge).
 import Foundation
+import UIKit
 import WebKit
 
-let contractVersion = 1
+let contractVersion = 2
 let shellVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0"
 
 struct ShellError: Error {
@@ -86,7 +87,7 @@ final class Bridge: NSObject, WKScriptMessageHandlerWithReply {
     static let methods = [
         "bundle.activate", "bundle.begin", "bundle.confirm", "bundle.remove", "bundle.seal",
         "bundle.state", "bundle.write", "files.list", "files.read", "files.remove", "files.rename",
-        "files.sync", "files.truncate", "files.write", "shell.hello", "tcp.close", "tcp.connect",
+        "files.sync", "files.truncate", "files.write", "shell.hello", "shell.openExternal", "tcp.close", "tcp.connect",
         "tcp.receive", "tcp.send", "tcp.shutdown",
     ]
 
@@ -128,12 +129,33 @@ final class Bridge: NSObject, WKScriptMessageHandlerWithReply {
         dispatch(method, params, send)
     }
 
+    /// An absolute `https:` URL with a host, in printable ASCII; anything else is refused.
+    static func externalURL(_ p: Params) throws -> URL {
+        let s = try p.string("url")
+        guard s.unicodeScalars.allSatisfy({ $0.value >= 0x21 && $0.value <= 0x7e }),
+            let c = URLComponents(string: s), c.scheme?.lowercased() == "https",
+            let host = c.host, !host.isEmpty, let url = c.url
+        else { throw ShellError.bad("url: not an absolute https URL") }
+        return url
+    }
+
     func dispatch(_ method: String, _ p: Params, _ done: @escaping Done) {
         if method == "shell.hello" {
             return done(.success([
                 "contract": contractVersion, "platform": "ios", "shell": shellVersion,
                 "methods": Bridge.methods,
             ]))
+        }
+        if method == "shell.openExternal" {
+            // The system browser, outside the app; never this webview, never an in-app browser.
+            do {
+                let url = try Self.externalURL(p)
+                return UIApplication.shared.open(url) { opened in
+                    done(opened ? .success([:]) : .failure(.io("the system did not open the URL")))
+                }
+            } catch let e as ShellError {
+                return done(.failure(e))
+            } catch { return done(.failure(.io("\(error)"))) }
         }
         #if DEBUG
             // A test hook, not part of the contract: the flushes made since the last call.

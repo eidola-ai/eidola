@@ -1,16 +1,16 @@
 # The mobile shell contract
 
-**Contract version 1.** This document is the whole interface between Eidola's native mobile shells (`mobile/ios`, `mobile/android`) and the app bundle they host (the wasm build of the Rust app, or any page, such as `mobile/contract-test/`). Both shells implement exactly this, and the app may rely on nothing else.
+**Contract version 2.** This document is the whole interface between Eidola's native mobile shells (`mobile/ios`, `mobile/android`) and the app bundle they host (the wasm build of the Rust app, or any page, such as `mobile/contract-test/`). Both shells implement exactly this, and the app may rely on nothing else.
 
 ## Roles
 
-The **shell** is the native app the stores distribute. It is part of the platform: small, dependency-free, and dumb. It serves a bundle's bytes, moves raw TCP bytes, keeps files in the app sandbox, stores bundles the app hands it, shows which bundle is running, and fits the webview to the screen. It never fetches anything from the network on its own, never verifies or judges any bytes, and holds no product logic.
+The **shell** is the native app the stores distribute. It is part of the platform: small, dependency-free, and dumb. It serves a bundle's bytes, moves raw TCP bytes, keeps files in the app sandbox, stores bundles the app hands it, shows which bundle is running, fits the webview to the screen, and hands `https:` links to the system browser. It never fetches anything from the network on its own, never verifies or judges any bytes, and holds no product logic.
 
 The **app** is the bundle running in the system webview. TLS, attestation, update verification, and every other trust decision happen in the app. A byte the app hands the shell has already been judged by the app; a byte the shell hands the app is whatever the peer or the disk held.
 
 ## Versioning
 
-- The contract has one integer version, returned by `shell.hello`. This document describes version 1.
+- The contract has one integer version, returned by `shell.hello`. This document describes version 2. Version 2 added `shell.openExternal`.
 - Changes are additive only: a new method, a new optional parameter, a new member in a result, a new error code. A new version never removes a method, a member or a code, and never changes what an existing one means. The version increases with each addition.
 - The app detects what a shell supports with `shell.hello`'s `contract` and `methods`, and must ignore result members it does not know.
 
@@ -102,10 +102,18 @@ A failed request replies `{"ok": false, "error": {"code", "message"}}`. `message
 
 The version handshake. Params: none. Result:
 
-- `contract`: the contract version (1).
+- `contract`: the contract version (2).
 - `platform`: `"ios"` or `"android"`.
 - `shell`: the shell's own version string, for display and logs.
 - `methods`: every method this shell implements, sorted.
+
+### `shell.openExternal`
+
+Params: `url`. Result: `{}`, once the operating system has accepted the URL.
+
+Hands the URL to the system's own browser (or the app the system routes it to): `UIApplication.open` on iOS, an `ACTION_VIEW` intent on Android. It is never loaded in the shell's webview and never in a browser inside the app (no `SFSafariViewController`, no Custom Tabs), so the page the user sees there is the browser's, with its own address bar, and nothing of it reaches the app.
+
+It exists because some things the app offers happen on the web, purchases first: the app links out to them. The app decides which URLs to open; the shell only refuses what is not an absolute `https:` URL: the scheme `https` (any case), a host, and nothing but printable ASCII (`bad_request` otherwise; percent-encode anything else). The shell neither fetches the page nor looks at it. `io` when the system opened nothing.
 
 ### TCP pipe
 
@@ -227,7 +235,7 @@ It opens from the app icon: a long press on the home-screen icon offers **Bundle
 
 ## What the shell never does
 
-- Fetch anything from the network on its own, follow a link out of its origin, or serve another origin.
+- Fetch anything from the network on its own, load another origin in its webview, or serve one. (`shell.openExternal` hands a URL to the system browser; the shell itself loads nothing.)
 - Verify, sign, compare or interpret any bytes: of a bundle, a file, or a socket.
 - Choose a bundle by anything but the state above.
 - Keep any state of the app's besides the files the app wrote.

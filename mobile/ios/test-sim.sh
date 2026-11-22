@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Runs the contract test page in the iOS Simulator under XCUITest: the whole contract,
-# the native bundle sheet (opened from the home-screen quick action) against the page's
-# digest, and a cold relaunch. Screenshots go to SHOTS (default build/shots).
+# Runs the contract test page in the iOS Simulator under XCUITest: the whole contract (seeing
+# Safari open for shell.openExternal), the native bundle sheet (opened from the home-screen
+# quick action) against the page's digest, and a cold relaunch. Screenshots go to SHOTS
+# (default build/shots).
 #   test-sim.sh [SHOTS]
 # Uses (and creates once) its own simulator, "eidola-shell"; never another device.
 set -euo pipefail

@@ -13,8 +13,8 @@ The native apps the App Store and Play Store distribute. Each is a thin shell ar
 
 ## Doctrine
 
-- **Six jobs and nothing else**: serve the bundle on the shell's origin; a raw TCP pipe; a flat file directory; a bundle store with provisional activation; the bundle sheet (the serving bundle's digest in native UI); fitting the webview to the screen and keyboard. A seventh is a design change: raise it, don't add it.
-- **No network of its own, no trust decisions.** The shell fetches nothing, follows no link out, compares no hash, and serves only its origin. Both webviews are configured to make no requests of their own (Safe Browsing and fraud warnings off, Android metrics opted out).
+- **Seven jobs and nothing else**: serve the bundle on the shell's origin; a raw TCP pipe; a flat file directory; a bundle store with provisional activation; the bundle sheet (the serving bundle's digest in native UI); fitting the webview to the screen and keyboard; handing `https:` links to the system browser (purchases happen on the web). An eighth is a design change: raise it, don't add it.
+- **No network of its own, no trust decisions.** The shell fetches nothing, loads no other origin in its webview, compares no hash, and serves only its origin; an external link goes to the system browser, never an in-app one. Both webviews are configured to make no requests of their own (Safe Browsing and fraud warnings off, Android metrics opted out).
 - **No third-party code.** System frameworks only. Android carries the Kotlin standard library, shrunk by R8 to what the shell calls; nothing else.
 - **The contract changes additively.** A new call, parameter, result member or error code bumps the contract version in `shell-contract.md`, both shells (`contractVersion` / `CONTRACT_VERSION`, the method lists), and `contract-test/test.js`; nothing existing changes meaning. A change that is not additive is a new contract and needs the app's host bridge to handle both.
 - **Both shells move together.** A behaviour lands in iOS and Android in the same change, with a test-page check, and both test runs pass.

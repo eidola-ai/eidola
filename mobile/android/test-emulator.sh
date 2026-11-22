@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Runs the contract test page on an Android emulator: the whole contract, the native bundle
-# sheet (the launcher shortcut's intent) against the page's digest, and a cold relaunch.
-# Screenshots go to SHOTS (default build/shots).
+# Runs the contract test page on an Android emulator: the whole contract (seeing the system
+# browser open for shell.openExternal), the native bundle sheet (the launcher shortcut's
+# intent) against the page's digest, and a cold relaunch. Screenshots go to SHOTS (default
+# build/shots).
 #   test-emulator.sh [SHOTS]
 # Uses (and creates once) its own AVD, "eidola-shell", on the android-36.1 Play image; never
 # another AVD or a device. Needs the SDK's emulator, platform-tools and that system image.
@@ -73,10 +74,26 @@ wait_for() { # wait_for FIELD SECONDS
   return 1
 }
 
+top() { "${ADB[@]}" shell dumpsys activity activities | grep -m1 topResumedActivity || true; }
+
 "${ADB[@]}" logcat -c
 "${ADB[@]}" shell am start -W -n "$PKG/ai.eidola.shell.MainActivity" >/dev/null
-wait_for summary 180
-sleep 1
+# The run ends by handing an https URL to the system browser; bring the shell back when it shows.
+BROWSER=no
+for _ in $(seq 240); do
+  if [[ "$BROWSER" == no && "$(top)" == *chrome* ]]; then
+    BROWSER=yes
+    sleep 2
+    "${ADB[@]}" exec-out screencap -p >"$SHOTS/0-open-external.png"
+    "${ADB[@]}" shell am start -n "$PKG/ai.eidola.shell.MainActivity" >/dev/null
+  fi
+  [[ -n "$(report | field summary)" && "$BROWSER" == yes ]] && break
+  sleep 1
+done
+wait_for summary 30
+echo "browser opened: $BROWSER"
+"${ADB[@]}" shell am start -W -n "$PKG/ai.eidola.shell.MainActivity" >/dev/null
+sleep 2
 "${ADB[@]}" exec-out screencap -p >"$SHOTS/1-contract.png"
 SUMMARY="$(report | field summary)"
 echo "$SUMMARY"
@@ -102,4 +119,4 @@ RESTART="$(report | field restart)"
 echo "$RESTART"
 "${ADB[@]}" logcat -d -s EidolaShell:V >"$SHOTS/logcat.txt"
 echo "screenshots: $SHOTS"
-[[ "$SUMMARY" == "contract: PASS"* && "$SHEET_OK" == PASS && "$RESTART" == "restart: PASS"* ]]
+[[ "$SUMMARY" == "contract: PASS"* && "$BROWSER" == yes && "$SHEET_OK" == PASS && "$RESTART" == "restart: PASS"* ]]

@@ -22,10 +22,16 @@ final class ContractUITests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
 
+        // The run ends by handing an https URL to the system browser: Safari comes to the front.
+        let safari = XCUIApplication(bundleIdentifier: "com.apple.mobilesafari")
+        XCTAssertTrue(safari.wait(for: .runningForeground, timeout: 240), "shell.openExternal did not open Safari")
+        shot("0-open-external")
+        app.activate()
+
         let verdict = app.staticTexts.matching(
             NSPredicate(format: "label BEGINSWITH 'contract: PASS' OR label BEGINSWITH 'contract: FAIL'")
         ).firstMatch
-        XCTAssertTrue(verdict.waitForExistence(timeout: 180), "the page reached no verdict")
+        XCTAssertTrue(verdict.waitForExistence(timeout: 60), "the page reached no verdict")
         shot("1-contract")
         XCTAssertTrue(verdict.label.hasPrefix("contract: PASS"), verdict.label)
 
