@@ -49,6 +49,17 @@ assert_scope 'rust=false
 apple=true
 markdown=true
 oci=false' scripts/fixtures/apple-roundtrip/README.md
+# The mobile shells are built and gated by their own workflow.
+for mobile_path in mobile/ios/Shell/App.swift mobile/android/build.sh mobile/contract-test/test.js; do
+  assert_scope 'rust=false
+apple=false
+markdown=false
+oci=false' "$mobile_path"
+done
+assert_scope 'rust=false
+apple=false
+markdown=true
+oci=false' mobile/shell-contract.md
 assert_scope 'rust=true
 apple=false
 markdown=false

@@ -1,0 +1,48 @@
+name: Mobile shells
+
+# The Android shell builds on Linux with pinned, hash-checked tools (no SDK, no
+# Gradle): two clean builds must be identical, a signed APK must strip back to
+# them, and the result must equal mobile/android/reproducible.sha256, the same
+# bytes a macOS build gives. The iOS shell needs macOS and stays a local gate
+# (mobile/AGENTS.md). Path-filtered: nothing outside mobile/ reaches either.
+on:
+  push:
+    branches: [mobile]
+    paths:
+      - "mobile/**"
+      - ".github/workflows/mobile-shells.yml"
+  pull_request:
+    branches: [mobile]
+    paths:
+      - "mobile/**"
+      - ".github/workflows/mobile-shells.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  android:
+    name: Android shell reproducible
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The archives are verified by SHA-256 on every use of the cache too.
+      - name: Cache the pinned build tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/eidola/android-tools
+          key: android-tools-${{ hashFiles('mobile/android/tools.sh') }}
+
+      - name: Build twice, strip a signed build, compare with the committed hash
+        run: |
+          java -version
+          mobile/android/repro.sh
