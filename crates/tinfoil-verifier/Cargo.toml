@@ -43,20 +43,6 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # environment without dragging the wrong dep into the others.
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 
-# Connector layer plumbing for the per-handshake attesting client.
-# `tower` gives us Layer/Service traits; `hyper` and `hyper-util` give us the
-# Read/Write/Connection traits and the TokioIo adapter that lets us drive an
-# inline HTTP/1.1 request on a freshly handshaked connection; `httparse`
-# parses the response head.
-tower = { version = "0.5", default-features = false }
-hyper = { version = "1", default-features = false }
-hyper-util = { version = "0.1", default-features = false }
-httparse = "1"
-http = "1"
-
-# Async runtime
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
-
 # Hashing. Pinned to 0.10 because the rsa crate's `VerifyingKey<D>`
 # bounds require `D: rsa::sha2::Digest`, which only resolves when our
 # `Sha384` comes from the same `sha2` version rsa was compiled against.
@@ -95,6 +81,32 @@ eidola-common = { path = "../eidola-common", optional = true }
 
 # Logging
 tracing = "0.1"
+
+# The per-handshake attesting client is native-only (`attesting_client`): it
+# drives TCP and TLS through tokio and reqwest's native connector. The
+# verification core compiles for wasm32 without it.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Connector layer plumbing for the per-handshake attesting client.
+# `tower` gives us Layer/Service traits; `hyper` and `hyper-util` give us the
+# Read/Write/Connection traits and the TokioIo adapter that lets us drive an
+# inline HTTP/1.1 request on a freshly handshaked connection; `httparse`
+# parses the response head.
+tower = { version = "0.5", default-features = false }
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+httparse = "1"
+http = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
+
+# wasm32-unknown-unknown has no OS randomness or clock: the nonce (getrandom
+# 0.4) and the RSA crates (getrandom 0.2) draw from the browser's, and rustls
+# reads the browser's clock (`rustls-pki-types/web`).
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+rustls-pki-types = { version = "1", features = ["web"] }
 
 [features]
 platform-endorsements = ["dep:eidola-common", "dep:const-oid", "dep:spki", "dep:p256", "dep:p384", "dep:signature"]

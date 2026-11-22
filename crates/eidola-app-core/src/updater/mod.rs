@@ -46,8 +46,8 @@
 //! otherwise an adversary who produced a single forged attestation could
 //! also forge a `release.json` that lowered the threshold to 1.
 
+use crate::rt::Instant;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use sha2::Digest;
 
@@ -60,7 +60,9 @@ pub use eidola_attestation::{
 
 pub mod ci_sigstore;
 pub mod human_attestation;
+#[cfg(feature = "desktop")]
 pub mod install;
+#[cfg(feature = "desktop")]
 pub mod install_kind;
 pub mod installed;
 mod merkle;
@@ -1356,7 +1358,7 @@ async fn fetch_url_network_with(
     // and not a whole-request timeout, which would cut off a large
     // container that is still arriving.
     let resp =
-        match tokio::time::timeout(stall, client.get(url).header("Accept", accept).send()).await {
+        match crate::rt::timeout(stall, client.get(url).header("Accept", accept).send()).await {
             Ok(sent) => sent.map_err(|e| {
                 let malformed = e.is_builder();
                 let message = format!("GET {label}: {}", crate::error::request_error_text(e));
@@ -1390,7 +1392,7 @@ async fn fetch_url_network_with(
         // finishes. The bound is per read rather than overall: a large
         // container on a slow link keeps arriving, and only silence is
         // grounds to give up.
-        let next = match tokio::time::timeout(stall, stream.next()).await {
+        let next = match crate::rt::timeout(stall, stream.next()).await {
             Ok(next) => next,
             Err(_) => {
                 return Err(FetchFailure::Unreachable(format!(
@@ -1430,27 +1432,7 @@ async fn fetch_url_network_with(
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client, AppError> {
-    // Idempotent — AppCore::new normally installs this; for standalone
-    // updater callers (tests, future binaries) this is the safety net.
-    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(crate::load_native_root_store())
-        .with_no_client_auth();
-
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(tls_config)
-        .user_agent(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION")))
-        // Bounds the handshake only. A whole-request timeout would be
-        // wrong here: the same client fetches a small signed document and
-        // a container of tens of megabytes, and the second is allowed to
-        // take as long as it keeps making progress — which is what the
-        // per-read stall bound measures.
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| AppError::Update {
-            message: format!("constructing HTTPS client: {e}"),
-        })
+    crate::transport::update_client()
 }
 
 #[cfg(test)]

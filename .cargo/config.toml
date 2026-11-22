@@ -1,0 +1,6 @@
+# wasm32-unknown-unknown has no OS randomness. getrandom 0.3 selects its
+# browser backend only under this cfg (0.2 and 0.4 select it by feature
+# alone). A `RUSTFLAGS` environment variable replaces these flags, so a wasm
+# build must not set one.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

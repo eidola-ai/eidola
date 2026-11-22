@@ -68,6 +68,11 @@
 //! This crate deliberately does **not** depend on either source so neither
 //! gets dragged into the wrong consumer transitively.
 
+// The handshake verifier is reached only through the native connector, so on
+// wasm32 the verification core compiles but nothing calls it yet.
+#![cfg_attr(target_family = "wasm", allow(dead_code))]
+
+#[cfg(not(target_family = "wasm"))]
 mod attesting_client;
 pub mod bundle;
 mod device;
@@ -198,6 +203,7 @@ pub struct AttestingClientConfig<'a> {
 /// Callers that want fail-fast-at-startup semantics should make one trivial
 /// request (e.g. `client.get(format!("{base}/v1/models")).send().await`)
 /// after construction and treat its outcome as the readiness check.
+#[cfg(not(target_family = "wasm"))]
 pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwest::Client, Error> {
     let tls_roots = std::sync::Arc::new(config.tls_roots);
 

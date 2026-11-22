@@ -85,6 +85,7 @@ pub enum AppError {
     /// written — typed ([`crate::proxy::ProxyRefusal`]) so a surface can choose
     /// its own words for which one. Prints as the configuration error it
     /// always was.
+    #[cfg(feature = "desktop")]
     #[error("config error: {refusal}")]
     ProxyRefused { refusal: crate::proxy::ProxyRefusal },
 
@@ -95,6 +96,12 @@ pub enum AppError {
     /// Enclave attestation verification failed.
     #[error("attestation failed: {message}")]
     Attestation { message: String },
+
+    /// This build has no HTTP transport (wasm32), so no client could be
+    /// built and nothing was sent.
+    #[cfg(target_family = "wasm")]
+    #[error("no HTTP transport on this target")]
+    NoTransport,
 
     /// The server returned a non-success HTTP status.
     #[error("server error ({status}): {message}")]

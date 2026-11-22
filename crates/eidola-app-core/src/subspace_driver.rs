@@ -362,15 +362,18 @@ impl DelegationFailure {
             | AppError::Config { .. }
             // Unreachable from a driven turn (only account creation raises it).
             | AppError::AccountNotSaved { .. }
-            // Unreachable from a driven turn (no turn writes proxy settings);
-            // placed where the variant it replaced would have landed.
-            | AppError::ProxyRefused { .. }
             | AppError::NotAParticipant { .. }
             | AppError::WrongPostKind { .. }
             | AppError::SpawnRefused { .. }
             | AppError::NotJoined { .. }
             | AppError::DrivenConversation { .. }
             | AppError::SpaceArchived { .. } => Self::Configuration,
+            // Unreachable from a driven turn (no turn writes proxy settings).
+            #[cfg(feature = "desktop")]
+            AppError::ProxyRefused { .. } => Self::Configuration,
+            // No client could be built, so no model was reached.
+            #[cfg(target_family = "wasm")]
+            AppError::NoTransport => Self::Upstream,
             // A regeneration collision cannot reach a driven room at all (the
             // driver never revises or continues) — it lands in the honest
             // catch-all.
@@ -683,7 +686,7 @@ impl Inner {
             return;
         }
         // No runtime (a synchronous unit test) ⇒ nothing to spawn onto.
-        if tokio::runtime::Handle::try_current().is_err() {
+        if !crate::rt::in_runtime() {
             return;
         }
         {
@@ -699,7 +702,7 @@ impl Inner {
         }
         let inner = self.clone();
         let space_id = space_id.to_string();
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let mut arm = arm;
             loop {
                 // **The queue is here, behind the registry claim and in front
@@ -775,7 +778,7 @@ impl Inner {
                     // A pause between attempts, so a room whose upstream is
                     // briefly away is retried rather than hammered. Short,
                     // because the meter is only three deep.
-                    tokio::time::sleep(RETRY_PAUSE).await;
+                    crate::rt::sleep(RETRY_PAUSE).await;
                 }
             }
         });
@@ -867,7 +870,7 @@ impl Inner {
                         "warning: delegated conversations could not be enumerated \
                          (will retry): {e}"
                     );
-                    tokio::time::sleep(RETRY_PAUSE).await;
+                    crate::rt::sleep(RETRY_PAUSE).await;
                 }
             }
         }
@@ -1925,7 +1928,7 @@ impl Inner {
     /// no-op walk.
     fn schedule_anchor_grace(&self, space_id: &str, generation: u64) {
         // No runtime (a synchronous unit test) ⇒ nothing to spawn onto.
-        if tokio::runtime::Handle::try_current().is_err() {
+        if !crate::rt::in_runtime() {
             return;
         }
         let Some(inner) = self.self_ref.upgrade() else {
@@ -1933,8 +1936,8 @@ impl Inner {
         };
         let space_id = space_id.to_string();
         let grace = self.anchor_wait_grace();
-        tokio::spawn(async move {
-            tokio::time::sleep(grace).await;
+        crate::rt::spawn(async move {
+            crate::rt::sleep(grace).await;
             let still_this_wait = inner
                 .awaiting_anchor
                 .lock()
