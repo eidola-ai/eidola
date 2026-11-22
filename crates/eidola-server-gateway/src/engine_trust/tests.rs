@@ -753,12 +753,12 @@ fn the_prompt_cache_policy_is_the_configs() {
 fn the_gateway_token_is_a_secret_and_never_measured() {
     let mut tree = Tree::fixture();
     tree.edit_config("      - ENGINE_GATEWAY_TOKEN\n", "");
-    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\"]");
+    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\", ");
 
     // The secret carries the prefix too.
     let mut tree = Tree::fixture();
     tree.edit_config("      - ENGINE_GATEWAY_TOKEN\n", "      - GATEWAY_TOKEN\n");
-    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\"]");
+    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\", ");
 
     for token in ["ENGINE_GATEWAY_TOKEN", "GATEWAY_TOKEN"] {
         let mut tree = Tree::fixture();
@@ -1812,16 +1812,21 @@ fn the_weights_dir_is_the_granted_pinned_pack() {
     tree.check().expect("a weights directory inside the pack");
 }
 
-/// Any secret besides the gateway token is refused: it would reach the node
-/// outside the measurement.
+/// The secrets are the gateway token and where the node's telemetry goes,
+/// and nothing else: any other would reach the node outside the measurement.
 #[test]
-fn the_gateway_token_is_the_only_secret() {
+fn the_secrets_are_the_token_and_the_telemetry_endpoint() {
+    let expected = "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\", \
+                    \"ENGINE_OTEL_EXPORTER_OTLP_ENDPOINT\", \"ENGINE_OTEL_EXPORTER_OTLP_HEADERS\"]";
     let mut tree = Tree::fixture();
     tree.edit_config(
         "      - ENGINE_GATEWAY_TOKEN\n",
         "      - ENGINE_GATEWAY_TOKEN\n      - ENGINE_RUST_LOG\n",
     );
-    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\"]");
+    refused(&tree, expected);
+    let mut tree = Tree::fixture();
+    tree.edit_config("      - ENGINE_OTEL_EXPORTER_OTLP_HEADERS\n", "");
+    refused(&tree, expected);
 }
 
 /// The env sets exactly the node's measured variables: a name any dependency

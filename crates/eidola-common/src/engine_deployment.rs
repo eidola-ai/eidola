@@ -40,6 +40,11 @@ pub mod env {
     /// the token keeps anyone but the gateway from spending the node's GPUs,
     /// which is the operator's interest, not a client's.
     pub const GATEWAY_TOKEN: &str = "GATEWAY_TOKEN";
+    /// Where the node exports its telemetry over OTLP (`eidola-telemetry`), and
+    /// the headers that authenticate it. Secrets, so a measured configuration
+    /// names no telemetry vendor; unset or empty, the node exports nothing.
+    pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+    pub const OTEL_EXPORTER_OTLP_HEADERS: &str = "OTEL_EXPORTER_OTLP_HEADERS";
     /// `cpu` or `cuda`.
     pub const EXECUTOR: &str = "EXECUTOR";
     /// Listen address, `host:port`.
@@ -1795,11 +1800,15 @@ pub fn is_gateway_token(token: &str) -> bool {
         && token.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// The one secret an engine container takes, under its prefix: everything
-/// else it reads is in the measured env. A secret is delivered outside the
-/// measurement, so any other one (a log level, say) would change the node's
-/// behaviour unmeasured.
-pub const SECRETS: &[&str] = &[env::GATEWAY_TOKEN];
+/// The secrets an engine container takes, under its prefix: the gateway's
+/// token, and where its telemetry goes. Everything else it reads is in the
+/// measured env. A secret is delivered outside the measurement, so any other
+/// one (a log level, say) would change the node's behaviour unmeasured.
+pub const SECRETS: &[&str] = &[
+    env::GATEWAY_TOKEN,
+    env::OTEL_EXPORTER_OTLP_ENDPOINT,
+    env::OTEL_EXPORTER_OTLP_HEADERS,
+];
 
 /// Whether the engine container's `secrets` are exactly [`SECRETS`] under
 /// `prefix`.
@@ -3358,15 +3367,21 @@ mod tests {
     }
 
     #[test]
-    fn the_only_secret_is_the_gateway_token() {
+    fn the_secrets_are_the_gateway_token_and_the_telemetry_endpoint() {
         let prefix = Env::with_prefix("ENGINE_").unwrap();
-        assert!(check_secrets(&prefix, ["ENGINE_GATEWAY_TOKEN"]).is_ok());
+        let all = [
+            "ENGINE_GATEWAY_TOKEN",
+            "ENGINE_OTEL_EXPORTER_OTLP_ENDPOINT",
+            "ENGINE_OTEL_EXPORTER_OTLP_HEADERS",
+        ];
+        assert!(check_secrets(&prefix, all).is_ok());
         assert!(check_secrets(&prefix, []).is_err());
-        assert!(check_secrets(&prefix, ["GATEWAY_TOKEN"]).is_err());
-        assert!(check_secrets(&prefix, ["ENGINE_GATEWAY_TOKEN", "ENGINE_RUST_LOG"]).is_err());
-        assert!(check_secrets(&prefix, ["ENGINE_GATEWAY_TOKEN", "ENGINE_GATEWAY_TOKEN"]).is_err());
+        assert!(check_secrets(&prefix, ["ENGINE_GATEWAY_TOKEN"]).is_err());
+        assert!(check_secrets(&prefix, all.map(|s| &s["ENGINE_".len()..])).is_err());
+        assert!(check_secrets(&prefix, all.iter().copied().chain(["ENGINE_RUST_LOG"])).is_err());
+        assert!(check_secrets(&prefix, all.iter().copied().chain([all[0]])).is_err());
         let err = check_secrets(&prefix, []).unwrap_err();
-        assert!(err.contains("[\"ENGINE_GATEWAY_TOKEN\"]"), "{err}");
+        assert!(err.contains(&format!("{all:?}")), "{err}");
     }
 
     #[test]

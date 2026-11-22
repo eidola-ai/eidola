@@ -1,5 +1,5 @@
-//! The OTLP export pipeline Eidola's servers share: the gateway, and the
-//! billing receiver and worker.
+//! The OTLP export pipeline Eidola's servers share: the gateway, the billing
+//! receiver and worker, and the inference node.
 //!
 //! Telemetry is enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` is set and not
 //! empty, and ships over HTTP/protobuf. These variables, read by the caller
@@ -26,8 +26,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
 /// How often metrics are exported: each export covers this interval, so it is the
-/// finest time resolution any exported metric has. An engine node publishes its
-/// snapshot at the same epoch (`eidola_common::engine_protocol::telemetry::SNAPSHOT_EPOCH`).
+/// finest time resolution any exported metric has.
 pub const METRIC_EXPORT_INTERVAL: std::time::Duration =
     opentelemetry_sdk::metrics::OTEL_METRIC_EXPORT_INTERVAL_DEFAULT;
 

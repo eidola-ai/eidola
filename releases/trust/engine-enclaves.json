@@ -3,13 +3,13 @@
     "2a94a85c36b9d4d29ef733142091f88853fcce4d9f3ca4a1725dbfabab7f1dec": [
       {
         "config": "deploy/engine/mimo-v2.6-flash/b300x1/tinfoil-config.yml",
-        "config_sha256": "5a85813a0aab57250bbbf9b06c0200d206bdc7e58007dda7002c570f7caec141",
+        "config_sha256": "57ccf5b69ec7859bd4d719ddf685ff4b3e006e01c6aac3ee4a516141b583a5af",
         "cvm_version": "0.15.4-rc.2+gpu@sha256:de67844398b970d5bbddd9ab42f7cded933b49d268ca0b7f8e86861b2e1f2094",
         "pin": {
           "expected_gpus": 1,
           "platform": {
             "tdx": {
-              "mrconfigid": "5a85813a0aab57250bbbf9b06c0200d206bdc7e58007dda7002c570f7caec14100000000000000000000000000000000",
+              "mrconfigid": "57ccf5b69ec7859bd4d719ddf685ff4b3e006e01c6aac3ee4a516141b583a5af00000000000000000000000000000000",
               "mrtd": "5d4ccd0da195adf465c058a101a9c1330550a6b0bb18461a4dd3d124bfcb07326a7217bb2957f07c9b0f3641eb784de5",
               "policy": {
                 "cached_keys": "true",
@@ -45,13 +45,13 @@
     "4fc667ee21b46b0f7127370ea42c8766988e62433a7737b7eb434f77b93035e1": [
       {
         "config": "deploy/engine/qwen3.8-27b/b200x1/tinfoil-config.yml",
-        "config_sha256": "26e91bb6efe623a6007c31b9944e1493190f3805650ece3281c45e4ddea10559",
+        "config_sha256": "2fe291f82a703cf7d3990be7c5ef3d539e41b786583890c04eec0ac12d4175d0",
         "cvm_version": "0.15.4-rc.2+gpu@sha256:de67844398b970d5bbddd9ab42f7cded933b49d268ca0b7f8e86861b2e1f2094",
         "pin": {
           "expected_gpus": 1,
           "platform": {
             "tdx": {
-              "mrconfigid": "26e91bb6efe623a6007c31b9944e1493190f3805650ece3281c45e4ddea1055900000000000000000000000000000000",
+              "mrconfigid": "2fe291f82a703cf7d3990be7c5ef3d539e41b786583890c04eec0ac12d4175d000000000000000000000000000000000",
               "mrtd": "5d4ccd0da195adf465c058a101a9c1330550a6b0bb18461a4dd3d124bfcb07326a7217bb2957f07c9b0f3641eb784de5",
               "policy": {
                 "cached_keys": "true",

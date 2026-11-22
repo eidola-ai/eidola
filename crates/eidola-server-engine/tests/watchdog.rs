@@ -147,13 +147,11 @@ async fn a_stalled_step_ends_the_stream_with_an_error_and_exits() {
         engine: handle.clone(),
         admission: admission.clone(),
         reading: Admission::new(4),
-        boot_id: AppState::new_boot_id(),
         overloaded: Default::default(),
         failed: Default::default(),
         streams_failed: Default::default(),
-        published: Default::default(),
     });
-    let telemetry = http::TelemetryPublisher::start(&state);
+    let telemetry = eidola_server_engine::telemetry::Source::new(&state);
     let node = common::TestNode::serve(eidola_server_engine::Node {
         telemetry,
         router: http::router(state),
@@ -206,25 +204,16 @@ async fn a_stalled_step_ends_the_stream_with_an_error_and_exits() {
     .await
     .expect("refused at once");
     assert_eq!(status, 503);
-    // Neither is logged; the snapshot counts both: the stream that failed under the
-    // stuck step, and the request the stopped engine refused.
-    assert!(node.telemetry.publish());
-    let info: serde_json::Value = node
-        .client
-        .get(format!("{}/v1/engine/info", node.base))
-        .bearer_auth(common::TOKEN)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let snapshot = eidola_common::engine_protocol::telemetry::NodeTelemetry::from_value(
-        &info[eidola_common::engine_protocol::telemetry::INFO_TELEMETRY_MEMBER],
-    )
-    .expect("a snapshot");
-    assert_eq!(snapshot.counters.streams_failed, 1);
-    assert_eq!(snapshot.counters.requests_failed, 1);
+    // Neither is logged; the node's counters count both: the stream that failed under
+    // the stuck step, and the request the stopped engine refused.
+    use eidola_server_engine::telemetry::Value;
+    for outcome in ["stream_failed", "failed"] {
+        assert_eq!(
+            node.observed("engine.node.requests", &[("outcome", outcome)]),
+            Some(Value::Count(1)),
+            "{outcome}"
+        );
+    }
 
     gate.release();
     assert!(

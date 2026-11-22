@@ -21,9 +21,7 @@
 //!   traffic, and again periodically: `/healthz` must answer `ok` and
 //!   `/v1/engine/info` must report the pinned model id and weights hash on
 //!   `verified-readonly` storage. Every chat request also carries the pinned
-//!   hash, which the node checks before reading the body. The info answer
-//!   also carries the node's telemetry snapshot, which `node_telemetry`
-//!   exports for it.
+//!   hash, which the node checks before reading the body.
 //! - **Whether an engine is well** — `breaker`, local to this process.
 //! - **Which engine a request goes to** — `rendezvous`: the client's cache key
 //!   when it sent one (so a conversation stays on the engine holding its
@@ -73,14 +71,14 @@ use eidola_common::engine_protocol::{
 use eidola_common::stream_shape::{StreamEvent, StreamReader, Unreadable, unpadded};
 
 mod breaker;
-pub mod node_telemetry;
+mod labels;
 pub mod placement;
 mod rendezvous;
 pub mod subset;
 
 use breaker::Breaker;
 pub use breaker::BreakerConfig;
-use node_telemetry::{NodeLabels, NodeReport, NodeState, Reading};
+use labels::NodeLabels;
 use placement::PlacementSource;
 
 /// The provider name an engine-served response carries in its privacy
@@ -92,8 +90,8 @@ pub struct EngineModel {
     pinned: PinnedModel,
     /// The config hash of every accepted deployment.
     deployments: Vec<String>,
-    /// Each accepted deployment's `deployment` metric label, in the order of
-    /// `deployments` ([`node_telemetry::deployment_label`]).
+    /// Each accepted deployment's `deployment` log label, in the order of
+    /// `deployments` ([`labels::deployment_label`]).
     deployment_labels: Vec<String>,
     /// Every accepted deployment's pin: what each upstream's client attests
     /// against.
@@ -115,9 +113,7 @@ impl EngineModel {
                     deployments: accepted.iter().map(|d| d.config_sha256.clone()).collect(),
                     deployment_labels: accepted
                         .iter()
-                        .map(|d| {
-                            node_telemetry::deployment_label(Some(&d.config), &d.config_sha256)
-                        })
+                        .map(|d| labels::deployment_label(Some(&d.config), &d.config_sha256))
                         .collect(),
                     pins: accepted.into_iter().map(|d| d.pin).collect(),
                 })
@@ -136,13 +132,13 @@ impl EngineModel {
             deployments: deployments.iter().map(|(d, _)| d.clone()).collect(),
             deployment_labels: deployments
                 .iter()
-                .map(|(d, _)| node_telemetry::deployment_label(None, d))
+                .map(|(d, _)| labels::deployment_label(None, d))
                 .collect(),
             pins: deployments.into_iter().map(|(_, p)| p).collect(),
         }
     }
 
-    /// The `deployment` metric label of the accepted deployment whose config
+    /// The `deployment` log label of the accepted deployment whose config
     /// hashes to `config_sha256`.
     fn deployment_label(&self, config_sha256: &str) -> String {
         self.deployments
@@ -150,7 +146,7 @@ impl EngineModel {
             .zip(&self.deployment_labels)
             .find(|(d, _)| *d == config_sha256)
             .map_or_else(
-                || node_telemetry::deployment_label(None, config_sha256),
+                || labels::deployment_label(None, config_sha256),
                 |(_, label)| label.clone(),
             )
     }
@@ -289,10 +285,11 @@ pub struct Upstream {
     in_flight: AtomicUsize,
     breaker: std::sync::Mutex<Breaker>,
     probing: AtomicBool,
-    /// What its `engine.node.*` series are labelled by, besides the model.
+    /// What its log lines are labelled by, besides the model.
     labels: NodeLabels,
-    /// What its telemetry snapshots have left behind.
-    node: std::sync::Mutex<NodeState>,
+    /// The node's `instance_id` as its last passing probe read it: a new one
+    /// is a restart.
+    instance: std::sync::Mutex<Option<String>>,
     /// Why its last probe failed, while its probes fail: a failure is logged when it
     /// starts or its reason changes, not on every probe.
     probe_failure: std::sync::Mutex<Option<String>>,
@@ -312,13 +309,17 @@ impl Upstream {
             in_flight: AtomicUsize::new(0),
             breaker: std::sync::Mutex::new(Breaker::new()),
             probing: AtomicBool::new(false),
-            node: std::sync::Mutex::new(NodeState::default()),
+            instance: std::sync::Mutex::new(None),
             probe_failure: std::sync::Mutex::new(None),
         }
     }
 
-    fn node(&self) -> std::sync::MutexGuard<'_, NodeState> {
-        self.node.lock().unwrap_or_else(|e| e.into_inner())
+    /// The node's `instance_id` as its last passing probe read it.
+    pub(crate) fn instance(&self) -> Option<String> {
+        self.instance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// An upstream with a plain client, for tests of ranking.
@@ -624,23 +625,6 @@ impl EngineRouter {
             .collect()
     }
 
-    /// Every placed upstream's labels and last levels, for the
-    /// `engine.node.*` gauges: levels while its last probe read a snapshot,
-    /// none otherwise. A model with no placed upstream has none here.
-    pub(crate) fn node_reports(&self) -> Vec<NodeReport> {
-        let snapshot = self.inner.upstreams.load();
-        snapshot
-            .iter()
-            .flat_map(|(model, upstreams)| {
-                upstreams.iter().map(move |upstream| NodeReport {
-                    model: model.clone(),
-                    labels: upstream.labels.clone(),
-                    gauges: upstream.node().gauges().cloned(),
-                })
-            })
-            .collect()
-    }
-
     /// Read placement from `source` and apply it, then probe what is due. A
     /// failed read keeps the current placement.
     pub async fn refresh(&self, source: &dyn PlacementSource) {
@@ -680,14 +664,13 @@ impl EngineRouter {
             Err(_) => Err("the probe timed out".to_string()),
         };
         let was_routable = upstream.routable();
-        if outcome.is_err() {
-            upstream.node().lapse();
-        }
         upstream
             .breaker()
             .on_probe(outcome.is_ok(), Instant::now(), &self.inner.config.breaker);
-        // Each change is said once, with the labels its `engine.node.*` series carry.
+        // Each change is said once, with the upstream's labels and its node's
+        // instance, which names the series the node exports.
         let labels = &upstream.labels;
+        let instance = upstream.instance().unwrap_or_default();
         let previous_failure = {
             let mut failure = upstream
                 .probe_failure
@@ -700,6 +683,7 @@ impl EngineRouter {
                 model = %model.pinned.id(),
                 deployment = %labels.deployment,
                 node = %labels.node,
+                instance = %instance,
                 upstream = %upstream.base_url,
                 "engine upstream verified; taking traffic"
             ),
@@ -719,8 +703,8 @@ impl EngineRouter {
     /// `/healthz` answers `ok`, and `/v1/engine/info` reports the pinned model
     /// and weights on verified read-only storage. Both over the upstream's
     /// attesting client, so the connection they use is attested too. An info
-    /// answer that passes carries the node's telemetry snapshot, which is
-    /// exported ([`node_telemetry`]) and decides nothing here.
+    /// answer that passes also names the node's process ([`labels::instance_id`]),
+    /// which decides nothing: a new one is said once, as a restart.
     async fn probe(&self, model: &EngineModel, upstream: &Upstream) -> Result<(), String> {
         let health = upstream
             .client
@@ -767,31 +751,23 @@ impl EngineRouter {
         if member("weights_storage")? != "verified-readonly" {
             return Err("its weights are not on verified read-only storage".to_string());
         }
-        let reading = Reading::of(&info);
-        let growth = match &reading {
-            Reading::Read(snapshot) => {
-                let growth = upstream.node().observe(snapshot.as_ref().clone());
-                if growth.restarted {
-                    warn!(
-                        model = %model.pinned.id(),
-                        deployment = %upstream.labels.deployment,
-                        node = %upstream.labels.node,
-                        "engine node restarted since its last snapshot"
-                    );
-                }
-                Some(growth)
-            }
-            Reading::Absent | Reading::Unparsed => {
-                upstream.node().lapse();
-                None
-            }
-        };
-        node_telemetry::record(
-            model.pinned.id(),
-            &upstream.labels,
-            &reading,
-            growth.as_ref(),
+        let instance = labels::instance_id(&info);
+        let previous = std::mem::replace(
+            &mut *upstream.instance.lock().unwrap_or_else(|e| e.into_inner()),
+            instance.clone(),
         );
+        if let (Some(previous), Some(instance)) = (previous, &instance)
+            && previous != *instance
+        {
+            warn!(
+                model = %model.pinned.id(),
+                deployment = %upstream.labels.deployment,
+                node = %upstream.labels.node,
+                instance = %instance,
+                previous_instance = %previous,
+                "engine node restarted: it answers as a new instance"
+            );
+        }
         Ok(())
     }
 
