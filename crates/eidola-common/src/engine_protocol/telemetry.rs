@@ -17,12 +17,16 @@
 //! a count since the process started ([`NodeCounters`], cumulative and
 //! monotonic, so the reader turns two snapshots into a delta), or a level now
 //! ([`NodeGauges`]). There is no request id, cache key, lineage, salt,
-//! token, timestamp of an event, or size of any one request. Two kinds of
-//! value are coarsened on the node, before they leave it, because nothing
-//! the gateway exports already says as much: the KV pools' occupancy, rounded
-//! to [`OCCUPANCY_STEPS`] steps of its pool ([`quantize_occupancy`]), and the
-//! prefix cache's hit and miss token counts, floored to
-//! [`PREFIX_TOKEN_QUANTUM`] ([`quantize_prefix_tokens`]).
+//! token, timestamp of an event, or size of any one request. What would say
+//! more than the gateway already exports is coarsened on the node, before it
+//! leaves it: the KV pools' occupancy, rounded to [`OCCUPANCY_STEPS`] steps
+//! of its pool ([`quantize_occupancy`]), and every counter from which a
+//! quiet interval's cached prompt length could be read, floored to its
+//! quantum ([`NodeCounters::coarsened`]): the prompt positions computed and
+//! the prefix cache's hits and misses ([`PROMPT_TOKEN_QUANTUM`]), the steps
+//! and their rows ([`STEP_QUANTUM`]), their time ([`STEP_MICROS_QUANTUM`]),
+//! and the cache's evictions and tier transfers ([`BLOCK_QUANTUM`]). The
+//! reader refuses a counter that is not a multiple of its quantum.
 //! `crates/eidola-server-engine/AGENTS.md` → Telemetry has the reasoning
 //! for each member.
 //!
@@ -57,8 +61,27 @@ pub const MAX_POOLS: usize = 8;
 /// nearest multiple of `ceil(total / OCCUPANCY_STEPS)` blocks.
 pub const OCCUPANCY_STEPS: u64 = 256;
 
-/// The step the prefix cache's hit and miss token counts are floored to.
-pub const PREFIX_TOKEN_QUANTUM: u64 = 1024;
+/// The step the counts of prompt positions are floored to: those computed,
+/// and those the prefix cache found and did not. With the gateway's exact
+/// prompt-token totals, any one of them exact would give a lone request's
+/// cached length.
+pub const PROMPT_TOKEN_QUANTUM: u64 = 1024;
+
+/// The step the step and row counts are floored to. A lone request's prompt
+/// takes one step per prefill chunk, and its decode steps follow from the
+/// exact generated and draft counts, so exact steps would give its uncached
+/// length to within a chunk; 64 steps is 64 chunks.
+pub const STEP_QUANTUM: u64 = 64;
+
+/// The step the steps' wall time is floored to, in microseconds: one
+/// second, many prefill chunks' worth on any production GPU.
+pub const STEP_MICROS_QUANTUM: u64 = 1_000_000;
+
+/// The step the prefix cache's block and entry counts are floored to: one
+/// entry is one block, so exact counts would give a promoted hit's length,
+/// or an evicted or demoted conversation's, to within a block. 64 blocks of
+/// 16 tokens is [`PROMPT_TOKEN_QUANTUM`].
+pub const BLOCK_QUANTUM: u64 = 64;
 
 /// `count` blocks of a pool of `total`, rounded to the nearest multiple of
 /// the pool's step (`ceil(total / OCCUPANCY_STEPS)`, at least one block),
@@ -70,17 +93,18 @@ pub const fn quantize_occupancy(count: u64, total: u64) -> u64 {
     if rounded > total { total } else { rounded }
 }
 
-/// A cumulative prefix-cache token count, floored to
-/// [`PREFIX_TOKEN_QUANTUM`]. Floored rather than rounded, so the reported
-/// value never decreases while the count grows.
-pub const fn quantize_prefix_tokens(count: u64) -> u64 {
-    count / PREFIX_TOKEN_QUANTUM * PREFIX_TOKEN_QUANTUM
+/// A cumulative count floored to a multiple of `quantum`. Floored rather
+/// than rounded, so the reported value never decreases while the count
+/// grows.
+pub const fn floor_to(count: u64, quantum: u64) -> u64 {
+    count / quantum * quantum
 }
 
 macro_rules! counters {
-    ($($(#[$doc:meta])* $name:ident,)*) => {
+    ($($(#[$doc:meta])* $name:ident / $quantum:expr,)*) => {
         /// Counts since the process started: each only ever grows within one
-        /// `boot_id`.
+        /// `boot_id`. Each member states the quantum it leaves the node
+        /// floored to ([`NodeCounters::QUANTA`]), 1 for exact.
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
         pub struct NodeCounters {
             $($(#[$doc])* pub $name: u64,)*
@@ -93,6 +117,17 @@ macro_rules! counters {
             /// Each member's name and value, in [`NodeCounters::MEMBERS`] order.
             pub fn entries(&self) -> Vec<(&'static str, u64)> {
                 vec![$((stringify!($name), self.$name)),*]
+            }
+
+            /// Each member's name and the quantum its value is floored to on
+            /// the wire, 1 for one reported exactly.
+            pub const QUANTA: &'static [(&'static str, u64)] =
+                &[$((stringify!($name), $quantum)),*];
+
+            /// The counts as they leave the node: each floored to its
+            /// quantum ([`floor_to`]).
+            pub const fn coarsened(&self) -> Self {
+                Self { $($name: floor_to(self.$name, $quantum),)* }
             }
 
             /// Each member's growth since `earlier`, zero where it did not
@@ -117,7 +152,8 @@ macro_rules! counters {
                 if object.len() != Self::MEMBERS.len() {
                     return None;
                 }
-                Some(Self { $($name: object.get(stringify!($name))?.as_u64()?,)* })
+                let counters = Self { $($name: object.get(stringify!($name))?.as_u64()?,)* };
+                (counters.coarsened() == counters).then_some(counters)
             }
         }
     };
@@ -125,62 +161,61 @@ macro_rules! counters {
 
 counters! {
     /// Requests the engine accepted.
-    requests_accepted,
+    requests_accepted / 1,
     /// Requests that finished on their own (an end of sequence, a length).
-    requests_finished,
+    requests_finished / 1,
     /// Requests cancelled: a disconnect, a stop sequence, a reader cut off.
-    requests_cancelled,
+    requests_cancelled / 1,
     /// Of those, readers cut off because they stopped draining their output.
-    requests_cut_off,
+    requests_cut_off / 1,
     /// Requests the engine refused at submission.
-    requests_rejected,
+    requests_rejected / 1,
     /// Requests refused at first admission because the prefix cache did not
     /// hold their declared prefix.
-    requests_prefix_refused,
+    requests_prefix_refused / 1,
     /// Requests the node refused before reading or admitting them because
     /// every read or admission slot was taken (`overloaded`).
-    requests_overloaded,
+    requests_overloaded / 1,
     /// Requests answered with a failure on the node's side, before any
     /// stream opened: the engine not running, or an internal error.
-    requests_failed,
+    requests_failed / 1,
     /// Streams that ended with an error event after they opened: the engine
     /// stopped or failed under them.
-    streams_failed,
+    streams_failed / 1,
     /// Engine steps that ran at least one sequence.
-    steps,
+    steps / STEP_QUANTUM,
     /// Wall time of those steps, in microseconds.
-    step_micros,
+    step_micros / STEP_MICROS_QUANTUM,
     /// Sequences those steps ran, summed over the steps: over `steps`, the
     /// mean batch.
-    step_rows,
+    step_rows / STEP_QUANTUM,
     /// Prompt positions computed: the prompts' uncached parts, and the
     /// recomputation of a preempted sequence.
-    prefill_tokens,
+    prefill_tokens / PROMPT_TOKEN_QUANTUM,
     /// Tokens generated.
-    generated_tokens,
+    generated_tokens / 1,
     /// Speculative draft tokens proposed.
-    drafted_tokens,
+    drafted_tokens / 1,
     /// Of those, the ones accepted.
-    accepted_drafts,
+    accepted_drafts / 1,
     /// Running sequences preempted to make room.
-    preemptions,
+    preemptions / 1,
     /// Requests admitted for the first time, each with one prefix-cache
     /// lookup.
-    prefix_lookups,
-    /// Prompt tokens those lookups found in the prefix cache, floored to
-    /// [`PREFIX_TOKEN_QUANTUM`].
-    prefix_hit_tokens,
-    /// Prompt tokens they did not, floored to [`PREFIX_TOKEN_QUANTUM`].
-    prefix_miss_tokens,
+    prefix_lookups / 1,
+    /// Prompt tokens those lookups found in the prefix cache.
+    prefix_hit_tokens / PROMPT_TOKEN_QUANTUM,
+    /// Prompt tokens they did not.
+    prefix_miss_tokens / PROMPT_TOKEN_QUANTUM,
     /// Cache entries dropped from the device pools to make room, with no
     /// host tier to take them.
-    cache_device_evictions,
+    cache_device_evictions / BLOCK_QUANTUM,
     /// Cache entries dropped from the host tier to make room.
-    cache_host_evictions,
+    cache_host_evictions / BLOCK_QUANTUM,
     /// Blocks demoted from the device pools to the host tier.
-    cache_demoted_blocks,
+    cache_demoted_blocks / BLOCK_QUANTUM,
     /// Blocks promoted from the host tier back to the device for a hit.
-    cache_promoted_blocks,
+    cache_promoted_blocks / BLOCK_QUANTUM,
 }
 
 /// One pool's occupancy, its counts quantized ([`quantize_occupancy`]).
@@ -333,8 +368,10 @@ impl NodeTelemetry {
 
     /// Reads the member's value: exactly [`NodeTelemetry::MEMBERS`], each of
     /// exactly its own members, `boot_id` as [`BOOT_ID_BYTES`] of lowercase
-    /// hex, every number an integer that fits `u64`, at most [`MAX_POOLS`]
-    /// pools, none occupied past its size. `None` for anything else.
+    /// hex, every number an integer that fits `u64`, every counter a
+    /// multiple of its quantum ([`NodeCounters::QUANTA`]), at most
+    /// [`MAX_POOLS`] pools, none occupied past its size. `None` for anything
+    /// else.
     pub fn from_value(value: &Value) -> Option<Self> {
         let object = value.as_object()?;
         if object.len() != Self::MEMBERS.len() {
@@ -381,10 +418,11 @@ mod tests {
 
     fn sample() -> NodeTelemetry {
         let mut counters = NodeCounters::default();
-        for (i, name) in NodeCounters::MEMBERS.iter().enumerate() {
-            // A distinct value per member, through the wire names.
+        for (i, (name, quantum)) in NodeCounters::QUANTA.iter().enumerate() {
+            // A distinct value per member, on its quantum, through the wire
+            // names.
             let mut value = counters.to_value();
-            value[*name] = (i as u64 + 1).into();
+            value[*name] = ((i as u64 + 1) * quantum).into();
             counters = NodeCounters::from_value(&value).unwrap();
         }
         NodeTelemetry {
@@ -517,6 +555,10 @@ mod tests {
                 Box::new(|v| v["counters"]["steps"] = "1".into()),
             ),
             (
+                "coarse counter off its quantum",
+                Box::new(|v| v["counters"]["prefill_tokens"] = 1025.into()),
+            ),
+            (
                 "unknown gauge",
                 Box::new(|v| v["gauges"]["lineages"] = 1.into()),
             ),
@@ -567,11 +609,11 @@ mod tests {
     fn deltas_are_growth_since_an_earlier_snapshot() {
         let earlier = sample().counters;
         let mut later = earlier;
-        later.steps += 10;
+        later.requests_finished += 10;
         later.generated_tokens += 40;
         assert!(later.covers(&earlier));
         let delta = later.since(&earlier);
-        assert_eq!(delta.steps, 10);
+        assert_eq!(delta.requests_finished, 10);
         assert_eq!(delta.generated_tokens, 40);
         assert_eq!(
             delta.entries().iter().map(|(_, v)| v).sum::<u64>(),
@@ -624,16 +666,85 @@ mod tests {
     }
 
     #[test]
-    fn prefix_token_counts_are_floored() {
-        assert_eq!(quantize_prefix_tokens(0), 0);
-        assert_eq!(quantize_prefix_tokens(PREFIX_TOKEN_QUANTUM - 1), 0);
+    fn counts_are_floored_to_their_quantum() {
+        assert_eq!(floor_to(0, PROMPT_TOKEN_QUANTUM), 0);
+        assert_eq!(floor_to(PROMPT_TOKEN_QUANTUM - 1, PROMPT_TOKEN_QUANTUM), 0);
         assert_eq!(
-            quantize_prefix_tokens(PREFIX_TOKEN_QUANTUM),
-            PREFIX_TOKEN_QUANTUM
+            floor_to(PROMPT_TOKEN_QUANTUM, PROMPT_TOKEN_QUANTUM),
+            PROMPT_TOKEN_QUANTUM
         );
         assert_eq!(
-            quantize_prefix_tokens(3 * PREFIX_TOKEN_QUANTUM + 5),
-            3 * PREFIX_TOKEN_QUANTUM
+            floor_to(3 * PROMPT_TOKEN_QUANTUM + 5, PROMPT_TOKEN_QUANTUM),
+            3 * PROMPT_TOKEN_QUANTUM
+        );
+        assert_eq!(floor_to(17, 1), 17);
+    }
+
+    /// The counters a quiet interval's cached prompt length could be read
+    /// from, given the gateway's exact token totals, are exactly these, at
+    /// these quanta; every other is exact. A new member states its quantum
+    /// here on purpose.
+    #[test]
+    fn the_counters_coarsened_are_exactly_these() {
+        let coarse: Vec<(&str, u64)> = NodeCounters::QUANTA
+            .iter()
+            .copied()
+            .filter(|&(_, q)| q != 1)
+            .collect();
+        assert_eq!(
+            coarse,
+            [
+                ("steps", STEP_QUANTUM),
+                ("step_micros", STEP_MICROS_QUANTUM),
+                ("step_rows", STEP_QUANTUM),
+                ("prefill_tokens", PROMPT_TOKEN_QUANTUM),
+                ("prefix_hit_tokens", PROMPT_TOKEN_QUANTUM),
+                ("prefix_miss_tokens", PROMPT_TOKEN_QUANTUM),
+                ("cache_device_evictions", BLOCK_QUANTUM),
+                ("cache_host_evictions", BLOCK_QUANTUM),
+                ("cache_demoted_blocks", BLOCK_QUANTUM),
+                ("cache_promoted_blocks", BLOCK_QUANTUM),
+            ]
+        );
+        assert_eq!(
+            NodeCounters::QUANTA
+                .iter()
+                .map(|(m, _)| *m)
+                .collect::<Vec<_>>(),
+            NodeCounters::MEMBERS
+        );
+        // 64 blocks of the pinned deployments' 16 tokens is the prompt quantum.
+        assert_eq!(BLOCK_QUANTUM * 16, PROMPT_TOKEN_QUANTUM);
+    }
+
+    /// The reader takes each member on its quantum and refuses a coarse one
+    /// off it, so a node that sent one exact is not exported; coarsening
+    /// floors each member to its own quantum.
+    #[test]
+    fn the_reader_refuses_a_count_off_its_quantum() {
+        for (name, quantum) in NodeCounters::QUANTA {
+            let mut value = NodeCounters::default().to_value();
+            value[*name] = (3 * quantum).into();
+            let read = NodeCounters::from_value(&value)
+                .unwrap_or_else(|| panic!("{name} on its quantum is refused"));
+            assert_eq!(read.coarsened(), read, "{name}");
+            value[*name] = (3 * quantum + 1).into();
+            assert_eq!(
+                NodeCounters::from_value(&value).is_some(),
+                *quantum == 1,
+                "{name} off its quantum"
+            );
+        }
+        let exact = NodeCounters {
+            steps: STEP_QUANTUM + 5,
+            generated_tokens: 7,
+            prefill_tokens: 2 * PROMPT_TOKEN_QUANTUM + 1,
+            ..NodeCounters::default()
+        };
+        let c = exact.coarsened();
+        assert_eq!(
+            (c.steps, c.generated_tokens, c.prefill_tokens),
+            (STEP_QUANTUM, 7, 2 * PROMPT_TOKEN_QUANTUM)
         );
     }
 }

@@ -2354,19 +2354,20 @@ async fn a_fallback_that_opened_while_the_request_waited_is_skipped() {
     last.state.release.notify_waiters();
 }
 
-/// A node's telemetry snapshot, as one would report it.
+/// A node's telemetry snapshot, as one would report it: `steps` in the
+/// quantum the node floors them to.
 fn node_snapshot(
     boot: u8,
     steps: u64,
     running: u64,
 ) -> eidola_common::engine_protocol::telemetry::NodeTelemetry {
     use eidola_common::engine_protocol::telemetry::{
-        BOOT_ID_BYTES, NodeCounters, NodeGauges, NodeTelemetry, PoolOccupancy,
+        BOOT_ID_BYTES, NodeCounters, NodeGauges, NodeTelemetry, PoolOccupancy, STEP_QUANTUM,
     };
     NodeTelemetry {
         boot_id: [boot; BOOT_ID_BYTES],
         counters: NodeCounters {
-            steps,
+            steps: steps * STEP_QUANTUM,
             ..NodeCounters::default()
         },
         gauges: NodeGauges {

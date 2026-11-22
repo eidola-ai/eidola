@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use common::*;
 use eidola_common::engine_protocol::telemetry::{
-    INFO_TELEMETRY_MEMBER, NodeTelemetry, PoolOccupancy, quantize_prefix_tokens,
+    INFO_TELEMETRY_MEMBER, NodeTelemetry, PROMPT_TOKEN_QUANTUM, PoolOccupancy, STEP_MICROS_QUANTUM,
+    STEP_QUANTUM, floor_to,
 };
 use eidola_server_engine::config::env;
 use futures_util::StreamExt;
@@ -132,20 +133,30 @@ async fn the_snapshot_follows_the_engine() {
     assert_eq!(c.requests_cancelled, 1);
     assert_eq!(c.requests_overloaded, 1);
     assert_eq!(c.prefix_lookups, 3);
-    assert!(c.steps > 0 && c.step_rows >= c.steps, "{c:?}");
-    assert!(c.step_micros > 0, "{c:?}");
     assert!(c.generated_tokens >= 2 * 4, "{c:?}");
-    assert!(c.prefill_tokens > 0, "{c:?}");
     assert!(c.drafted_tokens >= c.accepted_drafts, "{c:?}");
-    // The prefix cache's token counts leave the node floored; the engine's own are
-    // exact.
+    // The step, step time and prompt counts leave the node floored, each to its
+    // quantum (at this little work, mostly to zero); the request and token counts
+    // are exact.
+    assert!(
+        s.forward_steps > 0 && s.step_rows >= s.forward_steps && s.step_micros > 0,
+        "{s:?}"
+    );
+    assert!(s.prefill_tokens > 0, "{s:?}");
+    assert_eq!(c.steps, floor_to(s.forward_steps, STEP_QUANTUM));
+    assert_eq!(c.step_rows, floor_to(s.step_rows, STEP_QUANTUM));
+    assert_eq!(c.step_micros, floor_to(s.step_micros, STEP_MICROS_QUANTUM));
+    assert_eq!(
+        c.prefill_tokens,
+        floor_to(s.prefill_tokens, PROMPT_TOKEN_QUANTUM)
+    );
     assert_eq!(
         c.prefix_hit_tokens,
-        quantize_prefix_tokens(s.prefix_hit_tokens)
+        floor_to(s.prefix_hit_tokens, PROMPT_TOKEN_QUANTUM)
     );
     assert_eq!(
         c.prefix_miss_tokens,
-        quantize_prefix_tokens(s.prefix_miss_tokens)
+        floor_to(s.prefix_miss_tokens, PROMPT_TOKEN_QUANTUM)
     );
     assert!(after.counters.covers(&during.counters));
     assert_eq!(

@@ -48,7 +48,7 @@ use eidola_common::engine_protocol::DeclaredPrefixRefusal;
 use eidola_common::engine_protocol::STREAM_CADENCE;
 use eidola_common::engine_protocol::telemetry::{
     BOOT_ID_BYTES, INFO_TELEMETRY_MEMBER, MAX_POOLS, NodeCounters, NodeGauges, NodeTelemetry,
-    PoolOccupancy, SNAPSHOT_EPOCH, quantize_prefix_tokens,
+    PoolOccupancy, SNAPSHOT_EPOCH,
 };
 use eidola_common::stream_shape::{Framer, StreamEvent, pad_body};
 use eidola_engine::engine::{FinishReason, SubmitError};
@@ -238,8 +238,8 @@ pub fn build_info() -> Value {
 
 /// The node's telemetry snapshot (`eidola_common::engine_protocol::telemetry`): the
 /// engine thread's counters as last published, the node's own count of `overloaded`
-/// refusals, and the pools as last recounted, with the prefix cache's token counts and
-/// the pools' occupancy coarsened as the contract states. Nothing in it is per request
+/// refusals, and the pools as last recounted, with the counters and the pools'
+/// occupancy coarsened as the contract states. Nothing in it is per request
 /// (`AGENTS.md` → Telemetry).
 fn telemetry(state: &AppState) -> NodeTelemetry {
     let s = state.engine.stats();
@@ -264,13 +264,14 @@ fn telemetry(state: &AppState) -> NodeTelemetry {
             accepted_drafts: s.accepted_drafts,
             preemptions: s.preemptions,
             prefix_lookups: s.admissions,
-            prefix_hit_tokens: quantize_prefix_tokens(s.prefix_hit_tokens),
-            prefix_miss_tokens: quantize_prefix_tokens(s.prefix_miss_tokens),
+            prefix_hit_tokens: s.prefix_hit_tokens,
+            prefix_miss_tokens: s.prefix_miss_tokens,
             cache_device_evictions: s.device_evictions,
             cache_host_evictions: s.host_evictions,
             cache_demoted_blocks: s.demoted_blocks,
             cache_promoted_blocks: s.promoted_blocks,
-        },
+        }
+        .coarsened(),
         gauges: NodeGauges {
             sequences_waiting: s.waiting,
             sequences_running: s.running,

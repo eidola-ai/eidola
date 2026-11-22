@@ -947,11 +947,16 @@ mod tests {
     fn a_snapshot_reads_as_present_absent_or_unparsed() {
         let mut info = serde_json::json!({"model": "m", "weights_sha256": "00"});
         assert_eq!(Reading::of(&info), Reading::Absent);
-        info[INFO_TELEMETRY_MEMBER] = snapshot(1, 5, 0).to_value();
+        let steps = eidola_common::engine_protocol::telemetry::STEP_QUANTUM;
+        info[INFO_TELEMETRY_MEMBER] = snapshot(1, steps, 0).to_value();
         assert_eq!(
             Reading::of(&info),
-            Reading::Read(Box::new(snapshot(1, 5, 0)))
+            Reading::Read(Box::new(snapshot(1, steps, 0)))
         );
+        // A count the node should have floored, sent exact, is not read.
+        info[INFO_TELEMETRY_MEMBER] = snapshot(1, steps + 5, 0).to_value();
+        assert_eq!(Reading::of(&info), Reading::Unparsed);
+        info[INFO_TELEMETRY_MEMBER] = snapshot(1, steps, 0).to_value();
         info[INFO_TELEMETRY_MEMBER]["request_ids"] = serde_json::json!([]);
         assert_eq!(Reading::of(&info), Reading::Unparsed);
         info[INFO_TELEMETRY_MEMBER] = serde_json::Value::Null;
