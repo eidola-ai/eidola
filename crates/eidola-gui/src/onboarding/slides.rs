@@ -335,7 +335,10 @@ impl RenderOnce for CreateAccount {
                             .checked(self.agreed)
                             .disabled(!have_documents)
                             .tab_stop(false)
-                            .p_1(),
+                            .p_1()
+                            // A Medium checkbox's label is 0.875rem in the
+                            // component; the consent line is set at 1rem.
+                            .text_base(),
                     ),
             )
             .when_some(self.error, |el, err| {
@@ -406,7 +409,7 @@ impl RenderOnce for CreateAccount {
                 Button::new("onboarding-btn-create")
                     .role(RoleOverride::Presentational)
                     .ghost()
-                    .label(label)
+                    .child(crate::theme::button_label(label))
                     .disabled(!enabled)
                     .tab_stop(false),
             );
@@ -777,7 +780,7 @@ fn cta_button(
             Button::new(SharedString::from(format!("onboarding-btn-{key}")))
                 .role(RoleOverride::Presentational)
                 .ghost()
-                .label(label)
+                .child(crate::theme::button_label(label))
                 .tab_stop(false),
         )
 }

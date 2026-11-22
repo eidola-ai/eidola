@@ -22,7 +22,7 @@
 use gpui::{
     AnyElement, App, AppContext, Bounds, BoxShadow, Context, Element, Entity, Focusable,
     GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
-    ParentElement, Pixels, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    ParentElement, Pixels, ScrollEvent, SharedString, StatefulInteractiveElement, Styled,
     TouchPhase, Window, div, hsla, linear_color_stop, linear_gradient, point,
     prelude::FluentBuilder as _, px, size,
 };
@@ -1223,7 +1223,7 @@ impl SpaceView {
             // reintroduces no phantom scroll.
             .overflow_y_scroll()
             .track_scroll(&self.composer_scroll)
-            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
+            .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
                 if matches!(ev.touch_phase, TouchPhase::Started) {
                     this.scroll_owner = None;
                 }

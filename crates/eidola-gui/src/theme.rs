@@ -760,28 +760,29 @@ fn circadian_day(character: LightCharacter, font_scale: f32) -> ThemeConfig {
         LightCharacter::Neutral => "Circadian Day",
         LightCharacter::Warm => "Circadian Sunset",
     };
-    ThemeConfig {
-        is_default: true,
-        name: SharedString::new_static(name),
-        mode: ThemeMode::Light,
-        // Components (buttons, chrome, bylines) use the default system UI font.
-        // Prose/narrative content opts into Newsreader explicitly via its own
-        // `MarkdownStyle` (see `FONT_FAMILY`); the two font systems are kept
-        // separate on purpose.
-        font_family: None,
-        // gpui-component installs this as the window `rem_size`, so scaling it
-        // scales every `rems()`-relative chrome size, line height, and padding
-        // in one move (see `space_view::prose_style` for the prose ramp — the
-        // one absolute-pixel exception that scales itself).
-        font_size: Some(UI_FONT_SIZE * font_scale),
-        mono_font_family: None,
-        mono_font_size: Some(UI_FONT_SIZE * font_scale),
-        radius: Some(6),
-        radius_lg: Some(12),
-        shadow: Some(true),
-        colors: character_colors(day_colors(), false, character),
-        ..ThemeConfig::default()
-    }
+    // `ThemeConfig` is `#[non_exhaustive]`: start from its default and
+    // assign the fields this theme sets.
+    let mut config = ThemeConfig::default();
+    config.is_default = true;
+    config.name = SharedString::new_static(name);
+    config.mode = ThemeMode::Light;
+    // Components (buttons, chrome, bylines) use the default system UI font.
+    // Prose/narrative content opts into Newsreader explicitly via its own
+    // `MarkdownStyle` (see `FONT_FAMILY`); the two font systems are kept
+    // separate on purpose.
+    config.font_family = None;
+    // gpui-component installs this as the window `rem_size`, so scaling it
+    // scales every `rems()`-relative chrome size, line height, and padding
+    // in one move (see `space_view::prose_style` for the prose ramp — the
+    // one absolute-pixel exception that scales itself).
+    config.font_size = Some(UI_FONT_SIZE * font_scale);
+    config.mono_font_family = None;
+    config.mono_font_size = Some(UI_FONT_SIZE * font_scale);
+    config.radius = Some(6);
+    config.radius_lg = Some(12);
+    config.shadow = Some(true);
+    config.colors = character_colors(day_colors(), false, character);
+    config
 }
 
 /// The designed UI (chrome/component) font size at Actual Size — the value
@@ -796,6 +797,20 @@ const UI_FONT_SIZE: f32 = 14.;
 /// quarter rem a side keeps the frame height and gives the line its full
 /// height. Applied at every `Input` site.
 pub const INPUT_PY: gpui::Rems = gpui::Rems(0.25);
+
+/// The label of a default-size (Medium) gpui-component `Button`, at the 1rem
+/// the app's buttons are designed at. The component sets a Medium button's
+/// content to 0.875rem, which a `text_base()` on the button cannot reach, so
+/// the label goes in as its own child instead of through `Button::label`.
+pub fn button_label(label: impl Into<SharedString>) -> impl gpui::IntoElement {
+    use gpui::{ParentElement as _, Styled as _};
+    gpui::div()
+        .min_w_0()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .text_base()
+        .child(label.into())
+}
 
 fn day_colors() -> ThemeConfigColors {
     let mut c = ThemeConfigColors::default();
@@ -887,27 +902,28 @@ fn circadian_night(character: LightCharacter, font_scale: f32) -> ThemeConfig {
         LightCharacter::Neutral => "Circadian Night",
         LightCharacter::Warm => "Circadian Dusk",
     };
-    ThemeConfig {
-        is_default: true,
-        name: SharedString::new_static(name),
-        mode: ThemeMode::Dark,
-        // System UI font for components; prose opts into Newsreader itself.
-        // Scaled like Day (this size becomes the window `rem_size`).
-        font_family: None,
-        font_size: Some(UI_FONT_SIZE * font_scale),
-        // Must be set explicitly: gpui-component only overwrites the live
-        // `Theme.mono_font_size` when the config's is `Some` (theme
-        // `schema.rs`), so leaving it `None` (via `..default`) would let dark
-        // code blocks keep the framework default `px(13.)` — unscaled, and
-        // stale-dependent on whether light was applied first.
-        mono_font_family: None,
-        mono_font_size: Some(UI_FONT_SIZE * font_scale),
-        radius: Some(8),
-        radius_lg: Some(12),
-        shadow: Some(true),
-        colors: character_colors(night_colors(), true, character),
-        ..ThemeConfig::default()
-    }
+    // `ThemeConfig` is `#[non_exhaustive]`: start from its default and
+    // assign the fields this theme sets.
+    let mut config = ThemeConfig::default();
+    config.is_default = true;
+    config.name = SharedString::new_static(name);
+    config.mode = ThemeMode::Dark;
+    // System UI font for components; prose opts into Newsreader itself.
+    // Scaled like Day (this size becomes the window `rem_size`).
+    config.font_family = None;
+    config.font_size = Some(UI_FONT_SIZE * font_scale);
+    // Must be set explicitly: gpui-component only overwrites the live
+    // `Theme.mono_font_size` when the config's is `Some` (theme
+    // `schema.rs`), so leaving it `None` (via `..default`) would let dark
+    // code blocks keep the framework default `px(13.)` — unscaled, and
+    // stale-dependent on whether light was applied first.
+    config.mono_font_family = None;
+    config.mono_font_size = Some(UI_FONT_SIZE * font_scale);
+    config.radius = Some(8);
+    config.radius_lg = Some(12);
+    config.shadow = Some(true);
+    config.colors = character_colors(night_colors(), true, character);
+    config
 }
 
 fn night_colors() -> ThemeConfigColors {

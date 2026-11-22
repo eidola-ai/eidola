@@ -6616,7 +6616,7 @@ fn a_delegated_library_row_names_the_conversation_it_came_from(cx: &mut TestAppC
 /// Send one key **down** — what a view's own key listener reads (navigation,
 /// Escape). Activation of a focused control needs the up too; see
 /// [`press_enter`].
-fn press_key(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
+fn press_key(cx: &mut TestAppContext, window: AnyWindowHandle, key: &'static str) {
     let ks = gpui::Keystroke::parse(key).unwrap();
     cx.update_window(window, |_, window, cx| {
         window.dispatch_event(
@@ -6640,7 +6640,7 @@ fn press_enter(cx: &mut TestAppContext, window: AnyWindowHandle) {
 }
 
 /// [`press_enter`] for any key: a key-down and its key-up.
-fn activate_with(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
+fn activate_with(cx: &mut TestAppContext, window: AnyWindowHandle, key: &'static str) {
     let ks = gpui::Keystroke::parse(key).unwrap();
     cx.update_window(window, |_, window, cx| {
         window.dispatch_event(
@@ -9464,7 +9464,7 @@ fn the_find_bar_qualifies_an_empty_branch_when_the_space_is_not(cx: &mut TestApp
     })
     .unwrap();
     cx.run_until_parked();
-    let type_query = |cx: &mut TestAppContext, keys: &[&str]| {
+    let type_query = |cx: &mut TestAppContext, keys: &[&'static str]| {
         cx.update_window(window, |_, window, cx| {
             for key in keys {
                 window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);

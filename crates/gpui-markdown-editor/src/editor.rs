@@ -2950,6 +2950,25 @@ impl RenderOnce for MarkdownEditor {
     }
 }
 
+/// A key binding whose chord uses gpui's `secondary-` modifier alias (⌘ on
+/// macOS, Ctrl elsewhere), resolved for the host OS. `gpui::KeyBinding::new`
+/// parses explicit modifiers only and panics on the alias. Panics on a
+/// malformed chord or context, like `KeyBinding::new`.
+pub fn secondary_key_binding<A: gpui::Action>(
+    keystrokes: &str,
+    action: A,
+    context: Option<&str>,
+    cx: &App,
+) -> gpui::KeyBinding {
+    let context = context.map(|context| {
+        gpui::KeyBindingContextPredicate::parse(context)
+            .expect("valid key context")
+            .into()
+    });
+    gpui::KeyBinding::load(keystrokes, Box::new(action), context, false, None, cx)
+        .expect("valid keystroke")
+}
+
 /// Install the editor's default keymap, scoped to the `MarkdownEditor`
 /// key context. Self-contained so the editor is a drop-in like
 /// `gpui_component::Input` (whose keymap `gpui_component::init` installs) —
@@ -2988,21 +3007,23 @@ pub fn init(cx: &mut App) {
             },
             ctx,
         ),
-        gpui::KeyBinding::new(
+        secondary_key_binding(
             "secondary-enter",
             Enter {
                 secondary: true,
                 shift: false,
             },
             ctx,
+            cx,
         ),
-        gpui::KeyBinding::new(
+        secondary_key_binding(
             "secondary-shift-enter",
             Enter {
                 secondary: true,
                 shift: true,
             },
             ctx,
+            cx,
         ),
         // Editing
         gpui::KeyBinding::new("backspace", Backspace, ctx),
@@ -3025,19 +3046,19 @@ pub fn init(cx: &mut App) {
         // Clipboard — the `secondary-` alias, scoped to the editor context so
         // they coexist with `gpui_component::Input`'s own `Input`-context
         // bindings (which are per-platform upstream).
-        gpui::KeyBinding::new("secondary-a", SelectAll, ctx),
-        gpui::KeyBinding::new("secondary-c", Copy, ctx),
-        gpui::KeyBinding::new("secondary-x", Cut, ctx),
-        gpui::KeyBinding::new("secondary-v", Paste, ctx),
-        gpui::KeyBinding::new("secondary-shift-v", PastePlain, ctx),
+        secondary_key_binding("secondary-a", SelectAll, ctx, cx),
+        secondary_key_binding("secondary-c", Copy, ctx, cx),
+        secondary_key_binding("secondary-x", Cut, ctx, cx),
+        secondary_key_binding("secondary-v", Paste, ctx, cx),
+        secondary_key_binding("secondary-shift-v", PastePlain, ctx, cx),
         // Semantic inline formatting (⌘B/⌘I on macOS, Ctrl+B/Ctrl+I
         // elsewhere). The update pipeline owns all delimiter/context logic.
-        gpui::KeyBinding::new("secondary-b", ToggleBold, ctx),
-        gpui::KeyBinding::new("secondary-i", ToggleItalic, ctx),
+        secondary_key_binding("secondary-b", ToggleBold, ctx, cx),
+        secondary_key_binding("secondary-i", ToggleItalic, ctx, cx),
         // Undo / redo — the `secondary-` alias, scoped to the editor context
         // so they coexist with `gpui_component::Input`'s own bindings.
-        gpui::KeyBinding::new("secondary-z", Undo, ctx),
-        gpui::KeyBinding::new("secondary-shift-z", Redo, ctx),
+        secondary_key_binding("secondary-z", Undo, ctx, cx),
+        secondary_key_binding("secondary-shift-z", Redo, ctx, cx),
     ];
 
     // macOS motion/deletion idiom: ⌥ = word, ⌘ = line (arrows) / document

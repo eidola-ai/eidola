@@ -1934,7 +1934,7 @@ impl SpaceView {
                 // conversation behind it. Inner scrollers run first (dispatch
                 // bubbles inner→outer), so this stops only the gestures that
                 // landed on the overlay's own padding.
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .on_scroll(|_, _, cx| cx.stop_propagation())
                 .flex()
                 .flex_row()
                 .items_stretch()

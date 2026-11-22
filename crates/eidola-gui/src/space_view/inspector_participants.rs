@@ -2304,7 +2304,7 @@ impl SpaceView {
                         .track_focus(&form.list_focus)
                         // The candidate list is bounded and nested in the
                         // inspector body; its wheel must not scroll that body.
-                        .on_scroll_wheel(cx.listener(|_, _: &gpui::ScrollWheelEvent, _, cx| {
+                        .on_scroll(cx.listener(|_, _: &gpui::ScrollEvent, _, cx| {
                             cx.stop_propagation();
                         }))
                         .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
