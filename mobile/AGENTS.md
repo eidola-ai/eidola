@@ -9,6 +9,7 @@ The native apps the App Store and Play Store distribute. Each is a thin shell ar
 | `android/` | Kotlin, framework APIs only (WebView, `org.json`, `java.net`), built without Gradle by the SDK's own tools. |
 | `contract-test/` | A plain-JS page that exercises the whole contract against the shell it runs in, and the default embedded bundle. `shell.js` is the reference bridge. |
 | `tools/` | `echo_server.py` (the test page's TCP peer), `bundle_digest.py` (the digest a shell shows, computed from a directory). |
+| `build-bundle.sh`, `bundle-repro.sh`, `self-test.sh` | The app bundle (`crates/eidola-mobile`, wasm32) built reproducibly, checked by two clean builds, and its headless self-test under either shell; see `crates/eidola-mobile/AGENTS.md`. |
 | `device-checklist.md` | What to prepare before running a build on a physical device. |
 
 ## Doctrine
@@ -27,8 +28,13 @@ Both launcher icons are generated from `brand/` (`just update-brand`, macOS only
 
 ## Building and testing
 
+Both shells embed **the app bundle** by default (`build.sh` without `--bundle` runs `../build-bundle.sh` and embeds `build/bundle`); their own tests embed the contract test page (`--bundle ../contract-test`), and so does `repro.sh` without arguments, which keeps `reproducible.sha256` independent of the Rust build.
+
 | Recipe | Script | Does |
 |---|---|---|
+| `just mobile-bundle` | `build-bundle.sh` | The app bundle into `build/bundle` (`--self-test`: the self-test bundle). Prints sizes and the bundle digest. |
+| `just mobile-bundle-repro` | `bundle-repro.sh` | Two builds from scratch, compared file by file. |
+| `just mobile-self-test ios\|android` | `self-test.sh` | The app's self-test bundle under a debug shell, on its own simulator or AVD (`eidola-bridge`), against shims and an echo server run here: attestation over the pipe and its refusal, the durability barrier, the profile across a cold relaunch, throughput. Evidence to `build/self-test/<platform>/`. |
 | `just mobile-ios-sim` | `ios/build.sh` | Builds the iOS shell for the Simulator, unsigned, embedding `--bundle DIR` (default the test page); `--release`, `--device` (signed by the team in the project). |
 | `just mobile-ios-test` | `ios/test-sim.sh` | XCUITest on the simulator `eidola-shell` (created once; never another device): the test page's verdict, the bundle sheet opened from the home-screen quick action and compared with the page's digest, a cold relaunch. Screenshots to `ios/build/shots`. |
 | `just mobile-android` | `android/build.sh` | Builds the APK (`--bundle DIR`, `--debug`, `--out DIR`); signs it too when `KEYSTORE` is set. |
@@ -75,4 +81,4 @@ A **signed** APK differs on every signing (ECDSA signatures are randomized). `to
 
 ## CI
 
-`.github/workflows/mobile-shells.yml` runs on changes under `mobile/` (and to itself) on the `mobile` branch: it builds the Android shell twice on Linux with the pinned tools, checks the strip round trip, and checks `reproducible.sha256`. iOS is the local gate above.
+`.github/workflows/mobile-shells.yml` runs on changes under `mobile/` and `crates/eidola-mobile/`, and to what pins the bundle's build (`Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`), on the `mobile` branch: it builds the Android shell twice on Linux with the pinned tools, checks the strip round trip, and checks `reproducible.sha256`; and it builds the app bundle twice from scratch (`bundle-repro.sh`). iOS is the local gate above. `rust-checks` lints `eidola-mobile` for wasm32 (with and without `self-test`) on every Rust change.
