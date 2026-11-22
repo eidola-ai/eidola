@@ -30,7 +30,6 @@
 //! every signature check.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -134,6 +133,7 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// Hashing an executable reads tens of megabytes, so the hash is taken once
 /// per process and per path. Blocking; call it off any async executor's
 /// worker threads.
+#[cfg(feature = "desktop")]
 pub fn running_install_commit(data_dir: &Path) -> Option<String> {
     let program = super::install_kind::running_program();
     let main = super::install_kind::detect(program).main_executable()?;
@@ -145,8 +145,10 @@ pub fn running_install_commit(data_dir: &Path) -> Option<String> {
 /// while this process runs keeps its first answer, which is the right one:
 /// the question is what *this* process is, and a replacement is a different
 /// release that the next launch will hash.
+#[cfg(feature = "desktop")]
 fn cached_sha256(path: &Path) -> Option<String> {
-    static CACHE: Mutex<Vec<(PathBuf, Option<String>)>> = Mutex::new(Vec::new());
+    static CACHE: std::sync::Mutex<Vec<(PathBuf, Option<String>)>> =
+        std::sync::Mutex::new(Vec::new());
     let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((_, hash)) = cache.iter().find(|(p, _)| p == path) {
         return hash.clone();

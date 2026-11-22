@@ -448,12 +448,14 @@ impl Config {
         options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&tmp).map_err(write_err)?;
-        let written = file
-            .write_all(contents.as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(write_err);
-        drop(file);
+        // The file is closed at the end of this block, before it is removed
+        // or renamed.
+        let written = {
+            let mut file = options.open(&tmp).map_err(write_err)?;
+            file.write_all(contents.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(write_err)
+        };
         if let Err(e) = written {
             let _ = fs::remove_file(&tmp);
             return Err(e);

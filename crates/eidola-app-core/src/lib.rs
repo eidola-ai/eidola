@@ -5,29 +5,33 @@ pub mod db;
 pub mod decline;
 pub mod discovery;
 pub mod error;
+#[cfg(feature = "desktop")]
 pub mod ipc;
 pub mod local_models;
 pub mod memory;
 pub mod model_catalog;
 mod peer_read;
 mod prefix_cache;
+#[cfg(feature = "desktop")]
 pub mod proxy;
 mod recorded;
 pub mod router;
+mod rt;
 pub mod search;
 pub mod subspace_driver;
 pub mod subspaces;
 pub mod summaries;
 pub mod tools;
+mod transport;
 pub mod trust_root;
 pub mod updater;
 pub mod updates;
 pub mod utility;
 mod whole_answer;
 
+use rt::{SystemTime, UNIX_EPOCH};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anonymous_credit_tokens::{
     CreditToken, IssuanceResponse, Params, PreIssuance, PreRefund, PublicKey, Refund, SpendProof,
@@ -2798,14 +2802,21 @@ impl Inner {
             + 1;
         let releases_url = self.load_config().update_releases_url();
         // Hashing the install's main executable reads tens of megabytes the
-        // first time, so it runs where blocking is allowed.
-        let data_dir = self.data_dir.clone();
-        let installed_git_commit = tokio::task::spawn_blocking(move || {
-            updater::installed::running_install_commit(&data_dir)
-        })
-        .await
-        .ok()
-        .flatten();
+        // first time, so it runs where blocking is allowed. A build without
+        // the desktop install kinds has no installed executable to hash, so
+        // it reads as a fresh install: no commit known, continuity skipped.
+        #[cfg(feature = "desktop")]
+        let installed_git_commit = {
+            let data_dir = self.data_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                updater::installed::running_install_commit(&data_dir)
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        #[cfg(not(feature = "desktop"))]
+        let installed_git_commit = None;
 
         let outcome = match updater::build_http_client() {
             Ok(client) => {
@@ -3145,20 +3156,14 @@ impl Inner {
             .cloned()
             .map(tinfoil_verifier::AllowedMeasurement::sev_snp)
             .collect();
-        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &allowed,
-            inference_base_url: &eidola.base_url,
-            trusted_ark_der: hardware_root_der.as_deref(),
-            trusted_ask_der: hardware_intermediate_der.as_deref(),
-            snp_min_tcb: None,
-            snp_observer: None,
+        transport::attesting_client(
+            &allowed,
+            &eidola.base_url,
+            hardware_root_der.as_deref(),
+            hardware_intermediate_der.as_deref(),
             attestation_observer,
-            tls_roots: load_native_root_store(),
-        })
+        )
         .await
-        .map_err(|e| AppError::Attestation {
-            message: format!("attestation client build failed: {e}"),
-        })
     }
 
     /// The plain-HTTP client used for local-engine and generic
@@ -3193,6 +3198,7 @@ impl Inner {
     /// header set is an allowlist the Record repeats back to the reader and a
     /// header the builder adds would travel outside it. See
     /// [`local_models::proxy_http_client`].
+    #[cfg(feature = "desktop")]
     fn proxy_client(&self) -> Result<reqwest::Client, AppError> {
         #[cfg(feature = "test-support")]
         if let Some(client) = &self.http_override {
@@ -3851,9 +3857,9 @@ impl Inner {
     /// rather than left waiting — a turn waits here holding `spend_gate`.
     async fn lock_issuance_gate(
         &self,
-        deadline: tokio::time::Instant,
+        deadline: rt::Instant,
     ) -> Result<tokio::sync::MutexGuard<'_, ()>, AppError> {
-        tokio::time::timeout_at(deadline, self.issuance_gate.lock())
+        rt::timeout_at(deadline, self.issuance_gate.lock())
             .await
             .map_err(|_| AppError::ProvisioningTimeout {
                 message: "timed out waiting for another credential issuance to finish".into(),
@@ -3862,7 +3868,7 @@ impl Inner {
 
     /// The account balance, read under the issuance deadline.
     async fn account_balances_bounded(&self) -> Result<BalancesResult, AppError> {
-        tokio::time::timeout(self.issuance_request_timeout(), self.account_balances())
+        rt::timeout(self.issuance_request_timeout(), self.account_balances())
             .await
             .map_err(|_| AppError::Network {
                 message: "timed out reading the account balance".into(),
@@ -3901,7 +3907,7 @@ impl Inner {
     /// answer was lost would otherwise debit once per attempt.
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
         let _issuing = self
-            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .lock_issuance_gate(rt::Instant::now() + self.provision_wait())
             .await?;
         let recovered = Box::pin(self.resolve_pending_issuances_locked()).await?;
         if !recovered.is_empty() {
@@ -3952,7 +3958,7 @@ impl Inner {
                 message: "the core is shutting down".into(),
             });
         };
-        tokio::spawn(async move { inner.allocate_locked(credits).await })
+        rt::spawn(async move { inner.allocate_locked(credits).await })
             .await
             .map_err(join_err)?
     }
@@ -4171,7 +4177,7 @@ impl Inner {
     /// the wallet; nothing about a request that is about to be made enters it.
     async fn provision_once(&self) -> Result<ProvisionOutcome, AppError> {
         let _issuing = self
-            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .lock_issuance_gate(rt::Instant::now() + self.provision_wait())
             .await?;
         // A disabled backend is asked for nothing, not even a recovery: the
         // reader has turned the service off, and nothing unattended converts
@@ -4535,7 +4541,7 @@ impl Inner {
             // The spend exactly as it was presented.
             let presented =
                 PresentedSpend::new(&issuer_key_hash, &spend_proof_cbor, &row.pre_refund_data);
-            let answer = tokio::time::timeout(
+            let answer = rt::timeout(
                 SPEND_RECOVERY_REQUEST_TIMEOUT,
                 recover_refund(&client, base_url, &presented, Some(row.spend_until)),
             )
@@ -4580,7 +4586,7 @@ impl Inner {
     /// or its recovery except on the reader's own instruction.
     async fn recover_pending_issuances(&self) -> Result<IssuanceRecovery, AppError> {
         let _issuing = self
-            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .lock_issuance_gate(rt::Instant::now() + self.provision_wait())
             .await?;
         let recovered = Box::pin(self.recover_pending_issuances_locked()).await?;
         let (waiting, unresolved) = self.pending_issuance_counts().await?;
@@ -7186,7 +7192,7 @@ impl Inner {
         funding: Funding,
     ) -> Result<Vec<(db::SpendableCredential, i64)>, AppError> {
         let wait = self.provision_wait();
-        let deadline = tokio::time::Instant::now() + wait;
+        let deadline = rt::Instant::now() + wait;
         // A hold no turn in this process is flying with settles only when
         // somebody asks for it: once before anything is converted for this
         // request, and once more while it waits, with the last quarter of
@@ -7247,9 +7253,9 @@ impl Inner {
                     .map(|c| c.credits)
                     .collect();
                 if settlement_could_cover(&in_flight, &held, charge_credits)
-                    && tokio::time::Instant::now() < deadline
+                    && rt::Instant::now() < deadline
                 {
-                    tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
+                    rt::sleep(PROVISION_POLL_INTERVAL).await;
                     continue;
                 }
                 return match chosen_inputs(db_conn, charge_credits).await? {
@@ -7326,14 +7332,14 @@ impl Inner {
                 ))
                 .collect();
             let recoverable = settlement_could_cover(&in_flight, &held, charge_credits);
-            if recoverable && tokio::time::Instant::now() < deadline {
-                if stranded_asks == 1 && tokio::time::Instant::now() >= last_ask_at {
+            if recoverable && rt::Instant::now() < deadline {
+                if stranded_asks == 1 && rt::Instant::now() >= last_ask_at {
                     stranded_asks = 0;
                     if self.recover_stranded_spends_by(deadline).await {
                         continue;
                     }
                 }
-                tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
+                rt::sleep(PROVISION_POLL_INTERVAL).await;
                 continue;
             }
 
@@ -7404,13 +7410,13 @@ impl Inner {
     ///
     /// On a task of its own: a turn's future is deep already, and settling a
     /// refund checks its proof on the stack.
-    async fn recover_stranded_spends_by(&self, deadline: tokio::time::Instant) -> bool {
+    async fn recover_stranded_spends_by(&self, deadline: rt::Instant) -> bool {
         let Some(inner) = self.self_ref.upgrade() else {
             return false;
         };
-        let recovery = tokio::spawn(async move { inner.recover_stranded_spends().await });
+        let recovery = rt::spawn(async move { inner.recover_stranded_spends().await });
         matches!(
-            tokio::time::timeout_at(deadline, recovery).await,
+            rt::timeout_at(deadline, recovery).await,
             Ok(Ok(Ok(recovered))) if !recovered.is_empty()
         )
     }
@@ -11102,7 +11108,7 @@ pub(crate) fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
 // ============================================================================
 
 pub struct AppCore {
-    runtime: tokio::runtime::Runtime,
+    runtime: rt::Runtime,
     inner: Arc<Inner>,
     /// The invalidation bus, shared with `Inner` so callers can subscribe
     /// while `Inner` emits on the tokio runtime.
@@ -11110,6 +11116,7 @@ pub struct AppCore {
 }
 
 impl AppCore {
+    #[cfg(not(target_family = "wasm"))]
     pub fn runtime(&self) -> &tokio::runtime::Runtime {
         &self.runtime
     }
@@ -11547,7 +11554,7 @@ impl AppCore {
 }
 
 /// Convert a `tokio::task::JoinError` (panic / cancellation) into `AppError`.
-fn join_err(e: tokio::task::JoinError) -> AppError {
+fn join_err(e: rt::JoinError) -> AppError {
     AppError::Internal {
         message: format!("async task failed: {e}"),
     }
@@ -11721,13 +11728,9 @@ impl AppCore {
         // error instead of silently racing the first.
         let db_lock = db::DbLock::acquire(&data_dir, holder)?;
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(8 * 1024 * 1024) // 8 MB — matches default main-thread size
-            .build()
-            .map_err(|e| AppError::Internal {
-                message: format!("failed to create tokio runtime: {e}"),
-            })?;
+        let runtime = rt::new_runtime().map_err(|e| AppError::Internal {
+            message: format!("failed to create tokio runtime: {e}"),
+        })?;
         let bus = BroadcastSource::new();
         Ok(Self {
             runtime,
@@ -12288,7 +12291,7 @@ impl AppCore {
         self.runtime.spawn(async move {
             loop {
                 let _ = inner.run_update_check().await;
-                tokio::time::sleep(updates::next_poll_delay(&mut OsRng)).await;
+                rt::sleep(updates::next_poll_delay(&mut OsRng)).await;
             }
         });
     }
@@ -12376,8 +12379,8 @@ impl AppCore {
                 // provisioner's pass an account-authenticated one, so they
                 // are kept at least a quarter of the interval apart.
                 let before_sweep = provision_delay(interval / 4, interval * 3 / 4);
-                tokio::time::sleep(before_sweep).await;
-                let _ = tokio::time::timeout(
+                rt::sleep(before_sweep).await;
+                let _ = rt::timeout(
                     PROVISION_PASS_DEADLINE,
                     changes::with_origin(
                         changes::ChangeOrigin::Unattended,
@@ -12385,11 +12388,11 @@ impl AppCore {
                     ),
                 )
                 .await;
-                tokio::time::sleep(interval.saturating_sub(before_sweep)).await;
+                rt::sleep(interval.saturating_sub(before_sweep)).await;
                 // Offline, signed out, a server error: each is simply another
                 // look later. Nothing here is the reader's to see.
                 // Nobody is waiting on these writes.
-                let _ = tokio::time::timeout(
+                let _ = rt::timeout(
                     PROVISION_PASS_DEADLINE,
                     changes::with_origin(
                         changes::ChangeOrigin::Unattended,
@@ -12778,6 +12781,7 @@ impl AppCore {
     /// Snapshot of the local-inference domain: resolved engine binary and
     /// every model with its lifecycle state. Refresh on
     /// [`Change::LocalModels`].
+    #[cfg(feature = "desktop")]
     pub async fn local_models_state(&self) -> Result<LocalModelsState, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12789,6 +12793,7 @@ impl AppCore {
     /// Start a background model download from a direct `.gguf` URL (or a
     /// Hugging Face file-page URL). Returns the future `<slug>@local` id
     /// immediately; progress arrives via [`Change::LocalModels`].
+    #[cfg(feature = "desktop")]
     pub async fn download_local_model(&self, url: String) -> Result<String, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12798,6 +12803,7 @@ impl AppCore {
     }
 
     /// Cancel an in-flight model download; the partial file is removed.
+    #[cfg(feature = "desktop")]
     pub async fn cancel_local_model_download(&self, id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12808,6 +12814,7 @@ impl AppCore {
 
     /// Delete a downloaded model from disk. Fails while the model is
     /// loaded (unload first) or downloading (cancel instead).
+    #[cfg(feature = "desktop")]
     pub async fn delete_local_model(&self, id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12824,6 +12831,7 @@ impl AppCore {
     /// the row [`Self::local_models_state`] synthesizes, so this is what makes
     /// such a row go away once the reader has read it. Idempotent; emits
     /// [`Change::LocalModels`] only when something was actually forgotten.
+    #[cfg(feature = "desktop")]
     pub async fn dismiss_local_model_failure(&self, id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12836,6 +12844,7 @@ impl AppCore {
     /// is ready to serve. Resolves when the model is chat-selectable (or
     /// the load failed); intermediate states arrive via
     /// [`Change::LocalModels`].
+    #[cfg(feature = "desktop")]
     pub async fn load_local_model(&self, id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12845,6 +12854,7 @@ impl AppCore {
     }
 
     /// Unload a local model, terminating its engine subprocess.
+    #[cfg(feature = "desktop")]
     pub async fn unload_local_model(&self, id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12869,6 +12879,7 @@ impl AppCore {
     /// Signalling is not reaping: the supervisor task owns the child, so a
     /// caller that is about to `exit()` must leave the runtime a moment to
     /// run them.
+    #[cfg(feature = "desktop")]
     pub fn shutdown_engines(&self) -> usize {
         self.inner.shutdown_all_engines()
     }
@@ -12889,6 +12900,7 @@ impl AppCore {
     ///
     /// Synchronous, infallible, no filesystem and no database: one mutex
     /// acquisition over an in-memory map, safe to call from a UI callback.
+    #[cfg(feature = "desktop")]
     pub fn running_engines(&self) -> Vec<RunningEngine> {
         self.inner.running_engines()
     }
@@ -12896,6 +12908,7 @@ impl AppCore {
     /// Pin or unpin a loaded model's engine. Pinned engines are protected
     /// from automatic (LRU) unloading when another model needs the memory;
     /// manual unload still applies.
+    #[cfg(feature = "desktop")]
     pub async fn set_local_model_pinned(&self, id: String, pinned: bool) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12918,7 +12931,7 @@ impl AppCore {
     /// `backend_id`'s current incarnation — a load in flight, as another
     /// caller would find it.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     pub fn test_register_warming_local_model(&self, backend_id: &str, slug: &str, port: u16) {
         self.inner
             .local
@@ -12928,7 +12941,7 @@ impl AppCore {
     /// Test-only seam: register a fake ready engine with explicit
     /// footprint / pin / LRU timestamp — the eviction tests' fixture.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     #[allow(clippy::too_many_arguments)]
     pub fn test_register_engine(
         &self,
@@ -13477,7 +13490,7 @@ impl AppCore {
     /// Test-only seam: pin the engine-pool memory budget so eviction tests
     /// are deterministic on any machine.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     pub fn test_set_memory_budget(&self, budget: u64) {
         self.inner.local.set_memory_budget_for_test(budget);
     }
@@ -13499,7 +13512,7 @@ impl AppCore {
     /// started — the witness for "nothing was executed", which a child killed
     /// microseconds after `fork` cannot provide from outside.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     pub fn test_engine_spawn_count(&self) -> u64 {
         self.inner.local.engine_spawn_count()
     }
@@ -13508,7 +13521,7 @@ impl AppCore {
     /// — before it reserves, and before its supervisor starts the child — so a
     /// test can drive the races a retirement has with an in-flight load.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     pub fn test_pause_at_load_checkpoints(&self, pause: std::time::Duration) {
         self.inner.local.set_load_pause_for_test(pause);
     }
@@ -13516,7 +13529,7 @@ impl AppCore {
     /// Test-only seam: shorten the engine readiness budget (five minutes in
     /// production) so a test can watch the load deadline fire.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     pub fn test_set_engine_ready_timeout(&self, timeout: std::time::Duration) {
         self.inner.local.set_ready_timeout_for_test(timeout);
     }
@@ -14949,10 +14962,7 @@ fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usiz
         bytes[at..at + CACHE_KEY_PLACEHOLDER.len()].copy_from_slice(key.as_str().as_bytes());
         Ok::<_, std::io::Error>(bytes::Bytes::from(bytes))
     };
-    (
-        reqwest::Body::wrap_stream(futures_util::stream::once(chunk)),
-        len,
-    )
+    (transport::deferred_body(chunk), len)
 }
 
 /// A key stored nowhere and sent once: what a keyed body carries when its
@@ -20987,15 +20997,6 @@ pub fn iso_to_ms(s: &str) -> Result<i64, AppError> {
     let days = era * 146097 + doe as i64 - 719468;
     let secs = days * 86400 + hour * 3600 + min * 60 + sec;
     Ok(secs * 1000)
-}
-
-pub(crate) fn load_native_root_store() -> rustls::RootCertStore {
-    let mut store = rustls::RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        let _ = store.add(cert);
-    }
-    store
 }
 
 fn params_from_domain_separator(ds: &str) -> Result<Params, AppError> {

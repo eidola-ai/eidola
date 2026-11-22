@@ -15,6 +15,14 @@ license = "GPL-3.0-only"
 # unit + integration tests, so `cargo test` sees the seams while release
 # builds of the cli/GUI provably contain no attestation-bypass path.
 test-support = []
+# The desktop-only subsystems: the IPC control socket, the local inference
+# proxy, the local llama.cpp engines, and the updater's desktop install kinds
+# and installer. On by default, so the CLI and GUI build exactly as they did;
+# the wasm32 build for the mobile app turns it off. Platform facilities (the
+# multi-threaded runtime, the filesystem lock, the OS trust store) are gated
+# by target instead, so a native build without this feature keeps them.
+default = ["desktop"]
+desktop = ["dep:eidola-apple", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:zip"]
 
 [dependencies]
 anonymous-credit-tokens = "0.4"
@@ -27,9 +35,6 @@ ecdsa = { version = "0.16", features = ["der", "verifying"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 eidola-attestation = { path = "../eidola-attestation" }
 eidola-common = { path = "../eidola-common", features = ["spend-credentials"] }
-# Advisory (flock) file locking for the local-database lockfile. Pure Rust
-# (rustix), sync backend only — no async runtime pulled in.
-fs4 = { version = "1", default-features = false, features = ["sync"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -40,32 +45,24 @@ regex = "1"
 # packages to the client payload — which is why hyper is preferred here over
 # axum, whose routing and extractors this three-route surface has no use for.
 bytes = "1"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 futures-util = { version = "0.3", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-rustls-native-certs = "0.8"
 rustls-rustcrypto = "0.1.0-pre.0"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-eidola-apple = { path = "../eidola-apple" }
+# The installer's detached-signature reconstruction (`updater::install`).
+eidola-apple = { path = "../eidola-apple", optional = true }
 sha2 = "0.11"
 signature = "2"
 spki = { version = "0.7", features = ["pem"] }
 thiserror = "2"
 tinfoil-verifier = { path = "../tinfoil-verifier" }
-tokio = { version = "1", features = [
-    "sync",
-    "rt-multi-thread",
-    "process",
-    "fs",
-    "io-util",
-    "time",
-    "macros",
-] }
+tokio = { version = "1", features = ["sync", "rt", "io-util", "time", "macros"] }
 toml = "1"
 turso = { git = "https://github.com/eidola-ai/turso", branch = "fix-concurrent-view-expansion-guard", default-features = false, features = ["pure-rust-crypto"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
@@ -73,7 +70,32 @@ x509-cert = "0.2"
 # Scrubs the prefix-cache key (`prefix_cache`) wherever this crate holds it.
 # Already in this crate's graph through the credential and TLS crates.
 zeroize = "1"
-zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# The installer's container reader (`updater::install`).
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"], optional = true }
+
+# What a browser does not have: the multi-threaded runtime, subprocesses and
+# tokio's filesystem, the OS trust store, and flock.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Advisory (flock) file locking for the local-database lockfile. Pure Rust
+# (rustix), sync backend only — no async runtime pulled in.
+fs4 = { version = "1", default-features = false, features = ["sync"] }
+rustls-native-certs = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "fs"] }
+
+# What wasm32 needs in their place: randomness and the clock from the browser
+# (wasm32-unknown-unknown has no OS for either), and its event loop for the
+# runtime seam (`src/rt.rs`). getrandom 0.3 also needs the `getrandom_backend`
+# cfg that `.cargo/config.toml` sets for this target.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+js-sys = "0.3"
+rustls-pki-types = { version = "1", features = ["web"] }
+uuid = { version = "1", features = ["js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-time = "1"
 
 [build-dependencies]
 # The model catalog's reader (`models/`), the one the gateway's build runs, so
@@ -86,7 +108,10 @@ sha2 = "0.11"
 [dev-dependencies]
 # Self-reference: turns the `test-support` feature on for this crate's own
 # test builds (unit + `tests/`) without exposing it to downstream consumers.
-eidola-app-core = { path = ".", features = ["test-support"] }
+# `default-features = false`, so this reference cannot switch `desktop` back
+# on for a test build that turned it off; the default build gets it from the
+# package's own defaults.
+eidola-app-core = { path = ".", default-features = false, features = ["test-support"] }
 # Strict chat-request acceptance bridge for the real HTTP harness captures.
 # Test-only: app-core's production dependency graph must not include server.
 eidola-server-gateway = { path = "../eidola-server-gateway", features = ["test-support"] }
@@ -105,3 +130,31 @@ rustls-rustcrypto = "0.1.0-pre.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+# Suites of the desktop-only subsystems: a build without `desktop` skips them.
+# Each names its path, so the image builds' stub workspace (manifests without
+# sources) still resolves.
+[[test]]
+name = "ipc_protocol"
+path = "tests/ipc_protocol.rs"
+required-features = ["desktop"]
+
+[[test]]
+name = "local_models"
+path = "tests/local_models.rs"
+required-features = ["desktop"]
+
+[[test]]
+name = "proxy"
+path = "tests/proxy.rs"
+required-features = ["desktop"]
+
+[[test]]
+name = "updater_install_modes"
+path = "tests/updater_install_modes.rs"
+required-features = ["desktop"]
+
+[[test]]
+name = "updater_install_stage"
+path = "tests/updater_install_stage.rs"
+required-features = ["desktop"]

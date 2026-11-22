@@ -112,6 +112,7 @@ pub struct DbLock {
     /// descriptor and releases. The lockfile itself is left on disk (an
     /// unlocked file is meaningless, and unlinking it would race a contender
     /// that already opened it).
+    #[cfg(not(target_family = "wasm"))]
     _file: std::fs::File,
     path: PathBuf,
 }
@@ -131,6 +132,7 @@ pub enum LockHolder {
 }
 
 impl LockHolder {
+    #[cfg(not(target_family = "wasm"))]
     fn as_str(self) -> &'static str {
         match self {
             LockHolder::App => "app",
@@ -152,6 +154,7 @@ impl DbLock {
     /// lockfile if needed, and record `holder` in it. Fails with
     /// [`AppError::DatabaseInUse`] if another process (or another `AppCore`
     /// in this one) already holds it.
+    #[cfg(not(target_family = "wasm"))]
     pub fn acquire(data_dir: &Path, holder: LockHolder) -> Result<Self, AppError> {
         use fs4::{FileExt, TryLockError};
 
@@ -211,9 +214,42 @@ impl DbLock {
         Ok(Self { _file: file, path })
     }
 
+    /// wasm32 has no `flock`, and a browser page is one process: the lock is
+    /// held in this process alone, so a second `AppCore` on one data dir is
+    /// refused here exactly as natively. Nothing is written to disk.
+    #[cfg(target_family = "wasm")]
+    pub fn acquire(data_dir: &Path, _holder: LockHolder) -> Result<Self, AppError> {
+        let path = data_dir.join(LOCK_FILE_NAME);
+        let mut held = HELD_LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+        if held.contains(&path) {
+            return Err(AppError::DatabaseInUse {
+                pid: None,
+                message: format!(
+                    "this database is already open ({}).",
+                    data_dir.join("eidola.db").display()
+                ),
+            });
+        }
+        held.push(path.clone());
+        Ok(Self { path })
+    }
+
     /// Path of the lockfile this guard holds (diagnostics/tests).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// The lockfiles this process holds, on wasm32 (see the wasm32
+/// [`DbLock::acquire`]).
+#[cfg(target_family = "wasm")]
+static HELD_LOCKS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_family = "wasm")]
+impl Drop for DbLock {
+    fn drop(&mut self) {
+        let mut held = HELD_LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+        held.retain(|path| *path != self.path);
     }
 }
 
@@ -225,6 +261,7 @@ impl std::fmt::Debug for DbLock {
 
 /// Stamp our pid and holder kind into the (already locked) lockfile, as one
 /// line: `<pid> <app|command>`.
+#[cfg(not(target_family = "wasm"))]
 fn write_lock_record(file: &std::fs::File, holder: LockHolder) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
     let mut file = file;
