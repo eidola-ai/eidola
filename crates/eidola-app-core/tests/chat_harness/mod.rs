@@ -4902,6 +4902,28 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
     (mock, core, dir)
 }
 
+/// [`core_for`] on a profile its host owns ([`eidola_app_core::storage`]):
+/// the same mock and seating, with every write streamed to `profile`'s host.
+pub fn core_on_host(
+    config: MockConfig,
+    profile: eidola_app_core::storage::HostProfile,
+) -> (MockServer, AppCore) {
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("plain http client");
+    let core = AppCore::on_host_with_test_http_client(profile, client).expect("open core");
+    if let Some(calendar) = config.issuer_calendar {
+        core.test_set_issuer_calendar(calendar);
+    }
+    let mock = core.runtime().block_on(async { start(config).await });
+    core.runtime()
+        .block_on(core.set_base_url(mock.base_url.clone()))
+        .expect("set base url");
+    seat_default_agent_on_mock(&core);
+    (mock, core)
+}
+
 /// Re-seat the Default template's one agent on the mock's [`MODEL`], labelled
 /// [`DEFAULT_AGENT_LABEL`], so a space created from it is answered over the
 /// mock. The compiled default is a local model, which a harness profile has no
