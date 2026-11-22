@@ -5,6 +5,7 @@ use crate::measurement::MatchedMeasurement;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[cfg(not(target_family = "wasm"))]
     #[error("failed to fetch attestation document: {0}")]
     Fetch(#[from] reqwest::Error),
 
@@ -76,6 +77,11 @@ pub enum Error {
 
     #[error("TLS configuration error: {0}")]
     Tls(String),
+
+    /// Dialing a host-provided stream, or the TLS handshake over it, failed
+    /// (`pipe`): nothing was attested.
+    #[error("connection failed: {0}")]
+    Connect(String),
 
     /// Catch-all for failures that happen inside the per-handshake attesting
     /// connector layer: HTTP/1.1 framing errors, EOF, missing TLS info on the

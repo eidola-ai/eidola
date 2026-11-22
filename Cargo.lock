@@ -10274,9 +10274,12 @@ dependencies = [
  "signature 2.2.0",
  "spki 0.7.3",
  "thiserror 2.0.21",
+ "tinfoil-shim-mock",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tracing",
+ "url",
  "webpki-roots",
  "x509-cert 0.2.5",
 ]

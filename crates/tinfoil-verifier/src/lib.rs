@@ -68,16 +68,14 @@
 //! This crate deliberately does **not** depend on either source so neither
 //! gets dragged into the wrong consumer transitively.
 
-// The handshake verifier is reached only through the native connector, so on
-// wasm32 the verification core compiles but nothing calls it yet.
-#![cfg_attr(target_family = "wasm", allow(dead_code))]
-
+mod attest;
 #[cfg(not(target_family = "wasm"))]
 mod attesting_client;
 pub mod bundle;
 mod device;
 mod error;
 pub mod measurement;
+pub mod pipe;
 #[cfg(feature = "platform-endorsements")]
 pub mod platform_endorsements;
 pub mod sevsnp;
@@ -120,7 +118,8 @@ pub struct VerifiedAttestation {
 /// and non-blocking (e.g. push to a vec or increment a counter).
 pub type AttestationObserver = std::sync::Arc<dyn Fn(VerifiedAttestation) + Send + Sync>;
 
-/// Configuration for [`attesting_client`].
+/// Configuration for an attested endpoint: the native `attesting_client` and
+/// the byte-pipe [`pipe::AttestingPipe`] both take it.
 pub struct AttestingClientConfig<'a> {
     /// Allowed measurements, each tagged with its platform. Evidence is
     /// checked only against entries of its own platform; a platform with no
@@ -204,22 +203,14 @@ pub struct AttestingClientConfig<'a> {
 /// request (e.g. `client.get(format!("{base}/v1/models")).send().await`)
 /// after construction and treat its outcome as the readiness check.
 #[cfg(not(target_family = "wasm"))]
-pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwest::Client, Error> {
-    let tls_roots = std::sync::Arc::new(config.tls_roots);
-
-    let snp_policy = config.snp_min_tcb.unwrap_or_default();
-    let allowed_measurements = measurement::compile_pins(config.allowed_measurements)?;
-
-    attesting_client::build_attesting_client(attesting_client::BuildParams {
-        inference_base_url: config.inference_base_url.to_string(),
-        trusted_ark_der: config.trusted_ark_der.map(|d| d.to_vec()),
-        trusted_ask_der: config.trusted_ask_der.map(|d| d.to_vec()),
-        allowed_measurements,
-        snp_policy,
-        snp_observer: config.snp_observer,
-        attestation_observer: config.attestation_observer,
-        tls_roots,
-    })
+pub async fn attesting_client(
+    mut config: AttestingClientConfig<'_>,
+) -> Result<reqwest::Client, Error> {
+    let check = attest::AttestationCheck::from_config(&mut config)?;
+    attesting_client::build_attesting_client(
+        attest::tls_config(config.tls_roots),
+        std::sync::Arc::new(check),
+    )
 }
 
 /// Validate pins exactly as [`attesting_client`] compiles them, without
