@@ -1,0 +1,60 @@
+# eidola-mobile — Agent Development Guide
+
+The mobile app: `eidola-app-core` compiled to `wasm32-unknown-unknown` (without `desktop`), hosted by the native shells under `mobile/` and reaching everything outside the webview through the shell contract (`mobile/shell-contract.md`). It has no interface yet; today the bundle boots the core on its shell and confirms itself. GPL-3.0-only, like the GUI.
+
+| Module | What |
+|---|---|
+| `protocol` | The contract's wire format: request texts, reply parsing, base64 (`B64Ref` writes straight into the request text, `B64` decodes as the reply is parsed), the `Hello` check, and `ShellError` — every way a call can fail, typed. |
+| `client` | `ShellClient<T: Transport>`: one typed call per contract method. A `Transport` moves texts; `call` posts the request before it returns, so dropping the future never withdraws it. An optional trace records every request and reply in order (the self-test's barrier check). |
+| `socket` | `ShellDialer`: app-core's `Dialer` over `tcp.*`; `ShellSocket` is the `AsyncRead`/`AsyncWrite`. |
+| `files` | `ShellFiles`: app-core's `HostStorage` over `files.*`. |
+| `boot` | Hello, the profile, the core, `bundle.confirm`. |
+| `web` (wasm32) | The webview's transport over `js/bridge.js`, and the bundle's entry points (`start`, and `selfTest` with the feature). |
+| `selftest` (feature `self-test`) | The headless self-test (below). |
+
+Everything but `web` is target-independent: `tests/bridge.rs` runs it natively against `tests/fake_shell/`, a shell written in Rust that speaks the contract's JSON (files in memory, the pipe over real sockets) and logs every request's arrival and reply.
+
+## The bridge
+
+- **The JS side moves texts and nothing else** (`js/bridge.js`, imported by wasm-bindgen as a snippet file, so the bundle has no inline script): `platform()`, `postIos(text)` (the promise of the reply text), `openAndroid(onReply)` and `postAndroid(text)` (held until the port arrives). Ids, JSON, base64 and every error are Rust's.
+- **Replies are matched by id in Rust on Android** (one port carries every reply); iOS answers each message itself. `protocol::reply_id` reads a reply that opens with `{"id":N` (Android's always does) without scanning the rest; anything else is parsed in full.
+- **Copies per byte received**: the shell's base64 text becomes a Rust `String` (wasm-bindgen's one `encodeInto`), serde unescapes it only if the shell escaped `/` (both do), base64 decodes into the reply's buffer, and the reader copies out of that. Sending: the bytes are base64-written into the request text, which wasm-bindgen hands to JS once. Measured natively (release, `protocol::tests::measure_the_bridge_codec`, ignored by default), routing and decoding a 1 MiB receive reply takes about 0.5 ms and encoding a 1 MiB send about 0.7 ms; the self-test measures the whole path on each platform, where the shell and the webview's message passing dominate.
+- **Nothing panics on shell input.** A reply that is not JSON, has no result, carries bytes that are not base64 or numbers out of range is `ShellError::Malformed`; a code this app does not know is `Code::Other`. `From<ShellError> for io::Error` maps codes to kinds (`connect_failed` is `ConnectionRefused`, `not_found` is `NotFound`, `closed` is `ConnectionAborted`).
+- **The contract check** (`Hello::check`): a shell is accepted at contract version 2 or later that lists every method the app calls (`protocol::REQUIRED_METHODS`). Versions only add, so a later shell keeps everything; an older one, or one whose method list falls short of its version, is refused with `ShellError::Contract` before anything else is asked of it.
+
+## The pipe (`socket`)
+
+- **Receiving is pulled**: a `tcp.receive` is in flight only while a reader waits on an empty buffer, and at most one per socket (the contract's rule). The shell reads from the network only while a receive is pending, so a reader that stops stops the network, with at most one receive's bytes (`RECEIVE_MAX`, 256 KiB by default; the self-test compares 64 KiB to 1 MiB) waiting in the socket.
+- **Sending is buffered** like a kernel send buffer: writes are accepted into at most `SEND_BUFFER` (256 KiB) and go out one `tcp.send` at a time, so a TLS stream's small records coalesce while a send is in flight; a full buffer makes the writer wait. A failed send fails the next write or flush. `poll_flush` returns once the shell has handed everything to its OS; `poll_shutdown` flushes and sends `tcp.shutdown`; dropping posts `tcp.close`, as does abandoning a connect midway (`CloseOnDrop`).
+- IPv6 literals arrive bracketed from URLs; the brackets are stripped (the contract takes none).
+
+## Boot (`boot`) and boot health
+
+`boot` runs `shell.hello` and its check, `HostProfile::load` over `ShellFiles`, `AppCore::on_host` with the shell's dialer, `AppCore::open_database` (the database opens and its schema is one this build accepts; a first launch creates it), `AppCore::flush_storage` (what that wrote is synced on the shell), and only then `bundle.confirm`.
+
+**Boot health is judged there and nowhere else**: a bundle is healthy once it runs, speaks to its shell, and has the profile open and durable. The network is no part of it, so a bundle booted offline still confirms; a bundle that cannot open the profile never confirms, and the shell falls back at the next launch (`shell-contract.md` → Provisional activation). The interface that comes next should move the confirmation after its first frame, so a bundle that cannot draw falls back too.
+
+The profile's name (`boot::PROFILE`) keys app-core's single-writer lock, which on wasm32 is held in process; natively it is a real file lock, so native tests pass `BootOptions::profile` a directory of their own.
+
+## The bundle build (`mobile/build-bundle.sh`)
+
+- The toolchain is `rust-toolchain.toml`'s (the wasm target is added on demand: the Nix toolchain hashes that file); the wasm-bindgen CLI is exactly the lockfile's `wasm-bindgen` version, installed by `cargo install --locked` into `mobile/.tools/` (git-ignored).
+- `--profile mobile` (root `Cargo.toml`): the release profile's determinism (fat LTO, one codegen unit, no incremental state) without `strip`, which would drop the `target_features` section wasm-bindgen reads; wasm-bindgen removes the name and producers sections instead.
+- **turso needs an 8 MiB stack** (`-zstack-size`; the default 1 MiB overflows on the first insert as `memory access out of bounds`).
+- Paths are remapped (the checkout, `CARGO_HOME`, and the standard library's sources to `/rustc/<commit>`) so no machine path reaches the wasm. These flags go through `--config` and are joined to `.cargo/config.toml`'s `getrandom_backend` cfg; a `RUSTFLAGS` variable would replace them all, so the script refuses to run with one set.
+- The output is `index.html`, `boot.js`, wasm-bindgen's `eidola_mobile.js`, `eidola_mobile_bg.wasm` and the snippet `snippets/eidola-mobile-<hash>/js/bridge.js` (the hash is of the package name and version, not a path). The script prints the sizes and the bundle digest.
+- `mobile/bundle-repro.sh` builds twice in fresh target directories and requires identical files.
+- `wasm-bindgen`'s `JsValue::from(u64)` is a BigInt, which `JSON.stringify` refuses: nothing crosses as a `u64` (the bridge passes texts).
+
+## The self-test (`selftest`, `mobile/self-test.sh ios|android`)
+
+Built only into the self-test bundle (`build-bundle.sh --self-test`, its own page `web/self-test/`), never into a release bundle. The harness runs two `tinfoil-shim-mock`s on this machine (one attesting the measurement the app is told to trust, one another; the emulator reaches them at `10.0.2.2`, in their certificates through `EXTRA_TLS_NAMES`) in front of a static upstream serving `GET /v1/terms`, plus `mobile/tools/echo_server.py`, writes `selftest.json` into the bundle, embeds it in a debug shell, launches it, kills it and launches it again. It uses its own simulator and AVD, both named `eidola-bridge`.
+
+- **First launch**: boot and confirm; set the profile's trust (base URL, ARK, ASK, measurement); under the client's trace, commit a space and at once send a request — the barrier held if every file call posted before the request's `tcp.connect` was answered first, a sync of the write-ahead log among them (the debug shell's `debug.syncLog` confirms the flush); that request is attested over the pipe, and the same request to the other shim is refused as an untrusted measurement; the bundle store (stage, seal, compare the shell's digest with the contract's definition, remove); the bridge's round trip, the pipe's echo throughput at three receive sizes, the file API's.
+- **Second launch**: the space is there, and the trust settings with it (the request is attested again with nothing configured); the webview's own storage is empty.
+
+Each launch writes `selftest-<n>.json` (synced) to the file directory, which the harness reads from outside the app, and logs to the console. Reports, the console, the shims' logs and screenshots land in `mobile/build/self-test/<platform>/`.
+
+## Tests
+
+`cargo test -p eidola-mobile`: the wire format's unit tests (every malformed reply typed; escaped slashes; the contract check), and `tests/bridge.rs` — bytes intact both ways through many receives, one receive in flight; a reader that stops reading stops the pipe; close on drop and a typed refused connect; files round trip and an over-large write split; a shell answering nonsense fails typed; boot confirms only after the database's log is synced, an older shell is refused after `shell.hello` alone, a corrupt profile never confirms; a commit survives a relaunch; a request reaches the shell only after the commit before it is synced (file replies slowed to 500 ms); attestation over the pipe against an in-process shim, and refusal of another measurement. Native tests must not drop a core inside a tokio context (its runtime would be dropped inside another), hence `park_on` for boots.

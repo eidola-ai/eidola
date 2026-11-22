@@ -111,6 +111,14 @@ strip = true
 # Explicit overflow check setting
 overflow-checks = false
 
+# The mobile app's wasm (`mobile/build-bundle.sh`): the release profile's
+# determinism (fat LTO, one codegen unit, no incremental state), without its
+# `strip`, which would drop the `target_features` section wasm-bindgen reads;
+# the bundle build strips the name and producers sections itself.
+[profile.mobile]
+inherits = "release"
+strip = false
+
 # gpui-component's `eidola-0.7` branch: the 0.7.0 release plus one commit,
 # an app-level opt-out for its window border
 # (`set_window_border_enabled`), so the GUI's own Linux client-side
