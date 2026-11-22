@@ -209,6 +209,8 @@ pub struct TestNode {
     pub engine: EngineHandle,
     pub admission: Arc<eidola_server_engine::worker::Admission>,
     pub client: reqwest::Client,
+    /// Publishes the node's telemetry snapshot now, rather than at its next epoch.
+    pub telemetry: eidola_server_engine::http::TelemetryPublisher,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -268,6 +270,7 @@ impl TestNode {
             engine: node.engine,
             admission: node.admission,
             client: http_client(),
+            telemetry: node.telemetry,
             server,
         }
     }

@@ -72,6 +72,9 @@ pub struct Node {
     pub weights_hash: String,
     /// Resolves when the engine thread stops, however it stops.
     pub engine_stopped: oneshot::Receiver<()>,
+    /// Publishes the telemetry snapshot the info answer carries, on its own epoch
+    /// timer; [`http::TelemetryPublisher::publish`] also publishes one at once.
+    pub telemetry: http::TelemetryPublisher,
 }
 
 impl std::fmt::Debug for Node {
@@ -694,8 +697,11 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         reading,
         boot_id: AppState::new_boot_id(),
         overloaded: Default::default(),
+        published: Default::default(),
     });
+    let telemetry = http::TelemetryPublisher::start(&state);
     Ok(Node {
+        telemetry,
         router: http::router(state),
         engine,
         admission,

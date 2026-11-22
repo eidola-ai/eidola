@@ -25,6 +25,12 @@ use opentelemetry_sdk::Resource;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
+/// How often metrics are exported: each export covers this interval, so it is the
+/// finest time resolution any exported metric has. An engine node publishes its
+/// snapshot at the same epoch (`eidola_common::engine_protocol::telemetry::SNAPSHOT_EPOCH`).
+pub const METRIC_EXPORT_INTERVAL: std::time::Duration =
+    opentelemetry_sdk::metrics::OTEL_METRIC_EXPORT_INTERVAL_DEFAULT;
+
 /// The event and span filter: `EnvFilter::from_default_env`'s grammar over the
 /// prefixed `RUST_LOG`, defaulting to `error`, with `directives` (such as
 /// `eidola_server_gateway=info` or `hyper=warn`) added over it.
@@ -197,7 +203,7 @@ impl OtlpConfig {
             .expect("failed to create OTLP metrics exporter");
 
         let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
-            .with_interval(opentelemetry_sdk::metrics::OTEL_METRIC_EXPORT_INTERVAL_DEFAULT)
+            .with_interval(METRIC_EXPORT_INTERVAL)
             .build();
 
         opentelemetry_sdk::metrics::SdkMeterProvider::builder()

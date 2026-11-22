@@ -34,8 +34,8 @@
 
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
 use axum::Router;
@@ -48,7 +48,7 @@ use eidola_common::engine_protocol::DeclaredPrefixRefusal;
 use eidola_common::engine_protocol::STREAM_CADENCE;
 use eidola_common::engine_protocol::telemetry::{
     BOOT_ID_BYTES, INFO_TELEMETRY_MEMBER, MAX_POOLS, NodeCounters, NodeGauges, NodeTelemetry,
-    PoolOccupancy, quantize_prefix_tokens,
+    PoolOccupancy, SNAPSHOT_EPOCH, quantize_prefix_tokens,
 };
 use eidola_common::stream_shape::{Framer, StreamEvent, pad_body};
 use eidola_engine::engine::{FinishReason, SubmitError};
@@ -105,6 +105,9 @@ pub struct AppState {
     pub boot_id: [u8; BOOT_ID_BYTES],
     /// Requests refused `overloaded` (no read or admission slot free), since boot.
     pub overloaded: AtomicU64,
+    /// The telemetry snapshot last published ([`TelemetryPublisher`]): what the info
+    /// answer carries. `None` until the first, and the answer then has no snapshot.
+    pub published: Mutex<Option<NodeTelemetry>>,
 }
 
 impl AppState {
@@ -233,7 +236,7 @@ pub fn build_info() -> Value {
 /// refusals, and the pools as last recounted, with the prefix cache's token counts and
 /// the pools' occupancy coarsened as the contract states. Nothing in it is per request
 /// (`AGENTS.md` → Telemetry).
-pub fn telemetry(state: &AppState) -> NodeTelemetry {
+fn telemetry(state: &AppState) -> NodeTelemetry {
     let s = state.engine.stats();
     NodeTelemetry {
         boot_id: state.boot_id,
@@ -278,8 +281,57 @@ pub fn telemetry(state: &AppState) -> NodeTelemetry {
     }
 }
 
+/// Publishes the node's telemetry snapshot once per [`SNAPSHOT_EPOCH`].
+///
+/// The info answer carries only what this published, never a snapshot taken for the
+/// read: a token holder polling the answer as fast as it likes still sees the counts
+/// and levels at epoch boundaries, so no finer than the gateway's own export interval.
+/// The boundaries are the node's, from when it started, so a reader cannot choose when
+/// a snapshot is taken either. It holds the state weakly, so it never keeps the engine
+/// alive past the router, and its thread ends at the first boundary after the state
+/// is gone.
+#[derive(Clone)]
+pub struct TelemetryPublisher(Weak<AppState>);
+
+impl TelemetryPublisher {
+    /// Publishes the first snapshot now and starts the thread that publishes one at
+    /// every following epoch boundary.
+    pub fn start(state: &Arc<AppState>) -> Self {
+        let publisher = Self(Arc::downgrade(state));
+        publisher.publish();
+        let timer = publisher.clone();
+        std::thread::Builder::new()
+            .name("telemetry-snapshot".into())
+            .spawn(move || {
+                let start = std::time::Instant::now();
+                let mut boundary = 1u32;
+                loop {
+                    let due = start + SNAPSHOT_EPOCH * boundary;
+                    std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+                    if !timer.publish() {
+                        return;
+                    }
+                    boundary = boundary.saturating_add(1);
+                }
+            })
+            .expect("the telemetry thread could not be started");
+        publisher
+    }
+
+    /// Takes a snapshot now and makes it the one the info answer carries. False once
+    /// the node's state is gone.
+    pub fn publish(&self) -> bool {
+        let Some(state) = self.0.upgrade() else {
+            return false;
+        };
+        let snapshot = telemetry(&state);
+        *state.published.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
+        true
+    }
+}
+
 async fn engine_info(State(state): State<Arc<AppState>>) -> Response {
-    axum::Json(json!({
+    let answer = axum::Json(json!({
         "model": state.model_id,
         "weights_sha256": state.model.weights_hash(),
         "weights_storage": state.model.storage().as_str(),
@@ -292,9 +344,18 @@ async fn engine_info(State(state): State<Arc<AppState>>) -> Response {
             "sm_count": d.sm_count,
             "memory_bytes": d.memory_bytes,
         })),
-        INFO_TELEMETRY_MEMBER: telemetry(&state).to_value(),
-    }))
-    .into_response()
+    }));
+    let published = state
+        .published
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(NodeTelemetry::to_value);
+    let mut answer = answer;
+    if let (Some(snapshot), Some(members)) = (published, answer.0.as_object_mut()) {
+        members.insert(INFO_TELEMETRY_MEMBER.into(), snapshot);
+    }
+    answer.into_response()
 }
 
 fn check_weights_header(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {

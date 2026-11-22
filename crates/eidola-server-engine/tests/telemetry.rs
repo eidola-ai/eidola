@@ -34,11 +34,12 @@ async fn info(node: &TestNode) -> (usize, NodeTelemetry) {
     (bytes.len(), snapshot)
 }
 
-/// The first snapshot `pred` holds for, read again until it does: the pools are
-/// recounted at most once a second.
+/// The first snapshot `pred` holds for, published and read again until it does: the
+/// pools are recounted at most once a second.
 async fn info_until(node: &TestNode, pred: impl Fn(&NodeTelemetry) -> bool) -> NodeTelemetry {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
+        assert!(node.telemetry.publish());
         let (_, snapshot) = info(node).await;
         if pred(&snapshot) {
             return snapshot;
@@ -169,4 +170,27 @@ async fn the_snapshot_follows_the_engine() {
             PoolOccupancy::quantized(e.total, e.in_use, e.idle, e.host_total, e.host_used)
         );
     }
+}
+
+/// The answer carries the snapshot last published, not one taken for the read: the
+/// engine's activity reaches it only when the node publishes, at its epoch boundary
+/// (here, at once, by the test's hand), so polling faster sees nothing finer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_answer_carries_the_last_published_snapshot() {
+    let node = TestNode::start(&[]).await;
+    let (_, before) = info(&node).await;
+    let (status, v) = node.chat_json(&request("hi", 2)).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(node.stats().finished, 1);
+    for _ in 0..3 {
+        let (_, again) = info(&node).await;
+        assert_eq!(
+            again, before,
+            "a read between publications sees no new activity"
+        );
+    }
+    assert!(node.telemetry.publish());
+    let (_, published) = info(&node).await;
+    assert_eq!(published.counters.requests_finished, 1);
+    assert_eq!(published.boot_id, before.boot_id);
 }

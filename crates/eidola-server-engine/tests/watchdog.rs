@@ -149,8 +149,11 @@ async fn a_stalled_step_ends_the_stream_with_an_error_and_exits() {
         reading: Admission::new(4),
         boot_id: AppState::new_boot_id(),
         overloaded: Default::default(),
+        published: Default::default(),
     });
+    let telemetry = http::TelemetryPublisher::start(&state);
     let node = common::TestNode::serve(eidola_server_engine::Node {
+        telemetry,
         router: http::router(state),
         engine: handle.clone(),
         admission,

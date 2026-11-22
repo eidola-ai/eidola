@@ -600,6 +600,16 @@ mod tests {
     use super::*;
     use eidola_common::engine_protocol::telemetry::PoolOccupancy;
 
+    /// A node publishes its snapshot no more often than this gateway exports, so no
+    /// reader of either learns the node's activity at a finer resolution.
+    #[test]
+    fn nodes_publish_at_the_export_interval() {
+        assert_eq!(
+            eidola_common::engine_protocol::telemetry::SNAPSHOT_EPOCH,
+            eidola_telemetry::METRIC_EXPORT_INTERVAL
+        );
+    }
+
     fn snapshot(boot: u8, steps: u64, running: u64) -> NodeTelemetry {
         NodeTelemetry {
             boot_id: [boot; BOOT_ID_BYTES],

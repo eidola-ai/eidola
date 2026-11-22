@@ -26,6 +26,10 @@
 //! `crates/eidola-server-engine/AGENTS.md` → Telemetry has the reasoning
 //! for each member.
 //!
+//! **Nor is it live.** A node publishes the snapshot once per
+//! [`SNAPSHOT_EPOCH`], on its own timer, and the info answer carries the last
+//! one published, so polling faster than the epoch learns nothing more.
+//!
 //! `boot_id` is random per process: a reader holding an earlier snapshot
 //! with another one knows the node restarted and its counts started again.
 
@@ -33,6 +37,13 @@ use serde_json::{Map, Value, json};
 
 /// The info answer's member the snapshot travels in.
 pub const INFO_TELEMETRY_MEMBER: &str = "telemetry";
+
+/// How often a node publishes its snapshot. The info answer carries the
+/// snapshot taken at the last epoch boundary, on the node's own timer, never
+/// one taken for the read, so however often a token holder polls, it sees the
+/// node's counts and levels at this resolution and no finer. It equals the
+/// interval the gateway exports its metrics at.
+pub const SNAPSHOT_EPOCH: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Bytes of a [`NodeTelemetry::boot_id`], written as lowercase hex.
 pub const BOOT_ID_BYTES: usize = 16;
