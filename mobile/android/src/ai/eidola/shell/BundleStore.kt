@@ -139,7 +139,7 @@ class BundleStore(private val dir: File, private val assets: AssetManager) {
             if (!Names.bundlePath(path)) throw ShellError.bad("path: not a valid bundle path")
             if (!isStaging(v)) throw ShellError.state("not staging")
             val f = File(root(v), path)
-            f.parentFile!!.mkdirs()
+            f.parentFile?.mkdirs()
             RandomAccessFile(f, "rw").use {
                 it.seek(offset)
                 it.write(data)

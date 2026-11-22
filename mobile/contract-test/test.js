@@ -154,6 +154,15 @@ async function checkServing(platform) {
     eq((await fetch("shell.js?x=1")).status, 200, "query");
     eq(await (await fetch("/")).text(), await (await fetch("/index.html")).text(), "root");
   });
+  await test("the bare origin, with no path at all, is index.html", async () => {
+    eq(await (await fetch(location.origin)).text(), await (await fetch("/index.html")).text(), "bare origin");
+  });
+  await test("odd paths are 404, and the shell stays up", async () => {
+    for (const p of ["//index.html", "/%00", "/index.html%00", "/a%2Fb", "/%2e%2e%2Findex.html", "/x%5Cy", "/%C3%BC", "/index.html/", "/a/"]) {
+      eq((await fetch(location.origin + p)).status, 404, p);
+    }
+    eq((await call("shell.hello")).contract, 2, "still answering");
+  });
   await test("404: missing, dot segment, encoded slash", async () => {
     eq((await fetch("missing.txt")).status, 404, "missing");
     eq((await fetch("/.hidden")).status, 404, "dotfile");
@@ -490,6 +499,9 @@ async function phaseA(progress, platform) {
 }
 
 async function phaseB(progress) {
+  await test("a navigation to the bare origin loaded this document", () => {
+    ok(location.pathname === "" || location.pathname === "/", `pathname ${JSON.stringify(location.pathname)}`);
+  });
   await test("trial: the new bundle boots unconfirmed", async () => {
     const st = await call("bundle.state");
     eq([st.serving.version, st.serving.confirmed, st.active, st.confirmed], ["good", false, "good", false], "state");
@@ -620,7 +632,9 @@ async function main() {
     $("summary").textContent = await finish(platform, progress);
   } else {
     await save(progress);
-    location.reload();
+    // Phase A leaves by the bare origin (no path, not even "/"); the others by reloading.
+    if (progress.phase === "B") location.href = location.origin;
+    else location.reload();
   }
 }
 

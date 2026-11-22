@@ -324,14 +324,31 @@ final class SchemeHandler: NSObject, WKURLSchemeHandler {
         "ttf": "font/ttf", "otf": "font/otf",
     ]
 
+    /// What a request names: a bundle path, or the status that refuses it. The one place a
+    /// request's URL becomes a path; it never traps on what a page can send.
+    enum Target: Equatable {
+        case file(String)
+        case refuse(Int)
+    }
+
+    static func target(_ request: URLRequest) -> Target {
+        guard let url = request.url else { return .refuse(400) }
+        guard url.host() == Origin.host else { return .refuse(403) }
+        guard request.httpMethod == "GET" else { return .refuse(405) }
+        // Encoded as sent: `%2F`, `%00` and the like fail the bundle-path rule below.
+        let raw = url.path(percentEncoded: true)
+        if raw.isEmpty || raw == "/" { return .file("index.html") }
+        guard raw.hasPrefix("/") else { return .refuse(404) }
+        let path = String(raw.dropFirst())
+        return Names.isBundlePath(path) ? .file(path) : .refuse(404)
+    }
+
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
-        let url = task.request.url!
-        var path = url.path(percentEncoded: true)
-        if path == "/" { path = "/index.html" }
-        path.removeFirst()
-        guard url.host() == Origin.host else { return respond(task, 403) }
-        guard task.request.httpMethod == "GET" else { return respond(task, 405) }
-        guard Names.isBundlePath(path) else { return respond(task, 404) }
+        let path: String
+        switch Self.target(task.request) {
+        case .refuse(let status): return respond(task, status)
+        case .file(let p): path = p
+        }
         let file = store.servingRoot().appendingPathComponent(path)
         let ext = (path as NSString).pathExtension.lowercased()
         let key = ObjectIdentifier(task)
@@ -355,7 +372,10 @@ final class SchemeHandler: NSObject, WKURLSchemeHandler {
             "Content-Type": type, "Content-Length": String(body.count), "Content-Security-Policy": Self.csp,
             "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
         ]
-        task.didReceive(HTTPURLResponse(url: task.request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!)
+        let url = task.request.url ?? Origin.root
+        guard let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)
+        else { return task.didFailWithError(URLError(.badServerResponse)) }
+        task.didReceive(response)
         if !body.isEmpty { task.didReceive(body) }
         task.didFinish()
     }

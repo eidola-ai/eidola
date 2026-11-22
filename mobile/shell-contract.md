@@ -25,7 +25,7 @@ The bundle is served on an origin the shell owns:
 
 Both are secure contexts. The app must read its origin from `location.origin` and never hard-code it.
 
-- **Paths.** A request is served only if its path is `/` (which means `/index.html`) or a **bundle path**: one or more segments joined by `/`, each matching `[A-Za-z0-9._-]+` and not starting with `.`. Query strings and fragments are ignored. Any other path, and any path the selected bundle does not hold, is a `404`. Only `GET` is served; other methods get `405`.
+- **Paths.** A request is served only if its path is empty (the bare origin, as `location.origin` spells it) or `/`, both of which mean `/index.html`, or a **bundle path**: one or more segments joined by `/`, each matching `[A-Za-z0-9._-]+` and not starting with `.`. Query strings and fragments are ignored. Any other path, and any path the selected bundle does not hold, is a `404`. Only `GET` is served; other methods get `405`.
 - **No mixing.** Every response of one document load comes from one bundle, the one selected when that document's main-frame navigation began (see [Bundle store](#bundle-store)). A file missing from it is a `404`, never a file from another bundle.
 - **Headers.** Every response carries:
   - `Content-Type` by extension: `html` `text/html; charset=utf-8`, `js` and `mjs` `text/javascript; charset=utf-8`, `wasm` `application/wasm`, `css` `text/css; charset=utf-8`, `json` and `map` `application/json`, `txt` `text/plain; charset=utf-8`, `svg` `image/svg+xml`, `png` `image/png`, `jpg` and `jpeg` `image/jpeg`, `webp` `image/webp`, `ico` `image/x-icon`, `woff2` `font/woff2`, `woff` `font/woff`, `ttf` `font/ttf`, `otf` `font/otf`; anything else `application/octet-stream`.

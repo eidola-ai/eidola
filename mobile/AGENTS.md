@@ -17,6 +17,7 @@ The native apps the App Store and Play Store distribute. Each is a thin shell ar
 - **No network of its own, no trust decisions.** The shell fetches nothing, loads no other origin in its webview, compares no hash, and serves only its origin; an external link goes to the system browser, never an in-app one. Both webviews are configured to make no requests of their own (Safe Browsing and fraud warnings off, Android metrics opted out).
 - **No third-party code.** System frameworks only. Android carries the Kotlin standard library, shrunk by R8 to what the shell calls; nothing else.
 - **The contract changes additively.** A new call, parameter, result member or error code bumps the contract version in `shell-contract.md`, both shells (`contractVersion` / `CONTRACT_VERSION`, the method lists), and `contract-test/test.js`; nothing existing changes meaning. A change that is not additive is a new contract and needs the app's host bridge to handle both.
+- **Nothing a page sends can crash the shell.** Request input is parsed in one place per shell (`SchemeHandler.target` on iOS, `bundlePath` on Android), which yields a bundle path or a 4xx; no force-unwrap or unchecked slice touches it.
 - **Both shells move together.** A behaviour lands in iOS and Android in the same change, with a test-page check, and both test runs pass.
 - **Nothing durable in webview storage.** iOS uses a non-persistent website data store; Android turns DOM storage off. Durable state goes through the file API.
 

@@ -57,6 +57,18 @@ val TYPES = mapOf(
 )
 val CHARSET_TYPES = setOf("html", "js", "mjs", "css", "txt")
 
+/**
+ * The bundle path a request's (still encoded) URL path names, or null to refuse it with a 404.
+ * The one place a request's URL becomes a path: no path and "/" are index.html; `%2F`, `%00`
+ * and the like fail the bundle-path rule.
+ */
+fun bundlePath(encoded: String?): String? {
+    val raw = encoded ?: ""
+    if (raw.isEmpty() || raw == "/") return "index.html"
+    if (!raw.startsWith("/")) return null
+    return raw.substring(1).takeIf(Names::bundlePath)
+}
+
 fun isOurs(u: Uri) = u.scheme == "https" && u.host == "app.eidola.invalid" && u.port == -1
 
 /** The shell's parts outlive an activity (a recreated one after the renderer died). */
@@ -189,9 +201,7 @@ class MainActivity : Activity() {
                 Log.i(TAG, "document load: bundle ${s.version} confirmed=${s.confirmed}")
             }
             if (r.method != "GET") return respond(405, "Method Not Allowed")
-            val raw = u.encodedPath ?: "/"
-            val path = if (raw == "/") "index.html" else raw.removePrefix("/")
-            if (!Names.bundlePath(path)) return respond(404, "Not Found")
+            val path = bundlePath(u.encodedPath) ?: return respond(404, "Not Found")
             val body = Shell.store.open(path) ?: return respond(404, "Not Found")
             val ext = path.substringAfterLast('.', "").lowercase()
             return respond(200, "OK", TYPES[ext] ?: "application/octet-stream", if (ext in CHARSET_TYPES) "utf-8" else null, body)
