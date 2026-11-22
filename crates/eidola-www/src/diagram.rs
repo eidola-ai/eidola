@@ -407,7 +407,19 @@ pub fn render(source: &str, cx: &Context) -> Result<String, String> {
             FlowEdgeStroke::Thick => 3.0,
             _ => 1.0,
         });
-        let mut tooltip = format!("{} → {}", label_of(&e.from), label_of(&e.to));
+        // The tooltip names the line the way its arrow points, whichever end
+        // the source wrote first.
+        let (first, second) = if start_arrow && !end_arrow {
+            (&e.to, &e.from)
+        } else {
+            (&e.from, &e.to)
+        };
+        let between = match (start_arrow, end_arrow) {
+            (true, true) => "↔",
+            (false, false) => "–",
+            _ => "→",
+        };
+        let mut tooltip = format!("{} {between} {}", label_of(first), label_of(second));
         let mut href = None;
         let label = match (&e.label, &route.label) {
             (Some(text), Some(b)) if !text.trim().is_empty() => {
@@ -661,6 +673,15 @@ mod tests {
         assert_eq!(fit_scale(COLUMN), 1.0);
         assert_eq!(fit_scale(700.0) * 700.0, COLUMN);
         assert_eq!(fit_scale(COLUMN / MIN_FIT_SCALE + 1.0), 1.0);
+    }
+
+    #[test]
+    fn a_line_is_named_the_way_its_arrow_points() {
+        let source = SMALL.replace("  b --> a\n", "  a <--- b\n  a <--> b\n  a --- b\n");
+        let svg = draw(&source, &["talks"]).unwrap();
+        assert!(svg.contains("<title>B → A</title>"), "{svg}");
+        assert!(svg.contains("<title>A ↔ B</title>"));
+        assert!(svg.contains("<title>A – B</title>"));
     }
 
     #[test]

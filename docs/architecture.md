@@ -5,7 +5,7 @@ Eidola is composed of several distinct components that function as a complete sy
 ```mermaid
 flowchart TB
   accTitle: Eidola's components and the connections between them
-  accDescr: The Eidola app on your device connects to the attested gateway for chat and for its account. The gateway connects to the attested inference engines, to Postgres, to Stripe and to Grafana. Your browser pays at Stripe, Stripe notifies a webhook receiver, and a billing worker applies payments from Stripe to Postgres. The gateway and both billing processes send telemetry to Grafana. Prompts and answers travel only between the app, the gateway and the engines, and nothing on those connections is tied to an account.
+  accDescr: The Eidola app on your device connects to the attested gateway for chat and for its account. The gateway connects to the attested inference engines, to Postgres, to Stripe and to Grafana. Your browser pays at Stripe, Stripe notifies a webhook receiver, and a billing worker applies payments from Stripe to Postgres. The gateway, the engines and both billing processes send telemetry to Grafana. Prompts and answers travel only between the app, the gateway and the engines, and nothing on those connections is tied to an account.
 
   subgraph device [Your device]
     client[Eidola app]
@@ -34,14 +34,15 @@ flowchart TB
   gateway -. spends .-> pg
   gateway -- account records --> pg
   gateway -- checkout --> stripe
-  gateway -. telemetry .-> grafana
+  grafana <-. telemetry .- gateway
   browser -- payment --> stripe
   stripe -- events --> webhook
   webhook -- event queue --> pg
   worker -- billing work --> pg
   worker -- payment facts --> stripe
-  webhook -. telemetry .-> grafana
-  worker -. telemetry .-> grafana
+  grafana <-. telemetry .- webhook
+  grafana <-. telemetry .- worker
+  grafana <-. telemetry .- engines
 
   class client,gateway,engines content
   classDef content stroke-width:3px
@@ -80,7 +81,7 @@ Each line links to its section below, and each part to the page that describes i
 - **Webhook receiver** — a small process that accepts Stripe's notifications and queues them.
 - **Billing worker** — a process that works through that queue, asks Stripe for the facts behind each notification, and applies purchases, refunds and disputes to the account records ([anonymous-credits.md](anonymous-credits.md#payment-reversals)).
 - **Stripe** — the payment processor. It knows who paid, and never sees what was asked.
-- **Grafana** — where the gateway and the billing processes send their operational telemetry ([gateway.md](gateway.md#telemetry-scope-and-boundary)).
+- **Grafana** — where the gateway, the engines and the billing processes send their operational telemetry ([gateway.md](gateway.md#telemetry-scope-and-boundary)).
 
 ## The connections
 
@@ -146,13 +147,13 @@ The gateway asks Stripe for prices, creates the account's Stripe customer, start
 
 ### Telemetry
 
-The gateway, the webhook receiver and the billing worker each send operational telemetry to Grafana. The engines open no connections; the gateway reads each engine's figures when it checks on it, and sends them with its own.
+The gateway, the engines, the webhook receiver and the billing worker each send operational telemetry to Grafana.
 
-**Who can see it.** Grafana, and the network in between.
+**Who can see it.** Grafana, and the networks in between, the hosting provider's among them.
 
-**What they see.** From the gateway: counts, durations and token totals, aggregated in the enclave over each export interval and labelled only from fixed lists; each engine's totals since it started, labelled by model, deployment and an opaque engine id; a log line for each misconfiguration, engine health change or server error, with its content redacted; and a per-request trace only for a request that asked to be traced. An interval in which a single request fell describes that one request. From the billing processes: counts of Stripe notifications, jobs and calls to Stripe, purchases with their amounts by kind and currency, refunds and disputes, and how much work is waiting.
+**What they see.** From the gateway: counts, durations and token totals, aggregated in the enclave over each export interval and labelled only from fixed lists; a log line for each misconfiguration, engine health change or server error, with its content redacted; and a per-request trace only for a request that asked to be traced. From each engine, on the same interval: counts of requests, tokens and prefix-cache activity, and how much work is waiting, running and held in memory, labelled by model and a random id for the engine process. An interval in which a single request fell describes that one request. From the billing processes: counts of Stripe notifications, jobs and calls to Stripe, purchases with their amounts by kind and currency, refunds and disputes, and how much work is waiting.
 
-**What protects it.** Every label comes from a fixed list, and no identifier, account or Stripe text is ever one. Aggregation happens before anything is sent, so nothing per request leaves unless the request asked for it, and a condition that can happen once per request is counted rather than logged ([gateway.md](gateway.md#telemetry-scope-and-boundary)). The billing processes see only the account side, so their telemetry holds nothing about inference.
+**What protects it.** Every label comes from a fixed list, and no identifier, account or Stripe text is ever one. Aggregation happens before anything is sent, so nothing per request leaves unless the request asked for it, and a condition that can happen once per request is counted rather than logged ([gateway.md](gateway.md#telemetry-scope-and-boundary)). An engine coarsens every figure a cached prompt's length could be read from before it exports it, and exports on its own timer at a size that does not follow the values, so the export itself does not show when the engine is busy. What the gateway and the engines send is fixed by their measured code, and the operator chooses only where it goes. The engines' network lets them open connections to any address, so that code is what limits what leaves them. The billing processes see only the account side, so their telemetry holds nothing about inference.
 
 ### Payment
 
