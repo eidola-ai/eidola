@@ -31,6 +31,7 @@ use futures_util::StreamExt as _;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 
+use crate::durability::Durability;
 use crate::error::AppError;
 
 mod pipe;
@@ -60,11 +61,22 @@ pub struct HostNetwork {
 #[derive(Clone, Default)]
 pub(crate) struct Transport {
     host: Option<HostNetwork>,
+    /// The barrier every client built here awaits before a request leaves.
+    durability: Durability,
 }
 
 impl Transport {
     pub(crate) fn new(host: Option<HostNetwork>) -> Self {
-        Self { host }
+        Self {
+            host,
+            durability: Durability::default(),
+        }
+    }
+
+    /// The same transport, its clients waiting on `durability`'s barrier.
+    pub(crate) fn with_durability(mut self, durability: Durability) -> Self {
+        self.durability = durability;
+        self
     }
 }
 
@@ -126,9 +138,11 @@ pub(crate) async fn attesting_client(
         #[cfg(target_family = "wasm")]
         None => return Err(AppError::NoTransport),
     };
-    built.map_err(|e| AppError::Attestation {
-        message: format!("attestation client build failed: {e}"),
-    })
+    built
+        .map(|client| client.with_durability(transport.durability.clone()))
+        .map_err(|e| AppError::Attestation {
+            message: format!("attestation client build failed: {e}"),
+        })
 }
 
 /// A plain (non-attesting) HTTPS-capable client, for local engines and
@@ -138,7 +152,7 @@ pub(crate) fn plain_client(
     user_agent: Option<&'static str>,
     redirects: Redirects,
 ) -> Result<Client, AppError> {
-    match &transport.host {
+    let client = match &transport.host {
         Some(host) => Ok(Client::pipe(pipe::PipeClient::plain(
             host, user_agent, redirects, None,
         ))),
@@ -150,13 +164,14 @@ pub(crate) fn plain_client(
             }),
         #[cfg(target_family = "wasm")]
         None => Err(AppError::NoTransport),
-    }
+    };
+    client.map(|client| client.with_durability(transport.durability.clone()))
 }
 
 /// The updater's client (`updater::build_http_client`): follows redirects
 /// (release assets are served from a CDN), with a bounded handshake.
 pub(crate) fn update_client(transport: &Transport) -> Result<Client, AppError> {
-    match &transport.host {
+    let client = match &transport.host {
         Some(host) => Ok(Client::pipe(pipe::PipeClient::plain(
             host,
             Some(USER_AGENT),
@@ -171,7 +186,8 @@ pub(crate) fn update_client(transport: &Transport) -> Result<Client, AppError> {
             }),
         #[cfg(target_family = "wasm")]
         None => Err(AppError::NoTransport),
-    }
+    };
+    client.map(|client| client.with_durability(transport.durability.clone()))
 }
 
 /// A username and an optional password.
@@ -277,6 +293,7 @@ mod native {
 #[derive(Clone)]
 pub struct Client {
     kind: ClientKind,
+    durability: Durability,
 }
 
 #[derive(Clone)]
@@ -298,12 +315,14 @@ impl Client {
     fn native(client: reqwest::Client) -> Self {
         Self {
             kind: ClientKind::Native(client),
+            durability: Durability::default(),
         }
     }
 
     fn pipe(client: pipe::PipeClient) -> Self {
         Self {
             kind: ClientKind::Pipe(Arc::new(client)),
+            durability: Durability::default(),
         }
     }
 
@@ -324,6 +343,12 @@ impl Client {
             Redirects::Follow,
             None,
         ))
+    }
+
+    /// The same client, its requests waiting on `durability`'s barrier.
+    pub(crate) fn with_durability(mut self, durability: Durability) -> Self {
+        self.durability = durability;
+        self
     }
 
     pub(crate) fn get(&self, url: impl AsRef<str>) -> RequestBuilder {
@@ -356,7 +381,10 @@ impl Client {
                     .and_then(|parsed| pipe::PipeRequest::new(method, parsed)),
             },
         };
-        let builder = RequestBuilder { kind };
+        let builder = RequestBuilder {
+            kind,
+            durability: self.durability.clone(),
+        };
         match credentials {
             Some((username, password)) => builder.basic_auth(username, password),
             None => builder,
@@ -365,7 +393,7 @@ impl Client {
 
     /// Send a built request. A request built by another client is refused.
     pub(crate) async fn execute(&self, request: Request) -> Result<Response, Error> {
-        crate::durability::barrier().await;
+        barrier(&self.durability).await?;
         match (&self.kind, request.kind) {
             #[cfg(not(target_family = "wasm"))]
             (ClientKind::Native(client), RequestKind::Native(request)) => client
@@ -388,6 +416,7 @@ impl Client {
 /// sensitive, and a refused name or value fails the request at `build`/`send`.
 pub(crate) struct RequestBuilder {
     kind: BuilderKind,
+    durability: Durability,
 }
 
 enum BuilderKind {
@@ -408,6 +437,7 @@ impl RequestBuilder {
             #[cfg(not(target_family = "wasm"))]
             BuilderKind::Native(_) => self,
             BuilderKind::Pipe { client, request } => RequestBuilder {
+                durability: self.durability,
                 kind: BuilderKind::Pipe {
                     client,
                     request: request.and_then(f),
@@ -426,6 +456,7 @@ impl RequestBuilder {
         match self.kind {
             #[cfg(not(target_family = "wasm"))]
             BuilderKind::Native(builder) => RequestBuilder {
+                durability: self.durability,
                 kind: BuilderKind::Native(builder.header(name, value)),
             },
             BuilderKind::Pipe { .. } => self.map_pipe(|mut request| {
@@ -447,6 +478,7 @@ impl RequestBuilder {
         match self.kind {
             #[cfg(not(target_family = "wasm"))]
             BuilderKind::Native(builder) => RequestBuilder {
+                durability: self.durability,
                 kind: BuilderKind::Native(builder.basic_auth(username, password)),
             },
             BuilderKind::Pipe { .. } => {
@@ -465,6 +497,7 @@ impl RequestBuilder {
         match self.kind {
             #[cfg(not(target_family = "wasm"))]
             BuilderKind::Native(builder) => RequestBuilder {
+                durability: self.durability,
                 kind: BuilderKind::Native(builder.bearer_auth(token)),
             },
             BuilderKind::Pipe { .. } => {
@@ -487,6 +520,7 @@ impl RequestBuilder {
         match self.kind {
             #[cfg(not(target_family = "wasm"))]
             BuilderKind::Native(builder) => RequestBuilder {
+                durability: self.durability,
                 kind: BuilderKind::Native(builder.json(json)),
             },
             BuilderKind::Pipe { .. } => {
@@ -507,10 +541,11 @@ impl RequestBuilder {
     }
 
     pub(crate) fn body(self, body: impl Into<Body>) -> Self {
-        let body = body.into();
+        let body = body.into().behind(self.durability.clone());
         match self.kind {
             #[cfg(not(target_family = "wasm"))]
             BuilderKind::Native(builder) => RequestBuilder {
+                durability: self.durability,
                 kind: BuilderKind::Native(builder.body(body.into_native())),
             },
             BuilderKind::Pipe { .. } => self.map_pipe(|mut request| {
@@ -525,6 +560,7 @@ impl RequestBuilder {
         match self.kind {
             #[cfg(not(target_family = "wasm"))]
             BuilderKind::Native(builder) => RequestBuilder {
+                durability: self.durability,
                 kind: BuilderKind::Native(builder.timeout(timeout)),
             },
             BuilderKind::Pipe { .. } => self.map_pipe(|mut request| {
@@ -553,7 +589,7 @@ impl RequestBuilder {
         match self.kind {
             #[cfg(not(target_family = "wasm"))]
             BuilderKind::Native(builder) => {
-                crate::durability::barrier().await;
+                barrier(&self.durability).await?;
                 builder
                     .send()
                     .await
@@ -562,7 +598,7 @@ impl RequestBuilder {
             }
             BuilderKind::Pipe { client, request } => {
                 let request = request?;
-                crate::durability::barrier().await;
+                barrier(&self.durability).await?;
                 client.execute(request).await.map(Response::pipe)
             }
         }
@@ -629,6 +665,23 @@ enum BodyKind {
 }
 
 impl Body {
+    /// A deferred chunk followed by `durability`'s barrier; bytes as they are.
+    fn behind(self, durability: Durability) -> Self {
+        match self.kind {
+            BodyKind::Bytes(_) => self,
+            BodyKind::Deferred(chunk) => Self {
+                kind: BodyKind::Deferred(Box::pin(async move {
+                    let bytes = chunk.await?;
+                    durability
+                        .barrier()
+                        .await
+                        .map_err(|e| std::io::Error::other(format!("not sent: {e}")))?;
+                    Ok(bytes)
+                })),
+            },
+        }
+    }
+
     pub(super) fn empty() -> Self {
         Self::from(Bytes::new())
     }
@@ -675,9 +728,9 @@ impl From<String> for Body {
 
 /// A body of one chunk that `chunk` produces when the transport first asks
 /// for it: after the connection is open (and, to the Eidola backend,
-/// attested). The durability barrier runs after `chunk` and before its bytes
-/// are written, so a commit `chunk` makes is durable before the request
-/// carries what it wrote.
+/// attested). The sending client's durability barrier runs after `chunk` and
+/// before its bytes are written ([`RequestBuilder::body`]), so a commit
+/// `chunk` makes is durable before the request carries what it wrote.
 pub(crate) fn deferred_body<F>(chunk: F) -> Body
 where
     F: std::future::Future<Output = std::io::Result<Bytes>>
@@ -685,11 +738,7 @@ where
         + 'static,
 {
     Body {
-        kind: BodyKind::Deferred(Box::pin(async move {
-            let bytes = chunk.await?;
-            crate::durability::barrier().await;
-            Ok(bytes)
-        })),
+        kind: BodyKind::Deferred(Box::pin(chunk)),
     }
 }
 
@@ -766,6 +815,15 @@ impl Response {
             ResponseKind::Pipe(response) => response.into_stream(),
         }
     }
+}
+
+/// The client's durability barrier ([`Durability::barrier`]), refusing the
+/// request when it fails: it has not left, and must not.
+async fn barrier(durability: &Durability) -> Result<(), Error> {
+    durability
+        .barrier()
+        .await
+        .map_err(|e| Error::request(format!("not sent: {e}")))
 }
 
 /// A transport failure.

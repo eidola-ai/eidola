@@ -520,7 +520,12 @@ pub fn load_state(data_dir: &Path) -> UpdateState {
     let Ok(bytes) = std::fs::read(state_path(data_dir)) else {
         return UpdateState::default();
     };
-    match serde_json::from_slice::<UpdateState>(&bytes) {
+    state_from_bytes(&bytes)
+}
+
+/// [`load_state`]'s reading of the file's bytes.
+pub(crate) fn state_from_bytes(bytes: &[u8]) -> UpdateState {
+    match serde_json::from_slice::<UpdateState>(bytes) {
         Ok(state)
             if state.verdict_rules == VERDICT_RULES
                 && state.release_trust_sha256 == crate::trust_root::RELEASE_TRUST_SHA256 =>
@@ -531,14 +536,19 @@ pub fn load_state(data_dir: &Path) -> UpdateState {
     }
 }
 
+/// The file's bytes.
+pub(crate) fn state_to_bytes(state: &UpdateState) -> Result<Vec<u8>, AppError> {
+    serde_json::to_vec_pretty(state).map_err(|e| AppError::Update {
+        message: format!("serializing update state: {e}"),
+    })
+}
+
 /// Persist the state, creating the data dir as needed.
 pub fn save_state(data_dir: &Path, state: &UpdateState) -> Result<(), AppError> {
     std::fs::create_dir_all(data_dir).map_err(|e| AppError::Update {
         message: format!("creating data dir for update state: {e}"),
     })?;
-    let bytes = serde_json::to_vec_pretty(state).map_err(|e| AppError::Update {
-        message: format!("serializing update state: {e}"),
-    })?;
+    let bytes = state_to_bytes(state)?;
     std::fs::write(state_path(data_dir), bytes).map_err(|e| AppError::Update {
         message: format!("writing update state: {e}"),
     })

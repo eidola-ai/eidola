@@ -70,7 +70,9 @@ thiserror = "2"
 tinfoil-verifier = { path = "../tinfoil-verifier" }
 tokio = { version = "1", features = ["sync", "rt", "io-util", "time", "macros"] }
 toml = "1"
-turso = { git = "https://github.com/eidola-ai/turso", branch = "fix-concurrent-view-expansion-guard", default-features = false, features = ["pure-rust-crypto"] }
+# The fork's branch also reads the clock through `web-time` on wasm32, where
+# `std::time` panics (`strftime('now')` in the wallet's lifecycle view).
+turso = { git = "https://github.com/eidola-ai/turso", branch = "wasm-web-time-clock", default-features = false, features = ["pure-rust-crypto"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 x509-cert = "0.2"
 # Scrubs the prefix-cache key (`prefix_cache`) wherever this crate holds it.

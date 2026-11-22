@@ -313,10 +313,31 @@ pub async fn open(data_dir: &Path) -> Result<Database, AppError> {
         })?;
 
     let conn = connect(&db).await?;
-    initialize(&conn).await?;
+    initialize(&conn, false).await?;
 
     Ok(db)
 }
+
+/// [`open`] for a profile held in memory and streamed to its host
+/// ([`crate::storage`]): the same database, schema check and seeds, with
+/// every read and write served from `image`.
+pub async fn open_on_image(image: &crate::storage::ProfileImage) -> Result<Database, AppError> {
+    let db = Builder::new_local(IMAGE_DB_NAME)
+        .with_io_impl(image.turso_io())
+        .build()
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to open database: {e}"),
+        })?;
+
+    let conn = connect(&db).await?;
+    initialize(&conn, true).await?;
+
+    Ok(db)
+}
+
+/// The database's name inside a profile image; its log is `<name>-wal`.
+pub const IMAGE_DB_NAME: &str = "eidola.db";
 
 /// Open a **write** transaction — `BEGIN IMMEDIATE`, reserving the writer
 /// before the first read.
@@ -385,16 +406,40 @@ pub async fn connect(db: &Database) -> Result<Connection, AppError> {
 /// idempotent defaults; any *other* non-zero version is from an incompatible
 /// pre-release build and is refused with an honest "delete your dev database"
 /// error rather than limping against a schema it doesn't match.
-async fn initialize(conn: &Connection) -> Result<(), AppError> {
+///
+/// With `atomic_schema`, the schema and its version stamp commit as one
+/// transaction, so a process killed during a first open leaves an empty
+/// database rather than a half-made schema the next open refuses. A profile
+/// on a host asks for it: a phone may end the app during its first launch.
+async fn initialize(conn: &Connection, atomic_schema: bool) -> Result<(), AppError> {
     let version = get_user_version(conn).await?;
 
     if version == 0 {
-        conn.execute_batch(SCHEMA)
-            .await
-            .map_err(|e| AppError::Database {
-                message: format!("schema init failed: {e}"),
-            })?;
-        set_user_version(conn, LATEST_VERSION).await?;
+        if atomic_schema {
+            begin_write(conn).await?;
+        }
+        let made = async {
+            conn.execute_batch(SCHEMA)
+                .await
+                .map_err(|e| AppError::Database {
+                    message: format!("schema init failed: {e}"),
+                })?;
+            set_user_version(conn, LATEST_VERSION).await
+        }
+        .await;
+        if atomic_schema {
+            match made {
+                Ok(()) => {
+                    conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        } else {
+            made?;
+        }
     } else if version != LATEST_VERSION {
         return Err(AppError::Database {
             message: format!(
@@ -10541,7 +10586,7 @@ mod tests {
         // Mirror production: initialize (and seed) under FK enforcement, so a
         // seed-order bug would surface here too.
         let conn = connect(&db).await.unwrap();
-        initialize(&conn).await.unwrap();
+        initialize(&conn, false).await.unwrap();
         db
     }
 
@@ -10598,7 +10643,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let database = open(dir.path()).await.expect("open");
         let conn = fk_conn(&database).await;
-        initialize(&conn).await.unwrap();
+        initialize(&conn, false).await.unwrap();
         instantiate_template(
             &conn,
             crate::config::DEFAULT_TEMPLATE_ID,
@@ -11251,7 +11296,7 @@ mod tests {
     async fn initialize_is_idempotent() {
         let db = open_memory_fresh().await;
         let conn = db.connect().unwrap();
-        initialize(&conn).await.unwrap();
+        initialize(&conn, false).await.unwrap();
         assert_eq!(get_user_version(&conn).await.unwrap(), LATEST_VERSION);
     }
 
@@ -13868,7 +13913,9 @@ mod tests {
         let conn = db.connect().unwrap();
         // Simulate a database from an older, incompatible schema version.
         set_user_version(&conn, 1).await.unwrap();
-        let err = initialize(&conn).await.expect_err("stale version refused");
+        let err = initialize(&conn, false)
+            .await
+            .expect_err("stale version refused");
         let msg = format!("{err}");
         assert!(
             msg.contains("incompatible") && msg.contains("delete"),

@@ -10759,7 +10759,7 @@ dependencies = [
 [[package]]
 name = "turso"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "thiserror 2.0.21",
  "tracing",
@@ -10772,7 +10772,7 @@ dependencies = [
 [[package]]
 name = "turso_core"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "aegis",
  "aes 0.8.4",
@@ -10838,13 +10838,14 @@ dependencies = [
  "twox-hash",
  "uncased",
  "uuid",
+ "web-time",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "turso_ext"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -10854,7 +10855,7 @@ dependencies = [
 [[package]]
 name = "turso_macros"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10864,7 +10865,7 @@ dependencies = [
 [[package]]
 name = "turso_parser"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "bitflags 2.13.2",
  "memchr",
@@ -10878,7 +10879,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -10894,7 +10895,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit_macros"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10904,7 +10905,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_engine"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -10926,7 +10927,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_sdk_kit"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",

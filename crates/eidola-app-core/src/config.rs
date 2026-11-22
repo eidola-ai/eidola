@@ -355,7 +355,12 @@ impl Config {
         let Ok(contents) = fs::read_to_string(path) else {
             return Config::default();
         };
-        toml::from_str(&contents).unwrap_or_default()
+        Self::parse_lenient(&contents)
+    }
+
+    /// [`Config::load_from`]'s reading of a file's text.
+    pub(crate) fn parse_lenient(contents: &str) -> Config {
+        toml::from_str(contents).unwrap_or_default()
     }
 
     /// Load config from `path` **to write it back**: a missing file is the
@@ -374,13 +379,19 @@ impl Config {
                 });
             }
         };
+        Self::parse_for_update(&contents, path)
+    }
+
+    /// [`Config::load_for_update`]'s reading of a file's text; `path` names
+    /// the file in an error.
+    pub(crate) fn parse_for_update(contents: &str, path: &Path) -> Result<Config, AppError> {
         // Where, never what: the parser's `Display` quotes the failing source
         // line and its message can quote a value, and this file's lines
         // include the account secret (a partial sync write that leaves
         // `account_secret = "…` unterminated fails on exactly that line). The
         // text reaches a settings alert and `AccountNotSaved`'s reason, so it
         // names the position only.
-        toml::from_str(&contents).map_err(|e| {
+        toml::from_str(contents).map_err(|e| {
             let at = e
                 .span()
                 .map(|span| {
@@ -396,6 +407,13 @@ impl Config {
                     path.display()
                 ),
             }
+        })
+    }
+
+    /// The file's text.
+    pub(crate) fn to_toml(&self) -> Result<String, AppError> {
+        toml::to_string_pretty(self).map_err(|e| AppError::Config {
+            message: format!("failed to serialize config: {e}"),
         })
     }
 
@@ -427,9 +445,7 @@ impl Config {
                 message: format!("failed to create config directory: {e}"),
             })?;
         }
-        let contents = toml::to_string_pretty(self).map_err(|e| AppError::Config {
-            message: format!("failed to serialize config: {e}"),
-        })?;
+        let contents = self.to_toml()?;
         let write_err = |e: std::io::Error| AppError::Config {
             message: format!("failed to write config: {e}"),
         };
@@ -510,6 +526,7 @@ impl Config {
 /// lock belongs to the one `AppCore` that may write this profile, since the
 /// database's exclusive lock refuses a second. Best effort: a temporary that
 /// cannot be removed is left for the next update.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn sweep_stale_temporaries(path: &Path) {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
         return;

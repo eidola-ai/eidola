@@ -19,6 +19,7 @@ mod recorded;
 pub mod router;
 mod rt;
 pub mod search;
+pub mod storage;
 pub mod subspace_driver;
 pub mod subspaces;
 pub mod summaries;
@@ -2280,6 +2281,9 @@ struct Inner {
     /// [`Inner::update_config`]).
     config_write: Mutex<()>,
     data_dir: PathBuf,
+    /// Where the config, the update state and the database are read and
+    /// written: the filesystem, or a host's files ([`storage`]).
+    files: storage::ProfileFiles,
     db: tokio::sync::OnceCell<turso::Database>,
     /// Cached update-check state and the ordering that governs writes to it
     /// (see [`UpdateStateCell`]), lazily loaded from
@@ -2565,8 +2569,10 @@ struct Inner {
     /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
     /// silently contending for turso's single-writer file. Held purely by
     /// existing; released when this `Inner` drops (the descriptor closes), so
-    /// a crash cannot wedge it either. See [`db::DbLock`].
-    _db_lock: db::DbLock,
+    /// a crash cannot wedge it either. See [`db::DbLock`]. `None` for a
+    /// profile on a host: its stream holds the lock until its last write has
+    /// reached the host ([`storage`]).
+    _db_lock: Option<db::DbLock>,
 }
 
 // --- Config helpers (sync) ---------------------------------------------------
@@ -2625,14 +2631,14 @@ impl MechanicalOutcome {
 
 impl Inner {
     fn load_config(&self) -> Config {
-        Config::load_from(&self.config_path)
+        self.files.load_config(&self.config_path)
     }
 
     /// The config a setter is about to rewrite whole: see
     /// [`Config::load_for_update`] (an unreadable file refuses the write
     /// rather than reading as defaults the save would then persist).
     fn load_config_for_update(&self) -> Result<Config, AppError> {
-        Config::load_for_update(&self.config_path)
+        self.files.load_config_for_update(&self.config_path)
     }
 
     /// Rewrite the config: load it strictly, apply `change`, save it whole —
@@ -2655,10 +2661,10 @@ impl Inner {
         change: impl FnOnce(&mut Config) -> Result<(), AppError>,
     ) -> Result<(), AppError> {
         let _serialized = self.config_write.lock().unwrap_or_else(|e| e.into_inner());
-        config::sweep_stale_temporaries(&self.config_path);
-        let mut cfg = Config::load_for_update(&self.config_path)?;
+        self.files.sweep_config_temporaries(&self.config_path);
+        let mut cfg = self.files.load_config_for_update(&self.config_path)?;
         change(&mut cfg)?;
-        cfg.save_to(&self.config_path)
+        self.files.save_config(&cfg, &self.config_path)
     }
 
     fn require_credentials<'a>(&self, cfg: &'a Config) -> Result<(&'a str, &'a str), AppError> {
@@ -2733,7 +2739,7 @@ impl Inner {
         let mut guard = self.update_state.lock().expect("update_state lock");
         guard
             .state
-            .get_or_insert_with(|| updates::load_state(&self.data_dir))
+            .get_or_insert_with(|| self.files.load_update_state(&self.data_dir))
             .clone()
     }
 
@@ -2762,9 +2768,9 @@ impl Inner {
             let cell = &mut *guard;
             let state = cell
                 .state
-                .get_or_insert_with(|| updates::load_state(&self.data_dir));
+                .get_or_insert_with(|| self.files.load_update_state(&self.data_dir));
             let answer = f(state, &mut cell.applied_check);
-            if let Err(e) = updates::save_state(&self.data_dir, state) {
+            if let Err(e) = self.files.save_update_state(&self.data_dir, state) {
                 eprintln!("warning: failed to persist update-check state: {e}");
             }
             answer
@@ -2911,7 +2917,7 @@ impl Inner {
         let database = self
             .db
             .get_or_try_init(|| async {
-                let database = db::open(&self.data_dir).await?;
+                let database = self.files.open_database(&self.data_dir).await?;
                 self.forget_other_domains_cache_keys(&database).await;
                 self.sweep_pristine_spaces(&database).await;
                 Ok::<_, AppError>(database)
@@ -3409,7 +3415,7 @@ impl Inner {
                 account_secret: Some(created.secret.clone()),
                 ..Config::default()
             };
-            recovery.save_to(&path).ok().map(|()| path)
+            self.files.save_config(&recovery, &path).ok().map(|()| path)
         } else {
             None
         };
@@ -11577,6 +11583,7 @@ impl AppCore {
     /// it — turso is single-writer, so two openers would otherwise contend
     /// silently. The lock is released when the returned `AppCore` (and any
     /// task holding its inner `Arc`) drops.
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(config_dir: PathBuf, data_dir: PathBuf) -> Result<Self, AppError> {
         Self::open_as(config_dir, data_dir, db::LockHolder::App)
     }
@@ -11586,6 +11593,7 @@ impl AppCore {
     /// holder ([`db::LockHolder::Command`]): a contender refused while this
     /// core lives learns that the profile will be let go when the command
     /// ends, which is what lets another command wait for it rather than fail.
+    #[cfg(not(target_family = "wasm"))]
     pub fn new_for_command(config_dir: PathBuf, data_dir: PathBuf) -> Result<Self, AppError> {
         Self::open_as(config_dir, data_dir, db::LockHolder::Command)
     }
@@ -11594,36 +11602,113 @@ impl AppCore {
     /// request this core makes — account, credentials, chat, models, updates —
     /// is a stream `host`'s dialer opens, with TLS (and, to the Eidola
     /// backend, enclave attestation) run in this process over it. The host
-    /// moves ciphertext and makes no trust decision. How the mobile app's
-    /// wasm build reaches the network, which has no other transport.
+    /// moves ciphertext and makes no trust decision. The mobile app, whose
+    /// files its host owns too, passes its network to [`AppCore::on_host`].
+    #[cfg(not(target_family = "wasm"))]
     pub fn with_host_network(
         config_dir: PathBuf,
         data_dir: PathBuf,
         host: transport::HostNetwork,
     ) -> Result<Self, AppError> {
+        let db_lock = db::DbLock::acquire(&data_dir, db::LockHolder::App)?;
         Self::build(
             config_dir,
             data_dir,
-            db::LockHolder::App,
+            storage::ProfileFiles::Disk,
+            Some(db_lock),
             transport::Transport::new(Some(host)),
             #[cfg(feature = "test-support")]
             None,
         )
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn open_as(
         config_dir: PathBuf,
         data_dir: PathBuf,
         holder: db::LockHolder,
     ) -> Result<Self, AppError> {
+        // Loud DB contention: claim the single-writer database before
+        // building anything else, so a second opener is refused with a typed
+        // error instead of silently racing the first.
+        let db_lock = db::DbLock::acquire(&data_dir, holder)?;
         Self::build(
             config_dir,
             data_dir,
-            holder,
+            storage::ProfileFiles::Disk,
+            Some(db_lock),
             transport::Transport::default(),
             #[cfg(feature = "test-support")]
             None,
         )
+    }
+
+    /// Open a profile whose files the embedding app owns, loaded by
+    /// [`storage::HostProfile::load`] (which took the profile's lock). The
+    /// config lives beside the database, so [`Self::config_dir`] and
+    /// [`Self::data_dir`] are both the profile's `data_dir`.
+    ///
+    /// Writes stream to the host behind the work that made them, on this
+    /// core's runtime; [`Self::flush_storage`] waits for them, and so does
+    /// every request before it leaves (see [`storage`] for what is durable
+    /// when). `network`, when given, is the socket every request goes over
+    /// (as [`Self::with_host_network`]); wasm32 has no other.
+    pub fn on_host(
+        profile: storage::HostProfile,
+        network: Option<transport::HostNetwork>,
+    ) -> Result<Self, AppError> {
+        Self::on_host_inner(
+            profile,
+            transport::Transport::new(network),
+            #[cfg(feature = "test-support")]
+            None,
+        )
+    }
+
+    /// [`Self::on_host`] with [`Self::with_test_http_client`]'s client.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn on_host_with_test_http_client(
+        profile: storage::HostProfile,
+        client: impl Into<crate::transport::Client>,
+    ) -> Result<Self, AppError> {
+        Self::on_host_inner(
+            profile,
+            transport::Transport::default(),
+            Some(client.into()),
+        )
+    }
+
+    fn on_host_inner(
+        mut profile: storage::HostProfile,
+        transport: transport::Transport,
+        #[cfg(feature = "test-support")] http_override: Option<crate::transport::Client>,
+    ) -> Result<Self, AppError> {
+        let stream = profile.stream.take();
+        let core = Self::build(
+            profile.data_dir.clone(),
+            profile.data_dir.clone(),
+            storage::ProfileFiles::Host(profile.image.clone()),
+            None,
+            transport,
+            #[cfg(feature = "test-support")]
+            http_override,
+        )?;
+        if let Some(stream) = stream {
+            drop(core.runtime.spawn(stream));
+        }
+        Ok(core)
+    }
+
+    /// Wait until every write this core made before the call is durable on
+    /// its host ([`storage::ProfileImage::flush`]). Returns at once for a
+    /// profile on the filesystem, whose writes are durable when made.
+    pub async fn flush_storage(&self) -> Result<(), AppError> {
+        match &self.inner.files {
+            #[cfg(not(target_family = "wasm"))]
+            storage::ProfileFiles::Disk => Ok(()),
+            storage::ProfileFiles::Host(image) => image.flush().await,
+        }
     }
 
     /// Construct an `AppCore` whose HTTP client is the supplied plain
@@ -11640,16 +11725,18 @@ impl AppCore {
     /// [`AppCore::set_base_url`]); the injected client only governs *how*
     /// requests are made, not *where*.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
     pub fn with_test_http_client(
         config_dir: PathBuf,
         data_dir: PathBuf,
         client: impl Into<crate::transport::Client>,
     ) -> Result<Self, AppError> {
+        let db_lock = db::DbLock::acquire(&data_dir, db::LockHolder::App)?;
         Self::build(
             config_dir,
             data_dir,
-            db::LockHolder::App,
+            storage::ProfileFiles::Disk,
+            Some(db_lock),
             transport::Transport::default(),
             Some(client.into()),
         )
@@ -11755,14 +11842,22 @@ impl AppCore {
     fn build(
         config_dir: PathBuf,
         data_dir: PathBuf,
-        holder: db::LockHolder,
+        files: storage::ProfileFiles,
+        db_lock: Option<db::DbLock>,
         transport: transport::Transport,
         #[cfg(feature = "test-support")] http_override: Option<crate::transport::Client>,
     ) -> Result<Self, AppError> {
-        // Loud DB contention: claim the single-writer database before
-        // building anything else, so a second opener is refused with a typed
-        // error instead of silently racing the first.
-        let db_lock = db::DbLock::acquire(&data_dir, holder)?;
+        // Every request this core sends waits on its own profile's barrier.
+        let durability = match &files {
+            storage::ProfileFiles::Host(image) => durability::Durability::host(image.clone()),
+            #[cfg(not(target_family = "wasm"))]
+            storage::ProfileFiles::Disk => durability::Durability::default(),
+        };
+        let transport = transport.with_durability(durability.clone());
+        #[cfg(feature = "test-support")]
+        let http_override = http_override.map(|client| client.with_durability(durability));
+        #[cfg(not(feature = "test-support"))]
+        let _ = durability;
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let runtime = rt::new_runtime().map_err(|e| AppError::Internal {
             message: format!("failed to create tokio runtime: {e}"),
@@ -11776,6 +11871,7 @@ impl AppCore {
                 config_path: config_dir.join("config.toml"),
                 config_write: Mutex::new(()),
                 data_dir,
+                files,
                 db: tokio::sync::OnceCell::new(),
                 update_state: Mutex::new(UpdateStateCell::default()),
                 update_checks_started: std::sync::atomic::AtomicU64::new(0),
