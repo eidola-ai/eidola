@@ -28,7 +28,7 @@ python3 "$HERE/../tools/echo_server.py" 7777 &
 ECHO=$!
 trap 'kill $ECHO 2>/dev/null || true' EXIT
 
-"$HERE/build.sh"
+"$HERE/build.sh" --bundle "$HERE/../contract-test"
 rm -rf "$HERE/build/test.xcresult"
 TEST_RUNNER_SHOTS="$SHOTS" xcodebuild -project "$HERE/EidolaShell.xcodeproj" -scheme EidolaShell \
   -configuration Debug -derivedDataPath "$HERE/build/DerivedData" -destination "id=$UDID" \

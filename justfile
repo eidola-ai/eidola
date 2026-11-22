@@ -130,7 +130,19 @@ engine-platform-endorsements tag:
 engine:
     nix build .#llama-server -o crates/eidola-gui/build/llama-server
 
-# --- Mobile shells (mobile/AGENTS.md) ---
+# --- Mobile app and shells (mobile/AGENTS.md, crates/eidola-mobile/AGENTS.md) ---
+
+# Build the app bundle the shells embed (--self-test, --out DIR)
+mobile-bundle *args:
+    mobile/build-bundle.sh {{args}}
+
+# Two clean builds of the app bundle, byte for byte identical
+mobile-bundle-repro *args:
+    mobile/bundle-repro.sh {{args}}
+
+# The app's headless self-test in the iOS Simulator or Android emulator against local shims
+mobile-self-test platform *args:
+    mobile/self-test.sh {{platform}} {{args}}
 
 # Build the iOS shell for the Simulator (--bundle DIR, --release, --device)
 mobile-ios-sim *args:
