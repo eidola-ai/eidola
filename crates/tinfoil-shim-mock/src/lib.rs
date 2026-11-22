@@ -202,6 +202,19 @@ struct FreshBuilder {
     crl_der: Vec<u8>,
     /// NVIDIA GPU evidence items to carry, each bound to the nonce.
     gpus: u32,
+    misbind: Option<Misbinding>,
+}
+
+/// A binding the shim breaks on purpose, so a verifier's refusal of it can be
+/// tested against an otherwise genuine document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Misbinding {
+    /// The document endorses a TLS key the shim does not serve with: what a
+    /// relay holding another endpoint's document presents.
+    TlsKey,
+    /// The signed report's `REPORT_DATA` commits to another nonce than the
+    /// document's own challenge.
+    ReportData,
 }
 
 impl FreshBuilder {
@@ -213,7 +226,10 @@ impl FreshBuilder {
                 {
                     "id": "tls",
                     "format": "https://tinfoil.sh/key/spki-fp-sha256/v1",
-                    "data": hex::encode(self.tls_key_fp),
+                    "data": hex::encode(match self.misbind {
+                        Some(Misbinding::TlsKey) => Sha256::digest(self.tls_key_fp).into(),
+                        _ => self.tls_key_fp,
+                    }),
                 },
                 {
                     "id": "hpke",
@@ -254,7 +270,18 @@ impl FreshBuilder {
         h.update(device_evidence_hash);
         let report_data_prefix: [u8; 32] = h.finalize().into();
 
-        let mut report = build_report(&self.measurement, &self.host_data, &report_data_prefix);
+        let signed_report_data = match self.misbind {
+            Some(Misbinding::ReportData) => {
+                let mut h = Sha256::new();
+                h.update(b"https://tinfoil.sh/report-data/v1");
+                h.update([0u8; 32]);
+                h.update(crypto_material_hash);
+                h.update(device_evidence_hash);
+                h.finalize().into()
+            }
+            _ => report_data_prefix,
+        };
+        let mut report = build_report(&self.measurement, &self.host_data, &signed_report_data);
         sign_report(&mut report, &self.vcek_signing_key);
 
         let b64 = &base64::engine::general_purpose::STANDARD;
@@ -591,7 +618,8 @@ fn ca_extensions(
 ///   * ExtendedKeyUsage serverAuth (required by macOS for TLS server certs)
 ///   * SubjectKeyIdentifier from `own_key_id`
 ///   * AuthorityKeyIdentifier from `issuer_key_id`
-///   * SubjectAltName listing each DNS name
+///   * SubjectAltName listing each name: an IP literal as an address, anything
+///     else as a DNS name
 fn tls_leaf_extensions(
     dns_names: &[&str],
     own_key_id: &[u8],
@@ -630,7 +658,15 @@ fn tls_leaf_extensions(
 
     let mut general_names: Vec<GeneralName> = dns_names
         .iter()
-        .map(|n| Ok::<_, der::Error>(GeneralName::DnsName(Ia5String::new(*n)?)))
+        .map(|n| match n.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => Ok::<_, der::Error>(GeneralName::IpAddress(
+                der::asn1::OctetString::new(ip.octets().to_vec())?,
+            )),
+            Ok(std::net::IpAddr::V6(ip)) => Ok(GeneralName::IpAddress(
+                der::asn1::OctetString::new(ip.octets().to_vec())?,
+            )),
+            Err(_) => Ok(GeneralName::DnsName(Ia5String::new(*n)?)),
+        })
         .collect::<Result<_, _>>()?;
     // The IPv4 loopback too, so a client can reach an in-process shim
     // without resolving a name (a build sandbox may have no resolver).
@@ -1108,6 +1144,12 @@ pub struct ShimConfig {
     /// NVIDIA GPU evidence items each attestation carries, every one bound to
     /// that handshake's nonce.
     pub gpus: u32,
+    /// Names the TLS leaf is issued for beside `localhost`, `server`, `shim`
+    /// and `127.0.0.1`: DNS names, or IP literals (issued as addresses), such
+    /// as the LAN address a phone reaches a development machine's shim at.
+    pub extra_tls_names: Vec<String>,
+    /// Break one binding in every document served (tests of refusals).
+    pub misbind: Option<Misbinding>,
 }
 
 /// A shim serving in this process. Dropping it stops the listener and every
@@ -1165,6 +1207,8 @@ pub async fn start(config: ShimConfig) -> Result<RunningShim, BoxError> {
         host_data,
         cert_dir,
         gpus,
+        extra_tls_names,
+        misbind,
     } = config;
 
     // ── 1. Load or generate the persistent ARK + ASK ────────────────────
@@ -1235,7 +1279,12 @@ pub async fn start(config: ShimConfig) -> Result<RunningShim, BoxError> {
     // TLS — Apple's Security framework refuses to handle PSS in chain
     // validation, so we keep the SEV-SNP and TLS chains fully separate.
 
-    let (tls_cert_der, tls_key_der) = build_tls_leaf(&tls_ca, &["localhost", "server", "shim"])?;
+    let mut tls_names = vec!["localhost", "server", "shim"];
+    tls_names.extend(extra_tls_names.iter().map(String::as_str));
+    let (tls_cert_der, tls_key_der) = build_tls_leaf(&tls_ca, &tls_names)?;
+    if !extra_tls_names.is_empty() {
+        info!("TLS leaf also issued for: {}", extra_tls_names.join(", "));
+    }
     let cert_der = rustls::pki_types::CertificateDer::from(tls_cert_der.clone());
     let key_der = tls_key_der;
 
@@ -1278,6 +1327,7 @@ pub async fn start(config: ShimConfig) -> Result<RunningShim, BoxError> {
         cert_chain_pem,
         crl_der,
         gpus,
+        misbind,
     });
 
     let attestations = Arc::new(AtomicUsize::new(0));
@@ -1335,10 +1385,11 @@ pub async fn start(config: ShimConfig) -> Result<RunningShim, BoxError> {
                 let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                     Ok(s) => s,
                     Err(e) => {
-                        debug!("TLS handshake failed from {remote_addr}: {e}");
+                        info!("{remote_addr}: TLS handshake failed: {e}");
                         return;
                     }
                 };
+                info!("{remote_addr}: TLS established");
 
                 let io = TokioIo::new(tls_stream);
                 let service = hyper::service::service_fn(move |req| {
@@ -1352,6 +1403,7 @@ pub async fn start(config: ShimConfig) -> Result<RunningShim, BoxError> {
                 {
                     debug!("Connection error from {remote_addr}: {e}");
                 }
+                debug!("{remote_addr}: closed");
             });
         }
     });
@@ -1407,7 +1459,8 @@ async fn handle_attestation(
 
     match state.fresh.build(&nonce32) {
         Ok(json) => {
-            state.attestations.fetch_add(1, Ordering::Relaxed);
+            let served = state.attestations.fetch_add(1, Ordering::Relaxed) + 1;
+            info!("attestation #{served} served (nonce {}…)", &nonce_hex[..16]);
             (StatusCode::OK, [("content-type", "application/json")], json).into_response()
         }
         Err(e) => {
@@ -1450,7 +1503,7 @@ async fn handle_proxy(
         }
     };
 
-    let mut req = state.proxy_client.request(method, &target_url);
+    let mut req = state.proxy_client.request(method.clone(), &target_url);
     for (name, value) in &headers {
         if name == "host" || name == "transfer-encoding" {
             continue;
@@ -1462,6 +1515,7 @@ async fn handle_proxy(
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();
+            info!("{method} {} → {status}", uri.path());
             let resp_headers = resp.headers().clone();
 
             // Forward the upstream body as a *stream*. We previously
@@ -1489,6 +1543,9 @@ async fn handle_proxy(
             }
             response
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("proxy error: {e}")).into_response(),
+        Err(e) => {
+            info!("{method} {} → proxy error: {e}", uri.path());
+            (StatusCode::BAD_GATEWAY, format!("proxy error: {e}")).into_response()
+        }
     }
 }

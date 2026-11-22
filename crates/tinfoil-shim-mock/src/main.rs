@@ -8,6 +8,12 @@
 //!   DEV_MEASUREMENT - measurement to advertise (default: 48 zero bytes hex)
 //!   DEV_HOST_DATA   - HOST_DATA to advertise (default: 32 zero bytes hex)
 //!   CERT_DIR        - directory to store persistent certs (default: .dev-certs)
+//!   EXTRA_TLS_NAMES - comma-separated extra names for the TLS leaf: DNS names
+//!                     or IP literals, e.g. the LAN address a phone reaches
+//!                     this machine at (default: none)
+//!
+//! Each connection's TLS handshake and each attestation served are logged at
+//! `info`; `RUST_LOG=tinfoil_shim_mock=debug` adds connection closes.
 
 use std::net::SocketAddr;
 
@@ -46,6 +52,14 @@ async fn main() -> Result<(), BoxError> {
         Err(_) => [0; 32],
     };
 
+    let extra_tls_names: Vec<String> = std::env::var("EXTRA_TLS_NAMES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .collect();
+
     let shim = tinfoil_shim_mock::start(ShimConfig {
         upstream_url,
         listen_addr,
@@ -53,6 +67,8 @@ async fn main() -> Result<(), BoxError> {
         host_data,
         cert_dir: cert_dir.into(),
         gpus: 0,
+        extra_tls_names,
+        misbind: None,
     })
     .await?;
     shim.wait().await;
