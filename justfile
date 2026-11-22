@@ -130,6 +130,28 @@ engine-platform-endorsements tag:
 engine:
     nix build .#llama-server -o crates/eidola-gui/build/llama-server
 
+# --- Mobile shells (mobile/AGENTS.md) ---
+
+# Build the iOS shell for the Simulator (--bundle DIR, --release, --device)
+mobile-ios-sim *args:
+    mobile/ios/build.sh {{args}}
+
+# Run the contract test page in the iOS Simulator under XCUITest (own simulator)
+mobile-ios-test *args:
+    mobile/ios/test-sim.sh {{args}}
+
+# Build the Android shell APK (--bundle DIR, --debug, --out DIR)
+mobile-android *args:
+    mobile/android/build.sh {{args}}
+
+# Run the contract test page on the Android emulator (own AVD)
+mobile-android-test *args:
+    mobile/android/test-emulator.sh {{args}}
+
+# Two clean Android builds, identical, and a signed APK strips back to them
+mobile-android-repro *args:
+    mobile/android/repro.sh {{args}}
+
 # Build and run a system: gateway, billing, cli, gui, notepad, www, or engine-server
 run system *args:
     #!/usr/bin/env bash
