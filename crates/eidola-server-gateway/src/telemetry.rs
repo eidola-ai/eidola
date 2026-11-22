@@ -252,7 +252,13 @@ fn init_otel_providers(config: OtlpConfig) -> OtelGuard {
         crate::tls_config(),
         [timeouts.traces, timeouts.metrics, timeouts.logs],
     );
-    let resource = config.resource([]);
+    // Gateways run side by side during a cutover, and each re-exports the
+    // engine nodes' counters; the instance keeps their cumulative series
+    // apart. It names this process only.
+    let resource = config.resource([KeyValue::new(
+        "service.instance.id",
+        uuid::Uuid::new_v4().to_string(),
+    )]);
 
     // --- Traces ---
     // Two processors, and which one a span reaches is decided by its sampled
