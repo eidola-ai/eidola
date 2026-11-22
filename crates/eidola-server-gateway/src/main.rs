@@ -284,7 +284,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             router.refresh(source.as_ref()).await;
             router.spawn(source);
             telemetry::metrics::register_engine_router(router.clone());
-            engine_router::node_telemetry::register(router.clone());
             Some(router)
         }
         _ => None,

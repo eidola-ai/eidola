@@ -3,7 +3,7 @@
 //! | Route | Auth | Purpose |
 //! |---|---|---|
 //! | `POST /v1/chat/completions` | gateway token + weights hash | the strict chat subset, answered as a stream |
-//! | `GET /v1/engine/info` | gateway token | model id, weights hash, build, executor, device, telemetry snapshot |
+//! | `GET /v1/engine/info` | gateway token | model id, weights hash, build, executor, device, instance id |
 //! | `GET /healthz` | none | content-free liveness/readiness |
 //!
 //! A chat request is refused, in this order and before anything is admitted: a missing
@@ -34,8 +34,8 @@
 
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
 use axum::Router;
@@ -46,10 +46,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use eidola_common::engine_protocol::DeclaredPrefixRefusal;
 use eidola_common::engine_protocol::STREAM_CADENCE;
-use eidola_common::engine_protocol::telemetry::{
-    BOOT_ID_BYTES, INFO_TELEMETRY_MEMBER, MAX_POOLS, NodeCounters, NodeGauges, NodeTelemetry,
-    PoolOccupancy, SNAPSHOT_EPOCH,
-};
 use eidola_common::stream_shape::{Framer, StreamEvent, pad_body};
 use eidola_engine::engine::{FinishReason, SubmitError};
 use eidola_engine::secret::SaltDeriver;
@@ -101,8 +97,6 @@ pub struct AppState {
     pub admission: Arc<Admission>,
     /// The read bound: requests whose body is being read or parsed (module docs).
     pub reading: Arc<Admission>,
-    /// Random per process: the telemetry snapshot's `boot_id`.
-    pub boot_id: [u8; BOOT_ID_BYTES],
     /// Requests refused `overloaded` (no read or admission slot free), since boot.
     pub overloaded: AtomicU64,
     /// Requests answered with `engine_unavailable` or an internal error before any
@@ -110,19 +104,9 @@ pub struct AppState {
     pub failed: AtomicU64,
     /// Streams that ended with an error event, since boot.
     pub streams_failed: AtomicU64,
-    /// The telemetry snapshot last published ([`TelemetryPublisher`]): what the info
-    /// answer carries. `None` until the first, and the answer then has no snapshot.
-    pub published: Mutex<Option<NodeTelemetry>>,
 }
 
 impl AppState {
-    /// A fresh `boot_id`.
-    pub fn new_boot_id() -> [u8; BOOT_ID_BYTES] {
-        let mut id = [0u8; BOOT_ID_BYTES];
-        getrandom::fill(&mut id).expect("operating-system randomness unavailable");
-        id
-    }
-
     fn refuse_overloaded(&self) -> ApiError {
         self.overloaded.fetch_add(1, Ordering::Relaxed);
         ApiError::Overloaded
@@ -236,108 +220,6 @@ pub fn build_info() -> Value {
     })
 }
 
-/// The node's telemetry snapshot (`eidola_common::engine_protocol::telemetry`): the
-/// engine thread's counters as last published, the node's own count of `overloaded`
-/// refusals, and the pools as last recounted, with the counters and the pools'
-/// occupancy coarsened as the contract states. Nothing in it is per request
-/// (`AGENTS.md` → Telemetry).
-fn telemetry(state: &AppState) -> NodeTelemetry {
-    let s = state.engine.stats();
-    NodeTelemetry {
-        boot_id: state.boot_id,
-        counters: NodeCounters {
-            requests_accepted: s.submitted,
-            requests_finished: s.finished,
-            requests_cancelled: s.cancelled,
-            requests_cut_off: s.cut_off,
-            requests_rejected: s.rejected,
-            requests_prefix_refused: s.prefix_refused,
-            requests_overloaded: state.overloaded.load(Ordering::Relaxed),
-            requests_failed: state.failed.load(Ordering::Relaxed),
-            streams_failed: state.streams_failed.load(Ordering::Relaxed),
-            steps: s.forward_steps,
-            step_micros: s.step_micros,
-            step_rows: s.step_rows,
-            prefill_tokens: s.prefill_tokens,
-            generated_tokens: s.generated_tokens,
-            drafted_tokens: s.drafted,
-            accepted_drafts: s.accepted_drafts,
-            preemptions: s.preemptions,
-            prefix_lookups: s.admissions,
-            prefix_hit_tokens: s.prefix_hit_tokens,
-            prefix_miss_tokens: s.prefix_miss_tokens,
-            cache_device_evictions: s.device_evictions,
-            cache_host_evictions: s.host_evictions,
-            cache_demoted_blocks: s.demoted_blocks,
-            cache_promoted_blocks: s.promoted_blocks,
-        }
-        .coarsened(),
-        gauges: NodeGauges {
-            sequences_waiting: s.waiting,
-            sequences_running: s.running,
-            // No architecture has more pools than the contract carries.
-            pools: state
-                .engine
-                .pools()
-                .iter()
-                .take(MAX_POOLS)
-                .map(|p| {
-                    PoolOccupancy::quantized(p.total, p.in_use, p.idle, p.host_total, p.host_used)
-                })
-                .collect(),
-        },
-    }
-}
-
-/// Publishes the node's telemetry snapshot once per [`SNAPSHOT_EPOCH`].
-///
-/// The info answer carries only what this published, never a snapshot taken for the
-/// read: a token holder polling the answer as fast as it likes still sees the counts
-/// and levels at epoch boundaries, so no finer than the gateway's own export interval.
-/// The boundaries are the node's, from when it started, so a reader cannot choose when
-/// a snapshot is taken either. It holds the state weakly, so it never keeps the engine
-/// alive past the router, and its thread ends at the first boundary after the state
-/// is gone.
-#[derive(Clone)]
-pub struct TelemetryPublisher(Weak<AppState>);
-
-impl TelemetryPublisher {
-    /// Publishes the first snapshot now and starts the thread that publishes one at
-    /// every following epoch boundary.
-    pub fn start(state: &Arc<AppState>) -> Self {
-        let publisher = Self(Arc::downgrade(state));
-        publisher.publish();
-        let timer = publisher.clone();
-        std::thread::Builder::new()
-            .name("telemetry-snapshot".into())
-            .spawn(move || {
-                let start = std::time::Instant::now();
-                let mut boundary = 1u32;
-                loop {
-                    let due = start + SNAPSHOT_EPOCH * boundary;
-                    std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
-                    if !timer.publish() {
-                        return;
-                    }
-                    boundary = boundary.saturating_add(1);
-                }
-            })
-            .expect("the telemetry thread could not be started");
-        publisher
-    }
-
-    /// Takes a snapshot now and makes it the one the info answer carries. False once
-    /// the node's state is gone.
-    pub fn publish(&self) -> bool {
-        let Some(state) = self.0.upgrade() else {
-            return false;
-        };
-        let snapshot = telemetry(&state);
-        *state.published.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
-        true
-    }
-}
-
 async fn engine_info(State(state): State<Arc<AppState>>) -> Response {
     let answer = axum::Json(json!({
         "model": state.model_id,
@@ -352,17 +234,8 @@ async fn engine_info(State(state): State<Arc<AppState>>) -> Response {
             "sm_count": d.sm_count,
             "memory_bytes": d.memory_bytes,
         })),
+        "instance_id": crate::telemetry::instance_id(),
     }));
-    let published = state
-        .published
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(NodeTelemetry::to_value);
-    let mut answer = answer;
-    if let (Some(snapshot), Some(members)) = (published, answer.0.as_object_mut()) {
-        members.insert(INFO_TELEMETRY_MEMBER.into(), snapshot);
-    }
     answer.into_response()
 }
 

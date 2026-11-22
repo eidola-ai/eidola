@@ -10,9 +10,10 @@
 #
 # Secrets are organisation-scoped and reach a container by their own names,
 # so the node's carry a prefix: `EIDOLA_ENV_PREFIX` names it, and the node
-# reads every variable under it. Its one secret, ENGINE_GATEWAY_TOKEN, is the
-# token the gateway's GATEWAY_ENGINE_TOKEN carries; it is not measured, so
-# rotating it changes no identity.
+# reads every variable under it. Its secrets are ENGINE_GATEWAY_TOKEN, the
+# token the gateway's GATEWAY_ENGINE_TOKEN carries, and the OTLP endpoint and
+# headers its telemetry goes to (empty, it exports none); none is measured,
+# so setting or rotating one changes no identity.
 #
 # The weights pack is the modelwrap schema 1 pack of the repo below; its
 # reference is reproducible from the repo at that revision (`modelwrap
@@ -53,6 +54,8 @@ containers:
       - egress
     secrets:
       - ENGINE_GATEWAY_TOKEN
+      - ENGINE_OTEL_EXPORTER_OTLP_ENDPOINT
+      - ENGINE_OTEL_EXPORTER_OTLP_HEADERS
     env:
       - EIDOLA_ENV_PREFIX: "ENGINE_"
       - ENGINE_MODEL_ID: "4fc667ee21b46b0f7127370ea42c8766988e62433a7737b7eb434f77b93035e1"

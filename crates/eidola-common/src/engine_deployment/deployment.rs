@@ -1339,7 +1339,10 @@ shim:
         assert_eq!(d.measured, committed.measured);
         // The secret without the prefix, or the token in the measured env.
         let err = check(&text.replace("      - ENGINE_GATEWAY_TOKEN\n", "      - GATEWAY_TOKEN\n"));
-        assert!(err.contains("[\"ENGINE_GATEWAY_TOKEN\"]"), "{err}");
+        assert!(
+            err.contains("[\"ENGINE_GATEWAY_TOKEN\", \"ENGINE_OTEL_EXPORTER_OTLP_ENDPOINT\""),
+            "{err}"
+        );
         for token in ["ENGINE_GATEWAY_TOKEN", "GATEWAY_TOKEN"] {
             let err = check(&text.replace(
                 declared,

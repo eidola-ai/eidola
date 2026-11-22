@@ -41,15 +41,10 @@
 //!   is written as frames of one size on a fixed tick, through
 //!   `stream_shape`'s framer, and read back by its reader; every other one
 //!   is padded to `stream_shape::body_bucket`.
-//! - **A node's operational snapshot** ([`telemetry`]): the aggregate counts
-//!   and levels a node reports in its `/v1/engine/info` answer, which the
-//!   gateway reads when it probes the node and exports.
 //!
 //! The key is secret material on every side: a holder never logs it, prints
 //! it redacted, and scrubs it when done. Nothing here holds one; this module
 //! only states the shape, so it needs no secret-handling dependency.
-
-pub mod telemetry;
 
 /// Length of a decoded prefix-cache key, in bytes.
 pub const CACHE_KEY_BYTES: usize = 32;

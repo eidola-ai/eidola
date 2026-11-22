@@ -1,10 +1,11 @@
 //! The inference node's process. Configuration is environment-only (`config.rs`); see
 //! this crate's `AGENTS.md` for the contract.
 //!
-//! Logs go to stdout through `tracing` at a fixed `info` level. The filter is part of the
-//! measured image rather than read from the environment: everything that changes the
-//! node's behaviour is measured, and a level (or a per-crate directive) delivered any other
-//! way could turn on a dependency's debug logging, which this crate's content-free
+//! Logs go to stdout through `tracing`, and over OTLP with the node's metrics when the
+//! deployment's telemetry secrets name an endpoint (`telemetry.rs`). The filter is part
+//! of the measured image rather than read from the environment: everything that changes
+//! what the node logs is measured, and a level (or a per-crate directive) delivered any
+//! other way could turn on a dependency's debug logging, which this crate's content-free
 //! discipline does not cover. Colour follows whether stdout is a terminal, so the logger
 //! reads no variable either (its default would read a bare `NO_COLOR`). Nothing
 //! request-derived is ever logged: no prompt, output, cache key, salt or per-request size.
@@ -15,22 +16,25 @@
 use std::process::ExitCode;
 
 use eidola_server_engine::config::Config;
+use eidola_server_engine::telemetry;
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
-        .init();
-    match run() {
+    telemetry::install_crypto_provider();
+    let otel = telemetry::init(|name| std::env::var(name).ok());
+    let status = match run(otel.as_ref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e}; refusing to serve");
             ExitCode::FAILURE
         }
+    };
+    if let Some(otel) = otel {
+        otel.shutdown();
     }
+    status
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run(otel: Option<&telemetry::OtelGuard>) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     tracing::info!("environment variable prefix: {:?}", config.env.prefix());
     let bind = config.bind_addr;
@@ -40,7 +44,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verifying and loading weights"
     );
     let node = eidola_server_engine::boot(config)?;
-    tracing::info!(weights_sha256 = %node.weights_hash, "weights verified; engine started");
+    tracing::info!(
+        weights_sha256 = %node.weights_hash,
+        instance_id = telemetry::instance_id(),
+        "weights verified; engine started"
+    );
+    if let Some(otel) = otel {
+        node.telemetry.register(&otel.meter());
+    }
 
     // Only the router keeps the engine running from here on, so a shutdown that drops it
     // lets the engine thread finish its work and stop (`run`). A `..` pattern would leave

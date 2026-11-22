@@ -315,6 +315,8 @@ containers:
     models: ["weights"]
     secrets:
       - ENGINE_GATEWAY_TOKEN
+      - ENGINE_OTEL_EXPORTER_OTLP_ENDPOINT
+      - ENGINE_OTEL_EXPORTER_OTLP_HEADERS
     env:
       - EIDOLA_ENV_PREFIX: "ENGINE_"
       - ENGINE_MODEL_ID: "{weights}"

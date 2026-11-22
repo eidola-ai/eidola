@@ -10,9 +10,10 @@
 #
 # Secrets are organisation-scoped and reach a container by their own names,
 # so the node's carry a prefix: `EIDOLA_ENV_PREFIX` names it, and the node
-# reads every variable under it. Its one secret, ENGINE_GATEWAY_TOKEN, is the
-# token the gateway's GATEWAY_ENGINE_TOKEN carries; it is not measured, so
-# rotating it changes no identity.
+# reads every variable under it. Its secrets are ENGINE_GATEWAY_TOKEN, the
+# token the gateway's GATEWAY_ENGINE_TOKEN carries, and the OTLP endpoint and
+# headers its telemetry goes to (empty, it exports none); none is measured,
+# so setting or rotating one changes no identity.
 #
 # Platform release 0.15.4-rc.2+gpu was rebuilt from source on 2026-11-20 and every
 # published file was byte-identical (docs/contributing/
@@ -43,6 +44,8 @@ containers:
       - egress
     secrets:
       - ENGINE_GATEWAY_TOKEN
+      - ENGINE_OTEL_EXPORTER_OTLP_ENDPOINT
+      - ENGINE_OTEL_EXPORTER_OTLP_HEADERS
     env:
       - EIDOLA_ENV_PREFIX: "ENGINE_"
       - ENGINE_MODEL_ID: "2a94a85c36b9d4d29ef733142091f88853fcce4d9f3ca4a1725dbfabab7f1dec"
