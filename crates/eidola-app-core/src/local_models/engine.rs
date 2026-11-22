@@ -2083,7 +2083,7 @@ async fn remove_partial(path: &Path) {
 /// transfer that is blocked on a server that stopped talking, which is
 /// exactly when a user reaches for it.
 async fn run_download(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     url: &str,
     dir: &Path,
     file_name: &str,
@@ -2122,7 +2122,7 @@ async fn run_download(
     };
     let response = match sent {
         Ok(sent) => sent.map_err(|e| AppError::LocalModel {
-            // Never `{e}`: a request-phase `reqwest::Error` prints the URL it
+            // Never `{e}`: a request-phase `crate::transport::Error` prints the URL it
             // was fetching, and this one carries the caller's authorization —
             // see [`crate::error::request_error_text`].
             message: format!("download failed: {}", crate::error::request_error_text(e)),
@@ -2237,7 +2237,7 @@ async fn run_download(
 async fn supervise_engine(
     mut command: tokio::process::Command,
     port: u16,
-    http: reqwest::Client,
+    http: crate::transport::Client,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     bus: BroadcastSource,

@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod decline;
 pub mod discovery;
+mod durability;
 pub mod error;
 #[cfg(feature = "desktop")]
 pub mod ipc;
@@ -22,7 +23,7 @@ pub mod subspace_driver;
 pub mod subspaces;
 pub mod summaries;
 pub mod tools;
-mod transport;
+pub mod transport;
 pub mod trust_root;
 pub mod updater;
 pub mod updates;
@@ -2530,7 +2531,10 @@ struct Inner {
     /// crate's dev-dependency self-reference for `cargo test`), so release
     /// builds contain no bypass path at all.
     #[cfg(feature = "test-support")]
-    http_override: Option<reqwest::Client>,
+    http_override: Option<crate::transport::Client>,
+    /// How this core's requests reach the network: natively, or through the
+    /// embedding app's dialer ([`AppCore::with_host_network`]).
+    transport: transport::Transport,
     /// **Test-only seam.** Makes the eidola backend's declarations count as
     /// authoritative even though the harness reaches it through a base-URL
     /// override.
@@ -2818,7 +2822,7 @@ impl Inner {
         #[cfg(not(feature = "desktop"))]
         let installed_git_commit = None;
 
-        let outcome = match updater::build_http_client() {
+        let outcome = match updater::build_http_client(&self.transport) {
             Ok(client) => {
                 let mut ctx = updates::CheckContext::new(releases_url, env!("CARGO_PKG_VERSION"));
                 ctx.installed_git_commit = installed_git_commit;
@@ -3128,7 +3132,7 @@ impl Inner {
         &self,
         eidola: &EidolaResolved,
         attestation_observer: Option<tinfoil_verifier::AttestationObserver>,
-    ) -> Result<reqwest::Client, AppError> {
+    ) -> Result<crate::transport::Client, AppError> {
         // Test seam: a plain-HTTP client injected via
         // `AppCore::with_test_http_client` short-circuits attestation so
         // integration tests can drive the HTTP paths against a mock upstream.
@@ -3157,6 +3161,7 @@ impl Inner {
             .map(tinfoil_verifier::AllowedMeasurement::sev_snp)
             .collect();
         transport::attesting_client(
+            &self.transport,
             &allowed,
             &eidola.base_url,
             hardware_root_der.as_deref(),
@@ -3170,12 +3175,12 @@ impl Inner {
     /// OpenAI-compatible backends (no enclave, so nothing to attest). Under
     /// the `test-support` feature an injected test client takes its place so
     /// the chat harness can intercept these paths too.
-    fn plain_client(&self) -> Result<reqwest::Client, AppError> {
+    fn plain_client(&self) -> Result<crate::transport::Client, AppError> {
         #[cfg(feature = "test-support")]
         if let Some(client) = &self.http_override {
             return Ok(client.clone());
         }
-        local_models::plain_http_client()
+        local_models::plain_http_client(&self.transport)
     }
 
     /// The client a chat turn's or a chore's completion goes out on, to an
@@ -3185,12 +3190,12 @@ impl Inner {
     /// [`local_models::completion_http_client`]. Under the `test-support`
     /// feature an injected test client takes its place, so a test of the
     /// policy itself runs on an ordinary core.
-    fn completion_client(&self) -> Result<reqwest::Client, AppError> {
+    fn completion_client(&self) -> Result<crate::transport::Client, AppError> {
         #[cfg(feature = "test-support")]
         if let Some(client) = &self.http_override {
             return Ok(client.clone());
         }
-        local_models::completion_http_client()
+        local_models::completion_http_client(&self.transport)
     }
 
     /// The client a **proxied** completion goes out on: [`Inner::plain_client`]
@@ -3199,12 +3204,12 @@ impl Inner {
     /// header the builder adds would travel outside it. See
     /// [`local_models::proxy_http_client`].
     #[cfg(feature = "desktop")]
-    fn proxy_client(&self) -> Result<reqwest::Client, AppError> {
+    fn proxy_client(&self) -> Result<crate::transport::Client, AppError> {
         #[cfg(feature = "test-support")]
         if let Some(client) = &self.http_override {
             return Ok(client.clone());
         }
-        local_models::proxy_http_client()
+        local_models::proxy_http_client(&self.transport)
     }
 
     /// Is what this eidola connection says about its models a fact this
@@ -3978,7 +3983,7 @@ impl Inner {
     async fn allocate_with_key(
         &self,
         cfg: &Config,
-        client: &reqwest::Client,
+        client: &crate::transport::Client,
         base_url: &str,
         key: &CurrentIssuerKey,
         credits: i64,
@@ -11085,8 +11090,8 @@ pub(crate) fn is_padding_event(event: &[u8]) -> bool {
 /// half of the rule each streaming transport states at its shape check: the
 /// shapes it exists for (a JSON completion, an HTML error page) both name a
 /// content type, while a compliant SSE server always sets one.
-pub(crate) fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
-    let Some(value) = headers.get(reqwest::header::CONTENT_TYPE) else {
+pub(crate) fn is_event_stream(headers: &http::header::HeaderMap) -> bool {
+    let Some(value) = headers.get(http::header::CONTENT_TYPE) else {
         return true;
     };
     value
@@ -11585,20 +11590,44 @@ impl AppCore {
         Self::open_as(config_dir, data_dir, db::LockHolder::Command)
     }
 
+    /// [`AppCore::new`] for an app that supplies its own socket: every
+    /// request this core makes — account, credentials, chat, models, updates —
+    /// is a stream `host`'s dialer opens, with TLS (and, to the Eidola
+    /// backend, enclave attestation) run in this process over it. The host
+    /// moves ciphertext and makes no trust decision. How the mobile app's
+    /// wasm build reaches the network, which has no other transport.
+    pub fn with_host_network(
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        host: transport::HostNetwork,
+    ) -> Result<Self, AppError> {
+        Self::build(
+            config_dir,
+            data_dir,
+            db::LockHolder::App,
+            transport::Transport::new(Some(host)),
+            #[cfg(feature = "test-support")]
+            None,
+        )
+    }
+
     fn open_as(
         config_dir: PathBuf,
         data_dir: PathBuf,
         holder: db::LockHolder,
     ) -> Result<Self, AppError> {
-        #[cfg(feature = "test-support")]
-        let core = Self::build(config_dir, data_dir, holder, None);
-        #[cfg(not(feature = "test-support"))]
-        let core = Self::build(config_dir, data_dir, holder);
-        core
+        Self::build(
+            config_dir,
+            data_dir,
+            holder,
+            transport::Transport::default(),
+            #[cfg(feature = "test-support")]
+            None,
+        )
     }
 
     /// Construct an `AppCore` whose HTTP client is the supplied plain
-    /// `reqwest::Client` instead of the attesting client.
+    /// `crate::transport::Client` instead of the attesting client.
     ///
     /// **Test-only seam.** This bypasses per-handshake enclave attestation so
     /// integration tests can exercise `chat` / `chat_stream` (and the account /
@@ -11615,9 +11644,15 @@ impl AppCore {
     pub fn with_test_http_client(
         config_dir: PathBuf,
         data_dir: PathBuf,
-        client: reqwest::Client,
+        client: impl Into<crate::transport::Client>,
     ) -> Result<Self, AppError> {
-        Self::build(config_dir, data_dir, db::LockHolder::App, Some(client))
+        Self::build(
+            config_dir,
+            data_dir,
+            db::LockHolder::App,
+            transport::Transport::default(),
+            Some(client.into()),
+        )
     }
 
     /// **Test-only seam.** Treat the eidola backend as though it were reached
@@ -11721,7 +11756,8 @@ impl AppCore {
         config_dir: PathBuf,
         data_dir: PathBuf,
         holder: db::LockHolder,
-        #[cfg(feature = "test-support")] http_override: Option<reqwest::Client>,
+        transport: transport::Transport,
+        #[cfg(feature = "test-support")] http_override: Option<crate::transport::Client>,
     ) -> Result<Self, AppError> {
         // Loud DB contention: claim the single-writer database before
         // building anything else, so a second opener is refused with a typed
@@ -11811,6 +11847,7 @@ impl AppCore {
                 tool_incapable_models: std::sync::RwLock::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 http_override,
+                transport,
                 #[cfg(feature = "test-support")]
                 trust_declared_capabilities: std::sync::atomic::AtomicBool::new(false),
                 cache_clock: CacheClock::default(),
@@ -14911,7 +14948,7 @@ const CACHE_KEY_PLACEHOLDER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 /// the body carries a fresh random key that is stored nowhere and used once —
 /// exactly as unlinkable as no key, and the same length. Only if the OS cannot
 /// supply randomness at all does the body fail, and the request with it.
-fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usize) {
+fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (crate::transport::Body, usize) {
     let mut bytes = serde_json::to_vec(body).expect("a JSON value serializes");
     // Object members serialize sorted, and `cache_key` sorts first among the
     // body's members, so the first unescaped occurrence is the member itself
@@ -15058,7 +15095,7 @@ struct TurnPrep {
     #[allow(dead_code)]
     engine_lease: Option<local_models::EngineLease>,
     attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>>,
-    client: reqwest::Client,
+    client: crate::transport::Client,
     /// The `connection` row the request rows record: adopted from the most
     /// recent attestation flush on an attested route, or written once before
     /// the first send on a plain one ([`Self::attach_plain_connection`]).
@@ -15358,7 +15395,7 @@ impl SpendPrep {
     /// surfaced as a warning, never corrected locally.
     async fn settle(
         &mut self,
-        client: &reqwest::Client,
+        client: &crate::transport::Client,
         base_url: &str,
         db_conn: &turso::Connection,
         bus: &BroadcastSource,
@@ -15751,7 +15788,7 @@ impl TurnPrep {
     /// declared nothing, and for every other answer.
     fn declared_prefix_refusal(
         &self,
-        status: reqwest::StatusCode,
+        status: http::StatusCode,
         body: &serde_json::Value,
         text: &str,
     ) -> Option<AppError> {
@@ -15876,17 +15913,17 @@ impl TurnPrep {
     /// what the Record keeps, and it never holds a credential.
     fn with_body(
         &self,
-        request: reqwest::RequestBuilder,
+        request: crate::transport::RequestBuilder,
         body: &serde_json::Value,
-    ) -> reqwest::RequestBuilder {
+    ) -> crate::transport::RequestBuilder {
         let body = body_with_spend(body, self.spend.as_ref());
         if self.cache_scope.is_none() {
             return request.json(&*body);
         }
         let (stream, len) = keyed_body(self, &body);
         request
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::CONTENT_LENGTH, len)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::CONTENT_LENGTH, len)
             .body(stream)
     }
 
@@ -15971,8 +16008,8 @@ impl TurnPrep {
     /// was attempted ([`Self::attach_plain_connection`]).
     async fn send(
         &mut self,
-        request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, reqwest::Error> {
+        request: crate::transport::RequestBuilder,
+    ) -> Result<crate::transport::Response, crate::transport::Error> {
         let request = request.build()?;
         self.attach_plain_connection().await;
         self.cache_clock.at_send();
@@ -16927,7 +16964,7 @@ async fn process_refund(
 /// spent key's `spend_until` has passed (`spend_until`, when known), when the
 /// successor must be taken while it is worth anything.
 async fn recover_refund(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     base_url: &str,
     spend: &PresentedSpend,
     spend_until: Option<i64>,
@@ -20369,7 +20406,7 @@ struct CurrentIssuerKey {
 /// alike: the client cannot tell an emergency rotation from a server singling
 /// it out, and the honest design has no rotation within an epoch.
 async fn current_issuer_key(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     base_url: &str,
     expected_ds: &str,
     timeout: std::time::Duration,
@@ -20547,7 +20584,7 @@ enum IssuanceAttempt {
 /// answered with the stored response or the final `409`, and the stored
 /// response outlives the key's spend window, after which the issuance is no
 /// longer asked for (`db::list_pending_issuances`).
-fn retry_refusal_is_final(status: reqwest::StatusCode) -> bool {
+fn retry_refusal_is_final(status: http::StatusCode) -> bool {
     matches!(status.as_u16(), 400 | 409 | 422)
 }
 
@@ -20557,13 +20594,13 @@ fn retry_refusal_is_final(status: reqwest::StatusCode) -> bool {
 /// the named issuer key) and `428` (the terms). Any other status did not come
 /// from that path's own verdict on this request, so it proves nothing about
 /// whether the request reached the debit, and the issuance stays pending.
-fn first_refusal_is_final(status: reqwest::StatusCode) -> bool {
+fn first_refusal_is_final(status: http::StatusCode) -> bool {
     matches!(status.as_u16(), 400 | 401 | 402 | 409 | 422 | 428)
 }
 
 /// Send one issuance request.
 async fn send_issuance(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     base_url: &str,
     account_id: &str,
     secret: &str,
@@ -20919,17 +20956,17 @@ fn refund_recovery_key(pre_refund_cbor: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
 /// so the builder refuses it exactly as it did before (the refusal carries no
 /// value).
 pub(crate) fn with_authorization(
-    request: reqwest::RequestBuilder,
+    request: crate::transport::RequestBuilder,
     authorization: Option<&str>,
-) -> reqwest::RequestBuilder {
+) -> crate::transport::RequestBuilder {
     match authorization {
         None => request,
-        Some(auth) => match reqwest::header::HeaderValue::from_str(auth) {
+        Some(auth) => match http::header::HeaderValue::from_str(auth) {
             Ok(mut value) => {
                 value.set_sensitive(true);
-                request.header(reqwest::header::AUTHORIZATION, value)
+                request.header(http::header::AUTHORIZATION, value)
             }
-            Err(_) => request.header(reqwest::header::AUTHORIZATION, auth),
+            Err(_) => request.header(http::header::AUTHORIZATION, auth),
         },
     }
 }
@@ -21013,18 +21050,20 @@ fn params_from_domain_separator(ds: &str) -> Result<Params, AppError> {
 /// rule). This is the shared reader for every call this app makes to the Eidola
 /// server, so the ceiling lands on all of them at once; attested or not, the
 /// bytes are still chosen by the other end.
-async fn read_response(resp: reqwest::Response) -> Result<(reqwest::StatusCode, String), AppError> {
+async fn read_response(
+    resp: crate::transport::Response,
+) -> Result<(http::StatusCode, String), AppError> {
     crate::peer_read::read_api_answer(resp, "the server's answer").await
 }
 
-fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError> {
+fn check_status(status: http::StatusCode, body: &str) -> Result<(), AppError> {
     if status.is_success() {
         return Ok(());
     }
     // 428 Precondition Required is the server's terms-acceptance gate —
     // typed so UIs route to a review-and-accept step instead of showing a
     // generic server error.
-    if status == reqwest::StatusCode::PRECONDITION_REQUIRED {
+    if status == http::StatusCode::PRECONDITION_REQUIRED {
         return Err(AppError::TermsAcceptanceRequired {
             message: parse_server_error_message(body),
         });
@@ -21070,7 +21109,7 @@ pub(crate) fn parse_server_error_message(body: &str) -> String {
 }
 
 async fn fetch_models(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     base_url: &str,
 ) -> Result<ModelsResponseInfo, AppError> {
     let resp = client
@@ -21254,11 +21293,11 @@ mod tests {
         assert!(!format!("{spend:?}").contains(&key_text));
 
         // An external backend's bearer key is a sensitive header.
-        let client = reqwest::Client::builder().build().unwrap();
+        let client = crate::transport::Client::from(reqwest::Client::builder().build().unwrap());
         let bearer = with_authorization(client.get("http://127.0.0.1:9/"), Some("Bearer sk-x"))
             .build()
             .unwrap();
-        assert!(bearer.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+        assert!(bearer.headers()[http::header::AUTHORIZATION].is_sensitive());
         assert!(!format!("{bearer:?}").contains("sk-x"));
     }
 
@@ -22301,7 +22340,7 @@ mod tests {
 
     #[test]
     fn only_a_retry_refusal_no_attempt_in_flight_can_overturn_is_final() {
-        let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        let status = |code: u16| http::StatusCode::from_u16(code).unwrap();
         for code in [400, 409, 422] {
             assert!(
                 retry_refusal_is_final(status(code)),
@@ -22318,7 +22357,7 @@ mod tests {
 
     #[test]
     fn only_the_issuance_paths_own_refusals_end_a_first_attempt() {
-        let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        let status = |code: u16| http::StatusCode::from_u16(code).unwrap();
         for code in [400, 401, 402, 409, 422, 428] {
             assert!(
                 first_refusal_is_final(status(code)),
@@ -22336,7 +22375,7 @@ mod tests {
     #[test]
     fn check_status_maps_428_to_terms_acceptance_required() {
         let body = r#"{"error":{"message":"acceptance of the current terms_of_service is required","type":"terms_acceptance_required"}}"#;
-        let err = check_status(reqwest::StatusCode::PRECONDITION_REQUIRED, body).unwrap_err();
+        let err = check_status(http::StatusCode::PRECONDITION_REQUIRED, body).unwrap_err();
         match err {
             AppError::TermsAcceptanceRequired { message } => {
                 assert!(message.contains("terms_of_service"));

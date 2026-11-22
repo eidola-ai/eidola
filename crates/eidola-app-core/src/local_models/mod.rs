@@ -55,7 +55,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::transport::Redirects;
+use crate::transport::{Redirects, Transport};
 
 /// Context window requested from `llama-server` (`-c`). Deliberately
 /// bounded — KV-cache memory scales with it — and far below what Gemma 4
@@ -477,8 +477,11 @@ fn slug_for_file(file_name: &str) -> String {
 /// bytes whose integrity is checked afterwards, and every large-file host
 /// redirects to a CDN. See [`proxy_http_client`] for the client that does not,
 /// and why the difference is about what the request *carries*.
-pub(crate) fn plain_http_client() -> Result<reqwest::Client, AppError> {
+pub(crate) fn plain_http_client(
+    transport: &Transport,
+) -> Result<crate::transport::Client, AppError> {
     crate::transport::plain_client(
+        transport,
         Some(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION"))),
         Redirects::Follow,
     )
@@ -510,8 +513,10 @@ pub(crate) fn plain_http_client() -> Result<reqwest::Client, AppError> {
 /// ([`completion_http_client`]), and so does the attested client
 /// (`tinfoil_verifier::attesting_client`).
 #[cfg(feature = "desktop")]
-pub(crate) fn proxy_http_client() -> Result<reqwest::Client, AppError> {
-    crate::transport::plain_client(None, Redirects::Refuse)
+pub(crate) fn proxy_http_client(
+    transport: &Transport,
+) -> Result<crate::transport::Client, AppError> {
+    crate::transport::plain_client(transport, None, Redirects::Refuse)
 }
 
 /// The client a **chat turn or a chore** sends its completion on, to a local
@@ -525,8 +530,11 @@ pub(crate) fn proxy_http_client() -> Result<reqwest::Client, AppError> {
 /// It keeps [`plain_http_client`]'s `User-Agent`: the turn path's header set is
 /// not an allowlist the Record repeats back, which is the proxy's reason for
 /// dropping it.
-pub(crate) fn completion_http_client() -> Result<reqwest::Client, AppError> {
+pub(crate) fn completion_http_client(
+    transport: &Transport,
+) -> Result<crate::transport::Client, AppError> {
     crate::transport::plain_client(
+        transport,
         Some(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION"))),
         Redirects::Refuse,
     )

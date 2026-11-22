@@ -73,7 +73,7 @@ enum PcsResource {
 
 impl PcsResource {
     fn classify(url: &str) -> Result<Self, Error> {
-        let parsed = reqwest::Url::parse(url)
+        let parsed = url::Url::parse(url)
             .map_err(|e| Error::Quote(format!("intel-pcs response URL {url:?}: {e}")))?;
         if parsed.scheme() != "https" || parsed.port().is_some() {
             return Err(Error::Quote(format!(

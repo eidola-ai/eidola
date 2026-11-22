@@ -22,7 +22,7 @@ test-support = []
 # multi-threaded runtime, the filesystem lock, the OS trust store) are gated
 # by target instead, so a native build without this feature keeps them.
 default = ["desktop"]
-desktop = ["dep:eidola-apple", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:zip"]
+desktop = ["dep:eidola-apple", "hyper/server", "dep:http-body-util", "dep:zip"]
 
 [dependencies]
 anonymous-credit-tokens = "0.4"
@@ -39,16 +39,22 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8
 p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 regex = "1"
-# The local inference proxy's HTTP surface (`src/proxy/http.rs`). Every one of
-# these is **already in this crate's dependency graph** through `reqwest`, so
-# the proxy adds features to crates that are compiled anyway rather than
-# packages to the client payload — which is why hyper is preferred here over
-# axum, whose routing and extractors this three-route surface has no use for.
+# HTTP over a host-dialed stream (`transport::pipe`, hyper's client
+# connection), and the local inference proxy's HTTP surface
+# (`src/proxy/http.rs`, `desktop` adds hyper's server). Every one of these is
+# **already in this crate's native dependency graph** through `reqwest` —
+# which is why hyper is preferred for the proxy over axum, whose routing and
+# extractors this three-route surface has no use for.
 bytes = "1"
+http = "1"
 http-body-util = { version = "0.1", optional = true }
-hyper = { version = "1", features = ["server", "http1"], optional = true }
-hyper-util = { version = "0.1", features = ["tokio"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+# The URL parser `reqwest::Url` re-exports: the host-socket transport parses
+# a request's URL as the native client does.
+url = "2"
+# Decodes a URL's userinfo into credentials, as reqwest does (`transport`).
+percent-encoding = "2"
 futures-util = { version = "0.3", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.1.0-pre.0"
@@ -79,6 +85,9 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2
 # Advisory (flock) file locking for the local-database lockfile. Pure Rust
 # (rustix), sync backend only — no async runtime pulled in.
 fs4 = { version = "1", default-features = false, features = ["sync"] }
+# The native transport (`transport`). wasm32 links no reqwest, so nothing
+# there can fall back to the browser's `fetch`.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 rustls-native-certs = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "process", "fs"] }
 
@@ -94,6 +103,9 @@ js-sys = "0.3"
 rustls-pki-types = { version = "1", features = ["web"] }
 uuid = { version = "1", features = ["js"] }
 wasm-bindgen = "0.2"
+# The TLS roots a host-dialed connection is checked against: wasm32 has no OS
+# trust store (`transport::HostNetwork` adds a developer's own).
+webpki-roots = "1"
 wasm-bindgen-futures = "0.4"
 web-time = "1"
 
@@ -117,6 +129,9 @@ eidola-app-core = { path = ".", default-features = false, features = ["test-supp
 eidola-server-gateway = { path = "../eidola-server-gateway", features = ["test-support"] }
 libc = "0.2"
 tempfile = "3"
+# The host-socket transport's end-to-end suite attests against in-process
+# shims (`tests/pipe_transport.rs`).
+tinfoil-shim-mock = { path = "../tinfoil-shim-mock" }
 # Building the containers the install fixtures download. Same crate and
 # features the installer unpacks with, so a test never proves a shape the
 # shipping reader would refuse.

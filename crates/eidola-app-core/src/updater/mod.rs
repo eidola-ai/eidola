@@ -87,14 +87,16 @@ pub mod trust;
 /// Rekor, or inclusion-proof verification; the whole point is that the
 /// fixtures path exercises the same verifier code.
 pub enum Fetcher {
-    Network(reqwest::Client),
+    Network(crate::transport::Client),
     Fixtures(PathBuf),
 }
 
 impl Fetcher {
     /// Construct the default network fetcher (rustls + native roots).
     pub fn network() -> Result<Self, AppError> {
-        Ok(Fetcher::Network(build_http_client()?))
+        Ok(Fetcher::Network(build_http_client(
+            &crate::transport::Transport::default(),
+        )?))
     }
 
     /// Read release bytes from the given directory. URLs in `release.json`
@@ -1321,9 +1323,9 @@ pub(crate) const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 /// No error text here carries the URL. `reqwest` attaches it to the error
 /// it returns and prints it in `Display`, and a redirect can leave a
 /// credential in it, so errors go through `request_error_text` — the one
-/// path a `reqwest::Error` becomes text through in this crate.
+/// path a `crate::transport::Error` becomes text through in this crate.
 async fn fetch_url_network(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     url: &str,
     label: &str,
     max_bytes: u64,
@@ -1342,7 +1344,7 @@ async fn fetch_url_network(
 /// The body of [`fetch_url_network`], with the silence bound supplied —
 /// which is how a test drives it in milliseconds rather than minutes.
 async fn fetch_url_network_with(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     url: &str,
     accept: &str,
     label: &str,
@@ -1421,7 +1423,7 @@ async fn fetch_url_network_with(
         // Anything else is the server failing to answer — an outage, a rate
         // limit, a wall in front of it — which says nothing about the file.
         return Err(
-            if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+            if status == http::StatusCode::NOT_FOUND || status == http::StatusCode::GONE {
                 FetchFailure::Missing(message)
             } else {
                 FetchFailure::Unreachable(message)
@@ -1431,8 +1433,10 @@ async fn fetch_url_network_with(
     Ok(bytes)
 }
 
-pub(crate) fn build_http_client() -> Result<reqwest::Client, AppError> {
-    crate::transport::update_client()
+pub(crate) fn build_http_client(
+    transport: &crate::transport::Transport,
+) -> Result<crate::transport::Client, AppError> {
+    crate::transport::update_client(transport)
 }
 
 #[cfg(test)]
@@ -1525,7 +1529,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let client = build_http_client().unwrap();
+            let client = build_http_client(&crate::transport::Transport::default()).unwrap();
             let err = fetch_url_network(&client, &format!("{}/big", server.uri()), "a payload", 64)
                 .await
                 .expect_err("an oversized body must be refused");
@@ -1546,7 +1550,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let client = build_http_client().unwrap();
+            let client = build_http_client(&crate::transport::Transport::default()).unwrap();
             let err =
                 fetch_url_network(&client, &format!("{}/big", server.uri()), "a payload", 100)
                     .await
@@ -1727,8 +1731,8 @@ mod tests {
             );
         }
 
-        fn client_for_test() -> reqwest::Client {
-            build_http_client().unwrap()
+        fn client_for_test() -> crate::transport::Client {
+            build_http_client(&crate::transport::Transport::default()).unwrap()
         }
     }
 

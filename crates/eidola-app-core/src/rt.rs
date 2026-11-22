@@ -13,7 +13,7 @@
 //! regeneration guard) is finished, never cancelled halfway.
 //!
 //! On wasm32 nothing here requires `Send`, because the browser runs one thread
-//! and its futures (`JsFuture`, the fetch-backed reqwest) are not `Send`.
+//! and its futures (`JsFuture`, a host's socket bridge) are not `Send`.
 
 #[cfg(not(target_family = "wasm"))]
 mod imp {
