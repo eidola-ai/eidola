@@ -12,8 +12,6 @@
 //! replay an older AMD-signed CRL while that interval remains valid. That is
 //! the explicit availability/privacy tradeoff of the self-contained flow.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use der::oid::AssociatedOid;
 use der::{Decode, Encode};
 use rsa::RsaPublicKey;
@@ -82,7 +80,11 @@ pub(crate) fn check_revocation_at(
     Ok(())
 }
 
+/// The system clock, which the native handshake verifier checks the CRL
+/// against; wasm32 has no `std` clock, and its callers pass the time in.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn unix_now() -> Result<u64, Error> {
+    use std::time::{SystemTime, UNIX_EPOCH};
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| Error::CertChain(format!("system clock is before UNIX_EPOCH: {e}")))?
