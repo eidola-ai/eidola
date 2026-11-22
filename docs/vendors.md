@@ -18,7 +18,7 @@ The list is short because the architecture makes it short: inference content nev
 
 | Vendor | Role | What it sees |
 | --- | --- | --- |
-| **Tinfoil** | Confidential-compute hosting, for the gateway, the inference engines and billing | Ciphertext, attested enclaves, and network metadata (connection IPs, timing, volume). Inference content is decrypted only inside enclaves whose measurements are verified on every connection: the client verifies the gateway's, and the gateway verifies each engine's against the deployments its own build pins — see [inference engine](engine.md) and the [threat model](threat-model.md). We treat Tinfoil's network layer as potentially logging transport metadata, like any network operator. Tinfoil also stores the credentials our services are deployed with, so it is in a position to read what our billing database and Stripe keys can reach. |
+| **Tinfoil** | Confidential-compute hosting, for the gateway, the inference engines and billing | Ciphertext, attested enclaves, and network metadata (connection IPs, timing, volume). Inference content is decrypted only inside enclaves whose measurements are verified on every connection: the client verifies the gateway's, and the gateway verifies each engine's against the deployments its own build pins — see [the engine](engine.md) and the [threat model](threat-model.md). We treat Tinfoil's network layer as potentially logging transport metadata, like any network operator. Tinfoil also stores the credentials our services are deployed with, so it is in a position to read what our billing database and Stripe keys can reach. |
 
 ## Independent platforms we participate in
 

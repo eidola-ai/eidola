@@ -19,7 +19,7 @@ Every item is a permanent property of a specific release. Most are inherent attr
 
 **1.3.** `linked` endpoints never accept an anonymous credential. Those authenticated as the account holder accept the account's identifier and secret and nothing else. One is authenticated otherwise, of necessity: account creation, which mints the credential it would otherwise require. None of them receives or emits inference request or response content.
 
-**1.4.** No personally identifiable information is requested or accepted at account creation. Email, phone, name, address, and government identifiers are never collected by Eidola's API or stored on Eidola's servers. Payment runs through Stripe; what Stripe collects and retains is conduct outside the attested source, covered by the [privacy policy](https://www.eidola.ai/privacy/) and bounded in §8.4.
+**1.4.** No personally identifiable information is requested or accepted at account creation, and Eidola's API never requests or accepts an email address, phone number, name, postal address, or government identifier. Payment runs through Stripe and is reconciled by Eidola's billing processes and support tools, which run outside the attested boundary. What Stripe collects and retains, and what those processes and tools do with it, is conduct outside the attested source, covered by the [privacy policy](https://www.eidola.ai/privacy/) and bounded in §8.4.
 
 ## 2. Unlinkability
 
@@ -85,11 +85,11 @@ Every item is a permanent property of a specific release. Most are inherent attr
 
 ## 6. Release integrity
 
-**6.1.** Every released binary is bit-reproducible from public source. The only pull requests merged into `main` are through the promotion of the verified integration branch; the promotion pipeline re-derives `artifact-manifest.json` and refuses to advance if the result differs from the committed copy, and every other PR into `main` is refused outright.
+**6.1.** Every released binary is bit-reproducible from public source, and every human attestant reproduces the release's `artifact-manifest.json` from its source commit before signing (§6.3).
 
 **6.2.** Every release carries at least `MIN_HUMAN_ATTESTATIONS` independent human attestations conforming to the schema pinned in the client trust root. Each attestation is signed via `cosign sign-blob` under a hardware-bound key whose `sha256(PKIX SubjectPublicKeyInfo DER)` matches a fingerprint in `TRUSTED_ATTESTANT_FINGERPRINTS`, and is recorded in the Sigstore Rekor transparency log as a `hashedrekord` v0.0.1 entry.
 
-**6.3.** Every human release attestation contains positive, prose-equal claims that the attestant: (a) personally reproduced `artifact-manifest.json` from the source commit on hardware under exclusive physical control, (b) reviewed the source-level diff against the prior release, (c) is not aware of any backdoor, covert surveillance mechanism, or undisclosed data path in the release, (d) is not aware of any change that causes the code to fail to deliver these guarantees, and (e) confirms this document does not weaken, narrow, or remove any item that was in effect at the prior release. The verifier re-renders each claim from a pinned template and rejects any character mismatch. (See [releases.md](releases.md#what-the-engineer-attests-to).)
+**6.3.** Every human release attestation contains positive, prose-equal claims that the attestant: (a) personally reproduced `artifact-manifest.json` from the source commit on hardware under exclusive physical control, (b) reviewed the source-level diff against the prior release, (c) is not aware of any backdoor, covert surveillance mechanism, or undisclosed data path in the release, (d) is not aware of any change that causes the code to fail to deliver these guarantees, and (e) confirms this document does not weaken, narrow, or remove any guarantee that was in effect at the prior release. The verifier re-renders each claim from a pinned template and rejects any character mismatch. (See [releases.md](releases.md#what-the-engineer-attests-to).)
 
 **6.4.** Every release attestation contains positive, prose-equal claims that the attestant is **not** subject to legal compulsion that has caused the release to weaken any guarantee, is **not** subject to a gag order preventing truthful attestation, is **not** coerced, and is signing of their own volition with a hardware-held key under their exclusive physical control.
 
@@ -104,17 +104,17 @@ Every item is a permanent property of a specific release. Most are inherent attr
 
 **6.8.** Release-document `schema_version` values are integers with no semver tolerance. The verifier refuses a release document or attestation whose version is outside its pinned supported set. An artifact manifest with a version outside that set, or with a field the verifier does not recognize, is never accepted silently: it is shown to the user as a release whose claims differ from what the installed client expects, and is not trusted unless the user explicitly accepts it. (See [trust-root.md](trust-root.md#schema-versions-explicit-and-breaking).)
 
-## 7. Source, build, and operational discipline
+## 7. Source, build, and design
 
 **7.1.** All client, gateway and inference engine code, build configuration, and release tooling live in a single repository, public at the moment of release: one git commit identifies the complete first-party source of a release. Dependencies — including temporarily maintained forks, themselves public — may sit outside that tree but are pinned from within it by version and hash (§7.4).
 
 **7.2.** *Builds.* Every artifact of a release is built reproducibly, in an environment pinned in the same commit as its source, so the hashes a release publishes bind both the source and the tools that built it. The gateway, CLI and inference engine images are built with a source-bootstrapped toolchain (StageX). The desktop apps are built with Nix from pinned inputs, which are not source-bootstrapped. The engine's image has one further limit: its GPU kernels are compiled by NVIDIA's closed CUDA toolkit, a compiler that cannot be inspected, in a separate image built with Nix inside a pinned container and not in Nix's own sandbox. Every build of the engine's image checks the compiled kernels against hashes committed in the source.
 
-**7.3.** *What the published hashes cover.* The artifact manifest records a hash for every image and every desktop payload a release produces, and everything functional inside them is covered, whith two caveats: the GPU driver a desktop app uses, which the user's device already supplies; and Apple's signature and notarization on a signed macOS app, which are not reproducible and are bound by the human release attestation instead. The GPU driver an engine loads is not in Eidola's image either, but it is part of the platform's boot image, and so of the engine's pinned launch identity (§5.1, §8.9). (See [verification.md](verification.md) and [apple-distribution.md](apple-distribution.md).)
+**7.3.** *What the published hashes cover.* The artifact manifest records a hash for every image and every desktop payload a release produces, and everything functional inside them is covered, with two caveats: the GPU driver a desktop app uses, which the user's device already supplies; and Apple's signature and notarization on a signed macOS app, which are not reproducible and are bound by the human release attestation instead. The GPU driver an engine loads is not in Eidola's image either, but it is part of the platform's boot image, and so of the engine's pinned launch identity (§5.1, §8.9). (See [verification.md](verification.md) and [apple-distribution.md](apple-distribution.md).)
 
 **7.4.** Source dependencies are pinned by version and hash. Updates are explicit commits.
 
-**7.5.** No feature is added whose privacy depends on operator trustworthiness when a comparable feature with cryptographic enforcement is implementable. New items follow the introduction's enforcement-disclosure convention.
+**7.5.** A release contains no feature whose privacy depends on operator trustworthiness where a comparable feature with cryptographic enforcement was implementable. New items follow the introduction's enforcement-disclosure convention.
 
 **7.6.** Any feature whose existence would let an operator answer the question "did account X ever do Y", for anything done on the `unlinked` surface, is a violation of this document, regardless of operator intent or cited rationale.
 
@@ -150,7 +150,7 @@ Every item is a permanent property of a specific release. Most are inherent attr
 
 ## How this document evolves
 
-Changes are **append-only in spirit.** Subsequent releases may add items, narrow scope where doing so does not remove a promise, or correct ambiguous wording. They may not remove or weaken any item that was in effect at the prior release without breaking the update flow and flagging the discrepancy to the user. Weakening includes downgrading an item's enforcement mechanism — replacing a structural check with reviewed discipline, say — even when the item's text is unchanged.
+Changes are judged by what they promise, not by their text. A release may add, reword, or remove items, but it may not **weaken** any guarantee in effect at the prior release.
 
 Strengthening goes through the normal release flow. Weakening requires the attestant to be unable to sign `privacy_guarantees_not_weakened` truthfully; the release notes must call out the weakening explicitly, and users would have to opt into such a release out of band. The verifier enforces the structural side: a release whose attestation lacks `privacy_guarantees_not_weakened` will fail.
 
