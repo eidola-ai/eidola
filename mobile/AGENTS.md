@@ -39,7 +39,7 @@ The iOS check is a **local gate** (no macOS runner here): run `just mobile-ios-t
 ## iOS
 
 - `EidolaShell.xcodeproj` is hand-written and lists its five Swift files explicitly; a new file goes into `project.pbxproj` by hand (a build phase entry, a file reference, a group child). The embedded bundle is the folder reference `build/bundle`, which `build.sh` fills, so build through the script.
-- The bundle id is `ai.eidola.mobile.dev`, the team `7N2X49G865`, iOS 26 and later.
+- The bundle id is `ai.eidola.mobile` for the Release configuration (`--release`) and `ai.eidola.mobile.dev` for Debug, so a dev build installs beside a release one; the team is `7N2X49G865`, iOS 26 and later.
 - A document load is a main-frame navigation the navigation delegate allows; a fragment-only navigation is not one. The scheme handler then serves from the bundle selected for it.
 - A content rule list blocks every load outside the `eidola` scheme (and `data:`/`blob:`), so another origin is refused by the shell and not only by the CSP.
 - Durable means `F_FULLFSYNC` (plain `fsync` does not reach stable storage on Apple platforms) plus a directory `fsync`. Files are `completeUntilFirstUserAuthentication` and excluded from backup; the reasons are in the contract.
@@ -49,9 +49,9 @@ The iOS check is a **local gate** (no macOS runner here): run `just mobile-ios-t
 ## Android
 
 - The build chain is `aapt2 link` (manifest only) → `kotlinc` against `android.jar` alone → R8 (our classes plus `kotlin-stdlib.jar`, shrunk, `keep.pro`) → `tools/ApkZip.java` (sorted, stored, one fixed timestamp) → `zipalign` → `apksigner` (v2 + v3, alignment preserved).
-- `--debug` makes the APK debuggable (console in logcat, inspectable WebView); otherwise the variants are identical.
+- `--debug` makes the APK debuggable (console in logcat, inspectable WebView) and names it `ai.eidola.mobile.dev`; otherwise the variants are identical.
 - Edge to edge, the WebView reports no safe areas and does not resize for the keyboard, so `MainActivity` pads its container by the system bars, the cutout and the IME.
-- The package is `ai.eidola.mobile.dev` for now; the store package name is still to be chosen, and it cannot change once published.
+- The package is `ai.eidola.mobile` for a release build and `ai.eidola.mobile.dev` for `--debug` (aapt2 renames the manifest's package), so a dev build installs beside a release one. **The Play package name is permanent once published**: an app under another name is another app, with no upgrade path from this one.
 
 ### Reproducibility
 

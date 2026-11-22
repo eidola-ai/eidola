@@ -2,7 +2,8 @@
 # Builds the Android shell with the SDK's own tools and pinned kotlinc; no Gradle.
 #   build.sh [--bundle DIR] [--debug] [--out DIR]
 # --bundle  the bundle to embed (default: the contract test page)
-# --debug   a debuggable APK (console in logcat, inspectable WebView)
+# --debug   a debuggable APK as ai.eidola.mobile.dev (console in logcat, inspectable WebView);
+#           the default, release, is ai.eidola.mobile
 # --out     output directory (default build/<release|debug>)
 # Writes OUT/eidola-shell-unsigned.apk, the reproducible artifact, and, when KEYSTORE names a
 # PKCS#12 key store (password KS_PASS, default "android"), OUT/eidola-shell-signed.apk.
@@ -30,9 +31,10 @@ DIGEST="$(python3 "$HERE/../tools/bundle_digest.py" "$BUNDLE")"
 W="$OUT/stage"
 rm -rf "$W" && mkdir -p "$W/dex"
 
-# 1. The binary manifest (no resources of our own).
+# 1. The binary manifest. A debug build is debuggable and installs beside a release one, as
+#    ai.eidola.mobile.dev; the release package is the manifest's own, ai.eidola.mobile.
 DEBUG_MODE=()
-[[ $VARIANT == debug ]] && DEBUG_MODE=(--debug-mode)
+[[ $VARIANT == debug ]] && DEBUG_MODE=(--debug-mode --rename-manifest-package ai.eidola.mobile.dev)
 "$BT/aapt2" link -o "$W/base.apk" --manifest "$HERE/AndroidManifest.xml" -I "$ANDROID_JAR" \
   --min-sdk-version "$MIN_SDK" --target-sdk-version 36 --no-compress "${DEBUG_MODE[@]}"
 

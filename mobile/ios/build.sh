@@ -2,7 +2,8 @@
 # Builds the iOS shell with the bundle it embeds.
 #   build.sh [--bundle DIR] [--release] [--device]
 # --bundle  the bundle to embed (default: the contract test page)
-# --release the Release configuration (default Debug: console in the system log, inspectable)
+# --release the Release configuration, as ai.eidola.mobile (default Debug, as ai.eidola.mobile.dev:
+#           console in the system log, inspectable)
 # --device  an iPhoneOS build signed by the team in the project (needs that Apple ID in Xcode);
 #           default is an unsigned Simulator build.
 set -euo pipefail
