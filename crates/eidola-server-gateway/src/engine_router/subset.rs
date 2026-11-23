@@ -177,7 +177,6 @@ mod tests {
             (r#","stop":["a","b","c","d","e"]"#, r#""hi""#, "at most 4"),
             (r#","stop":"""#, r#""hi""#, "must not be empty"),
             (r#","temperature":-0.5"#, r#""hi""#, "temperature"),
-            (r#","temperature":1e39"#, r#""hi""#, "temperature"),
             (r#","top_p":0"#, r#""hi""#, "top_p"),
             (r#","top_p":1.5"#, r#""hi""#, "top_p"),
             (
@@ -194,6 +193,15 @@ mod tests {
         for (extra, content, reason) in cases {
             let message = refusal(&request(extra, content));
             assert!(message.contains(reason), "{extra} {content}: {message}");
+        }
+        // A temperature beyond f32's range is read by serde_json as infinity,
+        // which `check` refuses, unless serde_json's `float_roundtrip` is on
+        // (another crate in the build may enable it), when the type refuses
+        // it instead. Either way it never reaches routing.
+        let text =
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":1e39}"#;
+        if let Ok(request) = ValidatedRequest::from_bytes(bytes::Bytes::from(text)) {
+            assert!(refusal(&request).contains("temperature"));
         }
         let prefix = r#","cached_prefix":{"cached_tokens":256,"new_tokens":1}"#;
         assert!(refusal(&request(prefix, r#""hi""#)).contains("cache_key"));
