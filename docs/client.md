@@ -69,7 +69,7 @@ The inference engine can reuse the computation behind a prompt prefix it has alr
 
 ## Two surfaces: GUI and CLI, one core
 
-The client ships as a native GUI app (macOS and Linux/Wayland) and a CLI, both built on one shared core crate (`crates/eidola-app-core/`). Both run the same verifier code against the same embedded trust root, with the same fail-safe behavior.
+The client ships as a native GUI app (macOS and Linux/Wayland) and a CLI, both built on one shared core crate (`crates/eidola-app-core/`). Both run the same verifier code against the same embedded trust root, with the same fail-safe behavior. The mobile app runs that core too, compiled to WebAssembly in the phone's system webview, inside a small native shell ([the mobile app](mobile.md)).
 
 ## Configuration overrides
 
