@@ -132,7 +132,7 @@ engine:
 
 # --- Mobile app and shells (mobile/AGENTS.md, crates/eidola-mobile/AGENTS.md) ---
 
-# Build the app bundle the shells embed (--self-test, --out DIR)
+# Build the app bundle the shells embed (--self-test, --dev-backend URL, --out DIR)
 mobile-bundle *args:
     mobile/build-bundle.sh {{args}}
 
@@ -159,6 +159,14 @@ mobile-android *args:
 # Run the contract test page on the Android emulator (own AVD)
 mobile-android-test *args:
     mobile/android/test-emulator.sh {{args}}
+
+# The phone interface's UI test in the iOS Simulator: real taps and typing, a local model stub
+mobile-ios-ui-test *args:
+    mobile/ios/test-ui.sh {{args}}
+
+# The phone interface's UI test on the Android emulator: adb taps and typing, a local model stub
+mobile-android-ui-test *args:
+    mobile/android/test-ui.sh {{args}}
 
 # Two clean Android builds, identical, and a signed APK strips back to them
 mobile-android-repro *args:

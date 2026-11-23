@@ -32,6 +32,7 @@ trap 'kill $ECHO 2>/dev/null || true' EXIT
 rm -rf "$HERE/build/test.xcresult"
 TEST_RUNNER_SHOTS="$SHOTS" xcodebuild -project "$HERE/EidolaShell.xcodeproj" -scheme EidolaShell \
   -configuration Debug -derivedDataPath "$HERE/build/DerivedData" -destination "id=$UDID" \
-  -resultBundlePath "$HERE/build/test.xcresult" CODE_SIGNING_ALLOWED=NO test 2>&1 |
+  -resultBundlePath "$HERE/build/test.xcresult" -only-testing:EidolaShellUITests/ContractUITests \
+  CODE_SIGNING_ALLOWED=NO test 2>&1 |
   grep -E "Test Case|error:|\*\* TEST|contract:|restart:" 
 echo "screenshots: $SHOTS"

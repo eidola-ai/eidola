@@ -8,7 +8,7 @@ The native apps the App Store and Play Store distribute. Each is a thin shell ar
 | `ios/` | Swift, UIKit + WKWebView + Network.framework + CryptoKit. A hand-written Xcode project. |
 | `android/` | Kotlin, framework APIs only (WebView, `org.json`, `java.net`), built without Gradle by the SDK's own tools. |
 | `contract-test/` | A plain-JS page that exercises the whole contract against the shell it runs in, and the default embedded bundle. `shell.js` is the reference bridge. |
-| `tools/` | `echo_server.py` (the test page's TCP peer), `bundle_digest.py` (the digest a shell shows, computed from a directory), `bundle_container.py` (a bundle directory as the `ustar` container a release publishes it in, and its `artifact-manifest.json` row; the same bytes as app-core's `updater::mobile::container::write_ustar`). |
+| `tools/` | `echo_server.py` (the test page's TCP peer), `bundle_digest.py` (the digest a shell shows, computed from a directory), `bundle_container.py` (a bundle directory as the `ustar` container a release publishes it in, and its `artifact-manifest.json` row; the same bytes as app-core's `updater::mobile::container::write_ustar`), `openai_stub.py` (a development stand-in for a model: an OpenAI-compatible server streaming a fixed answer, for development bundles and the UI tests; never part of a release). |
 | `build-bundle.sh`, `bundle-repro.sh`, `self-test.sh` | The app bundle (`crates/eidola-mobile`, wasm32) built reproducibly, checked by two clean builds, and its headless self-test under either shell; see `crates/eidola-mobile/AGENTS.md`. |
 | `device-checklist.md` | What to prepare before running a build on a physical device. |
 
@@ -40,17 +40,20 @@ Both shells embed **the app bundle** by default (`build.sh` without `--bundle` r
 | `just mobile-ios-test` | `ios/test-sim.sh` | XCUITest on the simulator `eidola-shell` (created once; never another device): the test page's verdict, the bundle sheet opened from the home-screen quick action and compared with the page's digest, a cold relaunch. Screenshots to `ios/build/shots`. |
 | `just mobile-android` | `android/build.sh` | Builds the APK (`--bundle DIR`, `--debug`, `--out DIR`); signs it too when `KEYSTORE` is set. |
 | `just mobile-android-test` | `android/test-emulator.sh` | The same run on the AVD `eidola-shell` (created once from the android-36.1 Play image; never another AVD or a device), signed with a debug key generated into `android/.keys/` (git-ignored). The sheet is opened by the launcher shortcut's intent. |
+| `just mobile-ios-ui-test` | `ios/test-ui.sh` | The app's phone interface under XCUITest on its own simulators (`eidola-phone`; `eidola-phone-zh`, whose language is Chinese so Pinyin is its first keyboard): a development bundle answering from `tools/openai_stub.py`, a whole conversation by real taps and typing, a cold relaunch at night, Chinese through the Pinyin IME in the app's zh-Hans locale. Screenshots and a recording to `ios/build/ui`. |
+| `just mobile-android-ui-test` | `android/test-ui.sh` | The same flow on the AVD `eidola-shell` through `adb shell input`, elements found in the WebView's accessibility tree (`ui_test.py`). Screenshots and a recording to `android/build/ui`. |
 | `just mobile-android-repro` | `android/repro.sh` | Two clean release builds, identical; a signed APK strips back to them; the hash equals `android/reproducible.sha256`. |
 
 Both test runs start `tools/echo_server.py` on `127.0.0.1:7777` (the emulator reaches it as `10.0.2.2`). A full run takes about two minutes on either platform; the page phases through several document loads, so the bundle-store checks run against real reloads.
 
 Durability is checked through a test hook outside the contract: every flush either shell makes goes through one function (`Durable` in `Files.swift` and `Files.kt`), which in debug builds records it, and `debug.syncLog` returns and clears that record. The test page holds each file and bundle request to the contract's durability table with it; a release build answers `unknown_method` and the page skips those checks. Reverting any one of the flushes fails its check on both platforms.
 
-The iOS check is a **local gate** (no macOS runner here): run `just mobile-ios-test` before any change to `ios/`, `contract-test/` or the contract.
+The iOS check is a **local gate** (no macOS runner here): run `just mobile-ios-test` before any change to `ios/`, `contract-test/` or the contract. The UI tests (`just mobile-ios-ui-test`, `just mobile-android-ui-test`) are the local gate for the app's interface (`crates/eidola-mobile/src/ui/`): they find elements through the probe mirror a development bundle carries (`crates/eidola-mobile/AGENTS.md` → Development bundles) and tap their centres, which land on the app's canvas. `test-sim.sh` runs only `ContractUITests`; `test-ui.sh` runs `PhoneUITests`.
 
 ## iOS
 
 - `EidolaShell.xcodeproj` is hand-written and lists its five Swift files and `AppIcon.icon` explicitly; a new file goes into `project.pbxproj` by hand (a build phase entry, a file reference, a group child). The embedded bundle is the folder reference `build/bundle`, which `build.sh` fills, so build through the script.
+- `Info.plist` declares the app bundle's locales (`CFBundleLocalizations`: en, es, fr, zh-Hans, zh-Hant): WKWebView reports the device's languages to the page (`navigator.languages`) only among those an app declares, so the list moves with `crates/eidola-mobile/locales/`.
 - The bundle id is `ai.eidola.mobile` for the Release configuration (`--release`) and `ai.eidola.mobile.dev` for Debug, so a dev build installs beside a release one; the team is `7N2X49G865`, iOS 26 and later.
 - A document load is a main-frame navigation the navigation delegate allows; a fragment-only navigation is not one. The scheme handler then serves from the bundle selected for it.
 - A content rule list blocks every load outside the `eidola` scheme (and `data:`/`blob:`), so another origin is refused by the shell and not only by the CSP.
@@ -82,4 +85,4 @@ A **signed** APK differs on every signing (ECDSA signatures are randomized). `to
 
 ## CI
 
-`.github/workflows/mobile-shells.yml` runs on changes under `mobile/` and `crates/eidola-mobile/`, and to what pins the bundle's build (`Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`), on the `mobile` branch: it builds the Android shell twice on Linux with the pinned tools, checks the strip round trip, and checks `reproducible.sha256`; and it builds the app bundle twice from scratch (`bundle-repro.sh`). iOS is the local gate above. `rust-checks` lints `eidola-mobile` for wasm32 (with and without `self-test`) on every Rust change.
+`.github/workflows/mobile-shells.yml` runs on changes under `mobile/`, `crates/eidola-mobile/` and the crates its interface shares with the GUI (`eidola-theme`, `eidola-i18n`, `gpui-markdown-editor`), and to what pins the bundle's build (`Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`), on the `mobile` branch: it builds the Android shell twice on Linux with the pinned tools, checks the strip round trip, and checks `reproducible.sha256`; and it builds the app bundle twice from scratch (`bundle-repro.sh`). iOS is the local gate above. `rust-checks` lints `eidola-mobile` for wasm32 (bare, with `self-test`, and with `dev`) on every Rust change.
