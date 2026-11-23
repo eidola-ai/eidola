@@ -173,8 +173,22 @@ pub fn font_scale(cx: &App) -> f32 {
 
 /// The prose style every post body and the composer share — the desktop
 /// app's, at this app's type scale, so a post reads as what was typed.
+///
+/// **One difference, for the phone's width**: a gentler heading ramp (h1 1.5×,
+/// h2 1.3×, h3 1.15×, h4–h6 1.05× the body, against the desktop's 2.5× / 1.75×
+/// / 1.25× / 1.125×), so a heading does not take the screen from the words
+/// beneath it. Size still carries the hierarchy, at the desktop's uniform
+/// Medium weight.
 pub fn prose_style(cx: &App) -> MarkdownStyle {
-    let mut style = eidola_theme::prose::prose_style(cx, font_scale(cx));
+    let mut style =
+        eidola_theme::prose::prose_style(cx, font_scale(cx)).heading_font_size(|level, base| {
+            match level {
+                1 => base * 1.5,
+                2 => base * 1.3,
+                3 => base * 1.15,
+                _ => base * 1.05,
+            }
+        });
     style.mono_font_family = MONO_FAMILY.into();
     style.inline_code_font_family = MONO_FAMILY.into();
     style

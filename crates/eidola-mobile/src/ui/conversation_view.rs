@@ -313,7 +313,7 @@ impl ConversationView {
                         format!("{author}, {}", fmt_when(post.created_at)),
                     )
                     .px(GUTTER)
-                    .pt(px(18.))
+                    .pt(row_top(ix))
                     .pb(px(4.))
                     .flex()
                     .flex_col()
@@ -371,7 +371,7 @@ impl ConversationView {
                         msg::conversation_you(cx),
                     )
                     .px(GUTTER)
-                    .pt(px(18.))
+                    .pt(row_top(ix))
                     .pb(px(12.))
                     .flex()
                     .flex_col()
@@ -400,7 +400,7 @@ impl ConversationView {
                         author.clone().unwrap_or_default(),
                     )
                     .px(GUTTER)
-                    .pt(px(18.))
+                    .pt(row_top(ix))
                     .pb(px(12.))
                     .flex()
                     .flex_col()
@@ -656,6 +656,11 @@ impl Render for ConversationView {
             // No composer over a space that does not exist.
             .when(gone.is_none(), |d| d.child(self.composer.clone()))
     }
+}
+
+/// A row's top padding: the first row stands further from the header's rule.
+fn row_top(ix: usize) -> gpui::Pixels {
+    if ix == 0 { px(28.) } else { px(18.) }
 }
 
 /// A control's press: it takes no focus and leaves the keyboard as it is.
