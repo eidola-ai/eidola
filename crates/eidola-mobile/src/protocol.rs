@@ -316,40 +316,13 @@ pub struct Names {
     pub names: Vec<String>,
 }
 
-/// `bundle.seal`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Sealed {
-    pub digest: String,
-    pub files: u64,
-    pub bytes: u64,
-}
-
-/// The bundle this document was served from.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Serving {
-    pub version: String,
-    pub digest: String,
-    pub confirmed: bool,
-}
-
-/// One stored bundle version.
-#[derive(Debug, Clone, Deserialize)]
-pub struct StoredVersion {
-    pub version: String,
-    pub sealed: bool,
-    pub digest: Option<String>,
-}
-
-/// `bundle.state`, and the result of `bundle.activate` and `bundle.confirm`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct BundleState {
-    pub serving: Serving,
-    pub active: String,
-    pub confirmed: bool,
-    pub previous: String,
-    pub failed: Option<String>,
-    pub versions: Vec<StoredVersion>,
-}
+/// The bundle store's results (`bundle.seal`, `bundle.state`, and the
+/// state `bundle.activate` and `bundle.confirm` return) are app-core's own
+/// types, which its updater stages through (`eidola_app_core::updater::mobile`):
+/// one definition of the contract's shapes, read straight from the reply.
+pub use eidola_app_core::updater::mobile::{
+    BundleState, SealedBundle as Sealed, ServingBundle as Serving, StoredBundle as StoredVersion,
+};
 
 /// `debug.syncLog`, a debug shell's test hook outside the contract: every
 /// flush since the last call, as paths relative to the shell's storage.
@@ -457,6 +430,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hello.contract, 3);
+    }
+
+    #[test]
+    fn a_serving_digest_still_being_computed_reads_as_none() {
+        // The Android shell answers `null` until it has hashed the bundle it
+        // serves; a state read then must not fail the updater.
+        let state: BundleState = decode(
+            "bundle.state",
+            r#"{"id":1,"ok":true,"result":{"serving":{"version":"embedded","digest":null,"confirmed":true},"active":"embedded","confirmed":true,"previous":"embedded","failed":null,"versions":[{"version":"v1","sealed":false,"digest":null}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(state.serving.digest, None);
+        assert_eq!(state.versions[0].digest, None);
     }
 
     /// The Rust side's share of a receive: routing and decoding a 1 MiB

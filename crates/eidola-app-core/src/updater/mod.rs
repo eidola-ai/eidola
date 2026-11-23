@@ -62,10 +62,10 @@ pub mod ci_sigstore;
 pub mod human_attestation;
 #[cfg(feature = "desktop")]
 pub mod install;
-#[cfg(feature = "desktop")]
 pub mod install_kind;
 pub mod installed;
 mod merkle;
+pub mod mobile;
 mod rekor_verify;
 pub mod sigstore_bundle;
 pub mod trust;
@@ -161,7 +161,7 @@ impl Fetcher {
 
     /// Fetch a referenced asset with an explicit ceiling, for callers whose
     /// artifacts are larger than a signed document.
-    pub(crate) async fn fetch_url_bounded(
+    pub async fn fetch_url_bounded(
         &self,
         url: &str,
         label: &str,

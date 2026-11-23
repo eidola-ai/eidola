@@ -2840,6 +2840,7 @@ dependencies = [
  "futures-util",
  "hex",
  "js-sys",
+ "reqwest",
  "rustls",
  "rustls-rustcrypto",
  "serde",
@@ -2852,6 +2853,7 @@ dependencies = [
  "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wiremock",
 ]
 
 [[package]]

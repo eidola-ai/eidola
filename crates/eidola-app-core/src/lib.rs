@@ -12408,6 +12408,55 @@ impl AppCore {
         self.inner.accept_changed_claims(version, manifest_sha256)
     }
 
+    /// The mobile app's update check: find the release to offer next,
+    /// verify it exactly as [`Self::update_check`] does, and read the app
+    /// bundle it records ([`updater::mobile::prepare`]). Downloads the
+    /// signed documents only; nothing is staged. Refused anywhere but in the
+    /// mobile app ([`updater::install_kind::InstallKind::MobileBundle`]),
+    /// the one install a bundle replaces.
+    pub async fn prepare_bundle_update(&self) -> Result<updater::mobile::BundleUpdate, AppError> {
+        let kind = updater::install_kind::detect(updater::install_kind::running_program());
+        if kind != updater::install_kind::InstallKind::MobileBundle {
+            return Err(AppError::Update {
+                message: format!("this install ({kind:?}) is not updated by an app bundle"),
+            });
+        }
+        let releases_url = self.inner.load_config().update_releases_url();
+        let fetcher = self.update_fetcher()?;
+        // No installed commit: as for every install the updater has not yet
+        // recorded, continuity is not checked and the next release along the
+        // latest's history is offered (`updater::discover_next_release`).
+        updater::mobile::prepare(
+            &fetcher,
+            &releases_url,
+            env!("CARGO_PKG_VERSION"),
+            None,
+            &updater::ReleasePins::embedded(),
+        )
+        .await
+        .map_err(AppError::from)
+    }
+
+    /// The user approved `pending`: download its bundle, check every byte,
+    /// stage it in the shell's store and activate it
+    /// ([`updater::mobile::PendingBundleUpdate::approve`]). The caller then
+    /// reloads, and the new bundle's boot confirms it.
+    pub async fn install_bundle_update(
+        &self,
+        pending: updater::mobile::PendingBundleUpdate,
+        store: &dyn updater::mobile::BundleStore,
+    ) -> Result<updater::mobile::ActivatedBundle, AppError> {
+        Ok(pending.approve(&self.update_fetcher()?, store).await?)
+    }
+
+    /// The updater's byte source over this core's transport: plain WebPKI
+    /// TLS, natively through reqwest and on a host through its socket.
+    pub fn update_fetcher(&self) -> Result<updater::Fetcher, AppError> {
+        Ok(updater::Fetcher::Network(updater::build_http_client(
+            &self.inner.transport,
+        )?))
+    }
+
     /// Start the background poll loop: one check immediately, then one
     /// after each [`updates::next_poll_delay`] (about an hour) while the
     /// process runs.

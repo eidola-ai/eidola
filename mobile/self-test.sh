@@ -5,8 +5,16 @@
 #     another, both in front of a static upstream that serves GET /v1/terms;
 #   - tools/echo_server.py, for the pipe's throughput.
 # The self-test bundle is built, embedded in a debug shell, launched (phase 1: boot, attestation,
-# the barrier, the bundle store, throughput), killed and cold-launched (phase 2: the profile and
-# its settings survived). Reports, logs and screenshots go to OUT (default build/self-test/PLATFORM).
+# the barrier, the bundle store, throughput; the self-update: a captured signed release verified
+# in the app, and an update approved, checked, staged and activated), killed and cold-launched
+# (phase 2: the profile and its settings survived; the update booted and confirmed with its
+# release's digest, which the shell's native sheet shows on Android; a broken update approved),
+# launched again (the broken bundle's trial, which never confirms) and once more (phase 3: the
+# shell fell back to the confirmed update and recorded the failure; the user's revert).
+# The releases are served over HTTPS by the trusted shim: the captured v0.0.8 release (genuinely
+# signed; verified for real) and two bundle containers whose releases the app takes as verified,
+# since no manifest recording a bundle can be signed outside a release.
+# Reports, logs and screenshots go to OUT (default build/self-test/PLATFORM).
 #   self-test.sh ios|android [--out DIR]
 # Uses its own simulator ("eidola-bridge") or AVD ("eidola-bridge"), created once; never a device.
 set -euo pipefail
@@ -64,8 +72,57 @@ print(json.dumps({
     "measurement": good, "host_data": zero, "guest_policy": "0x30133",
     "ark_pem": pem("ark.pem"), "ask_pem": pem("ask.pem"), "tls_ca_pem": pem("tls-ca.pem"),
     "echo_host": host, "echo_port": 7777, "throughput_mib": 16,
+    "update_url": f"https://{host}:18443/selftest-update.json",
 }, indent=1))
 PY
+
+# The self-update's releases. The update is this bundle plus a marker (a digest of its own); the
+# broken update is a page with no app, which never confirms.
+cp -R "$T/bundle" "$T/update"
+echo "the self-update's target bundle" >"$T/update/update-marker.txt"
+mkdir -p "$T/broken"
+echo '<!doctype html><title>a bundle that never confirms</title>' >"$T/broken/index.html"
+FIXTURES="$ROOT/crates/eidola-app-core/tests/fixtures/v0.0.8"
+mkdir -p "$T/www/latest/download" "$T/www/download/v0.0.8" "$T/www/download/v0.0.9" "$T/www/download/v0.0.10"
+cp "$FIXTURES"/artifact-manifest.json "$FIXTURES"/artifact-manifest.json.sigstore \
+  "$FIXTURES"/attestation-throwaway.json "$FIXTURES"/attestation-throwaway.bundle.json "$T/www/download/v0.0.8/"
+python3 "$HERE/tools/bundle_container.py" "$T/update" "$T/www/download/v0.0.9/eidola-mobile-bundle.tar" >"$T/update-row.json"
+python3 "$HERE/tools/bundle_container.py" "$T/broken" "$T/www/download/v0.0.10/eidola-mobile-bundle.tar" >"$T/broken-row.json"
+python3 - "$T" "https://$HOST:18443" >"$T/www/selftest-update.json" <<'PY'
+import base64, json, sys
+t, base = sys.argv[1:]
+v8 = f"{base}/download/v0.0.8"
+with open(f"{t}/www/latest/download/release.json", "w") as f:
+    json.dump({
+        "schema_version": 1, "version": "0.0.8", "git_commit": "bb7773fafbaa90d40e7c7634ff7f690b54dd9be9",
+        "git_tag": "v0.0.8", "released_at": "2026-05-31T23:53:54Z",
+        "previous_release": {"version": "0.0.6", "git_commit": "7ba323817820a04948ffc70e78955201c96c733f"},
+        "artifact_manifest": {"url": f"{v8}/artifact-manifest.json",
+                              "sigstore_bundle_url": f"{v8}/artifact-manifest.json.sigstore"},
+        "human_attestations": [{"attestant_id": "throwaway", "url": f"{v8}/attestation-throwaway.json",
+                                "bundle_url": f"{v8}/attestation-throwaway.bundle.json"}],
+    }, f)
+def staged(version, row):
+    tag = f"v{version}"
+    manifest = json.dumps({"schema_version": 6, "artifacts": {"eidola-mobile-bundle": row}}).encode()
+    return {"index": {
+        "schema_version": 2, "version": version, "git_commit": "9c3a" + "0" * 34 + version.replace(".", "")[-2:],
+        "git_tag": tag, "released_at": "2026-11-23T00:00:00Z",
+        "artifact_manifest": {"url": f"{base}/download/{tag}/artifact-manifest.json",
+                              "sigstore_bundle_url": f"{base}/download/{tag}/artifact-manifest.json.sigstore"},
+        "human_attestations": [],
+        "artifacts": {"eidola-mobile-bundle": {"url": f"{base}/download/{tag}/eidola-mobile-bundle.tar"}},
+    }, "manifest": base64.b64encode(manifest).decode()}
+print(json.dumps({
+    "releases_url": base, "installed_version": "0.0.6",
+    "attestant_fingerprint": "9f2103792a8007816eb963d1b284d139ac3cf69f3d6ab7cb93878bb654d70915",
+    "ci_identity_pattern": "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*",
+    "good": staged("0.0.9", json.load(open(f"{t}/update-row.json"))),
+    "broken": staged("0.0.10", json.load(open(f"{t}/broken-row.json"))),
+}, indent=1))
+PY
+UPDATE_DIGEST="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["digest"][7:])' "$T/update-row.json")"
+echo "update digest: $UPDATE_DIGEST" | tee "$OUT/update.txt"
 
 wait_for() { # wait_for SECONDS COMMAND...: until COMMAND succeeds
   local n="$1"; shift
@@ -95,6 +152,7 @@ for devices in json.load(sys.stdin)["devices"].values():
   sleep 2
   FILES="$(xcrun simctl get_app_container "$UDID" "$PKG" data)/Library/Application Support/Eidola/files"
   report() { cat "$FILES/selftest-$1.json" 2>/dev/null; }
+  sheet() { :; } # opened from a home-screen quick action, which only XCUITest reaches
   launch() { xcrun simctl launch "$UDID" "$PKG" >/dev/null; }
   kill_app() { xcrun simctl terminate "$UDID" "$PKG"; }
   shot() { xcrun simctl io "$UDID" screenshot "$OUT/$1.png" >/dev/null 2>&1; }
@@ -147,6 +205,14 @@ CONFIG
   "${ADB[@]}" install -r "$T/apk/eidola-shell-signed.apk" >/dev/null
   "${ADB[@]}" logcat -c
   report() { "${ADB[@]}" shell run-as "$PKG" cat "no_backup/files/selftest-$1.json" 2>/dev/null | grep . ; }
+  sheet() { # the bundle sheet, through the intent the launcher shortcut sends; prints its text
+    "${ADB[@]}" shell am start -a ai.eidola.shell.SHOW_DIGEST -n "$PKG/ai.eidola.shell.MainActivity" >/dev/null
+    sleep 3
+    shot "$1"
+    "${ADB[@]}" shell uiautomator dump /sdcard/ui.xml >/dev/null
+    "${ADB[@]}" shell cat /sdcard/ui.xml | tr -d '\n' | sed 's/&#10;//g'
+    "${ADB[@]}" shell input keyevent KEYCODE_BACK
+  }
   launch() { "${ADB[@]}" shell am start -W -n "$PKG/ai.eidola.shell.MainActivity" >/dev/null; }
   kill_app() { "${ADB[@]}" shell am force-stop "$PKG"; }
   shot() { "${ADB[@]}" exec-out screencap -p >"$OUT/$1.png"; }
@@ -168,14 +234,37 @@ sleep 1
 shot 2-relaunch
 report 2 >"$OUT/selftest-2.json" || true
 files >"$OUT/files-after-phase-2.txt" 2>&1 || true
+# The update is serving: the shell's own sheet shows its digest.
+sheet 2-bundle-sheet >"$OUT/sheet.txt" || true
+kill_app
+sleep 1
+# The broken update's trial: it never confirms.
+launch
+sleep 8
+shot 3-broken-trial
+kill_app
+sleep 1
+# The shell falls back to the confirmed update.
+launch
+wait_for 120 report 3 >/dev/null || { echo "phase 3 reported nothing" >&2; }
+sleep 1
+shot 4-after-fallback
+report 3 >"$OUT/selftest-3.json" || true
 [[ $PLATFORM == android ]] && "${ADB[@]}" logcat -d -s EidolaShell:V >"$OUT/console.log"
 kill_app || true
 
-python3 - "$OUT" <<'PY'
+python3 - "$OUT" "$PLATFORM" "$UPDATE_DIGEST" <<'PY'
 import json, sys
-out = sys.argv[1]
+out, platform, digest = sys.argv[1:]
 ok = True
-for phase in (1, 2):
+if platform == "android":
+    shown = open(f"{out}/sheet.txt").read()
+    sheet = digest in shown and "on trial" not in shown
+    print(f"sheet: {'PASS' if sheet else 'FAIL'} the native bundle sheet shows the update's digest {digest}")
+    ok = ok and sheet
+else:
+    print("sheet: not checked here (iOS opens it from a home-screen quick action; mobile/ios/test-sim.sh)")
+for phase in (1, 2, 3):
     try:
         report = json.load(open(f"{out}/selftest-{phase}.json"))
     except Exception as e:

@@ -169,7 +169,12 @@ pub async fn start() -> Result<String, JsValue> {
         booted.hello.shell,
         booted.hello.contract,
         booted.bundle.serving.version,
-        booted.bundle.serving.digest,
+        booted
+            .bundle
+            .serving
+            .digest
+            .as_deref()
+            .unwrap_or("(digest pending)"),
         if booted.bundle.confirmed {
             "confirmed"
         } else {

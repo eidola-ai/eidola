@@ -21,6 +21,23 @@
 //!    first launch is there, and the trust settings with it (the request is
 //!    attested again without configuring anything).
 //!
+//! With `update` in the config, the self-update runs across those launches
+//! and two more (`self_update_*`):
+//!
+//! 1. The captured release the harness serves is verified over the shell's
+//!    pipe by `updater::mobile::prepare` (the desktop's verification, for
+//!    real, against the throwaway attestant pin), and a release carrying a
+//!    bundle — this bundle plus a marker file, as verified evidence the
+//!    harness supplies, since no manifest with a bundle row can be CI-signed
+//!    outside a release — is approved: downloaded, checked, staged, sealed
+//!    and activated.
+//! 2. The relaunch serves that bundle on trial, and its boot confirms it with
+//!    the release's digest. It then approves a broken bundle (a page with no
+//!    app, which never confirms).
+//! 3. The broken bundle's trial ends without a confirmation; at the next
+//!    launch the shell has fallen back to the confirmed update and records
+//!    the failure. The user's revert to the embedded bundle closes the run.
+//!
 //! Each launch writes its report (`selftest-<n>.json`, synced) to the file
 //! directory, where the harness reads it from outside the app, and logs it
 //! to the console.
@@ -36,9 +53,16 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use eidola_app_core::updater::mobile::{self, BundleReport, BundleUpdate, PendingBundleUpdate};
+use eidola_app_core::updater::{
+    Fetcher, ReleaseCheckError, ReleaseEvidence, ReleaseIndex, ReleasePins, ReleaseSummary,
+};
+
 use crate::boot::{self, BootOptions};
 use crate::client::{ShellClient, TraceEntry, TraceEvent, Transport};
+use crate::protocol::BundleState;
 use crate::socket::ShellDialer;
+use crate::update::{self, ShellBundles};
 
 const STATE: &str = "selftest-state.json";
 
@@ -61,6 +85,35 @@ pub struct Config {
     pub echo_port: u16,
     #[serde(default = "default_mib")]
     pub throughput_mib: usize,
+    /// The self-update's fixtures (`UpdateFixtures`), served over HTTPS by
+    /// the harness: fetched at run time, because the updates they describe
+    /// contain this bundle, and so its config.
+    #[serde(default)]
+    pub update_url: Option<String>,
+}
+
+/// What the self-update runs against.
+#[derive(Debug, Deserialize)]
+pub struct UpdateFixtures {
+    /// Serves a captured, genuinely signed release as the latest.
+    pub releases_url: String,
+    /// The version the verification treats as installed.
+    pub installed_version: String,
+    /// The pins that release verifies under.
+    pub attestant_fingerprint: String,
+    pub ci_identity_pattern: String,
+    /// A release carrying a bundle that boots, and one carrying a bundle that
+    /// never confirms.
+    pub good: StagedRelease,
+    pub broken: StagedRelease,
+}
+
+/// A release index and its manifest, taken as verified.
+#[derive(Debug, Deserialize)]
+pub struct StagedRelease {
+    pub index: ReleaseIndex,
+    /// The manifest's bytes, base64.
+    pub manifest: String,
 }
 
 fn default_mib() -> usize {
@@ -81,6 +134,12 @@ pub struct Env {
 #[derive(Serialize, Deserialize)]
 struct State {
     title: String,
+    /// The phase that wrote it.
+    #[serde(default)]
+    phase: u32,
+    /// The digest of the update staged in phase 1.
+    #[serde(default)]
+    update_digest: Option<String>,
 }
 
 mod verdict {
@@ -180,6 +239,9 @@ pub async fn run<T: Transport>(
     let mut report = Report::default();
     match state {
         None => first_launch(&client, &config, &env, &mut report).await,
+        Some(state) if state.phase >= 2 => {
+            after_broken(&client, &config, &env, &mut report, state).await
+        }
         Some(state) => relaunch(&client, &config, &env, &mut report, state).await,
     }
     let pass = report.finish();
@@ -202,7 +264,7 @@ async fn boot_core<T: Transport>(
     config: &Config,
     env: &Env,
     report: &mut Report,
-) -> Option<AppCore> {
+) -> Option<(AppCore, BundleState)> {
     let roots = match pem_der(&config.tls_ca_pem) {
         Ok(der) => vec![CertificateDer::from(der)],
         Err(e) => {
@@ -236,7 +298,7 @@ async fn boot_core<T: Transport>(
                     "ms": ms,
                 }),
             );
-            Some(booted.core)
+            Some((booted.core, booted.bundle))
         }
         Err(e) => {
             report.check(env, "boot", false, json!(e.to_string()));
@@ -252,7 +314,7 @@ async fn first_launch<T: Transport>(
     report: &mut Report,
 ) {
     report.set_phase(1);
-    let Some(core) = boot_core(client, config, env, report).await else {
+    let Some((core, _)) = boot_core(client, config, env, report).await else {
         return;
     };
 
@@ -326,11 +388,17 @@ async fn first_launch<T: Transport>(
 
     bundle_store(client, env, report).await;
     throughput(client, config, env, report).await;
+    let update_digest = match &config.update_url {
+        Some(url) => self_update_first(client, &core, url, env, report).await,
+        None => None,
+    };
 
     // (b) Leave the space for the relaunch to find, durably.
     let flushed = core.flush_storage().await;
     let state = serde_json::to_vec(&State {
         title: title.clone(),
+        phase: 1,
+        update_digest,
     })
     .unwrap_or_default();
     let saved = client.files_write(STATE, 0, &state, true).await;
@@ -356,7 +424,7 @@ async fn relaunch<T: Transport>(
     state: State,
 ) {
     report.set_phase(2);
-    let Some(core) = boot_core(client, config, env, report).await else {
+    let Some((core, bundle)) = boot_core(client, config, env, report).await else {
         return;
     };
     let spaces = core.list_spaces(false).await;
@@ -394,6 +462,233 @@ async fn relaunch<T: Transport>(
         .as_object()
         .is_some_and(|stores| stores.values().all(|v| v.is_null() || v == &json!(0)));
     report.check(env, "nothing in webview storage", empty, webview);
+    let Some(url) = &config.update_url else {
+        let _ = client.files_remove(STATE).await;
+        return;
+    };
+    self_update_second(client, &core, url, &bundle, &state, env, report).await;
+    let saved = serde_json::to_vec(&State { phase: 2, ..state }).unwrap_or_default();
+    let saved = client.files_write(STATE, 0, &saved, true).await;
+    report.check(
+        env,
+        "self-update: state kept",
+        saved.is_ok(),
+        json!(saved.map_err(|e| e.to_string()).err()),
+    );
+}
+
+/// The pins the captured release verifies under, and the fixtures.
+async fn update_fixtures(core: &AppCore, url: &str) -> Result<(Fetcher, UpdateFixtures), String> {
+    let fetcher = core.update_fetcher().map_err(|e| e.to_string())?;
+    let bytes = fetcher
+        .fetch_url_bounded(url, "the self-update fixtures", 1 << 20)
+        .await
+        .map_err(|e| e.to_string())?;
+    let fixtures = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    Ok((fetcher, fixtures))
+}
+
+/// A staged release, as `verify_release` would have returned it.
+fn staged_evidence(release: &StagedRelease) -> Result<ReleaseEvidence, String> {
+    let manifest_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&release.manifest)
+        .map_err(|e| e.to_string())?;
+    let index = &release.index;
+    Ok(ReleaseEvidence {
+        summary: ReleaseSummary {
+            version: index.version.clone(),
+            git_commit: index.git_commit.clone(),
+            git_tag: index.git_tag.clone(),
+            released_at: index.released_at.clone(),
+            previous_release: index.previous_release.clone(),
+            attestations: vec![],
+        },
+        manifest_sha256: hex(&Sha256::digest(&manifest_bytes)),
+        manifest_bytes,
+        ci_identity: String::new(),
+        ci_rekor_log_index: 0,
+    })
+}
+
+/// Approve `release` on the shell: its bundle's digest, once activated.
+async fn approve_staged<T: Transport>(
+    client: &ShellClient<T>,
+    fetcher: &Fetcher,
+    release: &StagedRelease,
+    env: &Env,
+) -> Result<(String, BundleState, f64), String> {
+    let evidence = staged_evidence(release)?;
+    let pending = match PendingBundleUpdate::from_evidence(&release.index, evidence)
+        .map_err(|e| e.to_string())?
+    {
+        BundleUpdate::Available(pending) => *pending,
+        other => return Err(format!("no bundle to approve: {other:?}")),
+    };
+    let digest = pending.bundle_digest().to_owned();
+    let started = (env.now_ms)();
+    let activated = pending
+        .approve(fetcher, &ShellBundles::new(client.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((digest, activated.state, (env.now_ms)() - started))
+}
+
+/// Phase 1: verify the captured release for real, then approve the update.
+async fn self_update_first<T: Transport>(
+    client: &ShellClient<T>,
+    core: &AppCore,
+    url: &str,
+    env: &Env,
+    report: &mut Report,
+) -> Option<String> {
+    let (fetcher, fixtures) = match update_fixtures(core, url).await {
+        Ok(found) => found,
+        Err(e) => {
+            report.check(env, "self-update: fixtures", false, json!(e));
+            return None;
+        }
+    };
+    let mut pins = ReleasePins::embedded();
+    pins.trusted_attestant_fingerprints = vec![fixtures.attestant_fingerprint.clone()];
+    pins.ci_identity_pattern = fixtures.ci_identity_pattern.clone();
+    let started = (env.now_ms)();
+    let verified = mobile::prepare(
+        &fetcher,
+        &fixtures.releases_url,
+        &fixtures.installed_version,
+        None,
+        &pins,
+    )
+    .await;
+    let ms = (env.now_ms)() - started;
+    report.check(
+        env,
+        "self-update: a signed release verifies in the app",
+        // The captured release's manifest is schema 1, outside the accepted
+        // set: the bundle reader refuses it, and it runs only once
+        // `verify_release` has passed, so this refusal is the verification
+        // passing in the app.
+        matches!(&verified, Err(ReleaseCheckError::Rejected(m))
+            if m.contains("declares schema_version 1, which this build does not accept")),
+        json!({
+            "result": match &verified {
+                Ok(other) => format!("{other:?}"),
+                Err(e) => format!("refused after verification: {e}"),
+            },
+            "ms": ms,
+        }),
+    );
+    let before = client.bundle_state().await.ok();
+    let approved = approve_staged(client, &fetcher, &fixtures.good, env).await;
+    let pass = matches!(&approved, Ok((_, state, _))
+        if state.active == fixtures.good.index.git_tag && !state.confirmed);
+    report.check(
+        env,
+        "self-update: approved, checked, staged and activated",
+        pass && before.is_some_and(|s| s.versions.is_empty()),
+        match &approved {
+            Ok((digest, state, ms)) => json!({
+                "version": state.active, "digest": digest, "ms": ms,
+                "awaiting_reload": BundleReport::from_state(state).awaiting_reload,
+            }),
+            Err(e) => json!(e),
+        },
+    );
+    approved.ok().map(|(digest, _, _)| digest)
+}
+
+/// Phase 2: the update booted and confirmed; approve the broken one.
+async fn self_update_second<T: Transport>(
+    client: &ShellClient<T>,
+    core: &AppCore,
+    url: &str,
+    booted: &BundleState,
+    state: &State,
+    env: &Env,
+    report: &mut Report,
+) {
+    let (fetcher, fixtures) = match update_fixtures(core, url).await {
+        Ok(found) => found,
+        Err(e) => {
+            report.check(env, "self-update: fixtures", false, json!(e));
+            return;
+        }
+    };
+    report.check(
+        env,
+        "self-update: the update booted, confirmed, with the release's digest",
+        booted.serving.version == fixtures.good.index.git_tag
+            && booted.serving.confirmed
+            && booted.serving.digest == state.update_digest,
+        json!({
+            "serving": booted.serving.version,
+            "digest": booted.serving.digest,
+            "expected": state.update_digest,
+            "confirmed": booted.serving.confirmed,
+        }),
+    );
+    let approved = approve_staged(client, &fetcher, &fixtures.broken, env).await;
+    report.check(
+        env,
+        "self-update: a broken bundle approved and activated",
+        matches!(&approved, Ok((_, s, _)) if s.active == fixtures.broken.index.git_tag && s.previous == fixtures.good.index.git_tag),
+        match &approved {
+            Ok((digest, s, _)) => json!({"version": s.active, "digest": digest, "previous": s.previous}),
+            Err(e) => json!(e),
+        },
+    );
+}
+
+/// Phase 3: after the broken bundle's trial, the shell fell back.
+async fn after_broken<T: Transport>(
+    client: &ShellClient<T>,
+    config: &Config,
+    env: &Env,
+    report: &mut Report,
+    state: State,
+) {
+    report.set_phase(3);
+    let Some((core, booted)) = boot_core(client, config, env, report).await else {
+        return;
+    };
+    let fixtures = match &config.update_url {
+        Some(url) => update_fixtures(&core, url).await.map(|(_, f)| f),
+        None => Err("no update fixtures".into()),
+    };
+    let (good, broken) = match &fixtures {
+        Ok(f) => (
+            f.good.index.git_tag.as_str(),
+            f.broken.index.git_tag.as_str(),
+        ),
+        Err(e) => {
+            report.check(env, "self-update: fixtures", false, json!(e));
+            return;
+        }
+    };
+    let shown = update::report(client).await;
+    report.check(
+        env,
+        "self-update: the broken bundle reverted to the last confirmed",
+        booted.serving.version == good
+            && booted.serving.confirmed
+            && booted.serving.digest == state.update_digest
+            && booted.failed.as_deref() == Some(broken)
+            && shown
+                .as_ref()
+                .is_ok_and(|r| r.failed.as_deref() == Some(broken)),
+        json!({
+            "serving": booted.serving.version,
+            "failed": booted.failed,
+            "report": shown.map(|r| format!("{r:?}")).map_err(|e| e.to_string()),
+        }),
+    );
+    let reverted = update::revert(client).await;
+    report.check(
+        env,
+        "self-update: the user's revert to the embedded bundle",
+        matches!(&reverted, Ok(s) if s.active == "embedded" && s.confirmed),
+        json!(reverted.map(|s| s.active).map_err(|e| e.to_string())),
+    );
     let _ = client.files_remove(STATE).await;
 }
 

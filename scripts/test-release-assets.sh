@@ -16,8 +16,11 @@
 #     manifest pointing at an undownloadable file is the gap this closes;
 #   * an artifact class nobody put in the publication table is rejected
 #     rather than silently skipped;
-#   * `oci` rows and the unsigned macOS container are skipped by
-#     construction, and their absence from the directory is not an error.
+#   * `oci` rows and the unsigned macOS container and Android APK are
+#     skipped by construction, and their absence from the directory is not
+#     an error;
+#   * the mobile app bundle is published as its container, `<key>.tar`,
+#     and a container that changed after it was measured is rejected.
 #
 # It also drives `wait-budget`, the other half of the same release path:
 # the publisher waits on the artifact workflow with no clock of its own, so
@@ -67,17 +70,19 @@ make_case() {
   printf 'arm64 debian package bytes\n' > "$case_dir/dir/eidola-gui-linux-deb-arm64.deb"
   printf 'static cli bytes\n' > "$case_dir/dir/eidola-cli-linux-static-amd64"
   printf 'arm64 static cli bytes\n' > "$case_dir/dir/eidola-cli-linux-static-arm64"
+  printf 'bundle container bytes\n' > "$case_dir/dir/eidola-mobile-bundle.tar"
   python3 - "$case_dir" "$(sha_of "$case_dir/dir/eidola-gui-linux-nix-amd64.tar.gz")" \
     "$(sha_of "$case_dir/dir/eidola-gui-linux-deb-amd64.deb")" \
     "$(sha_of "$case_dir/dir/eidola-gui-linux-deb-arm64.deb")" \
     "$(sha_of "$case_dir/dir/eidola-cli-linux-static-amd64")" \
-    "$(sha_of "$case_dir/dir/eidola-cli-linux-static-arm64")" <<'PY'
+    "$(sha_of "$case_dir/dir/eidola-cli-linux-static-arm64")" \
+    "$(sha_of "$case_dir/dir/eidola-mobile-bundle.tar")" <<'PY'
 import json
 import sys
 
-case_dir, nix_sha, amd_sha, arm_sha, cli_sha, cli_arm_sha = sys.argv[1:7]
+case_dir, nix_sha, amd_sha, arm_sha, cli_sha, cli_arm_sha, bundle_sha = sys.argv[1:8]
 manifest = {
-    "schema_version": 5,
+    "schema_version": 6,
     "enclave": {},
     "artifacts": {
         # Pulled by digest, never downloaded — must not be looked for.
@@ -120,6 +125,21 @@ manifest = {
             "platform": "darwin/universal",
             "sha256": "sha256:" + "b" * 64,
         },
+        # The same for the unsigned Android APK.
+        "eidola-mobile-android-apk": {
+            "type": "file",
+            "platform": "android/universal",
+            "sha256": "sha256:" + "d" * 64,
+        },
+        # The grader reads only the container's hash; the row's other
+        # fields are the client's and the determinism gate's to check.
+        "eidola-mobile-bundle": {
+            "type": "bundle",
+            "platform": "webview/wasm32",
+            "sha256": bundle_sha,
+            "digest": "sha256:" + "e" * 64,
+            "files": [],
+        },
     },
 }
 with open(case_dir + "/manifest.json", "w") as handle:
@@ -140,7 +160,8 @@ if run_case "$TMP_ROOT/ok"; then
 eidola-cli-linux-static-arm64
 eidola-gui-linux-deb-amd64.deb
 eidola-gui-linux-deb-arm64.deb
-eidola-gui-linux-nix-amd64.tar.gz"
+eidola-gui-linux-nix-amd64.tar.gz
+eidola-mobile-bundle.tar"
   actual="$(sed 's|.*/||' "$TMP_ROOT/ok/stdout" | sort)"
   if [[ "$actual" == "$expected" ]]; then
     note "publishes: $(tr '\n' ' ' < "$TMP_ROOT/ok/stdout" | sed 's|[^ ]*/||g')"
@@ -177,6 +198,21 @@ else
     note "rejected, naming the mismatch"
   else
     fail "rejected, but not for the hash mismatch:"$'\n'"$(cat "$TMP_ROOT/tampered-cli/stderr")"
+  fi
+fi
+
+echo "── a bundle container that changed after it was measured is rejected ──"
+make_case "$TMP_ROOT/tampered-bundle"
+printf 'bundle container bytes (tampered)\n' \
+  > "$TMP_ROOT/tampered-bundle/dir/eidola-mobile-bundle.tar"
+if run_case "$TMP_ROOT/tampered-bundle"; then
+  fail "a bundle container whose bytes no longer match its recorded hash was published"
+else
+  if grep -q "eidola-mobile-bundle: eidola-mobile-bundle.tar hashes to" \
+    "$TMP_ROOT/tampered-bundle/stderr"; then
+    note "rejected, naming the mismatch"
+  else
+    fail "rejected, but not for the hash mismatch:"$'\n'"$(cat "$TMP_ROOT/tampered-bundle/stderr")"
   fi
 fi
 

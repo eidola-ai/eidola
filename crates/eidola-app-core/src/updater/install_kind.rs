@@ -5,7 +5,8 @@
 //! own path says which one it is in. Nothing here asks a package manager or
 //! reads a marker file: a marker is one more thing a manual install over the
 //! top would leave stale, and the layout is the fact the update has to act
-//! on anyway.
+//! on anyway. The mobile app has no executable path at all: it runs as wasm
+//! in a webview, and the platform it was compiled for is the whole answer.
 //!
 //! | Layout | Kind | What an update replaces |
 //! |---|---|---|
@@ -14,6 +15,7 @@
 //! | `/usr/libexec/eidola/<exe>` | [`InstallKind::Deb`] | the package, through the system's package tool |
 //! | under `/nix/store/` | [`InstallKind::Nix`] | nothing: the profile that installed it updates it |
 //! | the CLI anywhere else on Linux | [`InstallKind::StaticCli`] | that one file |
+//! | wasm32, in a native shell's webview | [`InstallKind::MobileBundle`] | the shell's active bundle, through its bundle store (`super::mobile`) |
 //! | anything else | [`InstallKind::Unmanaged`] | nothing |
 //!
 //! "Anything else" includes every development build. A debug build is
@@ -46,12 +48,16 @@ pub enum Program {
 pub enum Platform {
     MacOs,
     Linux,
+    /// wasm32 in a webview: the mobile app, hosted by a native shell.
+    Webview,
     Other,
 }
 
 impl Platform {
     pub fn current() -> Self {
-        if cfg!(target_os = "macos") {
+        if cfg!(target_family = "wasm") {
+            Platform::Webview
+        } else if cfg!(target_os = "macos") {
             Platform::MacOs
         } else if cfg!(target_os = "linux") {
             Platform::Linux
@@ -79,6 +85,10 @@ pub enum InstallKind {
     Nix,
     /// The standalone static Linux CLI, at `path`.
     StaticCli { path: PathBuf },
+    /// The mobile app: a bundle a native shell serves. An update stages a
+    /// new bundle in the shell's store and activates it there
+    /// (`super::mobile`); there is no executable to replace or to hash.
+    MobileBundle,
     /// A development build, or a layout no release ships.
     Unmanaged,
 }
@@ -99,9 +109,10 @@ impl InstallKind {
             ),
             InstallKind::Deb => Some(Path::new(DEB_LIBEXEC).join(DEB_MAIN_EXECUTABLE)),
             InstallKind::StaticCli { path } => Some(path.clone()),
-            InstallKind::MacAppTranslocated { .. } | InstallKind::Nix | InstallKind::Unmanaged => {
-                None
-            }
+            InstallKind::MacAppTranslocated { .. }
+            | InstallKind::Nix
+            | InstallKind::MobileBundle
+            | InstallKind::Unmanaged => None,
         }
     }
 }
@@ -132,6 +143,9 @@ pub fn detect(program: Program) -> InstallKind {
     if cfg!(debug_assertions) {
         return InstallKind::Unmanaged;
     }
+    if Platform::current() == Platform::Webview {
+        return InstallKind::MobileBundle;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return InstallKind::Unmanaged;
     };
@@ -143,6 +157,10 @@ pub fn detect(program: Program) -> InstallKind {
 /// disk, so every layout is testable on every platform. `exe` should
 /// already be canonical.
 pub fn classify(exe: &Path, program: Program, platform: Platform) -> InstallKind {
+    // A webview has no executable path; whatever was passed names nothing.
+    if platform == Platform::Webview {
+        return InstallKind::MobileBundle;
+    }
     if !exe.is_absolute() || under_cargo_target(exe) {
         return InstallKind::Unmanaged;
     }
@@ -165,6 +183,8 @@ pub fn classify(exe: &Path, program: Program, platform: Platform) -> InstallKind
                 InstallKind::Unmanaged
             }
         }
+        // Answered above, before the path was read.
+        Platform::Webview => InstallKind::MobileBundle,
         Platform::Other => InstallKind::Unmanaged,
     }
 }
@@ -326,6 +346,15 @@ mod tests {
     #[test]
     fn a_relative_path_is_not_a_location() {
         assert_eq!(linux("eidola", Program::Cli), InstallKind::Unmanaged);
+    }
+
+    #[test]
+    fn the_webview_is_the_mobile_bundle_whatever_the_path() {
+        for path in ["", "/", "eidola", "/target/release/eidola"] {
+            let kind = classify(Path::new(path), Program::Gui, Platform::Webview);
+            assert_eq!(kind, InstallKind::MobileBundle, "{path:?}");
+            assert_eq!(kind.main_executable(), None);
+        }
     }
 
     #[test]

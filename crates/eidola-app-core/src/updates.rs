@@ -64,7 +64,7 @@
 //!
 //! | Claim key | Expected value | Derivation |
 //! |---|---|---|
-//! | `manifest.schema_version` | `2 or 3 or 4 or 5` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shapes this module's parser understands; a jump outside the set is a release-gated trust event (`docs/trust-root.md`) |
+//! | `manifest.schema_version` | `2 or 3 or 4 or 5 or 6` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shapes this module's parser understands; a jump outside the set is a release-gated trust event (`docs/trust-root.md`) |
 //! | `enclave.cvm_version` | `platform release with its manifest pinned (VERSION@sha256)` | the embedded trust root pins the paired server's SEV-SNP launch identity in the IGVM launch model (`trust_root::SERVER_SNP_MEASUREMENT` and friends), which is the launch of one release image |
 //! | `enclave.igvm_sha256` | `SEV-SNP IGVM image hash (32-byte hex)` | ditto: the image the digest is computed over |
 //! | `enclave.sev_snp.measurement` | `SEV-SNP launch measurement (48-byte hex)` | ditto, `trust_root::SERVER_SNP_MEASUREMENT` |
@@ -84,6 +84,8 @@
 //! | `artifacts.eidola-cli-linux-static-amd64` | `file (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_5`] — the static Linux CLI binary, the one file of the `eidola-cli` image, published on its own so a host binary needs no container runtime |
 //! | `artifacts.eidola-cli-linux-static-arm64` | `file (linux/arm64) or absent` | ditto, 64-bit ARM: the same client cross-compiled for `aarch64-unknown-linux-musl` by StageX's toolchain, taken out of the image that build produces |
 //! | `artifacts.eidola-billing` | `oci (linux/amd64) or absent` | [`EXPECTED_BILLING_IMAGE_SINCE_SCHEMA_5`] — the billing receiver/worker image, outside the attested boundary and recorded so its digest is tied to a reproducible build of the release's source |
+//! | `artifacts.eidola-mobile-android-apk` | `file (android/universal) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_6`] — the Android shell's APK, unsigned: a function of source, which a published signed APK reduces to once its signature is stripped. The signed APK's hash and identity belong in the human attestation |
+//! | `artifacts.eidola-mobile-bundle` | `bundle (webview/wasm32) or absent` | ditto — the mobile app bundle: its container's `sha256`, its bundle `digest` (what the shell shows), and every file's path, `size` and `sha256`, read by the one reader the mobile updater uses ([`crate::updater::mobile::row`]) |
 //!
 //! The `or absent` rows are the schema-conditional half: absent from the
 //! older manifests this build also accepts, required of any manifest
@@ -117,7 +119,9 @@
 //! payload makes redundant, retires, and the static Linux CLI arrives as a
 //! file of its own for each architecture — one retiring row and two
 //! arriving rows, each held to the schema a manifest declares. The billing
-//! image arrives at schema 5 too, as a slice of its own.
+//! image arrives at schema 5 too, as a slice of its own. Schema 6 adds the
+//! mobile app's two rows, one of them of a type of its own (`bundle`), whose
+//! nested file listing is held to an exact shape like every row's fields.
 //!
 //! That two-sided tolerance is the shape of every manifest schema rotation:
 //! a build **accepts** the new schema one release before any release
@@ -142,7 +146,7 @@ use crate::updater;
 /// manifest shape [`attested_claims`] walks. A version outside this set is a
 /// *claims change* (authentic but unintelligible to this build), not a
 /// verification failure.
-pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4, 5];
+pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4, 5, 6];
 
 /// The schema the current artifact set was introduced at:
 /// [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] rows become required at it, and
@@ -164,6 +168,12 @@ const CLI_ARTIFACT_SET_SCHEMA: u64 = 5;
 /// Its own name although it equals [`CLI_ARTIFACT_SET_SCHEMA`]: the two
 /// slices share a schema, not a reason.
 const BILLING_IMAGE_SCHEMA: u64 = 5;
+
+/// The schema the mobile app's artifacts arrive at:
+/// [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_6`] rows become required at it. The
+/// mobile updater reads the bundle row from a manifest declaring it or later
+/// (`crate::updater::mobile`).
+pub(crate) const MOBILE_ARTIFACT_SET_SCHEMA: u64 = 6;
 
 /// The artifact entries every accepted `artifact-manifest.json` records, as
 /// `(name, type, platform)`. Structure only — digests / narHashes /
@@ -276,6 +286,35 @@ pub const EXPECTED_ARTIFACTS_THROUGH_SCHEMA_4: &[(&str, &str, &str)] =
 pub const EXPECTED_BILLING_IMAGE_SINCE_SCHEMA_5: &[(&str, &str, &str)] =
     &[("eidola-billing", "oci", "linux/amd64")];
 
+/// Artifact entries schema 6 adds: the mobile app.
+///
+/// * The app bundle the shells boot (`eidola-mobile` for wasm32, with its
+///   page), `type: "bundle"`: the sha256 of the container it is published
+///   in, the bundle digest the shell shows in its own sheet, and every file
+///   with its length and sha256 (`crate::updater::mobile::row`). The mobile
+///   updater checks every byte it hands the shell against that listing.
+/// * The Android shell's APK, **unsigned**, `type: "file"`: a function of
+///   the source, the bundle and the pinned build tools
+///   (`mobile/android/repro.sh`). The APK a user installs is signed, and the
+///   signature depends on a key, so its hash and signing identity belong in
+///   the human attestation, as the macOS envelope's do; stripping the
+///   signature (`mobile/android/tools/strip_apk_signature.py`) gives back
+///   exactly these bytes. `android/universal`: it carries no native code.
+///
+/// The iOS shell has no row: Apple re-signs and encrypts what the App Store
+/// distributes, so no installed binary can be compared with a build.
+///
+/// The same tolerance as [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`], three
+/// schemas later.
+pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_6: &[(&str, &str, &str)] = &[
+    ("eidola-mobile-android-apk", "file", "android/universal"),
+    (
+        crate::updater::mobile::row::BUNDLE_KEY,
+        crate::updater::mobile::row::BUNDLE_TYPE,
+        crate::updater::mobile::row::BUNDLE_PLATFORM,
+    ),
+];
+
 /// One slice of the artifact set, as `(name, type, platform)` rows.
 type ArtifactRows = &'static [(&'static str, &'static str, &'static str)];
 
@@ -287,6 +326,10 @@ const ARRIVING_ARTIFACTS: &[(u64, ArtifactRows)] = &[
     (ENGINE_IMAGE_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_4),
     (CLI_ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_5),
     (BILLING_IMAGE_SCHEMA, EXPECTED_BILLING_IMAGE_SINCE_SCHEMA_5),
+    (
+        MOBILE_ARTIFACT_SET_SCHEMA,
+        EXPECTED_ARTIFACTS_SINCE_SCHEMA_6,
+    ),
 ];
 
 /// Every retiring slice, with the first schema that no longer records it.
@@ -1184,6 +1227,7 @@ fn describe_artifact(entry: &serde_json::Value, schema_version: Option<u64>) -> 
         Some("oci") => &["type", "platform", "digest"],
         Some("nix") => &["type", "platform", "narHash", "archiveSha256"],
         Some("file") => &["type", "platform", "sha256"],
+        Some("bundle") => &["type", "platform", "sha256", "digest", "files"],
         _ => return described,
     };
     let extra: Vec<&str> = obj
@@ -1252,6 +1296,17 @@ fn describe_artifact_fields(
                 format!("file ({platform}) — malformed: expected sha256: hex sha256")
             }
         }
+        // The mobile app bundle: its container, its digest and every file.
+        // One reader for the shape, shared with the installer, so a row
+        // this calls well formed is one the installer can act on. Its key
+        // set is checked above like every type's; a malformed nested
+        // listing reads here.
+        Some("bundle") => match crate::updater::mobile::row::BundleRow::from_value(
+            &serde_json::Value::Object(obj.clone()),
+        ) {
+            Ok(_) => format!("bundle ({platform})"),
+            Err(reason) => format!("bundle ({platform}) — malformed: {reason}"),
+        },
         Some(other) => format!("unrecognized type `{other}` ({platform})"),
         None => "missing type".into(),
     }
@@ -1427,6 +1482,8 @@ mod tests {
                 "artifacts.eidola-cli-linux-static-amd64",
                 "artifacts.eidola-cli-linux-static-arm64",
                 "artifacts.eidola-billing",
+                "artifacts.eidola-mobile-android-apk",
+                "artifacts.eidola-mobile-bundle",
             ]
         );
     }
@@ -1619,6 +1676,203 @@ mod tests {
             );
         }
         manifest
+    }
+
+    /// A well-formed bundle row: three files, the digest of their listing,
+    /// and a container hash.
+    fn bundle_row() -> serde_json::Value {
+        use sha2::Digest as _;
+        let files: [(&str, &[u8]); 3] = [
+            ("boot.js", b"import init from './eidola_mobile.js';"),
+            ("eidola_mobile_bg.wasm", b"\0asm"),
+            ("index.html", b"<!doctype html>"),
+        ];
+        let hex = |bytes: &[u8]| {
+            crate::updater::human_attestation::hex_encode(&sha2::Sha256::digest(bytes))
+        };
+        let hashes: Vec<(String, String)> = files
+            .iter()
+            .map(|(path, bytes)| (path.to_string(), hex(bytes)))
+            .collect();
+        let digest = crate::updater::mobile::row::bundle_digest(
+            hashes.iter().map(|(p, h)| (p.as_str(), h.as_str())),
+        );
+        serde_json::json!({
+            "type": "bundle",
+            "platform": "webview/wasm32",
+            "sha256": format!("sha256:{}", "7".repeat(64)),
+            "digest": format!("sha256:{digest}"),
+            "files": files
+                .iter()
+                .map(|(path, bytes)| serde_json::json!({
+                    "path": path,
+                    "size": bytes.len(),
+                    "sha256": format!("sha256:{}", hex(bytes)),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// A schema-6 manifest: schema 5's shape with the mobile app's rows.
+    fn schema_6_manifest() -> serde_json::Value {
+        let mut manifest = schema_5_manifest();
+        manifest["schema_version"] = serde_json::json!(6);
+        manifest["artifacts"]["eidola-mobile-android-apk"] = serde_json::json!({
+            "platform": "android/universal",
+            "sha256": format!("sha256:{}", "8".repeat(64)),
+            "type": "file"
+        });
+        manifest["artifacts"]["eidola-mobile-bundle"] = bundle_row();
+        manifest
+    }
+
+    fn mobile_keys() -> impl Iterator<Item = &'static str> {
+        EXPECTED_ARTIFACTS_SINCE_SCHEMA_6
+            .iter()
+            .map(|(key, _, _)| *key)
+    }
+
+    #[test]
+    fn schema_6_adds_the_mobile_app() {
+        assert_eq!(
+            EXPECTED_ARTIFACTS_SINCE_SCHEMA_6,
+            [
+                ("eidola-mobile-android-apk", "file", "android/universal"),
+                ("eidola-mobile-bundle", "bundle", "webview/wasm32"),
+            ]
+        );
+    }
+
+    #[test]
+    fn schema_6_manifest_with_its_own_rows_is_not_a_claims_change() {
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&schema_6_manifest()));
+        assert!(deltas.is_empty(), "unexpected deltas: {deltas:#?}");
+    }
+
+    #[test]
+    fn every_older_manifest_stays_clean_with_schema_6_accepted() {
+        // The accept side alone must not turn any release still emitting an
+        // older schema into a claims change.
+        for (manifest, declared) in [
+            (current_manifest(), 2),
+            (schema_3_manifest(), 3),
+            (schema_4_manifest(), 4),
+            (schema_5_manifest(), 5),
+        ] {
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert!(deltas.is_empty(), "schema {declared}: {deltas:#?}");
+        }
+    }
+
+    #[test]
+    fn schema_6_manifest_missing_a_mobile_row_is_a_delta() {
+        for key in mobile_keys() {
+            let mut manifest = schema_6_manifest();
+            manifest["artifacts"].as_object_mut().unwrap().remove(key);
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "{key}: unexpected deltas: {deltas:#?}");
+            assert_eq!(deltas[0].key, format!("artifacts.{key}"));
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some("missing (recorded from schema 6 on)"),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mobile_row_before_schema_6_is_a_delta() {
+        for key in mobile_keys() {
+            for (mut manifest, declared) in [
+                (current_manifest(), 2),
+                (schema_3_manifest(), 3),
+                (schema_4_manifest(), 4),
+                (schema_5_manifest(), 5),
+            ] {
+                manifest["artifacts"][key] = schema_6_manifest()["artifacts"][key].clone();
+                let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+                assert_eq!(deltas.len(), 1, "{key}, schema {declared}: {deltas:#?}");
+                assert_eq!(
+                    deltas[0].attested.as_deref(),
+                    Some(
+                        format!("present, but schema {declared} records it only from schema 6 on")
+                            .as_str()
+                    ),
+                    "{key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_6_manifest_missing_an_older_arriving_row_is_a_delta() {
+        for (since, rows) in [
+            (3, EXPECTED_ARTIFACTS_SINCE_SCHEMA_3),
+            (4, EXPECTED_ARTIFACTS_SINCE_SCHEMA_4),
+            (5, EXPECTED_ARTIFACTS_SINCE_SCHEMA_5),
+            (5, EXPECTED_BILLING_IMAGE_SINCE_SCHEMA_5),
+        ] {
+            for (row, _, _) in rows {
+                let mut manifest = schema_6_manifest();
+                manifest["artifacts"].as_object_mut().unwrap().remove(*row);
+                let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+                assert_eq!(deltas.len(), 1, "{row}: unexpected deltas: {deltas:#?}");
+                assert_eq!(
+                    deltas[0].attested.as_deref(),
+                    Some(format!("missing (recorded from schema {since} on)").as_str()),
+                    "{row}"
+                );
+            }
+        }
+    }
+
+    type Mutation = (&'static str, Box<dyn Fn(&mut serde_json::Value)>);
+
+    #[test]
+    fn a_malformed_bundle_row_is_a_delta() {
+        let cases: Vec<Mutation> = vec![
+            (
+                "a digest that is not its listing's",
+                Box::new(|row| row["digest"] = format!("sha256:{}", "0".repeat(64)).into()),
+            ),
+            (
+                "a container hash that is not a hash",
+                Box::new(|row| row["sha256"] = "sha256:nope".into()),
+            ),
+            (
+                "a field added to a file",
+                Box::new(|row| row["files"][0]["mode"] = 420.into()),
+            ),
+            (
+                "a path outside the bundle",
+                Box::new(|row| row["files"][0]["path"] = "../x".into()),
+            ),
+            (
+                "a field added to the row",
+                Box::new(|row| row["signature"] = "x".into()),
+            ),
+            (
+                "another platform",
+                Box::new(|row| row["platform"] = "ios/arm64".into()),
+            ),
+        ];
+        for (what, mutate) in cases {
+            let mut manifest = schema_6_manifest();
+            mutate(&mut manifest["artifacts"]["eidola-mobile-bundle"]);
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "{what}: {deltas:#?}");
+            assert_eq!(deltas[0].key, "artifacts.eidola-mobile-bundle", "{what}");
+        }
+    }
+
+    #[test]
+    fn the_apk_under_another_platform_is_a_delta() {
+        let mut manifest = schema_6_manifest();
+        manifest["artifacts"]["eidola-mobile-android-apk"]["platform"] =
+            serde_json::json!("android/arm64");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-mobile-android-apk");
     }
 
     /// The command-line client's rows as a schema-4 and a schema-5 manifest
@@ -2108,12 +2362,12 @@ mod tests {
     fn schema_version_jump_is_a_delta() {
         // Built on the newest shape this build knows, so the schema row is
         // the only thing that can differ.
-        let mut manifest = schema_5_manifest();
+        let mut manifest = schema_6_manifest();
         manifest["schema_version"] = serde_json::json!(99);
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].key, "manifest.schema_version");
-        assert_eq!(deltas[0].expected.as_deref(), Some("2 or 3 or 4 or 5"));
+        assert_eq!(deltas[0].expected.as_deref(), Some("2 or 3 or 4 or 5 or 6"));
         assert_eq!(deltas[0].attested.as_deref(), Some("99"));
     }
 

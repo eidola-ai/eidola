@@ -177,6 +177,7 @@ check_manifest() {
   fi
   if ! out="$(
     python3 -c '
+import hashlib
 import json
 import re
 import sys
@@ -187,7 +188,10 @@ ALLOWED = {
     "oci": ["digest", "platform", "type"],
     "nix": ["archiveSha256", "narHash", "platform", "type"],
     "file": ["platform", "sha256", "type"],
+    "bundle": ["digest", "files", "platform", "sha256", "type"],
 }
+BUNDLE_FILE = ["path", "sha256", "size"]
+HEX64 = re.compile("^sha256:[0-9a-f]{64}$")
 
 violations = []
 duplicates = []
@@ -229,6 +233,44 @@ def walk_keys(node, out):
     elif isinstance(node, list):
         for item in node:
             walk_keys(item, out)
+
+
+def check_bundle(name, entry):
+    # The nested listing is held to exact key sets like every other level,
+    # and its digest to the contract definition of one: the sha256sum line
+    # of every file, in path order, hashed together
+    # (mobile/shell-contract.md, Bundle digest). A digest that is not that
+    # function is a row every client refuses, so the gate refuses it first.
+    files = entry.get("files")
+    if not isinstance(files, list) or not files:
+        violations.append("artifacts.{}.files: not a non-empty list".format(name))
+        return
+    lines = []
+    for i, item in enumerate(files):
+        where = "artifacts.{}.files[{}]".format(name, i)
+        if not isinstance(item, dict):
+            violations.append("{}: not an object".format(where))
+            return
+        keyset(where, item, BUNDLE_FILE)
+        sha = item.get("sha256")
+        path = item.get("path")
+        if not isinstance(sha, str) or not HEX64.match(sha) or not isinstance(path, str):
+            violations.append("{}: needs a string path and a sha256:<64 hex>".format(where))
+            return
+        lines.append((path.encode(), sha[len("sha256:"):]))
+    if [p for p, _ in lines] != sorted(set(p for p, _ in lines)):
+        violations.append(
+            "artifacts.{}.files: not sorted by path, each path once".format(name)
+        )
+    digest = hashlib.sha256(
+        b"".join(h.encode() + b"  " + p + b"\n" for p, h in sorted(lines))
+    ).hexdigest()
+    if entry.get("digest") != "sha256:" + digest:
+        violations.append(
+            "artifacts.{}.digest: {} is not the digest of its files (sha256:{})".format(
+                name, json.dumps(entry.get("digest")), digest
+            )
+        )
 
 
 try:
@@ -301,7 +343,11 @@ else:
 
 # Field allow-list per artifact type. `oci` records the image digest; `nix`
 # records the store-path checkpoint plus the archive hash a user can check
-# without Nix; `file` records the sha256 of one published file.
+# without Nix; `file` records the sha256 of one published file; `bundle`
+# (the mobile app bundle) records the sha256 of its container, its bundle digest
+# and a listing of its files, each an object with exactly a path, a size and
+# a sha256 — the listing is a list rather than an object keyed by path, so a
+# file name never becomes a key for the deny-list below to misread.
 for name, entry in artifacts.items():
     if not isinstance(entry, dict):
         violations.append("artifacts.{}: not an object".format(name))
@@ -309,7 +355,7 @@ for name, entry in artifacts.items():
     kind = entry.get("type")
     if kind not in ALLOWED:
         violations.append(
-            "artifacts.{}: unknown type {} (allowed: oci, nix, file)".format(
+            "artifacts.{}: unknown type {} (allowed: oci, nix, file, bundle)".format(
                 name, json.dumps(kind)
             )
         )
@@ -320,6 +366,9 @@ for name, entry in artifacts.items():
                 name, kind, ", ".join(sorted(ALLOWED[kind])), ", ".join(sorted(entry))
             )
         )
+        continue
+    if kind == "bundle":
+        check_bundle(name, entry)
 
 # No key anywhere may name signing material, at any depth. Artifact names
 # are keys too, so `eidola-gui-macos-signed-zip` trips this as readily as a
@@ -737,7 +786,7 @@ if [[ "$violations" -gt 0 ]]; then
 fi
 
 if [[ "$SELF_TEST" -eq 1 ]]; then
-  echo "Self-test: every bad fixture must be rejected..."
+  echo "Self-test: every bad fixture must be rejected, every good one accepted..."
   rc=0
   manifest_fixtures=0
   workflow_fixtures=0
@@ -763,6 +812,21 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
     fi
   done
 
+  # The other direction, for shapes no committed manifest carries yet: a
+  # schema the client accepts before any release emits it must pass here
+  # too, or the release that first emits it fails at this gate.
+  good_fixtures=0
+  for fixture in "$FIXTURE_DIR"/good-*.json; do
+    [[ -e "$fixture" ]] || continue
+    good_fixtures=$((good_fixtures + 1))
+    if "${BASH_SOURCE[0]}" --manifest "$fixture" > /dev/null 2>&1; then
+      echo "  accepted: $(basename "$fixture")"
+    else
+      echo "  FAIL: $(basename "$fixture") was rejected" >&2
+      rc=1
+    fi
+  done
+
   # Counted per class, because an empty glob is silence: deleting every
   # workflow fixture would otherwise retire half the self-test while the
   # command still reported success.
@@ -779,7 +843,7 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
     echo "FAIL: the check has lost its teeth — a fixture it must reject passed, or a fixture class is gone." >&2
     exit 1
   fi
-  echo "  ($manifest_fixtures manifest fixtures, $workflow_fixtures workflow fixtures)"
+  echo "  ($manifest_fixtures manifest fixtures, $workflow_fixtures workflow fixtures, $good_fixtures accepted fixtures)"
 fi
 
 echo "OK: no key-dependent material can reach artifact-manifest.json."

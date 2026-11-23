@@ -8,6 +8,9 @@
 //! - [`files`]: the file directory as app-core's
 //!   [`eidola_app_core::storage::HostStorage`].
 //! - [`boot`]: hello, the profile, the core, and `bundle.confirm`.
+//! - [`update`]: the shell's bundle store as app-core's
+//!   [`eidola_app_core::updater::mobile::BundleStore`], and the self-update
+//!   on it.
 //! - `web` (wasm32): the webview's bridge, and the bundle's entry point.
 //!
 //! Everything but `web` is target-independent, so the native tests drive it
@@ -20,5 +23,6 @@ pub mod protocol;
 #[cfg(feature = "self-test")]
 pub mod selftest;
 pub mod socket;
+pub mod update;
 #[cfg(target_family = "wasm")]
 mod web;

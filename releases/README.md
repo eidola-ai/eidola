@@ -131,6 +131,21 @@ The emit side is gated on `CLI_ARTIFACT_SET_SCHEMA` in `scripts/artifact-manifes
 
 The billing image's emit side has its own gate, `BILLING_IMAGE_SCHEMA` in `scripts/artifact-manifest.sh` (5, beside `CLI_ARTIFACT_SET_SCHEMA`): CI's `oci-billing` job builds the image on every run and pushes it on push events, and its row is composed, and required by `check-complete`, only once `MANIFEST_SCHEMA_VERSION` reaches 5.
 
+**Schema 6 is accepted too, and it adds the mobile app.** Clients accept `2` through `6`; schema 6 is schema 5's artifact set plus two rows, in `EXPECTED_ARTIFACTS_SINCE_SCHEMA_6` at `MOBILE_ARTIFACT_SET_SCHEMA`:
+
+- the **app bundle** the mobile shells boot, `eidola-mobile-bundle`, of a type of its own, `bundle` (`webview/wasm32`): `sha256`, the hash of the uncompressed POSIX `ustar` container its files are published in; `files`, a list sorted by path of every file with exactly its `path` (a bundle path, `mobile/shell-contract.md` → Paths), `size` and `sha256`; and `digest`, the bundle digest of exactly those files (`mobile/shell-contract.md` → Bundle digest), which is what the shell shows in its native sheet. The listing is a list rather than an object keyed by path, so no file name becomes a key for the determinism gate's deny-list to misread. One reader holds the row to that shape, `updater::mobile::row::BundleRow`, for the claims check and the mobile updater alike, and `scripts/check-manifest-determinism.sh` holds the nested listing to exact key sets and the digest to its definition (`good-schema-6.json` is the fixture both read);
+- the Android shell's **unsigned** APK, `eidola-mobile-android-apk` (`type: "file"`, `android/universal`: it carries no native code), a function of the source, the bundle and the pinned build tools (`mobile/android/repro.sh`). The APK we publish beside Play is signed, and a signature depends on a key, so its hash and the signing certificate's identity belong in the human attestation, as the macOS envelope's do; a signed APK reduces to these bytes once its signature is stripped (`mobile/android/tools/strip_apk_signature.py`).
+
+The iOS shell has no row: Apple re-signs and encrypts what the App Store distributes, so no installed binary can be compared with a build.
+
+`scripts/release-assets.sh` already maps both rows: a `bundle` row publishes its container as `<key>.tar` (the one asset `release.json`'s schema-2 index names for the key, which the mobile updater downloads), and the unsigned APK is recorded and not published, like the unsigned macOS zip. Nothing emits schema 6 yet. The emit side needs, beside the `MANIFEST_SCHEMA_VERSION` flip (which, as each flip before it, needs every row of schemas 3 to 5 first):
+
+1. a `MOBILE_ARTIFACT_SET_SCHEMA` gate in `scripts/artifact-manifest.sh`, with both keys in `required_artifact_keys` from it on;
+2. a producer for the bundle row: the reproducible bundle build (`mobile/build-bundle.sh`) on the release toolchain, its container written deterministically (regular files only, in path order, fixed mode, owner and time; `mobile/tools/bundle_container.py` writes it and prints the row, the same bytes as `updater::mobile::container::write_ustar`, a test pins that, and the client's reader accepts exactly that shape), and the row composed from the built files and the container, under the key the publication table names;
+3. a producer for the APK row: `mobile/android/build.sh` over that same bundle, unsigned, its `sha256` recorded; CI's `mobile-shells` job already builds and checks it on Linux;
+4. `release.json` at schema 2, whose `artifacts` index carries the container's URL under `eidola-mobile-bundle` — which is the release-document rotation's own step 2 above;
+5. for the signed APK, an `attestation.json` rotation of its own (accept first, then emit, and a template claim, which binds a release later): the signed APK's `sha256` and its signing certificate's fingerprint, as schema 2 does for the macOS envelope.
+
 Regeneration host matters too. A Linux host builds only its own architecture, so at the moment of the flip it cannot supply the other architecture's `.deb` and has no committed row to copy one from; `just update-manifest` says so and stops. The macOS path builds both Linux architectures in containers, and CI composes the full set from its per-architecture jobs.
 
 ### Rotating the Sigstore trusted root
