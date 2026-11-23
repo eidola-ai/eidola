@@ -165,36 +165,41 @@ pub async fn insert_account(
 }
 
 /// Retrieve an account by ID.
-#[tracing::instrument(skip_all, name = "db.get_account", err)]
+#[tracing::instrument(skip_all, name = "db.get_account", fields(otel.status_code))]
 pub async fn get_account_by_id(pool: &Pool, id: Uuid) -> Result<AccountRow, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    crate::telemetry::span_result(
+        async {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
-    let row = client
-        .query_opt(
-            "SELECT id, secret_hash, stripe_customer_id, billing_state, created_at \
+            let row = client
+                .query_opt(
+                    "SELECT id, secret_hash, stripe_customer_id, billing_state, created_at \
              FROM account WHERE id = $1",
-            &[&id],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!("query account failed: {}", db_error_summary(&e)))
-        })?;
+                    &[&id],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!("query account failed: {}", db_error_summary(&e)))
+                })?;
 
-    match row {
-        Some(row) => Ok(AccountRow {
-            id: row.get("id"),
-            secret_hash: row.get("secret_hash"),
-            stripe_customer_id: row.get("stripe_customer_id"),
-            billing_state: row.get("billing_state"),
-            created_at: row.get("created_at"),
-        }),
-        None => Err(ServerError::NotFound {
-            message: "account not found".to_string(),
-        }),
-    }
+            match row {
+                Some(row) => Ok(AccountRow {
+                    id: row.get("id"),
+                    secret_hash: row.get("secret_hash"),
+                    stripe_customer_id: row.get("stripe_customer_id"),
+                    billing_state: row.get("billing_state"),
+                    created_at: row.get("created_at"),
+                }),
+                None => Err(ServerError::NotFound {
+                    message: "account not found".to_string(),
+                }),
+            }
+        }
+        .await,
+    )
 }
 
 /// Set the Stripe customer ID on an account (only if currently NULL).
@@ -652,30 +657,35 @@ where
 
 /// Retrieve all issuer keys that are still accepted (accept_until > now()),
 /// plus any future keys (issue_from > now()). Ordered by issue_from ASC.
-#[tracing::instrument(skip_all, name = "db.get_valid_issuer_keys", err)]
+#[tracing::instrument(skip_all, name = "db.get_valid_issuer_keys", fields(otel.status_code))]
 pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    crate::telemetry::span_result(
+        async {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
-    let rows = client
-        .query(
-            "SELECT id, private_key_enc, public_key, domain_separator, \
+            let rows = client
+                .query(
+                    "SELECT id, private_key_enc, public_key, domain_separator, \
                     issue_from, issue_until, accept_until \
              FROM issuer_key WHERE accept_until > now() \
              ORDER BY issue_from ASC",
-            &[],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "query valid issuer_keys failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
+                    &[],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "query valid issuer_keys failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
 
-    Ok(rows.iter().map(map_issuer_key_row).collect())
+            Ok(rows.iter().map(map_issuer_key_row).collect())
+        }
+        .await,
+    )
 }
 
 fn map_issuer_key_row(r: &tokio_postgres::Row) -> IssuerKeyRow {
@@ -746,17 +756,19 @@ fn map_stored_issuance(r: &tokio_postgres::Row) -> StoredIssuance {
 /// The issuance stored under `(account_id, idempotency_key)`, if any. A
 /// lock-free read, used only to answer a retry early; the decision that
 /// debits is [`record_credential_issuance`]'s, under the account lock.
-#[tracing::instrument(skip_all, name = "db.find_credential_issuance", err)]
+#[tracing::instrument(skip_all, name = "db.find_credential_issuance", fields(otel.status_code))]
 pub async fn find_credential_issuance(
     pool: &Pool,
     account_id: Uuid,
     idempotency_key: &[u8],
 ) -> Result<Option<StoredIssuance>, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-    let row = client
+    crate::telemetry::span_result(
+        async {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+            let row = client
         .query_opt(
             "SELECT request_digest, issuer_key_id, credits, issuance_response, ledger_entry_id \
              FROM credential_issuance WHERE account_id = $1 AND idempotency_key = $2",
@@ -769,7 +781,10 @@ pub async fn find_credential_issuance(
                 db_error_summary(&e)
             ))
         })?;
-    Ok(row.as_ref().map(map_stored_issuance))
+            Ok(row.as_ref().map(map_stored_issuance))
+        }
+        .await,
+    )
 }
 
 /// Debit an account for a credential issuance and store its response, once
@@ -783,7 +798,7 @@ pub async fn find_credential_issuance(
 /// (pool-aware, FIFO by expiry, through `debit_account`)
 /// and the stored response commit together, so a row exists exactly when the
 /// account paid for it.
-#[tracing::instrument(skip_all, name = "db.record_credential_issuance", err)]
+#[tracing::instrument(skip_all, name = "db.record_credential_issuance", fields(otel.status_code))]
 pub async fn record_credential_issuance(
     pool: &Pool,
     account_id: Uuid,
@@ -793,133 +808,153 @@ pub async fn record_credential_issuance(
     credits: i64,
     issuance_response: &[u8],
 ) -> Result<IssuanceRecord, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    crate::telemetry::span_result(
+        async {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
-    let row = client
-        .query_one(
-            "SELECT outcome, request_digest, issuer_key_id, credits, issuance_response, \
+            let row = client
+                .query_one(
+                    "SELECT outcome, request_digest, issuer_key_id, credits, issuance_response, \
              ledger_entry_id FROM record_credential_issuance($1, $2, $3, $4, $5, $6)",
-            &[
-                &account_id,
-                &idempotency_key,
-                &request_digest,
-                &credential_key_id,
-                &credits,
-                &issuance_response,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "credential issuance debit failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
+                    &[
+                        &account_id,
+                        &idempotency_key,
+                        &request_digest,
+                        &credential_key_id,
+                        &credits,
+                        &issuance_response,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "credential issuance debit failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
 
-    let outcome: String = row.get("outcome");
-    Ok(match outcome.as_str() {
-        "issued" => IssuanceRecord::Issued {
-            ledger_entry_id: row.get("ledger_entry_id"),
-        },
-        "stored" => IssuanceRecord::Stored(map_stored_issuance(&row)),
-        "retired" => IssuanceRecord::Retired,
-        "closed" => IssuanceRecord::Closed,
-        "insufficient" => IssuanceRecord::Insufficient,
-        other => {
-            return Err(ServerError::Internal(format!(
-                "unexpected issuance outcome {other:?}"
-            )));
+            let outcome: String = row.get("outcome");
+            Ok(match outcome.as_str() {
+                "issued" => IssuanceRecord::Issued {
+                    ledger_entry_id: row.get("ledger_entry_id"),
+                },
+                "stored" => IssuanceRecord::Stored(map_stored_issuance(&row)),
+                "retired" => IssuanceRecord::Retired,
+                "closed" => IssuanceRecord::Closed,
+                "insufficient" => IssuanceRecord::Insufficient,
+                other => {
+                    return Err(ServerError::Internal(format!(
+                        "unexpected issuance outcome {other:?}"
+                    )));
+                }
+            })
         }
-    })
+        .await,
+    )
 }
 
 /// Decide an issuance that names a key other than the current issuing key,
 /// under the account lock [`record_credential_issuance`] takes and on the
 /// same database clock, so a refusal is ordered against every attempt under
 /// the idempotency key still in flight.
-#[tracing::instrument(skip_all, name = "db.resolve_issuance_off_current_key", err)]
+#[tracing::instrument(skip_all, name = "db.resolve_issuance_off_current_key", fields(otel.status_code))]
 pub async fn resolve_issuance_off_current_key(
     pool: &Pool,
     account_id: Uuid,
     idempotency_key: &[u8],
     issuer_key_id: &str,
 ) -> Result<OffCurrentKey, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-    let row = client
-        .query_one(
-            "SELECT outcome, request_digest, issuer_key_id, credits, issuance_response, \
+    crate::telemetry::span_result(
+        async {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+            let row = client
+                .query_one(
+                    "SELECT outcome, request_digest, issuer_key_id, credits, issuance_response, \
              ledger_entry_id FROM resolve_issuance_off_current_key($1, $2, $3)",
-            &[&account_id, &idempotency_key, &issuer_key_id],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "credential issuance key check failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-    let outcome: String = row.get("outcome");
-    Ok(match outcome.as_str() {
-        "stored" => OffCurrentKey::Stored(map_stored_issuance(&row)),
-        "retired" => OffCurrentKey::Retired,
-        "issuing" => OffCurrentKey::Issuing,
-        other => {
-            return Err(ServerError::Internal(format!(
-                "unexpected issuance key outcome {other:?}"
-            )));
+                    &[&account_id, &idempotency_key, &issuer_key_id],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "credential issuance key check failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
+            let outcome: String = row.get("outcome");
+            Ok(match outcome.as_str() {
+                "stored" => OffCurrentKey::Stored(map_stored_issuance(&row)),
+                "retired" => OffCurrentKey::Retired,
+                "issuing" => OffCurrentKey::Issuing,
+                other => {
+                    return Err(ServerError::Internal(format!(
+                        "unexpected issuance key outcome {other:?}"
+                    )));
+                }
+            })
         }
-    })
+        .await,
+    )
 }
 
 /// Delete the stored issuance responses of every key retired at least
 /// `retain_past_accept` ago: the deadline nullifiers are pruned on.
-#[tracing::instrument(skip_all, name = "db.prune_expired_issuances", err)]
+#[tracing::instrument(skip_all, name = "db.prune_expired_issuances", fields(otel.status_code))]
 pub async fn prune_expired_issuances(
     pool: &Pool,
     retain_past_accept: std::time::Duration,
 ) -> Result<i64, ServerError> {
-    let retain_secs = retain_past_accept.as_secs_f64();
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-    let row = client
-        .query_one(
-            "SELECT prune_expired_issuances(make_interval(secs => $1)) AS pruned",
-            &[&retain_secs],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "prune_expired_issuances failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-    Ok(row.get("pruned"))
+    crate::telemetry::span_result(
+        async {
+            let retain_secs = retain_past_accept.as_secs_f64();
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+            let row = client
+                .query_one(
+                    "SELECT prune_expired_issuances(make_interval(secs => $1)) AS pruned",
+                    &[&retain_secs],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "prune_expired_issuances failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
+            Ok(row.get("pruned"))
+        }
+        .await,
+    )
 }
 
 /// Current balance, including the shared billing ledger's outstanding debt.
-#[tracing::instrument(skip_all, name = "db.get_available_balance", err)]
+#[tracing::instrument(skip_all, name = "db.get_available_balance", fields(otel.status_code))]
 pub async fn get_available_balance(pool: &Pool, account_id: Uuid) -> Result<i64, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    crate::telemetry::span_result(
+        async {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
-    let row = client
-        .query_one("SELECT available_balance($1) as balance", &[&account_id])
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!("balance query failed: {}", db_error_summary(&e)))
-        })?;
+            let row = client
+                .query_one("SELECT available_balance($1) as balance", &[&account_id])
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!("balance query failed: {}", db_error_summary(&e)))
+                })?;
 
-    Ok(row.get("balance"))
+            Ok(row.get("balance"))
+        }
+        .await,
+    )
 }
 
 /// A single balance pool row.
@@ -981,36 +1016,41 @@ pub async fn get_balance_pools(
 /// `accept_until + retain_past_accept > now()`. The caller decides on its
 /// own clock whether the key is usable for what it wants
 /// (`credentials::key_usable`).
-#[tracing::instrument(skip_all, name = "db.get_issuer_key", err)]
+#[tracing::instrument(skip_all, name = "db.get_issuer_key", fields(otel.status_code))]
 pub async fn get_issuer_key_by_hash(
     pool: &Pool,
     key_hash: &[u8],
     retain_past_accept: std::time::Duration,
 ) -> Result<Option<IssuerKeyRow>, ServerError> {
-    let id = hex::encode(key_hash);
-    let retain_secs = retain_past_accept.as_secs_f64();
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    crate::telemetry::span_result(
+        async {
+            let id = hex::encode(key_hash);
+            let retain_secs = retain_past_accept.as_secs_f64();
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
-    let row = client
-        .query_opt(
-            "SELECT id, private_key_enc, public_key, domain_separator, \
+            let row = client
+                .query_opt(
+                    "SELECT id, private_key_enc, public_key, domain_separator, \
                     issue_from, issue_until, accept_until \
              FROM issuer_key \
              WHERE id = $1 AND accept_until + make_interval(secs => $2) > now()",
-            &[&id, &retain_secs],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "query issuer_key by hash failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
+                    &[&id, &retain_secs],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "query issuer_key by hash failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
 
-    Ok(row.as_ref().map(map_issuer_key_row))
+            Ok(row.as_ref().map(map_issuer_key_row))
+        }
+        .await,
+    )
 }
 
 /// Delete the nullifiers of every key retired at least `retain_past_accept`
@@ -1020,29 +1060,34 @@ pub async fn get_issuer_key_by_hash(
 /// Called with `credentials::RETENTION_PAST_ACCEPT`, the same margin that
 /// bounds every use of a key, so a nullifier outlives anything that could
 /// accept a spend of it.
-#[tracing::instrument(skip_all, name = "db.prune_expired_nullifiers", err)]
+#[tracing::instrument(skip_all, name = "db.prune_expired_nullifiers", fields(otel.status_code))]
 pub async fn prune_expired_nullifiers(
     pool: &Pool,
     retain_past_accept: std::time::Duration,
 ) -> Result<i64, ServerError> {
-    let retain_secs = retain_past_accept.as_secs_f64();
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-    let row = client
-        .query_one(
-            "SELECT prune_expired_nullifiers(make_interval(secs => $1)) AS pruned",
-            &[&retain_secs],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "prune_expired_nullifiers failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-    Ok(row.get("pruned"))
+    crate::telemetry::span_result(
+        async {
+            let retain_secs = retain_past_accept.as_secs_f64();
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+            let row = client
+                .query_one(
+                    "SELECT prune_expired_nullifiers(make_interval(secs => $1)) AS pruned",
+                    &[&retain_secs],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "prune_expired_nullifiers failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
+            Ok(row.get("pruned"))
+        }
+        .await,
+    )
 }
 
 /// One nullifier row to record: the issuer key id, the nullifier value, and
@@ -1091,83 +1136,93 @@ pub async fn record_nullifier(
 /// What the database sees is what one request is: its rows commit together.
 /// That discloses the request's input count and key set to whoever watches
 /// the database, never an amount (`docs/anonymous-credits.md` → What Postgres may hold).
-#[tracing::instrument(skip_all, name = "db.record_nullifiers", err)]
+#[tracing::instrument(skip_all, name = "db.record_nullifiers", fields(otel.status_code))]
 pub async fn record_nullifiers(
     pool: &Pool,
     rows: &[NullifierRecord<'_>],
 ) -> Result<bool, ServerError> {
-    let mut sorted: Vec<&NullifierRecord<'_>> = rows.iter().collect();
-    sorted.sort_by(|a, b| (a.issuer_key_id, a.value).cmp(&(b.issuer_key_id, b.value)));
-    let key_ids: Vec<&str> = sorted.iter().map(|r| r.issuer_key_id).collect();
-    let values: Vec<&[u8]> = sorted.iter().map(|r| r.value).collect();
-    let tokens: Vec<&[u8]> = sorted.iter().map(|r| r.refund_token.as_bytes()).collect();
+    crate::telemetry::span_result(
+        async {
+            let mut sorted: Vec<&NullifierRecord<'_>> = rows.iter().collect();
+            sorted.sort_by(|a, b| (a.issuer_key_id, a.value).cmp(&(b.issuer_key_id, b.value)));
+            let key_ids: Vec<&str> = sorted.iter().map(|r| r.issuer_key_id).collect();
+            let values: Vec<&[u8]> = sorted.iter().map(|r| r.value).collect();
+            let tokens: Vec<&[u8]> = sorted.iter().map(|r| r.refund_token.as_bytes()).collect();
 
-    let mut client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-    let tx = client.transaction().await.map_err(|e| {
-        ServerError::Internal(format!(
-            "begin transaction failed: {}",
-            db_error_summary(&e)
-        ))
-    })?;
-    let inserted = tx
-        .execute(
-            "INSERT INTO nullifier (issuer_key_id, value, refund_token) \
+            let mut client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+            let tx = client.transaction().await.map_err(|e| {
+                ServerError::Internal(format!(
+                    "begin transaction failed: {}",
+                    db_error_summary(&e)
+                ))
+            })?;
+            let inserted = tx
+                .execute(
+                    "INSERT INTO nullifier (issuer_key_id, value, refund_token) \
              SELECT * FROM unnest($1::text[], $2::bytea[], $3::bytea[]) \
              ON CONFLICT DO NOTHING",
-            &[&key_ids, &values, &tokens],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "record_nullifiers failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-    if inserted != rows.len() as u64 {
-        tx.rollback().await.map_err(|e| {
-            ServerError::Internal(format!("rollback failed: {}", db_error_summary(&e)))
-        })?;
-        return Ok(false);
-    }
-    tx.commit()
-        .await
-        .map_err(|e| ServerError::Internal(format!("commit failed: {}", db_error_summary(&e))))?;
-    Ok(true)
+                    &[&key_ids, &values, &tokens],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "record_nullifiers failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
+            if inserted != rows.len() as u64 {
+                tx.rollback().await.map_err(|e| {
+                    ServerError::Internal(format!("rollback failed: {}", db_error_summary(&e)))
+                })?;
+                return Ok(false);
+            }
+            tx.commit().await.map_err(|e| {
+                ServerError::Internal(format!("commit failed: {}", db_error_summary(&e)))
+            })?;
+            Ok(true)
+        }
+        .await,
+    )
 }
 
 /// Store a sealed refund token on an existing nullifier row. Only a
 /// [`SealedRefundToken`] is accepted: the CBOR token carries the refund
 /// amount and is never written to Postgres in the clear.
-#[tracing::instrument(skip_all, name = "db.store_refund_token", err)]
+#[tracing::instrument(skip_all, name = "db.store_refund_token", fields(otel.status_code))]
 pub async fn store_refund_token(
     pool: &Pool,
     issuer_key_id: &str,
     nullifier_value: &[u8],
     refund_token: &SealedRefundToken,
 ) -> Result<(), ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    crate::telemetry::span_result(
+        async {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
-    client
-        .execute(
-            "UPDATE nullifier SET refund_token = $3 \
+            client
+                .execute(
+                    "UPDATE nullifier SET refund_token = $3 \
              WHERE issuer_key_id = $1 AND value = $2",
-            &[&issuer_key_id, &nullifier_value, &refund_token.as_bytes()],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "store_refund_token failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
+                    &[&issuer_key_id, &nullifier_value, &refund_token.as_bytes()],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "store_refund_token failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
 
-    Ok(())
+            Ok(())
+        }
+        .await,
+    )
 }
 
 /// Replace the sealed refund token on a nullifier row with `new`, **only if**
@@ -1177,7 +1232,7 @@ pub async fn store_refund_token(
 /// the provisional one final) exactly one wins, and the other sees it lost:
 /// under Postgres's row lock the loser re-checks its condition against the
 /// winner's row and matches nothing.
-#[tracing::instrument(skip_all, name = "db.replace_refund_token", err)]
+#[tracing::instrument(skip_all, name = "db.replace_refund_token", fields(otel.status_code))]
 pub async fn replace_refund_token(
     pool: &Pool,
     issuer_key_id: &str,
@@ -1185,59 +1240,72 @@ pub async fn replace_refund_token(
     expected: &SealedRefundToken,
     new: &SealedRefundToken,
 ) -> Result<bool, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-    let replaced = client
-        .execute(
-            "UPDATE nullifier SET refund_token = $4 \
+    crate::telemetry::span_result(
+        async {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+            let replaced = client
+                .execute(
+                    "UPDATE nullifier SET refund_token = $4 \
              WHERE issuer_key_id = $1 AND value = $2 AND refund_token = $3",
-            &[
-                &issuer_key_id,
-                &nullifier_value,
-                &expected.as_bytes(),
-                &new.as_bytes(),
-            ],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "replace_refund_token failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-    Ok(replaced > 0)
+                    &[
+                        &issuer_key_id,
+                        &nullifier_value,
+                        &expected.as_bytes(),
+                        &new.as_bytes(),
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "replace_refund_token failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
+            Ok(replaced > 0)
+        }
+        .await,
+    )
 }
 
 /// Retrieve the sealed refund token stored for a nullifier. Returns `None` if
 /// the nullifier does not exist or no refund token has been stored yet; the
 /// caller opens what comes back ([`crate::credentials::open_refund_token`]).
-#[tracing::instrument(skip_all, name = "db.get_refund_token", err)]
+#[tracing::instrument(skip_all, name = "db.get_refund_token", fields(otel.status_code))]
 pub async fn get_refund_token(
     pool: &Pool,
     issuer_key_id: &str,
     nullifier_value: &[u8],
 ) -> Result<Option<SealedRefundToken>, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    crate::telemetry::span_result(
+        async {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
-    let row = client
-        .query_opt(
-            "SELECT refund_token FROM nullifier \
+            let row = client
+                .query_opt(
+                    "SELECT refund_token FROM nullifier \
              WHERE issuer_key_id = $1 AND value = $2",
-            &[&issuer_key_id, &nullifier_value],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!("get_refund_token failed: {}", db_error_summary(&e)))
-        })?;
+                    &[&issuer_key_id, &nullifier_value],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "get_refund_token failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
 
-    Ok(row
-        .and_then(|r| r.get::<_, Option<Vec<u8>>>("refund_token"))
-        .map(SealedRefundToken::from_stored))
+            Ok(row
+                .and_then(|r| r.get::<_, Option<Vec<u8>>>("refund_token"))
+                .map(SealedRefundToken::from_stored))
+        }
+        .await,
+    )
 }
 
 /// A single ledger entry row.
@@ -1252,30 +1320,35 @@ pub struct LedgerEntryRow {
 }
 
 /// Whether a reconciled payment has ever funded this account.
-#[tracing::instrument(skip_all, name = "db.has_stripe_ledger_history", err)]
+#[tracing::instrument(skip_all, name = "db.has_stripe_ledger_history", fields(otel.status_code))]
 pub async fn has_stripe_ledger_history(pool: &Pool, account_id: Uuid) -> Result<bool, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    crate::telemetry::span_result(
+        async {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
-    let row = client
-        .query_one(
-            "SELECT EXISTS (\
+            let row = client
+                .query_one(
+                    "SELECT EXISTS (\
                  SELECT 1 FROM billing_purchase \
                  WHERE account_id = $1\
              )",
-            &[&account_id],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "stripe ledger history query failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
+                    &[&account_id],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "stripe ledger history query failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
 
-    Ok(row.get(0))
+            Ok(row.get(0))
+        }
+        .await,
+    )
 }
 
 /// Get all ledger entries for an account, sorted by created_at ASC, id ASC.

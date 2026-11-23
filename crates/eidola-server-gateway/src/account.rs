@@ -865,21 +865,26 @@ pub async fn create_checkout(
         (status = 503, description = "Billing unavailable", body = crate::types::ErrorResponse)
     )
 )]
-#[tracing::instrument(skip_all, name = "account.reconcile", err)]
+#[tracing::instrument(skip_all, name = "account.reconcile", fields(otel.status_code))]
 pub async fn reconcile_billing(
     BasicAuth(account_id): BasicAuth,
     State(state): State<AppState>,
     body: bytes::Bytes,
 ) -> Result<(StatusCode, Json<ReconcileResponse>), ServerError> {
-    if !body.is_empty() {
-        return Err(ServerError::BadRequest {
-            message: "billing repair does not accept a request body".into(),
-        });
-    }
-    let status = eidola_billing::store::Store::new(state.db_pool.clone())
-        .request_reconciliation(account_id)
-        .await?;
-    Ok((StatusCode::ACCEPTED, Json(status.into())))
+    crate::telemetry::span_result(
+        async {
+            if !body.is_empty() {
+                return Err(ServerError::BadRequest {
+                    message: "billing repair does not accept a request body".into(),
+                });
+            }
+            let status = eidola_billing::store::Store::new(state.db_pool.clone())
+                .request_reconciliation(account_id)
+                .await?;
+            Ok((StatusCode::ACCEPTED, Json(status.into())))
+        }
+        .await,
+    )
 }
 
 /// Read this account's durable repair status without initiating provider work.
@@ -894,15 +899,20 @@ pub async fn reconcile_billing(
         (status = 503, description = "Billing unavailable", body = crate::types::ErrorResponse)
     )
 )]
-#[tracing::instrument(skip_all, name = "account.reconcile_status", err)]
+#[tracing::instrument(skip_all, name = "account.reconcile_status", fields(otel.status_code))]
 pub async fn get_reconciliation(
     BasicAuth(account_id): BasicAuth,
     State(state): State<AppState>,
 ) -> Result<Json<ReconcileResponse>, ServerError> {
-    let status = eidola_billing::store::Store::new(state.db_pool.clone())
-        .reconciliation_status(account_id)
-        .await?;
-    Ok(Json(status.into()))
+    crate::telemetry::span_result(
+        async {
+            let status = eidola_billing::store::Store::new(state.db_pool.clone())
+                .reconciliation_status(account_id)
+                .await?;
+            Ok(Json(status.into()))
+        }
+        .await,
+    )
 }
 
 /// Ensure the account has a Stripe customer ID, creating one if needed.

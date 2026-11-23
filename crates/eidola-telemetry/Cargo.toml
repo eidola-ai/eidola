@@ -1,0 +1,17 @@
+[package]
+name = "eidola-telemetry"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# `blocking`: the OTLP exporters take a blocking client (`otlp_http_clients`).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

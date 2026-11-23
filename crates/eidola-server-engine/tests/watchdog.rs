@@ -147,8 +147,13 @@ async fn a_stalled_step_ends_the_stream_with_an_error_and_exits() {
         engine: handle.clone(),
         admission: admission.clone(),
         reading: Admission::new(4),
+        overloaded: Default::default(),
+        failed: Default::default(),
+        streams_failed: Default::default(),
     });
+    let telemetry = eidola_server_engine::telemetry::Source::new(&state);
     let node = common::TestNode::serve(eidola_server_engine::Node {
+        telemetry,
         router: http::router(state),
         engine: handle.clone(),
         admission,
@@ -199,6 +204,16 @@ async fn a_stalled_step_ends_the_stream_with_an_error_and_exits() {
     .await
     .expect("refused at once");
     assert_eq!(status, 503);
+    // Neither is logged; the node's counters count both: the stream that failed under
+    // the stuck step, and the request the stopped engine refused.
+    use eidola_server_engine::telemetry::Value;
+    for outcome in ["stream_failed", "failed"] {
+        assert_eq!(
+            node.observed("engine.node.requests", &[("outcome", outcome)]),
+            Some(Value::Count(1)),
+            "{outcome}"
+        );
+    }
 
     gate.release();
     assert!(

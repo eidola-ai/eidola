@@ -329,7 +329,7 @@ pub(crate) fn model_field<V: 'static>(
             .track_scroll(picker_scroll)
             // Keep a model picker's wheel inside the bounded list instead of
             // also moving the settings/inspector pane behind it.
-            .on_scroll_wheel(cx.listener(|_, _: &gpui::ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|_, _: &gpui::ScrollEvent, _, cx| {
                 cx.stop_propagation();
             }))
             .py_1()
@@ -612,7 +612,7 @@ pub(crate) fn router_field<V: 'static>(
             .track_scroll(picker_scroll)
             // Keep a router picker's wheel inside the bounded list instead of
             // also moving the settings/inspector pane behind it.
-            .on_scroll_wheel(cx.listener(|_, _: &gpui::ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|_, _: &gpui::ScrollEvent, _, cx| {
                 cx.stop_propagation();
             }))
             .py_1()

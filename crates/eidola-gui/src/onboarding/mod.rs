@@ -981,8 +981,8 @@ impl Render for OnboardingView {
                     // it can't drift the page); a rest deep in a slide's content
                     // simply releases to the native momentum so the reader keeps
                     // their place. A fresh `Started` releases ownership.
-                    .on_scroll_wheel(cx.listener(
-                        |this, ev: &gpui::ScrollWheelEvent, window, cx| match ev.touch_phase {
+                    .on_scroll(cx.listener(|this, ev: &gpui::ScrollEvent, window, cx| {
+                        match ev.touch_phase {
                             TouchPhase::Started => {
                                 this.owning = false;
                                 this.pinned_y = None;
@@ -1044,8 +1044,8 @@ impl Render for OnboardingView {
                                 this.last_dy = px(0.);
                                 cx.notify();
                             }
-                        },
-                    ))
+                        }
+                    }))
                     .children(slides),
             )
             // A right-edge scroll indicator that appears only while scrolling

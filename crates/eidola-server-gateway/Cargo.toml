@@ -26,8 +26,7 @@ axum = "0.8"
 utoipa-axum = "0.3"
 
 # HTTP client for upstream requests (using rustls with pure-Rust crypto for cross-compilation).
-# `blocking` is for the OTLP exporters' client (`telemetry::otlp_http_client`).
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream", "form", "query", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream", "form", "query"] }
 
 # Pure Rust TLS crypto provider (no C/assembly dependencies)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
@@ -45,10 +44,11 @@ utoipa = { version = "6", features = ["uuid"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# OpenTelemetry (enabled when OTEL_EXPORTER_OTLP_ENDPOINT is set)
+# OpenTelemetry (enabled when OTEL_EXPORTER_OTLP_ENDPOINT is set); the OTLP
+# exporters and providers are built by `eidola-telemetry`.
+eidola-telemetry = { path = "../eidola-telemetry" }
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
 tracing-opentelemetry = "0.34"
 opentelemetry-appender-tracing = "0.33"
 

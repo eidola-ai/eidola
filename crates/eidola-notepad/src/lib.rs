@@ -22,12 +22,13 @@ use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 use gpui::{
-    App, AppContext, Bounds, EntityId, Global, KeyBinding, Menu, MenuItem, OsAction,
-    PathPromptOptions, Pixels, PromptButton, PromptLevel, WeakEntity, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions, point, px, size,
+    App, AppContext, Bounds, EntityId, Global, Menu, MenuItem, OsAction, PathPromptOptions, Pixels,
+    PromptButton, PromptLevel, WeakEntity, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    point, px, size,
 };
 use gpui_component::Root;
 use gpui_kit_assets::Assets;
+use gpui_markdown_editor::secondary_key_binding;
 
 use crate::actions::*;
 use crate::document::{Contents, DocumentView};
@@ -545,23 +546,23 @@ fn open_about(cx: &mut App) {
 
 fn install_keybindings(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("secondary-n", NewDocument, None),
-        KeyBinding::new("secondary-o", Open, None),
-        KeyBinding::new("secondary-w", CloseWindow, None),
-        KeyBinding::new("secondary-s", Save, None),
-        KeyBinding::new("secondary-shift-s", SaveAs, None),
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("secondary-0", ActualSize, None),
-        KeyBinding::new("secondary-=", ZoomIn, None),
-        KeyBinding::new("secondary-+", ZoomIn, None),
-        KeyBinding::new("secondary--", ZoomOut, None),
+        secondary_key_binding("secondary-n", NewDocument, None, cx),
+        secondary_key_binding("secondary-o", Open, None, cx),
+        secondary_key_binding("secondary-w", CloseWindow, None, cx),
+        secondary_key_binding("secondary-s", Save, None, cx),
+        secondary_key_binding("secondary-shift-s", SaveAs, None, cx),
+        secondary_key_binding("secondary-q", Quit, None, cx),
+        secondary_key_binding("secondary-0", ActualSize, None, cx),
+        secondary_key_binding("secondary-=", ZoomIn, None, cx),
+        secondary_key_binding("secondary-+", ZoomIn, None, cx),
+        secondary_key_binding("secondary--", ZoomOut, None, cx),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
-        KeyBinding::new("cmd-h", Hide, None),
-        KeyBinding::new("alt-cmd-h", HideOthers, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+        gpui::KeyBinding::new("cmd-h", Hide, None),
+        gpui::KeyBinding::new("alt-cmd-h", HideOthers, None),
+        gpui::KeyBinding::new("cmd-m", Minimize, None),
+        gpui::KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
     ]);
     // Motion, editing, clipboard, undo and the bold/italic toggles — the
     // editor's own keymap, exactly as Eidola installs it.

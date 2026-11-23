@@ -119,15 +119,22 @@ overflow-checks = false
 inherits = "release"
 strip = false
 
-# gpui-component's `eidola-0.7` branch: the 0.7.0 release plus one commit,
+[patch.crates-io]
+# gpui-component's `eidola-0.10` branch: the 0.10.0 release plus one commit,
 # an app-level opt-out for its window border
 # (`set_window_border_enabled`), so the GUI's own Linux client-side
 # decorations stay the only ones. Every crate published from that repo that
 # we resolve is patched, so the lock holds one copy of each. The members
-# keep their `=0.7.0` requirements; remove this block when a released
+# keep their `=0.10.0` requirements; remove these four when a released
 # gpui-component carries the opt-out.
-[patch.crates-io]
-gpui-component = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }
-gpui-base = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }
-gpui-component-macros = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }
-gpui-kit-assets = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }
+gpui-component = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.10" }
+gpui-base = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.10" }
+gpui-component-macros = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.10" }
+gpui-kit-assets = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.10" }
+# Two gpui-pre 0.3.12 crates, imported as published plus one commit each
+# (see crates/eidola-gui/AGENTS.md → gpui / gpui-component pinning):
+# gpui-pre-macos builds on the pinned Rust (remove when the toolchain reaches
+# 1.98 or a snapshot no longer needs it), and gpui-pre-web lets iOS WebKit
+# show the software keyboard (remove when a snapshot carries the fix).
+gpui-pre-macos = { git = "https://github.com/eidola-ai/gpui-pre", branch = "eidola-0.3.12" }
+gpui-pre-web = { git = "https://github.com/eidola-ai/gpui-pre", branch = "eidola-0.3.12" }

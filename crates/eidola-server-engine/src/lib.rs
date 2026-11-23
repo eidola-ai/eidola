@@ -28,6 +28,7 @@ pub mod model;
 pub mod pipeline;
 pub mod storage;
 pub mod swap;
+pub mod telemetry;
 pub mod worker;
 
 use std::sync::Arc;
@@ -72,6 +73,8 @@ pub struct Node {
     pub weights_hash: String,
     /// Resolves when the engine thread stops, however it stops.
     pub engine_stopped: oneshot::Receiver<()>,
+    /// What the node's telemetry instruments read ([`telemetry::Source::register`]).
+    pub telemetry: telemetry::Source,
 }
 
 impl std::fmt::Debug for Node {
@@ -692,8 +695,13 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
         engine: engine.clone(),
         admission: admission.clone(),
         reading,
+        overloaded: Default::default(),
+        failed: Default::default(),
+        streams_failed: Default::default(),
     });
+    let telemetry = telemetry::Source::new(&state);
     Ok(Node {
+        telemetry,
         router: http::router(state),
         engine,
         admission,

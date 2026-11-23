@@ -50,7 +50,7 @@ use eidola_app_core::error::{AppError, IssuerKeyRefusal};
 use gpui::{
     AnyElement, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     FontWeight, InteractiveElement, IntoElement, IsZero, Overflow, ParentElement, Pixels, Render,
-    Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    Role, ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Task, TouchPhase, Window, div, prelude::FluentBuilder as _, px, rems,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
@@ -3281,19 +3281,17 @@ impl Render for SpaceView {
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.page_scroll)
-                    .on_scroll_wheel(cx.listener(
-                        |this, ev: &gpui::ScrollWheelEvent, window, cx| {
-                            let delta = ev.delta.pixel_delta(window.line_height());
-                            let moved = !delta.x.is_zero() || !delta.y.is_zero();
-                            this.note_scroll_activity(ev.touch_phase, moved, cx);
-                            if matches!(ev.touch_phase, gpui::TouchPhase::Started) {
-                                this.scroll_owner = None;
-                            }
-                            if !delta.y.is_zero() {
-                                this.scroll_owner.get_or_insert(ScrollOwner::Body);
-                            }
-                        },
-                    ))
+                    .on_scroll(cx.listener(|this, ev: &gpui::ScrollEvent, window, cx| {
+                        let delta = ev.delta.pixel_delta(window.line_height());
+                        let moved = !delta.x.is_zero() || !delta.y.is_zero();
+                        this.note_scroll_activity(ev.touch_phase, moved, cx);
+                        if matches!(ev.touch_phase, gpui::TouchPhase::Started) {
+                            this.scroll_owner = None;
+                        }
+                        if !delta.y.is_zero() {
+                            this.scroll_owner.get_or_insert(ScrollOwner::Body);
+                        }
+                    }))
                     .child(
                         v_flex()
                             .id("space-conversation")
@@ -3855,9 +3853,9 @@ impl SpaceView {
             .h(px(strip_h))
             .items_start()
             .overflow_x_scroll()
-            .on_scroll_wheel(cx.listener({
+            .on_scroll(cx.listener({
                 let node_id = node_id.clone();
-                move |this, ev: &ScrollWheelEvent, window, cx| {
+                move |this, ev: &ScrollEvent, window, cx| {
                     let delta = ev.delta.pixel_delta(window.line_height());
                     let moved = !delta.x.is_zero() || !delta.y.is_zero();
                     this.note_scroll_activity(ev.touch_phase, moved, cx);

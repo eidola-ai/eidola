@@ -1,7 +1,7 @@
 //! The wire contract between Eidola's clients, its gateway, and its inference
 //! nodes (`eidola-server-engine`) that every side must spell identically.
 //!
-//! Seven things live here:
+//! Eight things live here:
 //!
 //! - **The prefix-cache key** a client may send as the request body's
 //!   `cache_key` member: [`CACHE_KEY_BYTES`] bytes, encoded as unpadded
