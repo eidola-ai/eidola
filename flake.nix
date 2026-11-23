@@ -295,6 +295,20 @@
               || pkgs.lib.hasPrefix "/scripts/fixtures/apple-roundtrip/" relPath
             )
           )
+          # The manifest fixtures app-core's and release-tool's tests read
+          # (`include_bytes!` of the schema-6 shapes the determinism gate also
+          # checks). Only the workspace checks take them, exactly these files.
+          || (
+            wholeWorkspace
+            && builtins.elem relPath [
+              "/scripts"
+              "/scripts/fixtures"
+              "/scripts/fixtures/manifest-determinism"
+              "/scripts/fixtures/manifest-determinism/good-schema-6.json"
+              "/scripts/fixtures/manifest-determinism/good-schema-6-emitted.json"
+              "/scripts/fixtures/manifest-determinism/bad-bundle-digest.json"
+            ]
+          )
           # The committed `artifact-manifest.json`, which app-core's tests
           # hold to the claim set this build expects. Only the workspace
           # checks take it: a package source that included it would be an

@@ -22,6 +22,11 @@ variable "CACHE_REGISTRY" {
   default = ""
 }
 
+# Where the `mobile-bundle` target writes the bundle's files.
+variable "MOBILE_BUNDLE_OUT" {
+  default = "mobile/build/bundle-release"
+}
+
 # Cargo profile: "release" for reproducible builds, "docker-dev" for fast iteration
 variable "CARGO_PROFILE" {
   default = "release"
@@ -147,6 +152,23 @@ target "billing" {
   context    = "."
   dockerfile = "oci/eidola-billing/Containerfile"
   tags       = ["eidola-billing:dev"]
+}
+
+# The mobile app bundle, built by the same StageX toolchain for
+# wasm32-unknown-unknown (every build stage of its Containerfile runs on
+# linux/amd64). Its output is the bundle's files, not an image: the image is
+# empty but for them and never pushed, so the target exports a directory
+# (MOBILE_BUNDLE_OUT; mobile/build-bundle-release.sh passes its own). It
+# takes no registry layer cache: it is built from scratch wherever it is
+# checked. Its profile is the `mobile` one, so CARGO_PROFILE does not reach
+# it. No manifest row records an image digest for it; from manifest schema 6
+# the `eidola-mobile-bundle` row records the files
+# (scripts/artifact-manifest.sh build-mobile, MOBILE_ARTIFACT_SET_SCHEMA).
+target "mobile-bundle" {
+  inherits   = ["_common"]
+  context    = "."
+  dockerfile = "oci/eidola-mobile-bundle/Containerfile"
+  output     = ["type=local,dest=${MOBILE_BUNDLE_OUT}"]
 }
 
 target "postgres" {

@@ -10,6 +10,7 @@ The native apps the App Store and Play Store distribute. Each is a thin shell ar
 | `contract-test/` | A plain-JS page that exercises the whole contract against the shell it runs in, and the default embedded bundle. `shell.js` is the reference bridge. |
 | `tools/` | `echo_server.py` (the test page's TCP peer), `bundle_digest.py` (the digest a shell shows, computed from a directory), `bundle_container.py` (a bundle directory as the `ustar` container a release publishes it in, and its `artifact-manifest.json` row; the same bytes as app-core's `updater::mobile::container::write_ustar`), `openai_stub.py` (a development stand-in for a model: an OpenAI-compatible server streaming a fixed answer, for development bundles and the UI tests; never part of a release). |
 | `build-bundle.sh`, `bundle-repro.sh`, `self-test.sh` | The app bundle (`crates/eidola-mobile`, wasm32) built reproducibly, checked by two clean builds, and its headless self-test under either shell; see `crates/eidola-mobile/AGENTS.md`. |
+| `build-bundle-release.sh` | The release bundle: the same app built in the pinned StageX toolchain, the bundle a release records and the release APK embeds, which CI builds in two environments on every change and on two architectures weekly; see `crates/eidola-mobile/AGENTS.md` → The release bundle. |
 | `device-checklist.md` | What to prepare before running a build on a physical device. |
 
 ## Doctrine
@@ -35,14 +36,15 @@ Both shells embed **the app bundle** by default (`build.sh` without `--bundle` r
 |---|---|---|
 | `just mobile-bundle` | `build-bundle.sh` | The app bundle into `build/bundle` (`--self-test`: the self-test bundle). Prints sizes and the bundle digest. |
 | `just mobile-bundle-repro` | `bundle-repro.sh` | Two builds from scratch, compared file by file. |
+| `just mobile-bundle-release` | `build-bundle-release.sh` | The release bundle into `build/bundle-release`, built in Docker (`--no-cache`, `--out DIR`); prints its digest. |
 | `just mobile-self-test ios\|android` | `self-test.sh` | The app's self-test bundle under a debug shell, on its own simulator or AVD (`eidola-bridge`), against shims and an echo server run here: attestation over the pipe and its refusal, the durability barrier, the profile across a cold relaunch, throughput. Evidence to `build/self-test/<platform>/`. |
 | `just mobile-ios-sim` | `ios/build.sh` | Builds the iOS shell for the Simulator, unsigned, embedding `--bundle DIR` (default the test page); `--release`, `--device` (signed by the team in the project). |
 | `just mobile-ios-test` | `ios/test-sim.sh` | XCUITest on the simulator `eidola-shell` (created once; never another device): the test page's verdict, the bundle sheet opened from the home-screen quick action and compared with the page's digest, a cold relaunch. Screenshots to `ios/build/shots`. |
-| `just mobile-android` | `android/build.sh` | Builds the APK (`--bundle DIR`, `--debug`, `--out DIR`); signs it too when `KEYSTORE` is set. |
+| `just mobile-android` | `android/build.sh` | Builds the APK (`--bundle DIR`, `--debug`, `--out DIR`); signs it too when `KEYSTORE` is set; `--aab` also builds the App Bundle Play takes. |
 | `just mobile-android-test` | `android/test-emulator.sh` | The same run on the AVD `eidola-shell` (created once from the android-36.1 Play image; never another AVD or a device), signed with a debug key generated into `android/.keys/` (git-ignored). The sheet is opened by the launcher shortcut's intent. |
 | `just mobile-ios-ui-test` | `ios/test-ui.sh` | The app's phone interface under XCUITest on its own simulators (`eidola-phone`; `eidola-phone-zh`, whose language is Chinese so Pinyin is its first keyboard): a development bundle answering from `tools/openai_stub.py`, a whole conversation by real taps and typing, a cold relaunch at night, Chinese through the Pinyin IME in the app's zh-Hans locale. Screenshots and a recording to `ios/build/ui`. |
 | `just mobile-android-ui-test` | `android/test-ui.sh` | The same flow on the AVD `eidola-shell` through `adb shell input`, elements found in the WebView's accessibility tree (`ui_test.py`). Screenshots and a recording to `android/build/ui`. |
-| `just mobile-android-repro` | `android/repro.sh` | Two clean release builds, identical; a signed APK strips back to them; the hash equals `android/reproducible.sha256`. |
+| `just mobile-android-repro` | `android/repro.sh` | Two clean release builds, identical APKs and App Bundles; a signed APK strips back to the unsigned one; the APK bundletool generates from the App Bundle carries the same code and bundle; both hashes equal `android/reproducible.sha256`. |
 
 Both test runs start `tools/echo_server.py` on `127.0.0.1:7777` (the emulator reaches it as `10.0.2.2`). A full run takes about two minutes on either platform; the page phases through several document loads, so the bundle-store checks run against real reloads.
 
@@ -64,13 +66,14 @@ The iOS check is a **local gate** (no macOS runner here): run `just mobile-ios-t
 ## Android
 
 - The build chain is `aapt2 link` (manifest only) → `kotlinc` against `android.jar` alone → R8 (our classes plus `kotlin-stdlib.jar`, shrunk, `keep.pro`) → `tools/ApkZip.java` (sorted, stored, one fixed timestamp) → `zipalign` → `apksigner` (v2 + v3, alignment preserved).
+- **The App Bundle** (`--aab`, release only) is what Play takes for a new app. Nothing is compiled twice: `aapt2 link --proto-format` links the same manifest and resources as protocol buffers, `tools/aab_module.py` lays them out with the APK's own `classes.dex` and bundle as a bundletool module, `bundletool build-bundle` wraps it, and `tools/zip_stored.py` rewrites bundletool's deflated entries stored, in name order, with one timestamp, so the bytes do not depend on the JDK's zlib. Play rebuilds the APKs it delivers from it and signs them with its own key: what users verify is the APK we publish; a Play install compares by content (`tools/compare_apk_contents.py`: `classes.dex` and `assets/` must be our bytes; the manifest and resource table carry Play's split configuration, and the signature is Play's).
 - `--debug` makes the APK debuggable (console in logcat, inspectable WebView) and names it `ai.eidola.mobile.dev`; otherwise the variants are identical.
 - Edge to edge, the WebView reports no safe areas and does not resize for the keyboard, so `MainActivity` pads its container by the system bars, the cutout and the IME.
 - The package is `ai.eidola.mobile` for a release build and `ai.eidola.mobile.dev` for `--debug` (aapt2 renames the manifest's package), so a dev build installs beside a release one. **The Play package name is permanent once published**: an app under another name is another app, with no upgrade path from this one.
 
 ### Reproducibility
 
-The unsigned APK is a function of the source, the bundle and these pinned inputs, fetched once by `tools.sh` into `~/.cache/eidola/android-tools` and checked by SHA-256 before use (Google's repository manifest lists their SHA-1s, which match too). The local SDK is not used to build.
+The unsigned APK is a function of the source, the bundle and these pinned inputs, downloaded by `tools.sh` into `~/.cache/eidola/android-tools/archives` and, on every run, checked by SHA-256 and unpacked afresh before anything in them runs (`tools/fetch.sh`: an unpacked tree from an earlier run is never used, and a cached archive that does not hash to its pin is fetched again; `test-tools-cache.sh` holds both, and CI caches the archives alone). Google's repository manifest lists their SHA-1s, which match too. The local SDK is not used to build.
 
 | Input | Version | SHA-256 of the archive |
 |---|---|---|
@@ -78,11 +81,14 @@ The unsigned APK is a function of the source, the bundle and these pinned inputs
 | build-tools (Linux x86_64) | 36.1.0 | `a7b5889e4a79fcf3b0976bef40d401f4240fb1eed891d9d91169da1111e11d78` |
 | platform `android-36` | r02 | `37607369a28c5b640b3a7998868d45898ebcb777565a0e85f9acf36f29631d2e` |
 | `kotlin-compiler` | 2.3.10 | `c8d546f9ff433b529fb0ad43feceb39831040cae2ca8d17e7df46364368c9a9e` |
+| `bundletool-all` (jar, App Bundle only) | 1.18.3 | `a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29` (the digest GitHub records for the release asset) |
 
 The JDK is not an input: kotlinc compiles against `android.jar` only (`-no-jdk`), and R8 and the zip writer produce the same bytes on any JDK from 17 up. The same source gives the same APK on macOS (arm64, JetBrains Runtime 25) and on Linux (x86_64, Temurin 17 and 21), so `reproducible.sha256` holds on both.
 
 A **signed** APK differs on every signing (ECDSA signatures are randomized). `tools/strip_apk_signature.py SIGNED OUT` removes the v2/v3 signing block and the padding apksigner adds before it, restoring the unsigned bytes exactly; anyone can compare a published APK with their own build that way. This holds for an APK **we** publish. Play App Signing rebuilds what Play delivers (its own signature, a stamp, manifest additions), so a Play install compares by content, file by file, with Play's additions excluded.
 
+**Signing a release** is a person's step at release time, never CI's: the release key signs the APK we publish (`apksigner`, v2 + v3, alignment preserved, as above), and Play's upload key signs the App Bundle. The steps, and how the signed APK's hash and certificate reach the human attestation, are in `releases/README.md` → Signing the Android shell.
+
 ## CI
 
-`.github/workflows/mobile-shells.yml` runs on changes under `mobile/`, `crates/eidola-mobile/` and the crates its interface shares with the GUI (`eidola-theme`, `eidola-i18n`, `gpui-markdown-editor`), and to what pins the bundle's build (`Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`), on the `mobile` branch: it builds the Android shell twice on Linux with the pinned tools, checks the strip round trip, and checks `reproducible.sha256`; and it builds the app bundle twice from scratch (`bundle-repro.sh`). iOS is the local gate above. `rust-checks` lints `eidola-mobile` for wasm32 (bare, with `self-test`, and with `dev`) on every Rust change.
+`.github/workflows/mobile-shells.yml` runs on changes under `mobile/`, `crates/eidola-mobile/` and the crates its interface shares with the GUI (`eidola-theme`, `eidola-i18n`, `gpui-markdown-editor`), and to what pins the bundle's build (`Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`), on the `mobile` branch: it builds the Android shell twice on Linux with the pinned tools (APK and App Bundle), checks the strip round trip and the App Bundle's universal APK, and checks `reproducible.sha256`; and it builds the app bundle twice from scratch (`bundle-repro.sh`). `.github/workflows/mobile-bundle-release.yml` builds the release bundle in two different x86-64 environments and requires the same files (same architecture, different environment); `.github/workflows/mobile-bundle-cross-arch.yml` compares a native build with one emulated on arm64, weekly and on demand, because emulated it takes about two and a half hours. On `main`, the artifact chain's `mobile` job builds the release bundle and the unsigned APK and App Bundle over it, for the manifest (from schema 6) and the release-time signing step. iOS is the local gate above. `rust-checks` lints `eidola-mobile` for wasm32 (with and without `self-test`) on every Rust change.

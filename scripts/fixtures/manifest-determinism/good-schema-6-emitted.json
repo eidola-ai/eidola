@@ -1,0 +1,104 @@
+{
+  "artifacts": {
+    "eidola-billing": {
+      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-cli": {
+      "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-cli-linux-static-amd64": {
+      "platform": "linux/amd64",
+      "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "type": "file"
+    },
+    "eidola-cli-linux-static-arm64": {
+      "platform": "linux/arm64",
+      "sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "type": "file"
+    },
+    "eidola-gui-linux-deb-amd64": {
+      "platform": "linux/amd64",
+      "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "type": "file"
+    },
+    "eidola-gui-linux-deb-arm64": {
+      "platform": "linux/arm64",
+      "sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "type": "file"
+    },
+    "eidola-gui-linux-nix-amd64": {
+      "archiveSha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "narHash": "sha256-AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+      "platform": "linux/amd64",
+      "type": "nix"
+    },
+    "eidola-gui-macos-universal": {
+      "archiveSha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "narHash": "sha256-BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "platform": "darwin/universal",
+      "type": "nix"
+    },
+    "eidola-gui-macos-universal-zip": {
+      "platform": "darwin/universal",
+      "sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "type": "file"
+    },
+    "eidola-mobile-android-apk": {
+      "platform": "android/universal",
+      "sha256": "sha256:9d561152bd67b31939cefc974b955ddf226629e89d255dc7a138c1e2750ce86d",
+      "type": "file"
+    },
+    "eidola-mobile-bundle": {
+      "digest": "sha256:9c5844af6208607470246daf20345ed1ee04c1b7b31e164a0d013773836df35b",
+      "files": [
+        {
+          "path": "app.js",
+          "sha256": "sha256:51b17fd8825335773fcc7c7988d8d2d0948f4e312cfbed979dc6e49b9af5668f",
+          "size": 25
+        },
+        {
+          "path": "index.html",
+          "sha256": "sha256:d79f3a28b410e26a474af5582976de786cbbffe5ad1ff4cd91f8e8c0f25c7f9d",
+          "size": 107
+        },
+        {
+          "path": "js/bridge.js",
+          "sha256": "sha256:ddf066ee341c060cca67ed6faa462602690b490d98c6fecdf607c447754e14bb",
+          "size": 29
+        }
+      ],
+      "platform": "webview/wasm32",
+      "sha256": "sha256:25a5a4b4329a392d8244c46750ddbcb5f184744e12112a8ae4517dfbdf6486cc",
+      "type": "bundle"
+    },
+    "eidola-postgres": {
+      "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-server": {
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-server-engine": {
+      "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "platform": "linux/amd64",
+      "type": "oci"
+    }
+  },
+  "enclave": {
+    "cvm_version": "0.15.4-rc.2@sha256:689c945f62d8f8507d5051dfdc97abc019e7ea5c9cc153557fe8b6850db45dc2",
+    "igvm_sha256": "112501c5b3fa891cf05c96841903b000bd012bfa13cdc780692ce8f625470216",
+    "sev_snp": {
+      "guest_policy": "0x30133",
+      "host_data": "aa718d5425d9269e1186399efd67385bc0a7d083152569d331297e60a987c278",
+      "measurement": "cea56f9f4f8440ae96e6e6528a7571f4179a062e7a0919b1021c98dd3bc9f44eeeda321568407130745f80057533c015"
+    }
+  },
+  "schema_version": 6
+}

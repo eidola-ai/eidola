@@ -1749,6 +1749,26 @@ mod tests {
         assert!(deltas.is_empty(), "unexpected deltas: {deltas:#?}");
     }
 
+    /// The manifest the emitter composes once `MANIFEST_SCHEMA_VERSION` is
+    /// 6, from its real producers over fixture inputs
+    /// (`scripts/test-manifest-schema-flip.sh`, which holds this file to
+    /// the bytes they write): the release that first emits schema 6 meets a
+    /// client that has already read it.
+    #[test]
+    fn the_emitter_s_schema_6_manifest_is_not_a_claims_change() {
+        let bytes = include_bytes!(
+            "../../../scripts/fixtures/manifest-determinism/good-schema-6-emitted.json"
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(manifest["schema_version"], 6);
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert!(deltas.is_empty(), "unexpected deltas: {deltas:#?}");
+        crate::updater::mobile::row::BundleRow::from_value(
+            &manifest["artifacts"]["eidola-mobile-bundle"],
+        )
+        .expect("the emitted bundle row is one the mobile updater reads");
+    }
+
     #[test]
     fn every_older_manifest_stays_clean_with_schema_6_accepted() {
         // The accept side alone must not turn any release still emitting an
