@@ -82,8 +82,11 @@ fi
 #    bundle carries, and the module zip (manifest, resource table, dex, the bundle as assets) that
 #    bundletool wraps. Nothing is compiled twice: the dex and the bundle are the APK's own files.
 if $AAB; then
-  "$BT/aapt2" link --proto-format -o "$W/base-proto.apk" --manifest "$HERE/AndroidManifest.xml" \
-    -I "$ANDROID_JAR" --min-sdk-version "$MIN_SDK" --target-sdk-version 36 --no-compress \
+  #  --exclude-sources: the proto resource table would otherwise record each resource's absolute source
+  #  path, which is the checkout's location (the binary table the APK carries has no such field).
+  "$BT/aapt2" link --proto-format --exclude-sources -o "$W/base-proto.apk" \
+    --manifest "$HERE/AndroidManifest.xml" -I "$ANDROID_JAR" --min-sdk-version "$MIN_SDK" \
+    --target-sdk-version 36 --no-compress \
     $(find "$W/res" -name '*.flat' | LC_ALL=C sort)
   python3 "$HERE/tools/aab_module.py" "$W/base.zip" "$W/base-proto.apk" "$W/dex/classes.dex" "$BUNDLE"
   rm -f "$W/deflated.aab"

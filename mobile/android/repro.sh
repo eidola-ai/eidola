@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The reproducibility check: two clean release builds must give the same unsigned APK and the same
-# App Bundle, stripping the signature from a signed APK (a throwaway key, made here) must give the
-# unsigned one back, and the universal APK bundletool generates from the App Bundle, as Play does,
+# The reproducibility check: two clean release builds, from two locations, must give the same
+# unsigned APK and the same App Bundle, stripping the signature from a signed APK (a throwaway key,
+# made here) must give the unsigned one back, and the universal APK bundletool generates from the App Bundle, as Play does,
 # must carry the APK's code and bundle byte for byte.
 #   repro.sh [--bundle DIR]
 # Prints both SHA-256s. Without --bundle it embeds the contract test page, and both must also equal
@@ -16,8 +16,14 @@ keytool -genkeypair -keystore "$T/key.p12" -storetype PKCS12 -storepass android 
   -keyalg EC -groupname secp256r1 -validity 1 -dname "CN=throwaway" >/dev/null 2>&1
 ARGS=("$@")
 (($# == 0)) && ARGS=(--bundle "$HERE/../contract-test")
+# The second build runs from a copy of the shell's sources somewhere else, so a build that records
+# where its checkout is cannot pass.
+mkdir -p "$T/elsewhere/mobile"
+(cd "$HERE/.." && tar -cf - --exclude build --exclude .keys android tools) | tar -xf - -C "$T/elsewhere/mobile"
 for x in a b; do
-  KEYSTORE="$T/key.p12" "$HERE/build.sh" "${ARGS[@]}" --aab --out "$T/$x" >/dev/null
+  SRC="$HERE"
+  [[ $x == b ]] && SRC="$T/elsewhere/mobile/android"
+  KEYSTORE="$T/key.p12" "$SRC/build.sh" "${ARGS[@]}" --aab --out "$T/$x" >/dev/null
   python3 "$HERE/tools/strip_apk_signature.py" "$T/$x/eidola-shell-signed.apk" "$T/$x/stripped.apk"
 done
 cmp "$T/a/eidola-shell-unsigned.apk" "$T/b/eidola-shell-unsigned.apk"
