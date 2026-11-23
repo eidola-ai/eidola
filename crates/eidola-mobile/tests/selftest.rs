@@ -72,6 +72,7 @@ fn config(port: u16) -> Config {
         echo_host: "127.0.0.1".into(),
         echo_port: port,
         throughput_mib: 1,
+        update_url: None,
     }
 }
 

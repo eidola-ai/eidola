@@ -40,7 +40,10 @@ wasm-bindgen-futures = "0.4"
 # (`tests/selftest.rs`); dev-dependency features never reach a bundle build.
 eidola-mobile = { path = ".", features = ["self-test"] }
 hex = "0.4"
+reqwest = { version = "0.13", default-features = false }
 rustls-rustcrypto = "0.1.0-pre.0"
+sha2 = "0.11"
 tempfile = "3"
 tinfoil-shim-mock = { path = "../tinfoil-shim-mock" }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+wiremock = "0.6"

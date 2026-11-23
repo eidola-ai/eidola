@@ -1,5 +1,8 @@
 //! A shell written in Rust, speaking the contract's JSON: files in memory,
-//! the TCP pipe over real sockets, a bundle store that records confirmation.
+//! the TCP pipe over real sockets, and a bundle store with the contract's
+//! staging, sealing (the digest computed from the bytes stored) and
+//! provisional activation, document loads included ([`FakeShell::relaunch`],
+//! [`FakeShell::load_document`]).
 //! It keeps a log of every request's arrival and every reply, in order, so a
 //! test can read the order in which things reached it.
 
@@ -14,6 +17,7 @@ use base64::engine::general_purpose::STANDARD;
 use eidola_mobile::client::{BoxFuture, Transport};
 use eidola_mobile::protocol::REQUIRED_METHODS;
 use serde_json::{Value, json};
+use sha2::Digest as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
@@ -59,6 +63,104 @@ pub struct State {
     pub file_delay: Duration,
     /// `files.read` hands back the file with its last byte flipped.
     pub corrupt_reads: bool,
+    pub bundles: Bundles,
+}
+
+/// One stored bundle version.
+#[derive(Clone, Default)]
+pub struct StoredBundle {
+    pub sealed: bool,
+    pub files: BTreeMap<String, Vec<u8>>,
+    pub digest: Option<String>,
+}
+
+/// The bundle store and its provisional-activation state
+/// (`shell-contract.md` → Bundle store).
+#[derive(Clone)]
+pub struct Bundles {
+    pub versions: BTreeMap<String, StoredBundle>,
+    pub active: String,
+    pub confirmed: bool,
+    pub tried: bool,
+    pub previous: String,
+    pub failed: Option<String>,
+    /// The version this document was served from, and whether it was
+    /// confirmed when it was.
+    pub serving: String,
+    pub serving_confirmed: bool,
+}
+
+/// What the shell shows as the embedded bundle's digest.
+pub const EMBEDDED_DIGEST: &str = "00";
+
+impl Default for Bundles {
+    fn default() -> Self {
+        Self {
+            versions: BTreeMap::new(),
+            active: "embedded".into(),
+            confirmed: true,
+            tried: false,
+            previous: "embedded".into(),
+            failed: None,
+            serving: "embedded".into(),
+            serving_confirmed: true,
+        }
+    }
+}
+
+impl Bundles {
+    /// A main-frame document load: the contract's three rules, then serve
+    /// `active`.
+    pub fn load_document(&mut self) {
+        if !self.confirmed && !self.tried {
+            self.tried = true;
+        } else if !self.confirmed {
+            self.failed = Some(self.active.clone());
+            self.active = self.previous.clone();
+            self.confirmed = true;
+            self.previous = "embedded".into();
+        }
+        if self.active != "embedded"
+            && !self
+                .versions
+                .get(&self.active)
+                .is_some_and(|v| v.sealed && v.files.contains_key("index.html"))
+        {
+            self.failed = Some(self.active.clone());
+            self.active = "embedded".into();
+            self.previous = "embedded".into();
+            self.confirmed = true;
+        }
+        self.serving = self.active.clone();
+        self.serving_confirmed = self.confirmed;
+    }
+
+    fn digest_of(&self, version: &str) -> String {
+        if version == "embedded" {
+            return EMBEDDED_DIGEST.into();
+        }
+        self.versions
+            .get(version)
+            .and_then(|v| v.digest.clone())
+            .unwrap_or_default()
+    }
+
+    fn state(&self) -> Value {
+        json!({
+            "serving": {
+                "version": self.serving,
+                "digest": self.digest_of(&self.serving),
+                "confirmed": self.serving_confirmed,
+            },
+            "active": self.active,
+            "confirmed": self.confirmed,
+            "previous": self.previous,
+            "failed": self.failed,
+            "versions": self.versions.iter().map(|(name, v)| json!({
+                "version": name, "sealed": v.sealed, "digest": v.digest,
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// The shell. Clones share one state.
@@ -130,15 +232,32 @@ impl FakeShell {
         self
     }
 
-    /// A shell on the same files (a relaunch), with a fresh log.
+    /// A shell on the same files and bundle store (a relaunch), with a
+    /// fresh log: its first document load applies the store's rules.
     pub fn relaunch(&self) -> Self {
-        let files = self.state.lock().unwrap().files.clone();
+        let (files, mut bundles) = {
+            let s = self.state.lock().unwrap();
+            (s.files.clone(), s.bundles.clone())
+        };
+        bundles.load_document();
         let shell = Self {
             state: Arc::default(),
             ..self.clone()
         };
-        shell.state.lock().unwrap().files = files;
+        let mut s = shell.state.lock().unwrap();
+        s.files = files;
+        s.bundles = bundles;
+        drop(s);
         shell
+    }
+
+    /// A document load in this shell (`location.reload()`).
+    pub fn load_document(&self) {
+        self.state.lock().unwrap().bundles.load_document();
+    }
+
+    pub fn bundles(&self) -> Bundles {
+        self.state.lock().unwrap().bundles.clone()
     }
 
     /// The same for a shell and its relaunches.
@@ -214,16 +333,98 @@ impl FakeShell {
                 Ok(json!({}))
             }
             "files.list" => Ok(json!({"names": s.files.keys().collect::<Vec<_>>()})),
-            "bundle.confirm" | "bundle.state" => {
-                if method == "bundle.confirm" {
-                    s.confirms += 1;
+            "bundle.begin" => {
+                let v = name(p, "version")?;
+                let b = &mut s.bundles;
+                if v == "embedded" || b.versions.get(&v).is_some_and(|x| x.sealed) {
+                    return err("invalid_state", "sealed or embedded");
                 }
+                b.versions.insert(v, StoredBundle::default());
+                Ok(json!({}))
+            }
+            "bundle.write" => {
+                let v = name(p, "version")?;
+                let path = name(p, "path")?;
+                if !eidola_app_core::updater::mobile::row::is_bundle_path(&path) {
+                    return err("bad_request", path);
+                }
+                let offset = int(p, "offset")? as usize;
+                let data = bytes(p, "data")?;
+                let Some(version) = s.bundles.versions.get_mut(&v).filter(|x| !x.sealed) else {
+                    return err("invalid_state", "not staging");
+                };
+                let file = version.files.entry(path).or_default();
+                if file.len() < offset + data.len() {
+                    file.resize(offset + data.len(), 0);
+                }
+                file[offset..offset + data.len()].copy_from_slice(&data);
+                Ok(json!({}))
+            }
+            "bundle.seal" => {
+                let v = name(p, "version")?;
+                let Some(version) = s.bundles.versions.get_mut(&v).filter(|x| !x.sealed) else {
+                    return err("invalid_state", "not staging");
+                };
+                let hashes: Vec<(String, String)> = version
+                    .files
+                    .iter()
+                    .map(|(path, data)| (path.clone(), hex::encode(sha2::Sha256::digest(data))))
+                    .collect();
+                let digest = eidola_app_core::updater::mobile::row::bundle_digest(
+                    hashes.iter().map(|(p, h)| (p.as_str(), h.as_str())),
+                );
+                version.sealed = true;
+                version.digest = Some(digest.clone());
                 Ok(json!({
-                    "serving": {"version": "embedded", "digest": "00", "confirmed": true},
-                    "active": "embedded", "confirmed": true, "previous": "embedded",
-                    "failed": null, "versions": [],
+                    "digest": digest,
+                    "files": version.files.len(),
+                    "bytes": version.files.values().map(Vec::len).sum::<usize>(),
                 }))
             }
+            "bundle.activate" => {
+                let v = name(p, "version")?;
+                let b = &mut s.bundles;
+                if v == "embedded" {
+                    b.active = v.clone();
+                    b.previous = v;
+                    b.confirmed = true;
+                } else {
+                    match b.versions.get(&v) {
+                        None => return err("not_found", v),
+                        Some(x) if !x.sealed => return err("invalid_state", "not sealed"),
+                        Some(_) => {}
+                    }
+                    if b.confirmed {
+                        b.previous = b.active.clone();
+                    }
+                    b.active = v;
+                    b.confirmed = false;
+                    b.tried = false;
+                }
+                Ok(b.state())
+            }
+            "bundle.confirm" => {
+                s.confirms += 1;
+                let b = &mut s.bundles;
+                if b.serving == b.active && !b.confirmed {
+                    b.confirmed = true;
+                    b.serving_confirmed = true;
+                    b.previous = "embedded".into();
+                }
+                Ok(b.state())
+            }
+            "bundle.remove" => {
+                let v = name(p, "version")?;
+                let b = &mut s.bundles;
+                if v == "embedded" || v == b.active || v == b.previous || v == b.serving {
+                    return err("invalid_state", "in use");
+                }
+                if b.versions.remove(&v).is_none() {
+                    return err("not_found", v);
+                }
+                Ok(json!({}))
+            }
+            "bundle.state" => Ok(s.bundles.state()),
             "debug.syncLog" => Ok(json!({"syncs": std::mem::take(&mut s.syncs)})),
             _ => err("unknown_method", method),
         }
@@ -351,6 +552,7 @@ impl Transport for FakeShell {
         let target = p["name"]
             .as_str()
             .or(p["to"].as_str())
+            .or(p["version"].as_str())
             .map(str::to_owned)
             .or_else(|| p["socket"].as_u64().map(|s| format!("socket {s}")))
             .unwrap_or_default();
