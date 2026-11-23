@@ -107,4 +107,4 @@ Server/CLI Linux images stay OCI: they run in an untrusted environment, so the i
 
 ## The mobile app
 
-The mobile app's bundle is a release artifact like any other, checked against the manifest by hash, and its shell is not: the Android shell's APK reproduces byte for byte once its signature is removed, and the iOS shell, which Apple encrypts as it distributes it, cannot be compared with a build at all. What each platform lets a user check, and how, is in [the mobile app](mobile.md#what-can-be-verified).
+The mobile app's bundle and its Android shell's unsigned APK have manifest rows, checked by hash like any other artifact (no release emits them yet); a signed APK reduces to the unsigned one once its signature is removed. The iOS shell has none: Apple encrypts it as it distributes it, so it cannot be compared with a build at all. What each platform lets a user check, and how, is in [the mobile app](mobile.md#what-can-be-verified).
