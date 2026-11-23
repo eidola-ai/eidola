@@ -22,6 +22,7 @@
 use eidola_app_core::AppCore;
 use eidola_app_core::error::AppError;
 use eidola_app_core::storage::HostFuture;
+use eidola_app_core::updater::ReleaseCheckError;
 use eidola_app_core::updater::mobile::{
     ActivatedBundle, BundleReport, BundleState, BundleStore, BundleStoreError, BundleUpdate,
     PendingBundleUpdate, SealedBundle,
@@ -116,7 +117,10 @@ impl<T: Transport> BundleStore for ShellBundles<T> {
 }
 
 /// Find and verify the next release, and read its bundle. Stages nothing.
-pub async fn check(core: &AppCore) -> Result<BundleUpdate, AppError> {
+/// A release that arrived and did not verify is
+/// [`ReleaseCheckError::Rejected`]; a feed that could not be reached is
+/// [`ReleaseCheckError::Unreachable`].
+pub async fn check(core: &AppCore) -> Result<BundleUpdate, ReleaseCheckError> {
     core.prepare_bundle_update().await
 }
 
