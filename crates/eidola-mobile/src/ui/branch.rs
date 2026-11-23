@@ -33,6 +33,9 @@ pub enum Row {
     Pending {
         text: SharedString,
         created_at: i64,
+        /// The post's id once its save answered (it is persisted, though no
+        /// read has shown it yet).
+        action_id: Option<String>,
     },
     Turn {
         seq: u64,
@@ -69,6 +72,22 @@ pub fn replies<'a>(posts: &'a [Post], parent: &Option<String>) -> Vec<&'a Post> 
         .collect()
 }
 
+/// The post the next message on this branch replies to: the last post the
+/// branch shows, **the reader's own saved post included** — once its save has
+/// answered, its id is the branch's tip whether or not a read has shown it
+/// yet. A streaming answer is not a post yet and is passed over; a post still
+/// saving has no id (and a second save waits for it).
+pub fn tip(rows: &[Row]) -> Option<String> {
+    for row in rows.iter().rev() {
+        match row {
+            Row::Post { post, .. } => return Some(post.action_id.clone()),
+            Row::Pending { action_id, .. } => return action_id.clone(),
+            Row::Turn { .. } => {}
+        }
+    }
+    None
+}
+
 /// The rows on screen. `chosen` maps a parent to the reply the reader chose
 /// there; `label` names a participant for a streaming answer.
 pub fn visible(
@@ -103,6 +122,7 @@ pub fn visible(
             rows.push(Row::Pending {
                 text: p.text.clone(),
                 created_at: p.created_at,
+                action_id: p.action_id.clone(),
             });
             pending_shown = true;
             cursor = p.action_id.clone();
@@ -241,6 +261,34 @@ mod tests {
         ];
         let rows = visible(&read, &chosen, Some(&pending), &[], none);
         assert_eq!(keys(&rows), ["q1", "q2[2/2]"]);
+    }
+
+    #[test]
+    fn a_saved_post_not_yet_read_back_is_the_branch_tip() {
+        // Q saved as a reply to P; the read that would show it has not landed.
+        let posts = [post("p", None)];
+        let pending = Pending {
+            text: "q".into(),
+            reply_to: Some("p".into()),
+            action_id: Some("q".into()),
+            created_at: 2,
+        };
+        let chosen = HashMap::from([(Some("p".to_string()), "q".to_string())]);
+        let rows = visible(&posts, &chosen, Some(&pending), &[turn(0, "q")], none);
+        assert_eq!(keys(&rows), ["p", "pending", "turn0"]);
+        // The next message answers Q, not P.
+        assert_eq!(tip(&rows).as_deref(), Some("q"));
+        // Before its save answers there is no tip to give.
+        let unsaved = Pending {
+            action_id: None,
+            ..pending
+        };
+        let rows = visible(&posts, &HashMap::new(), Some(&unsaved), &[], none);
+        assert_eq!(tip(&rows), None);
+        // Read back, the post itself is the tip.
+        let read = [post("p", None), post("q", Some("p"))];
+        let rows = visible(&read, &chosen, None, &[], none);
+        assert_eq!(tip(&rows).as_deref(), Some("q"));
     }
 
     #[test]

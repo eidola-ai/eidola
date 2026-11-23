@@ -175,10 +175,7 @@ impl ConversationView {
 
     /// The action id at the end of the visible branch.
     fn branch_end(&self) -> Option<String> {
-        self.rows.iter().rev().find_map(|r| match r {
-            Row::Post { post, .. } => Some(post.action_id.clone()),
-            _ => None,
-        })
+        branch::tip(&self.rows)
     }
 
     fn author_of(&self, action_id: &str, cx: &gpui::App) -> SharedString {
@@ -361,7 +358,9 @@ impl ConversationView {
                     )
                     .into_any_element()
             }
-            Row::Pending { text, created_at } => {
+            Row::Pending {
+                text, created_at, ..
+            } => {
                 let editor = self.body(&key, &text, window, cx);
                 div()
                     .id(("pending", ix))
