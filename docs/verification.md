@@ -64,6 +64,17 @@ sha256sum eidola-gui-linux-nix-amd64.tar.gz     # `nix` row: archiveSha256
 
 **The mobile app bundle** (schema 6) is published as one container, `eidola-mobile-bundle.tar`, whose `sha256` the row records. Its files are listed one by one in the same row, and its `digest` is the fingerprint the mobile shell computes from the bytes it serves and shows in its own native sheet (long-press the app icon → **Bundle digest**). So the bundle running on a phone is checked against a verified release by reading that digest off the sheet and finding it in the manifest; and a downloaded container by unpacking it and running `mobile/tools/bundle_digest.py` over the result. The app's own updater checks the container's hash, then every file's length and hash, before it hands anything to the shell, and the shell's digest of what it stored after (`crates/eidola-app-core/src/updater/mobile/`). The iOS shell around it has no row: Apple re-signs and encrypts what the App Store distributes, so no installed binary can be compared with a build; the Android shell's unsigned APK can (`mobile/android/repro.sh`, and `mobile/android/tools/strip_apk_signature.py` to reduce a signed APK to it).
 
+The bundle a release records is built in the same pinned StageX toolchain as the server and CLI images (`oci/eidola-mobile-bundle/Containerfile`, every build stage on linux/amd64), so rebuilding it is `just mobile-bundle-release` on any host with Docker, which prints the digest to compare. The faster development build on a host's own Rust (`just mobile-bundle`) is a different bundle: rustup's Rust and StageX's are the same release built differently, and the code they generate differs (`crates/eidola-mobile/AGENTS.md` → The release bundle).
+
+**The Android APK.** A release publishes its own signed APK beside the copy on Google Play. Strip its signature and it is byte for byte the unsigned APK the manifest records:
+
+```bash
+python3 mobile/android/tools/strip_apk_signature.py Eidola-<version>-android.apk stripped.apk
+sha256sum stripped.apk        # compare with eidola-mobile-android-apk
+```
+
+Its own hash and its signing certificate's SHA-256 (what Android shows for an installed app, and what `apksigner verify --print-certs` prints) are signed facts in the attestation from attestation schema 3, not manifest rows: both depend on the release key. The copy on Play cannot be compared that way. Play takes an App Bundle, rebuilds the APKs it delivers from it, and signs them with its own key, adding to the manifest and resource table as it does; so a Play install is compared by content, file by file: its `classes.dex` and every file of the app bundle under `assets/` must be the same bytes as in the published APK (`mobile/android/tools/compare_apk_contents.py`), while the manifest, the resource table and the signature are Play's. The App Bundle we upload is built from the same compiled shell and the same bundle as the APK (`mobile/android/build.sh --aab`), and `mobile/android/repro.sh` checks that the APK bundletool generates from it, as Play does, carries the APK's code and bundle unchanged.
+
 **Rebuild — the stronger check.** Build the artifact and its archive from the release's git ref and compare both hashes to the verified manifest:
 
 ```bash
