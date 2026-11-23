@@ -38,6 +38,8 @@ None of these is a real manifest or a real workflow. The `.yml` files deliberate
 | `bad-bundle-file-field.json` | A field added to one file of the mobile bundle's listing (`mtime`). The listing is nested, and held to an exact key set like every other level. |
 | `bad-bundle-digest.json` | A mobile bundle row whose `digest` is not the digest of its own listing (`mobile/shell-contract.md` → Bundle digest). Every client refuses such a row, so the gate does first. |
 
+`good-schema-6-emitted.json` is accepted rather than refused: the manifest `scripts/artifact-manifest.sh` composes once it emits schema 6, written by its own producers over the inputs in `../manifest-flip/` with the constant flipped in a copy (`scripts/test-manifest-schema-flip.sh`, which requires it byte for byte and rewrites it with `--update`). App-core's claims check and `release-tool` read it in their tests too.
+
 | Accepted fixture | The shape it keeps open |
 | --- | --- |
 | `good-schema-6.json` | Manifest schema 6's mobile rows: the unsigned Android APK (`file`) and the app bundle (`bundle`, with its container hash, digest and file listing). The client's reader parses this same file (`updater::mobile::row` tests), so the gate and the client agree on the shape and the digest. |

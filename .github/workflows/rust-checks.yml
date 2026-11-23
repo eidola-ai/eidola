@@ -172,6 +172,12 @@ jobs:
         # Bash + python3, no toolchain.
         run: ./scripts/test-release-assets.sh
 
+      - name: Test the next manifest schema's emit side
+        # Deliberately ungated, like the two above: what flipping
+        # MANIFEST_SCHEMA_VERSION turns on otherwise runs first on the
+        # release that flips it. Bash, jq and python3; builds nothing.
+        run: ./scripts/test-manifest-schema-flip.sh
+
       - name: Test the release signing-identity guard
         # Deliberately ungated: the guard runs only on a real `v*` tag,
         # where a mistake in it either signs a release the previous

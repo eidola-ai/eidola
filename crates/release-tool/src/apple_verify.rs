@@ -716,6 +716,31 @@ mod tests {
     }
 
     #[test]
+    fn the_emitter_s_schema_6_manifest_records_what_attest_reads() {
+        // What `scripts/artifact-manifest.sh` composes once it emits schema
+        // 6 (`scripts/test-manifest-schema-flip.sh` holds this file to the
+        // bytes its producers write): the unsigned macOS zip the Apple claim
+        // binds to is recorded, and so is the unsigned APK a signed one must
+        // reduce to.
+        let manifest = include_bytes!(
+            "../../../scripts/fixtures/manifest-determinism/good-schema-6-emitted.json"
+        );
+        assert_eq!(
+            manifest_recorded_sha256(manifest, MACOS_UNSIGNED_ZIP_KEY).unwrap(),
+            Some("5".repeat(64))
+        );
+        let apk = manifest_recorded_sha256(manifest, "eidola-mobile-android-apk")
+            .unwrap()
+            .expect("schema 6 records the unsigned APK");
+        assert_eq!(apk.len(), 64);
+        assert!(
+            manifest_recorded_sha256(manifest, "eidola-mobile-bundle")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn a_recorded_row_reads_back_as_bare_hex() {
         let manifest = br#"{
             "schema_version": 3,

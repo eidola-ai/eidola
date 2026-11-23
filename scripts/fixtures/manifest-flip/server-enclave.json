@@ -1,0 +1,10 @@
+{
+  "cvm_version": "0.15.4-rc.2@sha256:689c945f62d8f8507d5051dfdc97abc019e7ea5c9cc153557fe8b6850db45dc2",
+  "igvm_sha256": "112501c5b3fa891cf05c96841903b000bd012bfa13cdc780692ce8f625470216",
+  "schema_version": 2,
+  "sev_snp": {
+    "guest_policy": "0x30133",
+    "host_data": "aa718d5425d9269e1186399efd67385bc0a7d083152569d331297e60a987c278",
+    "measurement": "cea56f9f4f8440ae96e6e6528a7571f4179a062e7a0919b1021c98dd3bc9f44eeeda321568407130745f80057533c015"
+  }
+}
