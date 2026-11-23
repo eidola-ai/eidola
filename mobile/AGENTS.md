@@ -70,7 +70,7 @@ The iOS check is a **local gate** (no macOS runner here): run `just mobile-ios-t
 
 ### Reproducibility
 
-The unsigned APK is a function of the source, the bundle and these pinned inputs, fetched once by `tools.sh` into `~/.cache/eidola/android-tools` and checked by SHA-256 before use (Google's repository manifest lists their SHA-1s, which match too). The local SDK is not used to build.
+The unsigned APK is a function of the source, the bundle and these pinned inputs, downloaded by `tools.sh` into `~/.cache/eidola/android-tools/archives` and, on every run, checked by SHA-256 and unpacked afresh before anything in them runs (`tools/fetch.sh`: an unpacked tree from an earlier run is never used, and a cached archive that does not hash to its pin is fetched again; `test-tools-cache.sh` holds both, and CI caches the archives alone). Google's repository manifest lists their SHA-1s, which match too. The local SDK is not used to build.
 
 | Input | Version | SHA-256 of the archive |
 |---|---|---|

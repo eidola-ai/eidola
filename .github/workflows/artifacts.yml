@@ -1158,14 +1158,17 @@ jobs:
           driver-opts: |
             image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
 
-      - name: Cache the pinned Android build tools # zizmor: ignore[cache-poisoning]
-        # Not gated on tags: every archive is checked against its pinned
-        # SHA-256 before it is unpacked (mobile/android/tools.sh), so a
-        # restored entry cannot alter outputs.
+      - name: Cache the pinned Android build tools' archives # zizmor: ignore[cache-poisoning]
+        # Archives only, never an unpacked tool: every run hashes each archive
+        # against its pin and unpacks it afresh before anything in it runs
+        # (mobile/android/tools/fetch.sh; mobile/android/test-tools-cache.sh
+        # holds that). Skipped entirely on v* release tags, like the cargo
+        # cache, so the attested release fetches its tools from their sources.
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cache/eidola/android-tools
-          key: android-tools-${{ hashFiles('mobile/android/tools.sh') }}
+          path: ~/.cache/eidola/android-tools/archives
+          key: android-tools-${{ hashFiles('mobile/android/tools.sh', 'mobile/android/tools/fetch.sh') }}
 
       - name: Build the release bundle and the Android shell over it
         id: partial

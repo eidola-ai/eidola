@@ -47,12 +47,16 @@ jobs:
         with:
           persist-credentials: false
 
-      # The archives are verified by SHA-256 on every use of the cache too.
-      - name: Cache the pinned build tools
+      # Archives only, never an unpacked tool: every run hashes each archive
+      # against its pin and unpacks it afresh (mobile/android/tools/fetch.sh).
+      - name: Cache the pinned build tools' archives
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cache/eidola/android-tools
-          key: android-tools-${{ hashFiles('mobile/android/tools.sh') }}
+          path: ~/.cache/eidola/android-tools/archives
+          key: android-tools-${{ hashFiles('mobile/android/tools.sh', 'mobile/android/tools/fetch.sh') }}
+
+      - name: The tools cache refuses bytes it did not check in this run
+        run: mobile/android/test-tools-cache.sh
 
       - name: Build twice, strip a signed build, compare with the committed hash
         run: |
@@ -70,18 +74,10 @@ jobs:
         with:
           persist-credentials: false
 
-      # Sources only (the registry and git checkouts) and the wasm-bindgen
-      # CLI, never a target directory: both builds below start from scratch.
-      - name: Cache crate sources and the wasm-bindgen CLI
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            mobile/.tools
-          key: mobile-bundle-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-
+      # No cache: a restored wasm-bindgen CLI would run without its bytes
+      # being checked, and cargo does not re-hash a crate archive it finds
+      # already downloaded. Everything comes from its source, checked by
+      # Cargo.lock, in every run.
       - name: Build the bundle twice from scratch and compare
         run: |
           rustup show

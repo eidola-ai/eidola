@@ -1,6 +1,7 @@
-# Sourced by build.sh. Fetches the pinned build tools once into a cache and verifies each
-# archive by SHA-256 before it is unpacked; nothing else is downloaded, and the local SDK is
-# not used. (Google's repository manifest lists the archives' SHA-1s; those match too.)
+# Sourced by build.sh. Fetches the pinned build tools into a cache and, on every run, checks each
+# archive by SHA-256 before it is unpacked afresh (tools/fetch.sh); nothing else is downloaded,
+# and the local SDK is not used. (Google's repository manifest lists the archives' SHA-1s; those
+# match too.)
 #
 #   build-tools 36.1.0   aapt2, d8/R8, zipalign, apksigner (per host OS; Linux is x86_64)
 #   platform android-36  r02, android.jar
@@ -18,32 +19,7 @@ case "$(uname -s)" in
   *) echo "unsupported host $(uname -s)" >&2; exit 1 ;;
 esac
 
-# sha256 FILE... -> `<hex>  <file>` lines, with whichever tool the host has.
-sha256() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
-
-# fetch URL SHA256 [NAME] -> prints the directory the verified archive was unpacked into. With NAME
-# the download is a single file, kept as it is under that name (a jar is not unpacked).
-fetch() {
-  local url="$1" sha="$2" name="${3:-}" dir="$ANDROID_TOOLS/$2"
-  if [[ ! -f "$dir/.verified" ]]; then
-    rm -rf "$dir" && mkdir -p "$dir"
-    echo "fetching $url" >&2
-    local file="$dir/${name:-archive.zip}"
-    curl -sSfL --retry 3 -o "$file" "$url"
-    local got
-    got="$(sha256 "$file" | cut -d' ' -f1)"
-    if [[ "$got" != "$sha" ]]; then
-      echo "$url: SHA-256 $got, expected $sha" >&2
-      rm -rf "$dir"
-      exit 1
-    fi
-    if [[ -z "$name" ]]; then
-      unzip -q "$file" -d "$dir" && rm "$file"
-    fi
-    touch "$dir/.verified"
-  fi
-  echo "$dir"
-}
+source "$(dirname "${BASH_SOURCE[0]}")/tools/fetch.sh"
 
 BT="$(fetch "$GOOGLE/$BT_ZIP" "$BT_SHA")/android-16"
 ANDROID_JAR="$(fetch "$GOOGLE/platform-36_r02.zip" 37607369a28c5b640b3a7998868d45898ebcb777565a0e85f9acf36f29631d2e)/android-36/android.jar"
