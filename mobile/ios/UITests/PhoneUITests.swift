@@ -100,6 +100,70 @@ final class PhoneUITests: XCTestCase {
         element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
 
+    /// The mean luminance (0 dark … 1 light) of a strip of the screen just under the status bar's
+    /// height, where every screen paints only its paper: the palette in force.
+    private func paperLuminance() -> CGFloat {
+        let image = XCUIScreen.main.screenshot().image
+        guard let cg = image.cgImage else { return -1 }
+        let width = cg.width, height = cg.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let context = CGContext(data: &pixels, width: width, height: height, bitsPerComponent: 8,
+                                bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        context?.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+        // A row near the bottom, above the home indicator: paper, under no text.
+        let y = height * 9 / 10
+        var sum: CGFloat = 0
+        var count: CGFloat = 0
+        for x in stride(from: width / 10, to: width * 9 / 10, by: 7) {
+            let i = (y * width + x) * 4
+            sum += (0.2126 * CGFloat(pixels[i]) + 0.7152 * CGFloat(pixels[i + 1]) + 0.0722 * CGFloat(pixels[i + 2])) / 255
+            count += 1
+        }
+        return sum / count
+    }
+
+    /// Scroll a screen's body (not a transcript) by `dy` points (positive: toward the start), in
+    /// strokes that stay well inside the window (a stroke from an edge is a system gesture).
+    private func scrollBody(_ dy: CGFloat) {
+        let window = app.windows.firstMatch
+        let origin = window.coordinate(withNormalizedOffset: .zero)
+        let midY = window.frame.midY
+        let most = window.frame.height * 0.5
+        var left = dy
+        while abs(left) > 1 {
+            let stroke = max(-most, min(most, left))
+            origin.withOffset(CGVector(dx: window.frame.midX, dy: midY - stroke / 2))
+                .press(forDuration: 0.05,
+                       thenDragTo: origin.withOffset(CGVector(dx: window.frame.midX, dy: midY + stroke / 2)),
+                       withVelocity: .slow, thenHoldForDuration: 0.3)
+            left -= stroke
+        }
+    }
+
+    /// Tap a probe on a scrolling screen, scrolling toward the end until it is in view.
+    private func tapScrolling(_ name: String) {
+        let element = probe(name)
+        let window = app.windows.firstMatch
+        for _ in 0..<10 {
+            if element.exists && element.frame.midY < window.frame.maxY - 60 && element.frame.midY > 120 { break }
+            scrollBody(-300)
+        }
+        tap(name)
+    }
+
+    /// The first run, on a fresh install, as far as the choice of an account.
+    private func throughTheIntroduction(shots prefix: String?) {
+        waitFor("onboarding/cta/understood", timeout: 60)
+        if let prefix { shot("\(prefix)-about") }
+        tap("onboarding/cta/understood")
+        waitFor("onboarding/cta/understood")
+        if let prefix { shot("\(prefix)-responsibility") }
+        tap("onboarding/cta/understood")
+        waitFor("onboarding/cta/new-account")
+        if let prefix { shot("\(prefix)-get-started") }
+    }
+
     private func keyboardUp() -> Bool {
         let up = app.keyboards.firstMatch.waitForExistence(timeout: 10)
         // The first keyboard of a fresh simulator teaches swipe typing over itself.
@@ -130,7 +194,7 @@ final class PhoneUITests: XCTestCase {
         XCUIDevice.shared.appearance = .light
         app.launch()
 
-        // The Library of a fresh install.
+        // The Library (testOnboardingAccount set the account up on this install, and ran first).
         waitFor("library/new", timeout: 60)
         shot("01-library-empty")
 
@@ -220,8 +284,35 @@ final class PhoneUITests: XCTestCase {
     /// and answered.
     func testChineseInput() throws {
         app.launch()
+        // A fresh install opens on the first run, in the app's zh-Hans words; going on without
+        // an account leads to the Library.
+        throughTheIntroduction(shots: "60-zh-onboarding")
+        tap("onboarding/cta/skip-account")
         waitFor("library/new", timeout: 60)
         shot("15-library-zh")
+        // The other screens, in Chinese.
+        tap("library/settings")
+        waitFor("settings/account")
+        shot("61-zh-settings")
+        tap("settings/account")
+        waitFor("account/set-up")
+        shot("62-zh-account-none")
+        tap("account/back")
+        tap("settings/appearance")
+        waitFor("appearance/day-night/system")
+        shot("63-zh-appearance")
+        tap("appearance/back")
+        tap("settings/updates")
+        waitFor("updates/check")
+        sleep(2)
+        shot("64-zh-updates")
+        tap("updates/back")
+        tap("settings/about")
+        waitFor("about/licences")
+        shot("65-zh-about")
+        tap("about/back")
+        tap("settings/back")
+        waitFor("library/new")
         tap("library/new")
         tap("composer/field")
         XCTAssertTrue(keyboardUp(), "the keyboard did not come up")
@@ -257,5 +348,218 @@ final class PhoneUITests: XCTestCase {
         shot("13-conversation-night-end")
         drag(3000)
         shot("14-conversation-night-start")
+        // The other screens at night.
+        tap("conversation/back")
+        tap("library/settings")
+        waitFor("settings/account")
+        shot("70-night-settings")
+        tap("settings/account")
+        waitFor("account/balance", timeout: 60)
+        shot("71-night-account")
+        tapScrolling("account/purchase")
+        waitFor("purchase/plan/0", timeout: 60)
+        shot("72-night-plans")
+        tap("purchase/back")
+        tap("account/back")
+        tap("settings/appearance")
+        waitFor("appearance/day-night/system")
+        shot("73-night-appearance")
+        tap("appearance/back")
+        tap("settings/updates")
+        waitFor("updates/check")
+        sleep(3)
+        shot("74-night-updates")
+        tap("updates/back")
+        tap("settings/about")
+        waitFor("about/licences")
+        shot("75-night-about")
+    }
+
+    /// A fresh install's first run against the local dev stack's real gateway (behind its
+    /// attesting shim): the introduction, a new account created under the terms snapshot the
+    /// consent page rendered, its credentials, the plans, a checkout handed to the system
+    /// browser, and back in the app the balance read again with the purchase in it.
+    func testOnboardingAccount() throws {
+        XCUIDevice.shared.appearance = .light
+        app.launch()
+        throughTheIntroduction(shots: "20-onboarding")
+        tap("onboarding/cta/new-account")
+        // The documents this account will accept, as the gateway lists them.
+        waitFor("onboarding/terms/terms-of-service", timeout: 60)
+        waitFor("onboarding/terms/privacy-policy")
+        shot("23-onboarding-consent")
+        // Not agreed: the Create button is off, and a tap on it creates nothing.
+        tapScrolling("onboarding/cta/create")
+        sleep(2)
+        XCTAssertFalse(probe("onboarding/copy/account-id/copy").exists, "created without agreement")
+        tapScrolling("onboarding/agree")
+        shot("24-onboarding-agreed")
+        tapScrolling("onboarding/cta/create")
+        waitFor("onboarding/copy/account-id/copy", timeout: 90)
+        waitFor("onboarding/copy/account-secret/copy")
+        shot("25-onboarding-new-account")
+        tapScrolling("onboarding/cta/saved")
+        waitFor("onboarding/cta/plans")
+        shot("26-onboarding-add-credit")
+        tap("onboarding/cta/plans")
+        waitFor("purchase/plan/0", timeout: 60)
+        shot("27-plans")
+
+        // Checkout leaves for the system browser.
+        tap("purchase/plan/0")
+        let safari = XCUIApplication(bundleIdentifier: "com.apple.mobilesafari")
+        XCTAssertTrue(safari.wait(for: .runningForeground, timeout: 30), "the browser did not open")
+        sleep(4)
+        shot("28-checkout-in-the-browser")
+        XCTAssertEqual(app.state, .runningBackground)
+        app.activate()
+        waitFor("purchase/opened", timeout: 30)
+        // Back in the foreground, the balance is read again: the purchase is in it.
+        sleep(4)
+        shot("29-back-from-the-browser")
+
+        tap("purchase/back")
+        waitFor("onboarding/cta/purchase-later")
+        tap("onboarding/cta/purchase-later")
+        waitFor("library/settings", timeout: 30)
+        shot("30-library-after-the-first-run")
+
+        // The account: its credentials, and the balance read again since the browser, with the
+        // purchase in it as a pool of its own.
+        tap("library/settings")
+        waitFor("settings/account")
+        shot("31-settings")
+        tap("settings/account")
+        waitFor("account/balance", timeout: 60)
+        waitFor("account/pool/0", timeout: 30)
+        shot("32-account")
+        tap("account/secret/reveal")
+        sleep(1)
+        shot("33-account-secret-shown")
+        tap("account/secret/reveal")
+        tapScrolling("account/reset")
+        waitFor("account/reset/warning")
+        shot("34-account-reset-armed")
+        tapScrolling("account/reset/keep")
+        waitFor("account/reset")
+        tap("account/back")
+        tap("settings/back")
+        waitFor("library/new")
+    }
+
+    /// Settings that apply at once: the night palette from Appearance, the text size; then the
+    /// wallet, About and the licences.
+    func testSettings() throws {
+        XCUIDevice.shared.appearance = .light
+        app.launch()
+        waitFor("library/settings", timeout: 60)
+        tap("library/settings")
+        tap("settings/appearance")
+        waitFor("appearance/day-night/night")
+        sleep(1)
+        let day = paperLuminance()
+        shot("40-appearance-day")
+        tap("appearance/day-night/night")
+        sleep(2)
+        let night = paperLuminance()
+        shot("41-appearance-night-live")
+        XCTAssertGreaterThan(day, 0.6, "not the day palette before")
+        XCTAssertLessThan(night, 0.3, "the night palette did not apply live")
+        tap("appearance/text-size/larger")
+        tap("appearance/text-size/larger")
+        sleep(1)
+        shot("42-appearance-larger-text-night")
+        tap("appearance/text-size/reset")
+        tap("appearance/day-night/system")
+        sleep(2)
+        XCTAssertGreaterThan(paperLuminance(), 0.6, "System did not follow the light simulator")
+        tap("appearance/back")
+        tap("settings/wallet")
+        waitFor("wallet/refresh")
+        sleep(2)
+        shot("43-wallet")
+        tap("wallet/back")
+        tap("settings/about")
+        waitFor("about/licences")
+        sleep(2)
+        shot("44-about")
+        scrollBody(-600)
+        shot("45-about-end")
+        tapScrolling("about/licences")
+        waitFor("licences/row/0", timeout: 30)
+        shot("46-licences")
+        tap("licences/row/0")
+        sleep(1)
+        shot("47-licence-text")
+        tap("licences/back")
+        tap("about/back")
+        tap("settings/back")
+        waitFor("library/new")
+    }
+
+    /// The verified update, approved here: the check offers a release (a fixture the harness
+    /// serves, taken as verified: no release recording a bundle can be signed outside a
+    /// release); nothing is staged until the approval; approved, it is downloaded, checked,
+    /// staged and activated, and the app restarts into it and confirms it. Then an update that
+    /// never starts: the next launch is back on the confirmed one, and says so. Then the way
+    /// back to the bundle built into the app.
+    func testUpdate() throws {
+        XCUIDevice.shared.appearance = .light
+        app.launch()
+        waitFor("library/settings", timeout: 60)
+        tap("library/settings")
+        tap("settings/updates")
+        waitFor("updates/serving/embedded", timeout: 30)
+        if probe("updates/accept-claims").waitForExistence(timeout: 30) {
+            shot("50-update-claims-changed")
+            tapScrolling("updates/accept-claims")
+        }
+        waitFor("updates/approve", timeout: 30)
+        shot("51-update-available")
+        // The approval gate: offered and verified, but nothing is staged until the tap.
+        sleep(3)
+        XCTAssertTrue(probe("updates/serving/embedded").exists)
+        tapScrolling("updates/approve")
+        // Staged, activated, the app reloaded into it; its first frame confirmed it.
+        waitFor("library/settings", timeout: 120)
+        tap("library/settings")
+        tap("settings/updates")
+        waitFor("updates/serving/update-confirmed", timeout: 30)
+        sleep(2)
+        scrollBody(-1500)
+        shot("52-update-running-confirmed")
+
+        // The next release never starts.
+        scrollBody(1500)
+        if probe("updates/accept-claims").waitForExistence(timeout: 30) {
+            tapScrolling("updates/accept-claims")
+        }
+        waitFor("updates/approve", timeout: 60)
+        tapScrolling("updates/approve")
+        sleep(8)
+        shot("53-broken-update-on-trial")
+        app.terminate()
+        app.launch()
+        waitFor("library/settings", timeout: 60)
+        tap("library/settings")
+        waitFor("settings/updates")
+        shot("54-settings-update-failed")
+        tap("settings/updates")
+        waitFor("updates/fell-back", timeout: 30)
+        waitFor("updates/serving/update-confirmed")
+        sleep(2)
+        shot("55-update-fell-back")
+        scrollBody(-6000)
+        shot("55b-update-fell-back-running")
+
+        // Back to the bundle built into the app.
+        tapScrolling("updates/revert")
+        waitFor("library/settings", timeout: 60)
+        tap("library/settings")
+        tap("settings/updates")
+        waitFor("updates/serving/embedded", timeout: 30)
+        sleep(2)
+        scrollBody(-1500)
+        shot("56-reverted-to-embedded")
     }
 }
