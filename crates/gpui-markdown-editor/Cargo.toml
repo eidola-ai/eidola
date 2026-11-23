@@ -19,7 +19,6 @@ path = "src/bin/demo.rs"
 # The same exact pins as eidola-gui, so the workspace resolves one gpui (see
 # eidola-gui's AGENTS.md → gpui / gpui-component pinning).
 gpui = { package = "gpui-pre", version = "=0.3.12" }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit"] }
 gpui-component = "=0.10.0"
 gpui-kit-assets = "=0.10.0"
 
@@ -43,6 +42,12 @@ ratex-font = "0.1.13"
 ratex-katex-fonts = "0.1.13"
 smallvec = "1.15"
 unicode-segmentation = "1"
+
+# Only the demo binary opens a platform; the library draws through whatever
+# platform its host runs. Native-only, so the library builds for wasm32 (the
+# mobile app) without the platform crate's default multi-threaded web backend.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit"] }
 
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }

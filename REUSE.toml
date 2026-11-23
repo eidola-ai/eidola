@@ -43,6 +43,8 @@ path = [
     "crates/eidola-gui/**",
     "crates/eidola-notepad/**",
     "crates/eidola-mobile/**",
+    "crates/eidola-theme/**",
+    "crates/eidola-i18n/**",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"

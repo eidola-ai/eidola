@@ -102,6 +102,8 @@ All view roots are wrapped in `gpui_component::Root` before `cx.open_window`. **
 
 ## Theme — Circadian (`src/theme.rs`)
 
+**The look is shared with the mobile app through `crates/eidola-theme`**: the palettes (`circadian_day` / `circadian_night` and the tint derivation), the pure schedule (`ThemeSettings`, `DayPhases`, `canonical_hour`, `character_for_hour`, `resolve`), the Newsreader faces and the prose typography (`eidola_theme::prose`: `prose_style`, `quoted_passage_wash`, the `PROSE_*` constants). That crate is pure and wasm-compatible; this module keeps everything that is this app's: the `ThemeState` global, the local clock (`localtime_r`), the sun from tzdb (`src/solar.rs`), the native chrome sync, the focus-ring snapshot, and the config wiring. `space_view::prose_style(cx)` is the shared style at `theme::font_scale(cx)`.
+
 Two user-facing axes, persisted in app-core config, surfaced in Settings → General:
 
 - **Day/night** (`AppearanceSetting`, key `appearance`): `system` (default) / `day` / `night` / `auto` (follow the sun; fixed 06:00–18:00 without geography).
@@ -124,7 +126,7 @@ Wiring:
 
 Anchors (the product's "good paper at noon, reading lamp at midnight" pair): **Day `#ffffff`** — neutral near-white paper; the base's only warmth is a few accent foregrounds, never the ground. **Night `#15191e`** — cool blue-grey dark; elevated surfaces follow the blue-grey ramp (R < G < B throughout), text stays warm-grey (`#d4d0c8`), brand warm orange (`#c39669`). The warm-on-cool night tension is deliberate; don't "fix" it by cooling the foregrounds. These anchors are the reference (not the marketing site).
 
-**Body font is Newsreader 16pt** (SIL OFL 1.1) — **six static TTF instances** (Regular, Italic, Medium, SemiBold, Bold, BoldItalic) in `assets/fonts/`, embedded via `include_bytes!`, registered with `cx.text_system().add_fonts`. Statics rather than the variable fonts because **gpui's macOS text system does not apply variable-font weight axes** — each TTF registers as one face at its default instance, so with only variable TTFs every weight request resolved to Regular and rendered un-bold. The Medium (500) face backs the prose heading weight. The theme family name is `"Newsreader 16pt"` (the typographic family, nid 16, that all six faces report).
+**Body font is Newsreader 16pt** (SIL OFL 1.1) — **six static TTF instances** (Regular, Italic, Medium, SemiBold, Bold, BoldItalic) in `crates/eidola-theme/assets/fonts/`, embedded there via `include_bytes!`, registered through `eidola_theme::load_fonts`. Statics rather than the variable fonts because **gpui's macOS text system does not apply variable-font weight axes** — each TTF registers as one face at its default instance, so with only variable TTFs every weight request resolved to Regular and rendered un-bold. The Medium (500) face backs the prose heading weight. The theme family name is `"Newsreader 16pt"` (the typographic family, nid 16, that all six faces report).
 
 ## Localization (`locales/`, `build.rs`, `src/i18n.rs`)
 
@@ -134,7 +136,7 @@ User-facing strings live in Fluent (`.ftl`) files under `crates/eidola-gui/local
 
 **Adding a message** — write it in `locales/en/<topic>.ftl`, rebuild, and call the generated accessor: id `about-version-value` becomes `i18n::msg::about_version_value(cx, version)`. **A message with a new variable also joins the argument bag in `every_message_formats_in_every_shipped_locale`** — that test passes one bag for every message, so a variable missing from it surfaces as an unresolved placeable there rather than on a reader's screen. A locale directory may hold several `.ftl` files (they are concatenated in filename order); the file's *name* carries no meaning, so group by surface. Translations restate the same ids in their own directory and may omit any of them.
 
-**The codegen contract** (`build_support/codegen.rs`, included by both `build.rs` and `tests/i18n.rs` so it is testable without committing malformed FTL). The module doc carries the authoritative enumerated list — keep the two in step, and add a rule there whenever you add a way to fail. In summary:
+**The codegen contract** (`crates/eidola-i18n/src/codegen.rs` — shared with the mobile app, run by `build.rs` through `eidola_i18n::build_script` and driven directly by `tests/i18n.rs`, so it is testable without committing malformed FTL). The runtime rules this module calls — the merged-bundle fallback (`bundle_for`), formatting with its error assertion, and negotiation (`match_locale`, `negotiate`) — are `eidola_i18n::runtime`, over this crate's generated `LOCALES`; the active-locale global, the cache, the config wiring and `sys-locale` stay here. The module doc carries the authoritative enumerated list — keep the two in step, and add a rule there whenever you add a way to fail. In summary:
 
 - One accessor per **English** message, with one parameter per placeable variable, in first-appearance order — so a **mistyped id is a missing function** and a **changed argument set is a changed signature**. Both are compile errors at the call site.
 - **A locale directory must be a canonical language tag.** The directory name *is* the tag at runtime and negotiation resolves to canonical spellings, so a `zh_Hans` or `zh-hans` directory would ship a translation nothing could ever select — silently, since it still parses and still embeds.

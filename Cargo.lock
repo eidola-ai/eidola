@@ -2806,8 +2806,9 @@ version = "0.1.0"
 dependencies = [
  "eidola-app-core",
  "eidola-common",
+ "eidola-i18n",
+ "eidola-theme",
  "fluent-bundle",
- "fluent-syntax",
  "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
@@ -2827,6 +2828,15 @@ dependencies = [
  "sys-locale",
  "tempfile",
  "tokio",
+ "unic-langid",
+]
+
+[[package]]
+name = "eidola-i18n"
+version = "0.1.0"
+dependencies = [
+ "fluent-bundle",
+ "fluent-syntax",
  "unic-langid",
 ]
 
@@ -2967,6 +2977,17 @@ dependencies = [
  "reqwest",
  "rustls",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "eidola-theme"
+version = "0.1.0"
+dependencies = [
+ "eidola-app-core",
+ "gpui-component",
+ "gpui-markdown-editor",
+ "gpui-pre",
+ "serde_json",
 ]
 
 [[package]]

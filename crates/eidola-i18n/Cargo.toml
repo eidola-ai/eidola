@@ -1,0 +1,20 @@
+[package]
+name = "eidola-i18n"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "GPL-3.0-only"
+
+[features]
+# The build-script half: an app's `build.rs` depends on this crate with
+# `default-features = false, features = ["codegen"]`.
+codegen = ["dep:fluent-syntax", "dep:unic-langid"]
+# The runtime half, for the app itself.
+runtime = ["dep:fluent-bundle", "dep:unic-langid"]
+
+[dependencies]
+fluent-bundle = { version = "0.16", optional = true }
+fluent-syntax = { version = "0.12", optional = true }
+unic-langid = { version = "0.9", optional = true }
