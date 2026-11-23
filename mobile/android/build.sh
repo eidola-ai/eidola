@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Builds the Android shell with the SDK's own tools and pinned kotlinc; no Gradle.
-#   build.sh [--bundle DIR] [--debug] [--out DIR]
+#   build.sh [--bundle DIR] [--debug] [--aab] [--out DIR]
 # --bundle  the bundle to embed (default: the app, built by ../build-bundle.sh; the tests embed
 #           ../contract-test)
 # --debug   a debuggable APK as ai.eidola.mobile.dev (console in logcat, inspectable WebView);
 #           the default, release, is ai.eidola.mobile
+# --aab     also the App Bundle Play takes, OUT/eidola-shell-unsigned.aab: the same compiled shell and
+#           bundle, laid out as a bundletool module (a release build only; Play signs what it
+#           delivers, and the upload key signs this file at release time, outside the build)
 # --out     output directory (default build/<release|debug>)
 # Writes OUT/eidola-shell-unsigned.apk, the reproducible artifact, and, when KEYSTORE names a
 # PKCS#12 key store (password KS_PASS, default "android"), OUT/eidola-shell-signed.apk.
@@ -13,15 +16,18 @@ export TZ=UTC LC_ALL=C LANG=C
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUNDLE=
 VARIANT=release
+AAB=false
 OUT=
 while (($#)); do
   case "$1" in
     --bundle) BUNDLE="$(cd "$2" && pwd)"; shift 2 ;;
     --debug) VARIANT=debug; shift ;;
+    --aab) AAB=true; shift ;;
     --out) OUT="$2"; shift 2 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
+[[ $AAB == true && $VARIANT == debug ]] && { echo "--aab builds the release variant only" >&2; exit 2; }
 OUT="$(mkdir -p "${OUT:-$HERE/build/$VARIANT}" && cd "${OUT:-$HERE/build/$VARIANT}" && pwd)"
 MIN_SDK=30
 source "$HERE/tools.sh"
@@ -72,6 +78,20 @@ if [[ -n "${KEYSTORE:-}" ]]; then
     --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled true --alignment-preserved \
     --out "$OUT/eidola-shell-signed.apk" "$OUT/eidola-shell-unsigned.apk"
 fi
+# 7. The App Bundle: the same manifest and resources linked as protocol buffers, which is the form a
+#    bundle carries, and the module zip (manifest, resource table, dex, the bundle as assets) that
+#    bundletool wraps. Nothing is compiled twice: the dex and the bundle are the APK's own files.
+if $AAB; then
+  "$BT/aapt2" link --proto-format -o "$W/base-proto.apk" --manifest "$HERE/AndroidManifest.xml" \
+    -I "$ANDROID_JAR" --min-sdk-version "$MIN_SDK" --target-sdk-version 36 --no-compress \
+    $(find "$W/res" -name '*.flat' | LC_ALL=C sort)
+  python3 "$HERE/tools/aab_module.py" "$W/base.zip" "$W/base-proto.apk" "$W/dex/classes.dex" "$BUNDLE"
+  rm -f "$W/deflated.aab"
+  java -jar "$BUNDLETOOL" build-bundle --modules="$W/base.zip" --output="$W/deflated.aab"
+  #  bundletool's entries are deflated by the JDK's zlib; stored, they depend on nothing but their contents.
+  python3 "$HERE/tools/zip_stored.py" "$W/deflated.aab" "$OUT/eidola-shell-unsigned.aab"
+fi
 echo "bundle: $BUNDLE"
 echo "digest: $DIGEST"
 sha256 "$OUT"/eidola-shell-*.apk
+if $AAB; then sha256 "$OUT/eidola-shell-unsigned.aab"; fi
