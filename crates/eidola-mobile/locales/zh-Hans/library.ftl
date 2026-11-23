@@ -1,0 +1,9 @@
+library-title = 对话
+library-new = 新对话
+library-empty = 还没有对话。
+library-empty-start = 开始一段对话
+library-untitled = 未命名对话
+library-row-label = { $title }，{ $when }
+library-load-failed = 无法加载你的对话。
+library-refresh-failed = 无法刷新——重试
+library-retry = 重试

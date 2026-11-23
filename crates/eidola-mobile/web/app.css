@@ -1,0 +1,29 @@
+/* The page under the app's canvas: the Circadian paper (day #ffffff, night
+   #15191e) so nothing flashes before the first frame, and no scrolling of its
+   own (the app scrolls itself). */
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: #ffffff;
+  color: #000000;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+@media (prefers-color-scheme: dark) {
+  html,
+  body {
+    background: #15191e;
+    color: #ffffff;
+  }
+}
+#status {
+  position: fixed;
+  inset: auto 16px max(env(safe-area-inset-bottom), 16px) 16px;
+  margin: 0;
+  font: 14px -apple-system, system-ui, sans-serif;
+}

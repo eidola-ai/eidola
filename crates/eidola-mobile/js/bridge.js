@@ -36,3 +36,9 @@ export function postAndroid(text) {
   if (port) port.postMessage(text);
   else queued.push(text);
 }
+
+/** The webview's preferred languages (they follow the device's), as JSON. */
+export function preferredLanguages() {
+  const list = globalThis.navigator?.languages ?? [globalThis.navigator?.language];
+  return JSON.stringify((list ?? []).filter((l) => typeof l === "string"));
+}

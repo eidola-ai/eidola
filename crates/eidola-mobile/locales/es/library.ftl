@@ -1,0 +1,9 @@
+library-title = Conversaciones
+library-new = Nueva conversación
+library-empty = Aún no hay conversaciones.
+library-empty-start = Empezar una conversación
+library-untitled = Conversación sin título
+library-row-label = { $title }, { $when }
+library-load-failed = No se pudieron cargar tus conversaciones.
+library-refresh-failed = No se pudo actualizar — reintentar
+library-retry = Reintentar

@@ -1,5 +1,6 @@
 //! The webview side: the bridge's transport over `js/bridge.js`, and the
-//! bundle's entry point.
+//! bundle's entry points — `start` (the app), `startDev` (a development
+//! bundle) and `selfTest`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -8,9 +9,10 @@ use tokio::sync::oneshot;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
-use crate::boot::{self, BootOptions, Booted};
+use crate::boot::{self, BootOptions};
 use crate::client::{BoxFuture, ShellClient, Transport};
 use crate::protocol;
+use crate::ui;
 
 #[wasm_bindgen(module = "/js/bridge.js")]
 extern "C" {
@@ -21,6 +23,21 @@ extern "C" {
     fn open_android(on_reply: &Closure<dyn FnMut(String)>) -> Result<(), JsValue>;
     #[wasm_bindgen(js_name = postAndroid, catch)]
     fn post_android(text: &str) -> Result<(), JsValue>;
+    #[wasm_bindgen(js_name = preferredLanguages)]
+    fn preferred_languages_json() -> String;
+}
+
+#[cfg(feature = "dev")]
+#[wasm_bindgen(module = "/js/probes.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = syncProbes)]
+    fn sync_probes_js(json: &str);
+}
+
+/// Mirror the frame's probes into the page (`crate::ui::probe`).
+#[cfg(feature = "dev")]
+pub(crate) fn sync_probes(json: &str) {
+    sync_probes_js(json);
 }
 
 #[wasm_bindgen]
@@ -141,49 +158,91 @@ impl Transport for WebTransport {
     }
 }
 
-thread_local! {
-    /// The booted app, alive for the document's lifetime.
-    static APP: RefCell<Option<Booted<WebTransport>>> = const { RefCell::new(None) };
-}
-
+#[cfg(feature = "self-test")]
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| log_error(&format!("panic: {info}"))));
 }
 
-/// Boot the app on its shell and confirm the bundle. Resolves to a line for
-/// the page to show; rejects with the reason the boot failed.
+/// The webview's preferred languages (which follow the device's), most
+/// preferred first.
+fn preferred_languages() -> Vec<String> {
+    serde_json::from_str(&preferred_languages_json()).unwrap_or_default()
+}
+
+/// Start the app on its shell: open the window at once ("Opening…") and boot
+/// behind it; the interface confirms the bundle once it has drawn
+/// (`crate::ui::app`). Returns as soon as the window is up; a boot that fails
+/// is shown, not thrown.
 #[wasm_bindgen]
-pub async fn start() -> Result<String, JsValue> {
-    install_panic_hook();
+pub fn start() -> Result<(), JsValue> {
+    launch(None)
+}
+
+/// A development bundle's start: the same app, with the default agent seated
+/// on the development server `config` (`dev-backend.json`) names.
+#[cfg(feature = "dev")]
+#[wasm_bindgen(js_name = startDev)]
+pub fn start_dev(config: String) -> Result<(), JsValue> {
+    let config: crate::dev::DevConfig =
+        serde_json::from_str(&config).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    launch(Some(config))
+}
+
+#[cfg(feature = "dev")]
+type DevConfig = crate::dev::DevConfig;
+#[cfg(not(feature = "dev"))]
+type DevConfig = std::convert::Infallible;
+
+fn launch(dev: Option<DevConfig>) -> Result<(), JsValue> {
+    // Panics and gpui's log to the console.
+    gpui_platform::web_init();
     let transport = WebTransport::connect().map_err(|e| JsValue::from_str(&e))?;
-    let booted = boot::boot(ShellClient::new(transport), BootOptions::default())
-        .await
-        .map_err(|e| {
-            let message = format!("boot failed: {e}");
-            log_error(&message);
-            JsValue::from_str(&message)
-        })?;
-    let status = format!(
-        "booted on the {} shell {} (contract {}); bundle {} {}, {}",
-        booted.hello.platform,
-        booted.hello.shell,
-        booted.hello.contract,
-        booted.bundle.serving.version,
-        booted
-            .bundle
-            .serving
-            .digest
-            .as_deref()
-            .unwrap_or("(digest pending)"),
-        if booted.bundle.confirmed {
-            "confirmed"
-        } else {
-            "on trial"
-        },
-    );
-    log(&status);
-    APP.with(|app| *app.borrow_mut() = Some(booted));
-    Ok(status)
+    let boot: ui::app::Boot = Box::pin(async move {
+        let prepared = boot::prepare(ShellClient::new(transport), BootOptions::default())
+            .await
+            .map_err(|e| e.to_string())?;
+        log(&format!(
+            "booted on the {} shell {} (contract {})",
+            prepared.hello.platform, prepared.hello.shell, prepared.hello.contract
+        ));
+        #[cfg(feature = "dev")]
+        if let Some(config) = &dev {
+            crate::dev::seed(&prepared.core, config)
+                .await
+                .map_err(|e| format!("development server: {e}"))?;
+        }
+        #[cfg(not(feature = "dev"))]
+        let _ = dev;
+        let client = prepared.client;
+        let confirm: ui::app::Confirm = Box::new(move || {
+            Box::pin(async move {
+                boot::confirm(&client)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+        });
+        Ok(ui::app::Booted {
+            core: prepared.core,
+            confirm,
+        })
+    });
+    let languages = preferred_languages();
+    // The single-threaded web platform, with the browser's own fonts allowed
+    // as a fallback for CJK as well as emoji: the bundle's faces are Latin,
+    // and a reader writing Chinese must see Chinese.
+    let platform = std::rc::Rc::new(gpui_web::WebPlatform::new_with_backend_and_font_fallback(
+        false,
+        gpui_web::WebBackendPreference::Auto,
+        gpui_web::CanvasFontFallback::EmojiAndCjk,
+    ));
+    gpui::Application::with_platform(platform)
+        .with_assets(ui::Icons)
+        .run(move |cx| {
+            ui::init(cx);
+            ui::open_window(boot, languages, cx);
+        });
+    Ok(())
 }
 
 /// The headless self-test (`crate::selftest`): `config` is the bundle's

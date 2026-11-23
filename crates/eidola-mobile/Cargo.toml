@@ -16,12 +16,30 @@ crate-type = ["cdylib", "rlib"]
 # The headless self-test (`src/selftest.rs`): only the self-test bundle
 # (`mobile/build-bundle.sh --self-test`) is built with it, so a release bundle
 # carries none of its code.
-self-test = ["dep:futures-util", "dep:sha2"]
+self-test = ["dep:sha2"]
+# Development bundles only (`mobile/build-bundle.sh --dev-backend URL`): seat
+# the default agent on an OpenAI-compatible server the developer names
+# (`mobile/tools/openai_stub.py`), and mirror every probe into the page as an
+# invisible labelled element, so the UI tests (XCUITest, UIAutomator) can find
+# what they tap. A release bundle carries neither.
+dev = []
 
 [dependencies]
 base64 = "0.23"
 eidola-app-core = { path = "../eidola-app-core", default-features = false }
-futures-util = { version = "0.3", default-features = false, optional = true }
+# The interface: gpui through the workspace's own pins (one gpui in the lock;
+# see crates/eidola-gui/AGENTS.md → gpui / gpui-component pinning), the
+# markdown editor every post renders through, and what the desktop app shares
+# with it: the Circadian look and the localization rules.
+eidola-i18n = { path = "../eidola-i18n", features = ["runtime"] }
+eidola-theme = { path = "../eidola-theme" }
+fluent-bundle = "0.16"
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui-component = "=0.10.0"
+gpui-kit-assets = "=0.10.0"
+gpui-markdown-editor = { path = "../gpui-markdown-editor" }
+log = "0.4"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -31,9 +49,19 @@ tinfoil-verifier = { path = "../tinfoil-verifier" }
 tokio = { version = "1", default-features = false, features = ["io-util", "sync"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
+# The single-threaded web platform on the stable toolchain: no default
+# features (they turn on the multi-threaded web backend).
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", default-features = false }
+# The web platform itself, constructed here to allow the browser's fonts as a
+# fallback for CJK text (`src/web.rs`).
+gpui_web = { package = "gpui-pre-web", version = "=0.3.12", default-features = false }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+
+[build-dependencies]
+# The typed accessors over `locales/` (shared with the desktop app).
+eidola-i18n = { path = "../eidola-i18n", default-features = false, features = ["codegen"] }
 
 [dev-dependencies]
 # Self-reference: the self-test's verdict is tested natively
@@ -47,3 +75,9 @@ tempfile = "3"
 tinfoil-shim-mock = { path = "../tinfoil-shim-mock" }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync"] }
 wiremock = "0.6"
+
+# The native test build links the markdown editor, whose platform crate would
+# otherwise compile gpui's Metal shaders with Apple's `metal` tool; runtime
+# shaders (as the GUI builds them) need no toolchain beyond Xcode's CLT.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["runtime_shaders"] }

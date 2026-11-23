@@ -1,10 +1,11 @@
-// Loads the app's wasm and boots it on the shell (src/web.rs → start).
+// Loads the app's wasm and starts it on the shell (src/web.rs → start): the
+// app draws its own window, boots behind it, and confirms the bundle once it
+// has drawn. Only a failure to load or start the wasm is reported here.
 import init, { start } from "./eidola_mobile.js";
 
-const status = document.getElementById("status");
 try {
   await init();
-  status.textContent = await start();
+  start();
 } catch (e) {
-  status.textContent = String(e?.message ?? e);
+  document.getElementById("status").textContent = String(e?.message ?? e);
 }

@@ -1,0 +1,3 @@
+app-starting = Abriendo…
+app-start-failed = Eidola no pudo abrir sus datos en este dispositivo.
+app-start-failed-detail = { $reason }

@@ -323,7 +323,8 @@ jobs:
         # tinfoil-verifier for wasm32-unknown-unknown without app-core's
         # `desktop` feature, and no other gate compiles that build, so it
         # would rot unnoticed. Clippy compiles everything `cargo check` does,
-        # so this is the check too; the self-test feature is linted with it.
+        # so this is the check too; the self-test and dev features are linted
+        # with it.
         # The target is added here rather than in rust-toolchain.toml, whose
         # hash the Nix toolchain pins. Its rustflags come from
         # .cargo/config.toml, which a RUSTFLAGS variable would replace, so
@@ -336,6 +337,8 @@ jobs:
             --target wasm32-unknown-unknown --no-default-features -- -D warnings
           cargo clippy -p eidola-mobile --target wasm32-unknown-unknown \
             --features self-test -- -D warnings
+          cargo clippy -p eidola-mobile --target wasm32-unknown-unknown \
+            --features dev -- -D warnings
           echo "::remove-matcher owner=rust::"
 
       - name: Markdown lint
