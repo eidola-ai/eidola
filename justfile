@@ -140,7 +140,7 @@ mobile-bundle *args:
 mobile-bundle-repro *args:
     mobile/bundle-repro.sh {{args}}
 
-# The release app bundle, built in the pinned StageX toolchain (Docker; --check, --update, --no-cache, --out DIR)
+# The release app bundle, built in the pinned StageX toolchain (Docker; --no-cache, --out DIR); prints its digest
 mobile-bundle-release *args:
     mobile/build-bundle-release.sh {{args}}
 

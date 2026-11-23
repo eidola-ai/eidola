@@ -1,0 +1,125 @@
+name: Mobile release bundle across architectures
+
+# The cross-architecture half of the release bundle's reproducibility check.
+# The per-change gate (mobile-bundle-release.yml) compares two native x86-64
+# builds in different environments; it cannot see a dependence on the host's
+# CPU or architecture. This builds the bundle on a native x86-64 runner and on
+# an arm64 runner running the same linux/amd64 stages under QEMU, from the
+# same commit, and fails unless the two are identical, file for file. Both
+# bundles are kept as artifacts.
+#
+# Weekly and on demand only, and never a merge gate: under emulation the
+# build takes about two and a half hours (measured: about 85 minutes for the
+# dependencies alone on a 4-CPU arm64 runner), against about nine natively.
+# A schedule runs from the default branch, so it builds that branch's tree;
+# `workflow_dispatch` builds the ref it is started on.
+#
+# The emulated build goes through the Docker engine's own BuildKit (the
+# `default` builder): the pinned BuildKit container's runtime cannot start an
+# emulated process on that runner ("can't get final child's PID from pipe",
+# for any linux/amd64 RUN), while the engine's starts them. A different
+# BuildKit does not weaken the comparison: the bundle's bytes are the
+# stages', whose image and inputs are pinned.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: Release bundle on ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: native x86-64
+            runner: ubuntu-24.04
+            builder: ""
+            timeout: 45
+            artifact: mobile-bundle-cross-arch-native
+          - host: x86-64 emulated on arm64
+            runner: ubuntu-24.04-arm
+            builder: default
+            timeout: 180
+            artifact: mobile-bundle-cross-arch-emulated
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        # The emulator's image runs privileged, so it is pinned by digest.
+        if: matrix.runner == 'ubuntu-24.04-arm'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: linux/amd64
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        # The pinned buildx and BuildKit the artifact chain builds with, for
+        # the native build. No layer cache of any kind.
+        if: matrix.builder == ''
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.31.1
+          platforms: linux/amd64
+          cache-binary: false
+          driver-opts: |
+            image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
+
+      - name: Build the release bundle
+        env:
+          BUILDER: ${{ matrix.builder }}
+        run: |
+          echo "$(uname -srm), $(nproc) CPUs"
+          started=$(date +%s)
+          mobile/build-bundle-release.sh --out "$RUNNER_TEMP/bundle" ${BUILDER:+--builder "$BUILDER"}
+          echo "built in $(( ($(date +%s) - started) / 60 )) min"
+
+      - name: Keep the bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/bundle
+          if-no-files-found: error
+          overwrite: true
+
+  compare:
+    name: Release bundle identical across architectures
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download both bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mobile-bundle-cross-arch-*
+          path: ${{ runner.temp }}/bundles
+
+      - name: Compare them file by file
+        env:
+          BUNDLES: ${{ runner.temp }}/bundles
+        run: |
+          for host in native emulated; do
+            echo "$host: $(python3 -I mobile/tools/bundle_digest.py "$BUNDLES/mobile-bundle-cross-arch-$host")"
+            (cd "$BUNDLES/mobile-bundle-cross-arch-$host" && find . -type f | LC_ALL=C sort | xargs sha256sum)
+          done
+          diff -r "$BUNDLES/mobile-bundle-cross-arch-native" "$BUNDLES/mobile-bundle-cross-arch-emulated"
+          echo "identical across architectures"
