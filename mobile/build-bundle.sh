@@ -2,12 +2,18 @@
 # Builds the app bundle the shells embed: eidola-mobile for wasm32-unknown-unknown on the pinned
 # stable toolchain, bound by the wasm-bindgen CLI at exactly the lockfile's version, plus the page
 # that loads it. No inline script anywhere (the shells' CSP refuses them).
-#   build-bundle.sh [--self-test | --dev-backend URL [--dev-model NAME]] [--out DIR]
+#   build-bundle.sh [--self-test | --dev-backend URL [--dev-model NAME] [--dev-update URL]
+#                   [--dev-eidola FILE]] [--out DIR]
 # --self-test    the self-test bundle (feature self-test, its own page); a release bundle has none of it
 # --dev-backend  a development bundle (feature dev): the default agent answers from the
 #                OpenAI-compatible server at URL (tools/openai_stub.py), and every probe is
 #                mirrored into the page for the UI tests; never a release bundle
 # --dev-model    the model id that server answers as (default: stub)
+# --dev-update   a development bundle's update check reads its release from this URL (a fixture
+#                release the UI tests serve, taken as verified) instead of the release feed
+# --dev-eidola   a development bundle trusts the Eidola gateway this JSON file describes (base_url,
+#                ark_pem, ask_pem, tls_ca_pem, measurement, host_data, guest_policy: the local
+#                stack's shim mock, tools/account_stack.sh) in place of the built-in pins
 # --out          output directory (default build/bundle, build/bundle-self-test or build/bundle-dev)
 # Prints the bundle digest (shell-contract.md → Bundle digest) and the sizes. CARGO_TARGET_DIR is
 # honoured; bundle-repro.sh builds twice in fresh ones and compares.
@@ -19,12 +25,16 @@ CRATE="$ROOT/crates/eidola-mobile"
 SELF_TEST=false
 DEV_BACKEND=
 DEV_MODEL=stub
+DEV_UPDATE=
+DEV_EIDOLA=
 OUT=
 while (($#)); do
   case "$1" in
     --self-test) SELF_TEST=true; shift ;;
     --dev-backend) DEV_BACKEND="$2"; shift 2 ;;
     --dev-model) DEV_MODEL="$2"; shift 2 ;;
+    --dev-update) DEV_UPDATE="$2"; shift 2 ;;
+    --dev-eidola) DEV_EIDOLA="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
@@ -82,10 +92,17 @@ elif [[ -n "$DEV_BACKEND" ]]; then
   cp "$CRATE/web/index.html" "$CRATE/web/app.css" "$CRATE/web/dev/boot.js" "$OUT/"
   # The palette follows the device's light/dark switch, untinted, so the UI tests' screenshots
   # show each palette whatever the hour.
-  python3 -c 'import json, sys; print(json.dumps({"base_url": sys.argv[1], "model": sys.argv[2], "appearance": "system", "tint": "off"}))' \
-    "$DEV_BACKEND" "$DEV_MODEL" >"$OUT/dev-backend.json"
+  python3 -c 'import json, sys; print(json.dumps({"base_url": sys.argv[1], "model": sys.argv[2], "appearance": "system", "tint": "off", "update_fixtures": sys.argv[3] or None, "eidola": json.load(open(sys.argv[4])) if sys.argv[4] else None}))' \
+    "$DEV_BACKEND" "$DEV_MODEL" "$DEV_UPDATE" "$DEV_EIDOLA" >"$OUT/dev-backend.json"
 else
   cp "$CRATE/web/index.html" "$CRATE/web/app.css" "$CRATE/web/boot.js" "$OUT/"
+fi
+# The app's licences screen reads this bundle file: every crate the wasm links and every asset it
+# embeds, with their licence texts, generated offline from the lockfile by crates/mobile-licences
+# (the release image runs the same generator).
+if ! $SELF_TEST; then
+  (cd "$ROOT" && cargo "+$TOOLCHAIN" run -q --locked -p mobile-licences -- "$ROOT" "${FEATURES[@]}") \
+    >"$OUT/licences.json"
 fi
 chmod -R u=rwX,go=rX "$OUT"
 

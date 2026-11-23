@@ -82,6 +82,76 @@ impl Model {
     }
 }
 
+/// A host with no shell behind it: these tests reach none of its calls.
+struct NoShell {
+    hello: eidola_mobile::protocol::Hello,
+}
+
+impl NoShell {
+    fn new() -> Self {
+        Self {
+            hello: eidola_mobile::protocol::Hello {
+                contract: 2,
+                platform: "test".into(),
+                shell: "none".into(),
+                methods: vec![],
+            },
+        }
+    }
+}
+
+impl eidola_mobile::ui::host::Host for NoShell {
+    fn hello(&self) -> &eidola_mobile::protocol::Hello {
+        &self.hello
+    }
+    fn open_external(&self, _: String) -> Unanswered<()> {
+        Box::pin(async { Err("no shell".into()) })
+    }
+    fn bundle_state(&self) -> Unanswered<eidola_app_core::updater::mobile::BundleState> {
+        Box::pin(async { Err("no shell".into()) })
+    }
+    fn check_update(
+        &self,
+        _: Rc<AppCore>,
+    ) -> futures_util::future::LocalBoxFuture<
+        'static,
+        Result<
+            eidola_app_core::updater::mobile::BundleUpdate,
+            eidola_app_core::updater::ReleaseCheckError,
+        >,
+    > {
+        Box::pin(async {
+            Err(eidola_app_core::updater::ReleaseCheckError::Unreachable(
+                "no shell".into(),
+            ))
+        })
+    }
+    fn install(
+        &self,
+        _: Rc<AppCore>,
+        _: eidola_app_core::updater::mobile::PendingBundleUpdate,
+    ) -> futures_util::future::LocalBoxFuture<
+        'static,
+        Result<eidola_app_core::updater::mobile::ActivatedBundle, eidola_app_core::error::AppError>,
+    > {
+        unreachable!("no update is offered")
+    }
+    fn revert(
+        &self,
+    ) -> futures_util::future::LocalBoxFuture<
+        'static,
+        Result<eidola_app_core::updater::mobile::BundleState, eidola_app_core::error::AppError>,
+    > {
+        unreachable!("nothing reverts")
+    }
+    fn reload(&self) {}
+    fn bundle_text(&self, _: &'static str) -> Unanswered<String> {
+        Box::pin(async { Err("no shell".into()) })
+    }
+}
+
+type Unanswered<T> = futures_util::future::LocalBoxFuture<'static, Result<T, String>>;
+
 /// A real core over a temporary profile, its default agent on the mock.
 fn stores(cx: &mut TestAppContext, model: &Model) -> (Stores, tempfile::TempDir) {
     // The core's runtime is real: declare it to the test scheduler.
@@ -94,9 +164,11 @@ fn stores(cx: &mut TestAppContext, model: &Model) -> (Stores, tempfile::TempDir)
         model: "stub".into(),
         appearance: None,
         tint: None,
+        update_fixtures: None,
+        eidola: None,
     };
     core.runtime().block_on(seed(&core, &config)).unwrap();
-    let stores = cx.update(|cx| Stores::new(Rc::new(core), cx));
+    let stores = cx.update(|cx| Stores::new(Rc::new(core), Rc::new(NoShell::new()), cx));
     (stores, dir)
 }
 

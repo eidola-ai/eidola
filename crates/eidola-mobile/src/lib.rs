@@ -22,6 +22,8 @@ pub mod client;
 #[cfg(feature = "dev")]
 pub mod dev;
 pub mod files;
+#[cfg(any(feature = "dev", feature = "self-test"))]
+pub mod fixture;
 pub mod protocol;
 #[cfg(feature = "self-test")]
 pub mod selftest;

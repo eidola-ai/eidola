@@ -1,0 +1,18 @@
+[package]
+name = "mobile-licences"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "MIT OR Apache-2.0"
+
+# Writes the mobile app bundle's licences.json (see src/main.rs). A binary
+# with one dependency, so the release image's build (oci/eidola-mobile-bundle)
+# and mobile/build-bundle.sh run the same generator.
+[[bin]]
+name = "mobile-licences"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"

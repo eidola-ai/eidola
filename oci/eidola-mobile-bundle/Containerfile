@@ -156,6 +156,10 @@ FROM fetch AS build
 COPY crates/ ./crates/
 COPY --parents releases/trust/server-enclave.json releases/trust/trust-constants.json releases/trust/sigstore-trusted-root.json releases/schema/attestation-templates.json ./
 COPY --parents models* ./
+# What the bundle's licences file (crates/mobile-licences) reads beyond the
+# packages: this repository's SPDX texts, and the Kotlin release the Android
+# shell carries.
+COPY --parents LICENSES mobile/android/tools.sh ./
 COPY --from=wasm-bindgen /out/wasm-bindgen /usr/local/bin/wasm-bindgen
 
 RUN find crates/ -name '*.rs' -exec touch {} +
@@ -174,6 +178,8 @@ RUN --network=none <<-'EOF'
 	wasm-bindgen target/${TARGET}/mobile/eidola_mobile.wasm --out-dir /out --target web \
 		--no-typescript --remove-name-section --remove-producers-section
 	cp crates/eidola-mobile/web/index.html crates/eidola-mobile/web/app.css crates/eidola-mobile/web/boot.js /out/
+	# The licences screen's file, from the lockfile, by the generator build-bundle.sh runs.
+	cargo run --frozen -p mobile-licences -- /src > /out/licences.json
 	chmod -R u=rwX,go=rX /out
 	find /out -type f | sort
 EOF

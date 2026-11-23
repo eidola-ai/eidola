@@ -7,3 +7,5 @@ library-row-label = { $title }，{ $when }
 library-load-failed = 无法加载你的对话。
 library-refresh-failed = 无法刷新——重试
 library-retry = 重试
+
+library-settings = 设置

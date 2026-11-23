@@ -21,6 +21,7 @@ use super::{GUTTER, HEADER_HEIGHT, TOUCH, fmt_when};
 pub enum LibraryEvent {
     Open(String),
     New,
+    Settings,
 }
 
 pub struct LibraryView {
@@ -156,6 +157,25 @@ impl Render for LibraryView {
                     .font_family(eidola_theme::FONT_FAMILY)
                     .text_size(px(28.))
                     .child(msg::library_title(cx)),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("library-settings")
+                    .probe("library/settings", Role::Button, msg::library_settings(cx))
+                    .size(TOUCH)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .active(|s| s.bg(theme.secondary))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(LibraryEvent::Settings)))
+                    .child(
+                        Icon::new(IconName::Settings)
+                            .size(px(22.))
+                            .text_color(theme.foreground),
+                    ),
             )
             .child(
                 div()

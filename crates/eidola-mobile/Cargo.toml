@@ -21,8 +21,9 @@ self-test = ["dep:sha2"]
 # the default agent on an OpenAI-compatible server the developer names
 # (`mobile/tools/openai_stub.py`), and mirror every probe into the page as an
 # invisible labelled element, so the UI tests (XCUITest, UIAutomator) can find
-# what they tap. A release bundle carries neither.
-dev = []
+# what they tap; and may take its update from a fixture release the UI tests
+# serve (`src/fixture.rs`). A release bundle carries none of it.
+dev = ["dep:sha2"]
 
 [dependencies]
 base64 = "0.23"
