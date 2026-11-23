@@ -359,13 +359,16 @@ impl ConversationView {
                     .into_any_element()
             }
             Row::Pending {
-                text, created_at, ..
+                seq,
+                text,
+                created_at,
+                ..
             } => {
                 let editor = self.body(&key, &text, window, cx);
                 div()
                     .id(("pending", ix))
                     .probe(
-                        "conversation/pending",
+                        format!("conversation/pending/{seq}"),
                         Role::Article,
                         msg::conversation_you(cx),
                     )

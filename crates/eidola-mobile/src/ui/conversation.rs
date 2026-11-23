@@ -93,9 +93,12 @@ impl Post {
     }
 }
 
-/// The reader's post while it saves.
+/// One of the reader's posts while it saves, and after, until a read shows
+/// it.
 #[derive(Clone, Debug)]
 pub struct Pending {
+    /// Which of this conversation's saves it is.
+    pub seq: u64,
     pub text: SharedString,
     pub reply_to: Option<String>,
     /// Known once the save answered; the overlay stands until a read
@@ -170,7 +173,11 @@ pub struct Conversation {
     covers_through: u64,
     load_task: Option<Task<()>>,
     row: watch::Sender<RowState>,
-    pending: Option<Pending>,
+    /// The reader's posts not yet read back, in the order they were written:
+    /// each stays until a read holds it (`branch::retain_unread`), so posts
+    /// written faster than the reads that show them stay on the branch.
+    pending: Vec<Pending>,
+    next_pending: u64,
     post_runner: Option<Task<()>>,
     turns: Vec<Turn>,
     turn_runners: HashMap<u64, Task<()>>,
@@ -209,7 +216,8 @@ impl Conversation {
             covers_through: 0,
             load_task: None,
             row,
-            pending: None,
+            pending: Vec::new(),
+            next_pending: 0,
             post_runner: None,
             turns: Vec::new(),
             turn_runners: HashMap::new(),
@@ -239,8 +247,8 @@ impl Conversation {
         &self.transcript
     }
 
-    pub fn pending(&self) -> Option<&Pending> {
-        self.pending.as_ref()
+    pub fn pending(&self) -> &[Pending] {
+        &self.pending
     }
 
     pub fn turns(&self) -> &[Turn] {
@@ -349,14 +357,7 @@ impl Conversation {
                 self.covers_through = mark;
                 let posts: Vec<Post> = nodes.iter().map(Post::from_node).collect();
                 let has = |id: &str| posts.iter().any(|p| p.action_id == id);
-                if self
-                    .pending
-                    .as_ref()
-                    .and_then(|p| p.action_id.as_deref())
-                    .is_some_and(has)
-                {
-                    self.pending = None;
-                }
+                super::branch::retain_unread(&mut self.pending, &posts);
                 let mut landed = Vec::new();
                 self.turns.retain(|t| match &t.landed {
                     None => true,
@@ -401,7 +402,10 @@ impl Conversation {
         if self.post_runner.is_some() || matches!(*self.row.borrow(), RowState::Gone(_)) {
             return false;
         }
-        self.pending = Some(Pending {
+        let seq = self.next_pending;
+        self.next_pending += 1;
+        self.pending.push(Pending {
+            seq,
             text: text.clone().into(),
             reply_to: reply_to.clone(),
             action_id: None,
@@ -423,7 +427,7 @@ impl Conversation {
                 match result {
                     Ok(submitted) => {
                         let action_id = submitted.post.action_id.clone();
-                        if let Some(pending) = &mut this.pending {
+                        if let Some(pending) = this.pending.iter_mut().find(|p| p.seq == seq) {
                             pending.action_id = Some(action_id.clone());
                         }
                         cx.emit(ConversationEvent::Posted {
@@ -434,7 +438,7 @@ impl Conversation {
                         this.follow_plan(submitted.plan, cx);
                     }
                     Err(e) => {
-                        this.pending = None;
+                        this.pending.retain(|p| p.seq != seq);
                         this.error = Some(e);
                         cx.emit(ConversationEvent::SubmitFailed { text, reply_to });
                         // A refused save may still have written something;
