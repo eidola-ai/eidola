@@ -693,6 +693,29 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_6_manifest_reads_like_any_other() {
+        // The tool reads a manifest by artifact key and is indifferent to
+        // the rows it does not ask about, so the mobile rows schema 6 adds
+        // (one of a type of its own, with a nested listing) change nothing
+        // it does. The same accepted fixture the determinism gate and the
+        // client both read.
+        let manifest =
+            include_bytes!("../../../scripts/fixtures/manifest-determinism/good-schema-6.json");
+        assert_eq!(
+            manifest_recorded_sha256(manifest, MACOS_UNSIGNED_ZIP_KEY).unwrap(),
+            None
+        );
+        assert_eq!(
+            manifest_recorded_sha256(manifest, "eidola-mobile-android-apk").unwrap(),
+            Some("8".repeat(64))
+        );
+        assert_eq!(
+            manifest_recorded_sha256(manifest, "eidola-mobile-bundle").unwrap(),
+            Some("7".repeat(64))
+        );
+    }
+
+    #[test]
     fn a_recorded_row_reads_back_as_bare_hex() {
         let manifest = br#"{
             "schema_version": 3,

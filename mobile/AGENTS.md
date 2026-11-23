@@ -8,7 +8,7 @@ The native apps the App Store and Play Store distribute. Each is a thin shell ar
 | `ios/` | Swift, UIKit + WKWebView + Network.framework + CryptoKit. A hand-written Xcode project. |
 | `android/` | Kotlin, framework APIs only (WebView, `org.json`, `java.net`), built without Gradle by the SDK's own tools. |
 | `contract-test/` | A plain-JS page that exercises the whole contract against the shell it runs in, and the default embedded bundle. `shell.js` is the reference bridge. |
-| `tools/` | `echo_server.py` (the test page's TCP peer), `bundle_digest.py` (the digest a shell shows, computed from a directory). |
+| `tools/` | `echo_server.py` (the test page's TCP peer), `bundle_digest.py` (the digest a shell shows, computed from a directory), `bundle_container.py` (a bundle directory as the `ustar` container a release publishes it in, and its `artifact-manifest.json` row; the same bytes as app-core's `updater::mobile::container::write_ustar`). |
 | `build-bundle.sh`, `bundle-repro.sh`, `self-test.sh` | The app bundle (`crates/eidola-mobile`, wasm32) built reproducibly, checked by two clean builds, and its headless self-test under either shell; see `crates/eidola-mobile/AGENTS.md`. |
 | `device-checklist.md` | What to prepare before running a build on a physical device. |
 
