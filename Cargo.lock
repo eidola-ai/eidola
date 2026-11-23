@@ -2894,6 +2894,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "eidola-app-core",
+ "eidola-mobile",
  "futures-util",
  "hex",
  "js-sys",

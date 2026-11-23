@@ -83,30 +83,77 @@ struct State {
     title: String,
 }
 
-#[derive(Serialize)]
-struct Check {
-    name: &'static str,
-    pass: bool,
-    detail: Value,
-}
+mod verdict {
+    //! The report, and the one way its verdict is reached: every check and
+    //! every measurement goes in through here, and a measurement always
+    //! brings the check of whether what it measured was correct, so a
+    //! transfer that failed or came back wrong fails the verdict however
+    //! fast it was.
 
-#[derive(Serialize, Default)]
-struct Report {
-    phase: u32,
-    pass: bool,
-    checks: Vec<Check>,
-    measurements: Vec<Value>,
-}
+    use serde::Serialize;
+    use serde_json::Value;
 
-impl Report {
-    fn check(&mut self, env: &Env, name: &'static str, pass: bool, detail: Value) {
-        (env.log)(&format!(
-            "self-test: {name}: {} {detail}",
-            if pass { "PASS" } else { "FAIL" }
-        ));
-        self.checks.push(Check { name, pass, detail });
+    use super::Env;
+
+    #[derive(Serialize)]
+    struct Check {
+        name: &'static str,
+        pass: bool,
+        detail: Value,
+    }
+
+    #[derive(Serialize, Default)]
+    pub(super) struct Report {
+        phase: u32,
+        pass: bool,
+        checks: Vec<Check>,
+        /// The numbers of measurements whose checks passed; informational.
+        measurements: Vec<Value>,
+    }
+
+    impl Report {
+        pub(super) fn set_phase(&mut self, phase: u32) {
+            self.phase = phase;
+        }
+
+        pub(super) fn phase(&self) -> u32 {
+            self.phase
+        }
+
+        pub(super) fn check(&mut self, env: &Env, name: &'static str, pass: bool, detail: Value) {
+            (env.log)(&format!(
+                "self-test: {name}: {} {detail}",
+                if pass { "PASS" } else { "FAIL" }
+            ));
+            self.checks.push(Check { name, pass, detail });
+        }
+
+        /// A measurement: its numbers when what it measured was correct, or
+        /// why it was not, which fails the check of the same name.
+        pub(super) fn measure(
+            &mut self,
+            env: &Env,
+            name: &'static str,
+            outcome: Result<Value, Value>,
+        ) {
+            match outcome {
+                Ok(numbers) => {
+                    self.check(env, name, true, numbers.clone());
+                    self.measurements.push(numbers);
+                }
+                Err(why) => self.check(env, name, false, why),
+            }
+        }
+
+        /// Passes when there is a check and every check passed.
+        pub(super) fn finish(&mut self) -> bool {
+            self.pass = !self.checks.is_empty() && self.checks.iter().all(|c| c.pass);
+            self.pass
+        }
     }
 }
+
+use verdict::Report;
 
 fn pem_der(pem: &str) -> Result<Vec<u8>, String> {
     let body: String = pem
@@ -135,17 +182,17 @@ pub async fn run<T: Transport>(
         None => first_launch(&client, &config, &env, &mut report).await,
         Some(state) => relaunch(&client, &config, &env, &mut report, state).await,
     }
-    report.pass = !report.checks.is_empty() && report.checks.iter().all(|c| c.pass);
+    let pass = report.finish();
     let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
-    let name = format!("selftest-{}.json", report.phase);
+    let name = format!("selftest-{}.json", report.phase());
     client
         .files_write(&name, 0, text.as_bytes(), true)
         .await
         .map_err(|e| e.to_string())?;
     (env.log)(&format!(
         "self-test: phase {} {}",
-        report.phase,
-        if report.pass { "PASS" } else { "FAIL" }
+        report.phase(),
+        if pass { "PASS" } else { "FAIL" }
     ));
     Ok(text)
 }
@@ -204,7 +251,7 @@ async fn first_launch<T: Transport>(
     env: &Env,
     report: &mut Report,
 ) {
-    report.phase = 1;
+    report.set_phase(1);
     let Some(core) = boot_core(client, config, env, report).await else {
         return;
     };
@@ -308,7 +355,7 @@ async fn relaunch<T: Transport>(
     report: &mut Report,
     state: State,
 ) {
-    report.phase = 2;
+    report.set_phase(2);
     let Some(core) = boot_core(client, config, env, report).await else {
         return;
     };
@@ -470,6 +517,22 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// The pipe's and the file API's transfers, alone, with the verdict `run`
+/// would reach on them: whether every one was correct, and the report.
+pub async fn transfers<T: Transport>(
+    client: &ShellClient<T>,
+    config: &Config,
+    env: &Env,
+) -> (bool, String) {
+    let mut report = Report::default();
+    throughput(client, config, env, &mut report).await;
+    let pass = report.finish();
+    (
+        pass,
+        serde_json::to_string_pretty(&report).unwrap_or_default(),
+    )
+}
+
 async fn throughput<T: Transport>(
     client: &ShellClient<T>,
     config: &Config,
@@ -486,17 +549,24 @@ async fn throughput<T: Transport>(
         }
     }
     let ms = (env.now_ms)() - started;
-    let line = json!({
-        "what": "bridge round trip (shell.hello)",
+    let numbers = json!({
         "calls": calls,
         "answered": answered,
         "ms_per_call": ms / calls as f64,
     });
-    (env.log)(&format!("self-test: throughput {line}"));
-    report.measurements.push(line);
+    let outcome = if answered == calls {
+        Ok(numbers)
+    } else {
+        Err(numbers)
+    };
+    report.measure(env, "bridge round trip (shell.hello)", outcome);
 
     let total = config.throughput_mib << 20;
-    for max in [64 << 10, 256 << 10, 1 << 20] {
+    for (name, max) in [
+        ("tcp echo, 64 KiB receives", 64 << 10),
+        ("tcp echo, 256 KiB receives", 256 << 10),
+        ("tcp echo, 1 MiB receives", 1 << 20),
+    ] {
         let started = (env.now_ms)();
         let result = {
             let echo = std::pin::pin!(echo(client, config, total, max));
@@ -506,18 +576,15 @@ async fn throughput<T: Transport>(
             }
         };
         let ms = (env.now_ms)() - started;
-        let line = match result {
-            Ok(()) => json!({
-                "what": "tcp echo (bytes each way)",
-                "receive_max": max,
-                "bytes": total,
+        let outcome = match result {
+            Ok(()) => Ok(json!({
+                "bytes_each_way": total,
                 "ms": ms,
                 "mib_per_s": (total as f64 / (1 << 20) as f64) / (ms / 1000.0),
-            }),
-            Err(e) => json!({"what": "tcp echo", "receive_max": max, "error": e}),
+            })),
+            Err(e) => Err(json!(e)),
         };
-        (env.log)(&format!("self-test: throughput {line}"));
-        report.measurements.push(line);
+        report.measure(env, name, outcome);
     }
 
     let name = "selftest-throughput.bin";
@@ -539,18 +606,32 @@ async fn throughput<T: Transport>(
     let started = (env.now_ms)();
     let read = client.files_read(name).await;
     let read_ms = (env.now_ms)() - started;
-    let intact = matches!(&read, Ok(Some(bytes)) if bytes.len() == mib << 20 && bytes.chunks(1 << 20).all(|c| c == chunk));
     let _ = client.files_remove(name).await;
-    let line = json!({
-        "what": "files: 8 MiB as 1 MiB writes + sync, then one read",
-        "write_ms": write_ms,
-        "write_mib_per_s": mib as f64 / (write_ms / 1000.0),
-        "read_ms": read_ms,
-        "read_mib_per_s": mib as f64 / (read_ms / 1000.0),
-        "ok": written.is_ok() && synced.is_ok() && intact,
-    });
-    (env.log)(&format!("self-test: throughput {line}"));
-    report.measurements.push(line);
+    let outcome = match (written, synced, read) {
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(json!(e.to_string())),
+        (Ok(()), Ok(()), Ok(None)) => Err(json!("the file was gone")),
+        (Ok(()), Ok(()), Ok(Some(bytes))) => {
+            if bytes.len() == mib << 20 && bytes.chunks(1 << 20).all(|c| c == chunk) {
+                Ok(json!({
+                    "write_ms": write_ms,
+                    "write_mib_per_s": mib as f64 / (write_ms / 1000.0),
+                    "read_ms": read_ms,
+                    "read_mib_per_s": mib as f64 / (read_ms / 1000.0),
+                }))
+            } else {
+                Err(json!(format!(
+                    "read back {} bytes that differ from the {} written",
+                    bytes.len(),
+                    mib << 20
+                )))
+            }
+        }
+    };
+    report.measure(
+        env,
+        "files: 8 MiB as 1 MiB writes + sync, then one read",
+        outcome,
+    );
 }
 
 /// Send `total` bytes to the echo server and read them back, concurrently.

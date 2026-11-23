@@ -36,6 +36,9 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
+# Self-reference: the self-test's verdict is tested natively
+# (`tests/selftest.rs`); dev-dependency features never reach a bundle build.
+eidola-mobile = { path = ".", features = ["self-test"] }
 hex = "0.4"
 rustls-rustcrypto = "0.1.0-pre.0"
 tempfile = "3"

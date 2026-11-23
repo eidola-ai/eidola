@@ -57,6 +57,8 @@ pub struct State {
     pub confirms: usize,
     /// How long a file request waits before its reply.
     pub file_delay: Duration,
+    /// `files.read` hands back the file with its last byte flipped.
+    pub corrupt_reads: bool,
 }
 
 /// The shell. Clones share one state.
@@ -159,7 +161,15 @@ impl FakeShell {
             "files.read" => {
                 let n = name(p, "name")?;
                 Ok(match s.files.get(&n) {
-                    Some(data) => json!({"data": STANDARD.encode(data)}),
+                    Some(data) => {
+                        let mut data = data.clone();
+                        if s.corrupt_reads
+                            && let Some(last) = data.last_mut()
+                        {
+                            *last ^= 1;
+                        }
+                        json!({"data": STANDARD.encode(data)})
+                    }
                     None => json!({"data": null}),
                 })
             }
