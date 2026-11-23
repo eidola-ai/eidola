@@ -115,3 +115,7 @@ It is the right artifact for NixOS, for `nix profile install`, and for anyone re
 The Nix Linux installable *references* nixpkgs Mesa so a Nix glibc binary can load Vulkan ICDs on a non-Nix host. Those driver bytes are not in the archive. The Debian package needs no such reference and carries no GPU bytes at all: its binary runs on the host's glibc, so the host's Vulkan loader and its Mesa or proprietary NVIDIA drivers load into the ABI they were built for.
 
 Server/CLI Linux images stay OCI: they run in an untrusted environment, so the image is the whole functional closure we can measure. The CLI's image has exactly one file, a static binary, so from manifest schema 5 that file is also published and hashed on its own — the same bytes, for a host that should not need a container runtime to run a client — beside the same client built for 64-bit ARM.
+
+## The mobile app
+
+The mobile app's bundle and its Android shell's unsigned APK have manifest rows, checked by hash like any other artifact (no release emits them yet); a signed APK reduces to the unsigned one once its signature is removed. The iOS shell has none: Apple encrypts it as it distributes it, so it cannot be compared with a build at all. What each platform lets a user check, and how, is in [the mobile app](mobile.md#what-can-be-verified).

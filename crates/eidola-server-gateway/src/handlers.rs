@@ -14,7 +14,7 @@ use eidola_common::spend_credentials::{ACT_L, partial_returns};
 use opentelemetry::KeyValue;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::AppState;
 use crate::auth::{ActSpend, AuthContext, AuthMethod};
@@ -313,9 +313,13 @@ pub(crate) async fn issue_refund_async(
     // Best-effort store in DB for client recovery, sealed under the client's
     // key: the token carries the refund amount, and Postgres is outside the
     // enclave. Failure here is not fatal — the refund is still returned in the
-    // response.
-    if let Err(e) = credentials::store_sealed_refund(state, act, &key_id, &refund_cbor).await {
-        warn!("Failed to store refund token for recovery: {e}");
+    // response. Counted, not logged: a spend's refund is a per-request event
+    // on the anonymous path.
+    if credentials::store_sealed_refund(state, act, &key_id, &refund_cbor)
+        .await
+        .is_err()
+    {
+        crate::telemetry::metrics::REFUND_STORE_FAILURES.add(1, &[]);
     }
 
     Ok(RefundInfo {
@@ -365,6 +369,11 @@ fn request_deadline_error() -> ServerError {
     }
 }
 
+/// The fixed class of the error a refund-bearing response answers
+/// (`ServerError::label`), carried on the response for the request counter.
+#[derive(Debug, Clone, Copy)]
+struct RefusalLabel(&'static str);
+
 /// Build an HTTP error response that carries a request's refunds, one per
 /// input in input order.
 fn error_response_with_refunds(
@@ -377,7 +386,11 @@ fn error_response_with_refunds(
         .into_iter()
         .map(|r| serde_json::to_value(r).unwrap())
         .collect();
-    (status, Json(body)).into_response()
+    let mut response = (status, Json(body)).into_response();
+    response
+        .extensions_mut()
+        .insert(RefusalLabel(error.label()));
+    response
 }
 
 /// The inputs of one paid request, in the order it presented them, each with
@@ -419,9 +432,15 @@ pub(crate) async fn settle_inputs(
         .unwrap_or_else(|| vec![0; inputs.shares.len()]);
     let mut refunds = Vec::with_capacity(inputs.acts.len());
     let mut complete = true;
+    let count = |outcome: &'static str| {
+        crate::telemetry::metrics::CREDENTIAL_REFUNDS.add(1, &[KeyValue::new("outcome", outcome)]);
+    };
     for (act, t) in inputs.acts.iter().zip(returns) {
         match issue_refund_async(state, act, t).await {
-            Ok(info) => refunds.push(info),
+            Ok(info) => {
+                count("issued");
+                refunds.push(info);
+            }
             // No amount in the log: `t` is a function of the prompt's
             // chargeable bytes and the upstream's token counts, the same
             // content-derived quantity the `PaymentRequired` redaction keeps
@@ -429,15 +448,20 @@ pub(crate) async fn settle_inputs(
             Err(e) if t > 0 => {
                 error!("CRITICAL: failed to issue refund: {e}, retrying with zero");
                 match issue_refund_async(state, act, 0).await {
-                    Ok(info) => refunds.push(info),
+                    Ok(info) => {
+                        count("zero_fallback");
+                        refunds.push(info);
+                    }
                     Err(e2) => {
                         error!("CRITICAL: failed to issue fallback zero refund: {e2}");
+                        count("failed");
                         complete = false;
                     }
                 }
             }
             Err(e) => {
                 error!("CRITICAL: failed to issue zero refund: {e}");
+                count("failed");
                 complete = false;
             }
         }
@@ -739,11 +763,17 @@ pub async fn chat_completions(
     // is the pre-flight refusals (invalid or duplicate credential,
     // unknown model, insufficient charge). A streaming request counts
     // `ok` once the SSE response opens; how the stream itself ends is
-    // `CHAT_STREAM_OUTCOME`'s job.
-    let status = match &result {
-        Ok(response) if response.status().is_success() => "ok",
-        Ok(_) => "error",
-        Err(_) => "rejected",
+    // `CHAT_STREAM_OUTCOME`'s job. `reason` is the refusal's fixed class.
+    let (status, reason) = match &result {
+        Ok(response) if response.status().is_success() => ("ok", "none"),
+        Ok(response) => (
+            "error",
+            response
+                .extensions()
+                .get::<RefusalLabel>()
+                .map_or("other", |label| label.0),
+        ),
+        Err(e) => ("rejected", e.label()),
     };
     crate::telemetry::metrics::CHAT_REQUESTS.add(
         1,
@@ -751,6 +781,7 @@ pub async fn chat_completions(
             KeyValue::new("model", model_label),
             KeyValue::new("stream", if stream { "true" } else { "false" }),
             KeyValue::new("status", status),
+            KeyValue::new("reason", reason),
         ],
     );
 
@@ -874,10 +905,7 @@ pub(crate) async fn run_paid_request(
         let (resolved, price) =
             match validate_request(inputs.hold(), request, resolution.as_ref().map_err(|e| *e)) {
                 Ok(validated) => validated,
-                Err(e) => {
-                    warn!("Request validation failed after nullifier recorded: {e}");
-                    return Ok(refuse_paid(&state, &inputs, &e).await);
-                }
+                Err(e) => return Ok(refuse_paid(&state, &inputs, &e).await),
             };
 
         // Phase 4: Handle the request.
@@ -922,13 +950,9 @@ async fn open_upstream(
 ) -> Opened {
     match tokio::time::timeout_at(deadline, dispatch_stream(state, validated)).await {
         Ok(Ok(rx)) => Opened::Stream(rx),
-        Ok(Err(e)) => {
-            // Nothing was generated: the engine refused it or never took it.
-            warn!("Engine error before the answer opened, charging the request fee: {e}");
-            Opened::Answered(refuse_paid(state, inputs, &e).await)
-        }
+        // Nothing was generated: the engine refused it or never took it.
+        Ok(Err(e)) => Opened::Answered(refuse_paid(state, inputs, &e).await),
         Err(_) => {
-            warn!("Request reached its deadline before its answer opened, issuing zero refund");
             let refunds = settle_inputs(state, inputs, inputs.hold()).await;
             Opened::Answered(error_response_with_refunds(
                 &request_deadline_error(),
@@ -1227,10 +1251,6 @@ async fn handle_streaming_request(
                 // Settled on what the engine generated up to its last chunk
                 // (`early_cost`), consumed from the inputs in input order
                 // like any charge; the engine was released before this.
-                warn!(
-                    "stream ended early ({}), settling on what was generated",
-                    reason.label()
-                );
                 timing.finish(reason.label(), None, Instant::now());
                 let cost = early_cost(final_usage.as_ref(), &price, charge_credits);
                 let refunds = settle_inputs(&state, &spent, cost).await;
@@ -1310,7 +1330,7 @@ pub(crate) enum EarlyEnding {
 }
 
 impl EarlyEnding {
-    /// The fixed label the stream-outcome counter and the log use.
+    /// The fixed label the stream-outcome counter uses.
     fn label(self) -> &'static str {
         match self {
             EarlyEnding::ClientGone => "client_disconnect",
@@ -1405,32 +1425,33 @@ async fn forward_stream(
                 }
                 return (StreamEnding::Done(meta, at), final_usage);
             }
-            Err(e) => {
-                error!("Stream error: {}", e);
-                return (StreamEnding::Early(EarlyEnding::UpstreamError), final_usage);
-            }
+            // The relay counted the failure by its reason
+            // (`engine.stream.failures`).
+            Err(_) => return (StreamEnding::Early(EarlyEnding::UpstreamError), final_usage),
         }
     }
 }
 
-/// `Json<T>` wrapper that logs the rejection's class at warn level on
-/// failure and answers it with a fixed message for that class.
+/// `Json<T>` wrapper that counts the rejection's class on failure
+/// (`http.server.body.rejected`) and answers it with a fixed message for
+/// that class.
 ///
 /// Why we need this: `Json<T>` rejections fail the request before the
-/// handler runs (the extractor runs first), so handler-level logging
+/// handler runs (the extractor runs first), so the handler's own counters
 /// can't see them. With `#[serde(deny_unknown_fields)]` on
 /// `ChatCompletionRequest`, an unrecognized field — for instance a
 /// client sending an OpenAI-extension key the server hasn't added —
-/// becomes a 422 with no log entry, and the client sees an opaque
-/// "(422): unknown error". This wrapper makes those failures visible
-/// to operators.
+/// becomes a 422, and the client sees an opaque "(422): unknown error".
+/// This wrapper makes those failures visible to operators, as a rate by
+/// class: a refusal is a per-request condition, so it is counted, never
+/// logged.
 ///
 /// **Privacy:** the rejection message produced by axum + serde **can
 /// echo client-authored body values** — `deny_unknown_fields` quotes the
 /// unrecognized field name verbatim, and serde's data errors quote the
 /// offending scalar (`invalid type: string "<the whole string>",
-/// expected u32`). So neither the log nor the client gets it: the log
-/// records the class, and the client gets a fixed message for the class
+/// expected u32`). So neither the counter nor the client gets it: the
+/// counter records the class, and the client gets a fixed message for the class
 /// (`refusal`), with the rejection's own status. Sent to the client, the
 /// detail would be its own data over its own attested connection, but the
 /// response's length would carry the echoed value to anyone watching the
@@ -1494,21 +1515,21 @@ async fn checked_body<T, S: Send + Sync>(
     state: &S,
 ) -> Result<(axum::http::request::Parts, axum::body::Bytes, BodyPermit), axum::response::Response> {
     use axum::http::StatusCode;
+    let rejected =
+        |class| crate::telemetry::metrics::body_rejected(std::any::type_name::<T>(), class);
     let too_large = || {
-        warn!(
-            payload_type = std::any::type_name::<T>(),
-            "request body rejected: too large"
-        );
+        rejected("too_large");
         refusal(
             StatusCode::PAYLOAD_TOO_LARGE,
             "the request body is too large",
         )
     };
     let unreadable = |status| {
-        warn!(
-            payload_type = std::any::type_name::<T>(),
-            "request body rejected: bytes error"
-        );
+        rejected(if status == StatusCode::REQUEST_TIMEOUT {
+            "read_timeout"
+        } else {
+            "unreadable"
+        });
         refusal(status, "the request body could not be read")
     };
     let (parts, body) = req.into_parts();
@@ -1521,14 +1542,15 @@ async fn checked_body<T, S: Send + Sync>(
         Some(len) if len > crate::MAX_REQUEST_BODY_BYTES as u64 => return Err(too_large()),
         Some(len) if len > crate::UNGATED_REQUEST_BODY_BYTES as u64 => {
             let Ok(permit) = LARGE_BODIES.try_acquire() else {
-                warn!(
-                    payload_type = std::any::type_name::<T>(),
-                    "request body rejected: no large-body permit free"
-                );
-                return Err(ServerError::ServiceUnavailable(
+                // Load, not an incident: answered without the 5xx log
+                // `ServerError`'s `IntoResponse` writes.
+                rejected("no_permit");
+                let refused = ServerError::ServiceUnavailable(
                     "too many large requests are being read; try again".to_string(),
-                )
-                .into_response());
+                );
+                return Err(
+                    (refused.status_code(), Json(refused.to_error_response())).into_response()
+                );
             };
             let read = axum::body::to_bytes(body, len as usize);
             match tokio::time::timeout(LARGE_BODY_READ_TIMEOUT, read).await {
@@ -1556,15 +1578,11 @@ async fn checked_body<T, S: Send + Sync>(
     if let Err(shape @ (JsonShapeError::TooManyValues | JsonShapeError::TooDeep)) =
         check_request_json(&bytes)
     {
-        let class = if shape == JsonShapeError::TooDeep {
-            "too deep"
+        rejected(if shape == JsonShapeError::TooDeep {
+            "too_deep"
         } else {
-            "too many values"
-        };
-        warn!(
-            payload_type = std::any::type_name::<T>(),
-            "request body rejected: {class} error"
-        );
+            "too_many_values"
+        });
         return Err(ServerError::BadRequest {
             message: shape.to_string(),
         }
@@ -1582,7 +1600,7 @@ fn read_body(parts: axum::http::request::Parts, bytes: axum::body::Bytes) -> Req
     req
 }
 
-/// axum's `Json` over `bytes`: its value, or its refusal, logged by class.
+/// axum's `Json` over `bytes`: its value, or its refusal, counted by class.
 #[allow(clippy::result_large_err)]
 async fn parse_logged<T, S>(
     parts: axum::http::request::Parts,
@@ -1607,16 +1625,13 @@ where
                     ("syntax", "the request body is not valid JSON")
                 }
                 JsonRejection::MissingJsonContentType(_) => (
-                    "missing content-type",
+                    "missing_content_type",
                     "expected a request with `Content-Type: application/json`",
                 ),
                 JsonRejection::BytesRejection(_) => ("bytes", "the request body could not be read"),
                 _ => ("other", "invalid request body"),
             };
-            warn!(
-                payload_type = std::any::type_name::<T>(),
-                "request body rejected: {class} error"
-            );
+            crate::telemetry::metrics::body_rejected(std::any::type_name::<T>(), class);
             Err(refusal(rejection.status(), message))
         }
     }

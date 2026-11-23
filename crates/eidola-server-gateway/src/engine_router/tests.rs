@@ -177,6 +177,8 @@ struct EngineState {
     release: tokio::sync::Notify,
     /// Held streams whose connection went away before they were released.
     abandoned: AtomicUsize,
+    /// The info answer's `instance_id` member; absent while `None`.
+    instance: Mutex<Option<serde_json::Value>>,
 }
 
 /// A fake engine behind its shim.
@@ -194,6 +196,10 @@ impl Engine {
 
     fn set_mode(&self, mode: Mode) {
         *self.state.mode.lock().unwrap() = mode;
+    }
+
+    fn set_instance(&self, instance: Option<serde_json::Value>) {
+        *self.state.instance.lock().unwrap() = instance;
     }
 
     fn row(&self, model: &str, deployment: &str) -> EnginePlacementRow {
@@ -246,6 +252,7 @@ async fn engine(identity: Identity) -> Engine {
         health_checks: AtomicUsize::new(0),
         release: tokio::sync::Notify::new(),
         abandoned: AtomicUsize::new(0),
+        instance: Mutex::new(None),
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -330,17 +337,18 @@ async fn info(State(state): State<Arc<EngineState>>, headers: HeaderMap) -> Resp
     if !authorized(&state, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error");
     }
-    padded_json(
-        StatusCode::OK,
-        serde_json::json!({
-            "model": state.model,
-            "weights_sha256": state.weights,
-            "weights_storage": state.storage,
-            "build": {"crate": "fake", "version": "0", "git_sha": null},
-            "executor": "cuda",
-            "device": null,
-        }),
-    )
+    let mut info = serde_json::json!({
+        "model": state.model,
+        "weights_sha256": state.weights,
+        "weights_storage": state.storage,
+        "build": {"crate": "fake", "version": "0", "git_sha": null},
+        "executor": "cuda",
+        "device": null,
+    });
+    if let Some(instance) = state.instance.lock().unwrap().clone() {
+        info["instance_id"] = instance;
+    }
+    padded_json(StatusCode::OK, info)
 }
 
 fn chunk(
@@ -1190,6 +1198,40 @@ async fn failures_open_an_engine_and_a_probe_restores_it() {
         .await
         .unwrap();
     assert_eq!(served_by(&refs, &before), home);
+}
+
+/// A request no engine can take fails its `engine.chat_stream` span, which
+/// the aggregator reads as `outcome=error`, and writes no log record. Every
+/// pinned model is reported to the upstream gauge, with no upstreams.
+#[test]
+fn a_request_no_engine_takes_is_an_error_span_and_no_log_line() {
+    let router = EngineRouter::new(
+        models(),
+        EngineToken::new(TOKEN.into()).unwrap(),
+        attesting_client_factory(AttestationRoots {
+            tls_roots: rustls::RootCertStore::empty(),
+            trusted_ark_der: None,
+            trusted_ask_der: None,
+        }),
+        fast_config(),
+    );
+    assert_eq!(
+        router.upstream_states(),
+        vec![(MODEL_A.to_string(), 0, 0), (MODEL_B.to_string(), 0, 0)]
+    );
+    let captured = crate::telemetry::capture::capture(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(router.send_stream(&request(MODEL_A, None, true)));
+        assert!(matches!(result, Err(ServerError::ServiceUnavailable(_))));
+    });
+    assert_eq!(
+        captured.spans,
+        vec![("engine.chat_stream".to_string(), "error")]
+    );
+    assert_eq!(captured.logs, 0, "a refused dispatch wrote a log record");
 }
 
 /// An engine that could not have run the request passes it on within the
@@ -2311,4 +2353,70 @@ async fn a_fallback_that_opened_while_the_request_waited_is_skipped() {
     assert_eq!(last.chats().len(), 1, "the one after it was still tried");
     stalled.state.release.notify_waiters();
     last.state.release.notify_waiters();
+}
+
+/// The probe reads the node's `instance_id` from its info answer and decides
+/// nothing by it: a node without one, or with one out of its shape, takes
+/// traffic all the same, and a new one (a restart) replaces the last.
+#[tokio::test]
+async fn the_probe_reads_a_nodes_instance_and_decides_nothing_by_it() {
+    const FIRST: &str = "0123456789abcdef0123456789abcdef";
+    const SECOND: &str = "fedcba9876543210fedcba9876543210";
+    let a = engine(Identity::of(MODEL_A)).await;
+    let router = router_for(&[&a], models());
+    router
+        .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+        .await;
+    let instance = |router: &EngineRouter| upstream(router, MODEL_A, &a.base_url).instance();
+
+    // None: verified and taking traffic.
+    router.probe_due().await;
+    assert!(router.send(&request(MODEL_A, None, true)).await.is_ok());
+    assert_eq!(instance(&router), None);
+
+    for (answer, read) in [
+        (Some(serde_json::json!(FIRST)), Some(FIRST)),
+        // A restart: a new instance replaces the last.
+        (Some(serde_json::json!(SECOND)), Some(SECOND)),
+        // Out of its shape: read as none, and traffic goes on.
+        (Some(serde_json::json!("NOT-AN-ID")), None),
+        (Some(serde_json::json!(7)), None),
+    ] {
+        a.set_instance(answer);
+        router.probe_due().await;
+        assert_eq!(instance(&router).as_deref(), read);
+        assert!(router.send(&request(MODEL_A, None, true)).await.is_ok());
+    }
+}
+
+/// Two nodes of one model are labelled apart in the gateway's logs, each by
+/// its deployment and its own node id, neither of which carries its URL.
+#[tokio::test]
+async fn two_nodes_of_one_model_are_labelled_apart_without_their_urls() {
+    let one = engine(Identity::of(MODEL_A)).await;
+    let two = engine(Identity::of(MODEL_A)).await;
+    let router = router_for(&[&one, &two], models());
+    router
+        .apply_placement(&[
+            one.row(MODEL_A, DEPLOYMENT_A),
+            two.row(MODEL_A, DEPLOYMENT_A),
+        ])
+        .await;
+    let mut nodes = Vec::new();
+    for engine in [&one, &two] {
+        let upstream = upstream(&router, MODEL_A, &engine.base_url);
+        let node = labels::node_id(&upstream.base_url);
+        assert_eq!(
+            upstream.labels,
+            labels::NodeLabels {
+                deployment: DEPLOYMENT_A[..16].to_string(),
+                node: node.clone(),
+            }
+        );
+        let authority = engine.base_url.trim_start_matches("https://");
+        let port = authority.rsplit(':').next().unwrap();
+        assert!(!node.contains("127.0.0.1") && node != port);
+        nodes.push(node);
+    }
+    assert_ne!(nodes[0], nodes[1]);
 }

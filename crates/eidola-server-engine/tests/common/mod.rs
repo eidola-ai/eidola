@@ -209,6 +209,8 @@ pub struct TestNode {
     pub engine: EngineHandle,
     pub admission: Arc<eidola_server_engine::worker::Admission>,
     pub client: reqwest::Client,
+    /// What the node's telemetry instruments observe when they are read.
+    pub telemetry: eidola_server_engine::telemetry::Source,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -219,6 +221,27 @@ impl Drop for TestNode {
 }
 
 impl TestNode {
+    /// What the node's instruments observe now for `instrument`, in the series with
+    /// every label in `labels` (besides `model`).
+    pub fn observed(
+        &self,
+        instrument: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<eidola_server_engine::telemetry::Value> {
+        self.telemetry
+            .observe()
+            .into_iter()
+            .find(|o| {
+                o.instrument == instrument
+                    && labels.iter().all(|&(k, v)| {
+                        o.attributes
+                            .iter()
+                            .any(|kv| kv.key.as_str() == k && kv.value.to_string() == v)
+                    })
+            })
+            .map(|o| o.value)
+    }
+
     /// Starts a node over the shared model, with `overrides` applied to [`env_map`].
     pub async fn start(overrides: &[(&'static str, &str)]) -> TestNode {
         let mut map = env_map();
@@ -268,6 +291,7 @@ impl TestNode {
             engine: node.engine,
             admission: node.admission,
             client: http_client(),
+            telemetry: node.telemetry,
             server,
         }
     }

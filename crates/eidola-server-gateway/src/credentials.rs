@@ -1538,6 +1538,22 @@ fn key_retired() -> ServerError {
     }
 }
 
+/// [`answer_stored`], setting `outcome` to `replayed`, or to `mismatch`
+/// when the idempotency key was used for another request.
+fn replay(
+    stored: db::StoredIssuance,
+    digest: &[u8; 32],
+    outcome: &mut &'static str,
+) -> Result<Json<IssueCredentialsResponse>, ServerError> {
+    let answer = answer_stored(stored, digest);
+    *outcome = if answer.is_ok() {
+        "replayed"
+    } else {
+        "mismatch"
+    };
+    answer
+}
+
 fn answer_stored(
     stored: db::StoredIssuance,
     digest: &[u8; 32],
@@ -1642,6 +1658,24 @@ pub async fn issue_credentials(
     State(state): State<AppState>,
     Json(request): Json<IssueCredentialsRequest>,
 ) -> Result<Json<IssueCredentialsResponse>, ServerError> {
+    // Counted, never logged: an issuance is a per-request event on a linked
+    // route, and a timestamped line for each could be matched by time
+    // against the anonymous spends that follow.
+    let mut outcome = "invalid";
+    let result = issue(&state, account_id, request, &mut outcome).await;
+    crate::telemetry::metrics::CREDENTIAL_ISSUANCE
+        .add(1, &[opentelemetry::KeyValue::new("outcome", outcome)]);
+    result
+}
+
+/// [`issue_credentials`] for one authenticated request, setting `outcome` to
+/// the `credentials.issuance` label its answer is counted under.
+async fn issue(
+    state: &AppState,
+    account_id: uuid::Uuid,
+    request: IssueCredentialsRequest,
+    outcome: &mut &'static str,
+) -> Result<Json<IssueCredentialsResponse>, ServerError> {
     let master_key = &state.credential_master_key;
 
     if request.credits <= 0 {
@@ -1683,13 +1717,14 @@ pub async fn issue_credentials(
     })?;
 
     let digest = issuance_request_digest(&issuance_cbor, request.credits, &request.issuer_key_id);
+    *outcome = "failed";
 
     // A retry of an issuance already paid for is answered from what was
     // stored, whatever has changed since: the terms in force, the current key.
     if let Some(stored) =
         db::find_credential_issuance(&state.db_pool, account_id, &idempotency_key).await?
     {
-        return answer_stored(stored, &digest);
+        return replay(stored, &digest, outcome);
     }
 
     let key_hash = ensure_keys(&state.credential_key_cache, master_key, &state.db_pool).await?;
@@ -1715,11 +1750,18 @@ pub async fn issue_credentials(
         )
         .await?
         {
-            db::OffCurrentKey::Stored(stored) => answer_stored(stored, &digest),
-            db::OffCurrentKey::Retired => Err(key_retired()),
-            db::OffCurrentKey::Issuing => Err(ServerError::ServiceUnavailable(
-                "the named issuer key is not this gateway's current issuing key yet".to_string(),
-            )),
+            db::OffCurrentKey::Stored(stored) => replay(stored, &digest, outcome),
+            db::OffCurrentKey::Retired => {
+                *outcome = "key_retired";
+                Err(key_retired())
+            }
+            db::OffCurrentKey::Issuing => {
+                *outcome = "key_pending";
+                Err(ServerError::ServiceUnavailable(
+                    "the named issuer key is not this gateway's current issuing key yet"
+                        .to_string(),
+                ))
+            }
         };
     }
 
@@ -1727,7 +1769,13 @@ pub async fn issue_credentials(
     // currently required terms/privacy versions (no-op when unconfigured).
     // After the key check, so a retry under a retired key is answered with
     // the final refusal whatever the terms in force.
-    crate::account::ensure_terms_accepted(&state, account_id).await?;
+    crate::account::ensure_terms_accepted(state, account_id)
+        .await
+        .inspect_err(|e| {
+            if matches!(e, ServerError::TermsAcceptanceRequired { .. }) {
+                *outcome = "terms_required";
+            }
+        })?;
 
     let issuance_response = {
         let cache = state.credential_key_cache.read().await;
@@ -1743,7 +1791,7 @@ pub async fn issue_credentials(
                 OsRng,
             )
             .map_err(|e| {
-                warn!("credential issuance failed: {}", e);
+                *outcome = "invalid";
                 ServerError::BadRequest {
                     message: format!("issuance failed: {}", e),
                 }
@@ -1769,14 +1817,19 @@ pub async fn issue_credentials(
     .await?
     {
         db::IssuanceRecord::Issued { ledger_entry_id } => ledger_entry_id,
-        db::IssuanceRecord::Stored(stored) => return answer_stored(stored, &digest),
-        db::IssuanceRecord::Retired => return Err(key_retired()),
+        db::IssuanceRecord::Stored(stored) => return replay(stored, &digest, outcome),
+        db::IssuanceRecord::Retired => {
+            *outcome = "key_retired";
+            return Err(key_retired());
+        }
         db::IssuanceRecord::Closed => {
+            *outcome = "closed";
             return Err(ServerError::Conflict {
                 message: "account is closing or closed".into(),
             });
         }
         db::IssuanceRecord::Insufficient => {
+            *outcome = "insufficient";
             let available = match db::get_available_balance(&state.db_pool, account_id).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -1791,11 +1844,7 @@ pub async fn issue_credentials(
         }
     };
 
-    // No ledger id and no amount: the ledger row already records both
-    // durably, and an exported log line naming them would hand the
-    // telemetry vendor a timestamped per-issuance record — the same rule
-    // the webhook success logs follow.
-    info!("credential issued");
+    *outcome = "issued";
 
     Ok(Json(IssueCredentialsResponse {
         issuance_response: URL_SAFE_NO_PAD.encode(&response_cbor),
@@ -1943,7 +1992,7 @@ pub(crate) async fn recover_presented_refund(
         let Some((stage, refund_cbor)) =
             open_refund_token(&act.refund_key, &key_id, &nullifier_bytes, &sealed)
         else {
-            warn!("stored refund token did not open; answering as if none were stored");
+            crate::telemetry::metrics::REFUND_RECOVERY_UNOPENED.add(1, &[]);
             return Err(ServerError::NotFound {
                 message: "no refund token is stored for this credential".to_string(),
             });

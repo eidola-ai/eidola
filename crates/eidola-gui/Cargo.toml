@@ -33,15 +33,15 @@ path = "src/main.rs"
 # reproducibility across developers and CI. Startup cost is a one-time
 # MTLDevice library compile (~50ms). Zed's own Nix package makes the same
 # trade-off.
-gpui = { package = "gpui-pre", version = "=0.3.7", features = ["inspector"] }
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["inspector"] }
 # `wayland` selects gpui's Linux windowing backend. It's gated inside
 # gpui_platform by `cfg(target_os = ...)`, so enabling it universally is a
 # no-op on macOS/Windows — no `[target.'cfg(...)']` split needed. Linux is
 # Wayland-only by decision (see AGENTS.md — cleaner all-open-source story,
 # narrower deployment surface); do not add the `x11` feature back.
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "runtime_shaders", "wayland"] }
-gpui-component = { version = "=0.7.0", features = ["inspector"] }
-gpui-kit-assets = "=0.7.0"
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "runtime_shaders", "wayland"] }
+gpui-component = { version = "=0.10.0", features = ["inspector"] }
+gpui-kit-assets = "=0.10.0"
 
 eidola-app-core = { path = "../eidola-app-core" }
 gpui-markdown-editor = { path = "../gpui-markdown-editor" }
@@ -114,10 +114,10 @@ fluent-syntax = "0.12"
 # this with the regular `gpui` dep, so feature flags merge for dev/test builds
 # — and for examples, which is how `examples/driver.rs` reaches the visual
 # test context outside `cargo test`.
-gpui = { package = "gpui-pre", version = "=0.3.7", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
 # The driver example's JSON-lines protocol.
 serde = { version = "1", features = ["derive"] }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["test-support", "font-kit", "wayland"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support", "font-kit", "wayland"] }
 # The embed-marker recognition lockstep test (tests/embed_lockstep.rs): this
 # crate is the one place that sees both the editor's parser-driven embed
 # recognition and eidola-common's structural scanner, so the corpus test
@@ -127,7 +127,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # `TextSelection::selected_text` for the Record perf harness's selection
 # fingerprints; gpui-component does not re-export it. Same exact pin as
 # gpui-component's own dependency on it.
-gpui-base = "=0.7.0"
+gpui-base = "=0.10.0"
 # Store-level tests (tests/stores.rs) build a real `AppCore` over tempdirs and
 # install the crypto provider (mirrors app-core's own test setup).
 tempfile = "3"

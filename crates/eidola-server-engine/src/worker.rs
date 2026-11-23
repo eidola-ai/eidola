@@ -59,6 +59,7 @@ use eidola_engine::engine::{
     Engine, FinishReason, Request, RequestId, SchedulerConfig, SubmitError,
 };
 use eidola_engine::executor::Executor;
+use eidola_engine::kv::PoolUsage;
 use tokio::sync::{mpsc, oneshot};
 
 /// Events buffered per request before a reader that stopped reading is cut off.
@@ -148,7 +149,9 @@ pub enum Output {
     Failed,
 }
 
-/// Content-free counters (tests and diagnostics).
+/// Content-free counters: the tests read them, and the node's telemetry snapshot is
+/// made from them (`http::telemetry`). Every one is zero until the engine has had a
+/// request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Requests the engine accepted.
@@ -168,12 +171,36 @@ pub struct Stats {
     /// Idle-KV keys the engine holds (a count): zero whenever no request is in the
     /// engine, since the last request's maintenance runs as soon as it ends.
     pub kv_keys_held: u64,
-    /// The engine's own counters.
+    /// Requests in the engine waiting for a seat, and running, now.
+    pub waiting: u64,
+    pub running: u64,
+    /// Wall time of the engine steps that ran a sequence, in microseconds: the step
+    /// call as the engine thread sees it, maintenance and scheduling included.
+    pub step_micros: u64,
+    /// The engine's own counters (`eidola_engine::engine::Stats`).
     pub engine_steps: u64,
+    pub forward_steps: u64,
+    pub step_rows: u64,
+    pub prefill_tokens: u64,
+    pub generated_tokens: u64,
     pub preemptions: u64,
     pub drafted: u64,
     pub accepted_drafts: u64,
+    pub admissions: u64,
+    pub prefix_hit_tokens: u64,
+    pub prefix_miss_tokens: u64,
+    /// The prefix cache's counters (`eidola_engine::kv::KvManager`): entries dropped
+    /// from the device pools to make room (with a host tier or without), entries
+    /// dropped from the host tier, and blocks moved between the two.
+    pub device_evictions: u64,
+    pub host_evictions: u64,
+    pub demoted_blocks: u64,
+    pub promoted_blocks: u64,
 }
+
+/// How often the engine thread recounts its pools ([`EngineHandle::pools`]): the count
+/// walks every block, so it is not made every step.
+pub const POOL_RECOUNT_INTERVAL: Duration = Duration::from_secs(1);
 
 enum Command {
     Submit {
@@ -231,6 +258,7 @@ pub struct EngineHandle {
     commands: std_mpsc::Sender<Command>,
     next_id: Arc<AtomicU64>,
     stats: Arc<Mutex<Stats>>,
+    pools: Arc<Mutex<Vec<PoolUsage>>>,
     healthy: Arc<AtomicBool>,
 }
 
@@ -283,6 +311,12 @@ impl EngineHandle {
 
     pub fn stats(&self) -> Stats {
         *self.stats.lock().expect("stats lock")
+    }
+
+    /// The engine's pools by what holds their blocks, as last recounted (at most
+    /// [`POOL_RECOUNT_INTERVAL`] ago while the engine thread runs).
+    pub fn pools(&self) -> Vec<PoolUsage> {
+        self.pools.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -356,9 +390,11 @@ where
 {
     let (commands, inbox) = std_mpsc::channel();
     let stats = Arc::new(Mutex::new(Stats::default()));
+    let pools = Arc::new(Mutex::new(Vec::new()));
     let healthy = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
     let thread_stats = stats.clone();
+    let thread_pools = pools.clone();
     let shared = Arc::new(Shared {
         busy: Busy::new(),
         live: Mutex::new(HashMap::new()),
@@ -404,6 +440,8 @@ where
                 inbox,
                 shared,
                 stats: thread_stats,
+                pools: thread_pools,
+                pools_counted: None,
                 counters: Stats::default(),
                 started: Instant::now(),
                 sweep_interval,
@@ -419,6 +457,7 @@ where
         commands,
         next_id: Arc::new(AtomicU64::new(1)),
         stats,
+        pools,
         healthy,
     })
 }
@@ -575,6 +614,9 @@ struct Worker<E: Executor> {
     inbox: std_mpsc::Receiver<Command>,
     shared: Arc<Shared>,
     stats: Arc<Mutex<Stats>>,
+    pools: Arc<Mutex<Vec<PoolUsage>>>,
+    /// When the pools were last recounted.
+    pools_counted: Option<Instant>,
     counters: Stats,
     started: Instant,
     sweep_interval: Duration,
@@ -597,6 +639,7 @@ impl<E: Executor> Worker<E> {
     }
 
     fn run(mut self) {
+        self.publish();
         // An absolute deadline, not a fresh timeout per wait: commands that leave the
         // engine idle (refused submissions, cancels of finished requests) can arrive
         // faster than the interval without ever postponing the sweep.
@@ -630,9 +673,14 @@ impl<E: Executor> Worker<E> {
             self.publish();
             if self.engine.unfinished() > 0 {
                 let now = self.now();
+                let forward = self.engine.stats().forward_steps;
+                let began = Instant::now();
                 let Some(stepped) = self.watched(|engine| engine.step(now)) else {
                     return;
                 };
+                if self.engine.stats().forward_steps > forward {
+                    self.counters.step_micros += began.elapsed().as_micros() as u64;
+                }
                 match stepped {
                     Ok(events) => {
                         self.announce_admissions();
@@ -764,12 +812,36 @@ impl<E: Executor> Worker<E> {
 
     fn publish(&mut self) {
         let s = self.engine.stats();
-        self.counters.in_engine = self.engine.unfinished() as u64;
-        self.counters.kv_keys_held = self.engine.kv_keys_held() as u64;
-        self.counters.engine_steps = s.steps;
-        self.counters.preemptions = s.preemptions;
-        self.counters.drafted = s.drafted;
-        self.counters.accepted_drafts = s.accepted;
+        let kv = self.engine.kv();
+        let tier = kv.tier_stats();
+        let c = &mut self.counters;
+        c.in_engine = self.engine.unfinished() as u64;
+        c.waiting = self.engine.waiting() as u64;
+        c.running = self.engine.running() as u64;
+        c.kv_keys_held = self.engine.kv_keys_held() as u64;
+        c.engine_steps = s.steps;
+        c.forward_steps = s.forward_steps;
+        c.step_rows = s.step_rows;
+        c.prefill_tokens = s.prefill_tokens;
+        c.generated_tokens = s.generated_tokens;
+        c.preemptions = s.preemptions;
+        c.drafted = s.drafted;
+        c.accepted_drafts = s.accepted;
+        c.admissions = s.admissions;
+        c.prefix_hit_tokens = s.prefix_hit_tokens;
+        c.prefix_miss_tokens = s.prefix_miss_tokens;
+        c.device_evictions = kv.evictions() + tier.device_drops;
+        c.host_evictions = tier.host_drops;
+        c.demoted_blocks = tier.demoted_blocks;
+        c.promoted_blocks = tier.promoted_blocks;
         *self.stats.lock().expect("stats lock") = self.counters;
+        if self
+            .pools_counted
+            .is_none_or(|at| at.elapsed() >= POOL_RECOUNT_INTERVAL)
+        {
+            let usage = self.engine.kv().pool_usage();
+            *self.pools.lock().unwrap_or_else(|p| p.into_inner()) = usage;
+            self.pools_counted = Some(Instant::now());
+        }
     }
 }

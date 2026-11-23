@@ -1,7 +1,7 @@
 //! Unified error handling for the Eidola gateway.
 
 use axum::http::StatusCode;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::types::ErrorResponse;
 
@@ -96,6 +96,27 @@ impl ServerError {
         }
     }
 
+    /// The error's fixed class, for a metric label: its kind, and for a
+    /// `Backend` error the upstream's classifier resolved against
+    /// [`KNOWN_UPSTREAM_ERROR_TYPES`], so no value outside the code reaches
+    /// a label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ServerError::BadRequest { .. } => "bad_request",
+            ServerError::Unauthorized { .. } => "unauthorized",
+            ServerError::Backend { error_type, .. } => upstream_error_type_label(error_type),
+            ServerError::Network(_) => "network",
+            ServerError::Parse(_) => "parse",
+            ServerError::NotFound { .. } => "not_found",
+            ServerError::PaymentRequired { .. } => "payment_required",
+            ServerError::Conflict { .. } => "conflict",
+            ServerError::TermsAcceptanceRequired { .. } => "terms_required",
+            ServerError::ServiceUnavailable(_) => "unavailable",
+            ServerError::ModelReference(e) => e.error_type(),
+            ServerError::Internal(_) => "internal",
+        }
+    }
+
     /// Convert to an OpenAI-format error response for the wire.
     pub fn to_error_response(&self) -> ErrorResponse {
         match self {
@@ -185,7 +206,8 @@ impl std::error::Error for ServerError {}
 /// arrives as upstream-authored free text, so the `Display` rendering
 /// resolves it against this list and collapses anything unrecognized to
 /// `other` — the client response keeps the verbatim value. `unknown` is
-/// this crate's own bucket for upstream error bodies that didn't parse.
+/// this crate's own bucket for upstream error bodies that didn't parse, and
+/// `timeout` its own for a request ended at its deadline.
 const KNOWN_UPSTREAM_ERROR_TYPES: &[&str] = &[
     "authentication_error",
     "cached_prefix_missing",
@@ -199,6 +221,7 @@ const KNOWN_UPSTREAM_ERROR_TYPES: &[&str] = &[
     "prompt_budget_exceeded",
     "rate_limit_error",
     "server_error",
+    "timeout",
     "unknown",
 ];
 
@@ -223,13 +246,16 @@ pub(crate) fn parse_error_summary(e: &serde_json::Error) -> String {
     format!("{:?} error", e.classify())
 }
 
+/// A 5xx is logged, as the incident it should be; a 4xx is not. A refusal
+/// is a per-request condition, and a log line per request would export a
+/// timestamped record of each, which on a linked route can be matched by
+/// time against an anonymous one. `http.server.request.count` counts every
+/// response by route and status, so refusals are visible as a rate.
 impl axum::response::IntoResponse for ServerError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status_code();
         if status.is_server_error() {
             error!(status = status.as_u16(), "{self}");
-        } else if status.is_client_error() {
-            warn!(status = status.as_u16(), "{self}");
         }
         let body = self.to_error_response();
         (status, axum::Json(body)).into_response()
@@ -332,6 +358,53 @@ mod tests {
             "offending value leaked: {summary}"
         );
         assert_eq!(summary, "Data error");
+    }
+
+    /// A refusal is a per-request condition and writes no log record; a
+    /// server error is an incident and writes one.
+    #[test]
+    fn only_server_errors_are_logged() {
+        use axum::response::IntoResponse;
+        let refusals = crate::telemetry::capture::capture(|| {
+            let _ = ServerError::BadRequest {
+                message: "bad".to_string(),
+            }
+            .into_response();
+            let _ = ServerError::Unauthorized {
+                message: "invalid credentials".to_string(),
+            }
+            .into_response();
+            let _ = ServerError::Conflict {
+                message: "credential already spent (duplicate nullifier)".to_string(),
+            }
+            .into_response();
+        });
+        assert_eq!(refusals.logs, 0);
+        let incident = crate::telemetry::capture::capture(|| {
+            let _ = ServerError::Internal("db pool error".to_string()).into_response();
+        });
+        assert_eq!(incident.logs, 1);
+    }
+
+    /// A metric label is a fixed class: an upstream classifier outside the
+    /// known list collapses to `other`, as in the log rendering.
+    #[test]
+    fn labels_come_from_a_fixed_set() {
+        let backend = |error_type: &str| ServerError::Backend {
+            status: 400,
+            error_type: error_type.to_string(),
+            message: "the prompt has 123457 tokens".to_string(),
+        };
+        assert_eq!(backend("overloaded").label(), "overloaded");
+        assert_eq!(backend("you requested 9001 tokens").label(), "other");
+        assert_eq!(
+            ServerError::PaymentRequired {
+                message: "4096 required".to_string(),
+                available: 120,
+            }
+            .label(),
+            "payment_required"
+        );
     }
 
     /// Server-authored messages stay in the logs — redaction is targeted, not

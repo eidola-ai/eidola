@@ -433,7 +433,7 @@ fn render_update_available(
                 Button::new("open-release")
                     .role(RoleOverride::Presentational)
                     .primary()
-                    .label("View Release…")
+                    .child(crate::theme::button_label("View Release…"))
                     .tab_stop(false),
             ),
     )

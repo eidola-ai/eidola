@@ -98,8 +98,8 @@ mod driver {
     use eidola_gui::window_input::WindowInput;
     use gpui::{
         AnyWindowHandle, App, AppContext, Capslock, Modifiers, ModifiersChangedEvent, MouseButton,
-        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent, Size,
-        TouchPhase, VisualTestAppContext, point, px, size,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollEvent,
+        ScrollSource, Size, TouchPhase, VisualTestAppContext, point, px, size,
     };
     use gpui_component::{Root, ThemeMode};
     use gpui_kit_assets::Assets;
@@ -2886,11 +2886,12 @@ mod driver {
                     let handle = self.window(window)?;
                     cx.simulate_event(
                         handle,
-                        ScrollWheelEvent {
+                        ScrollEvent {
                             position: pos,
                             delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
                             modifiers: Modifiers::default(),
                             touch_phase: TouchPhase::Moved,
+                            source: ScrollSource::Pointer,
                         },
                     );
                     Ok(json!({}))

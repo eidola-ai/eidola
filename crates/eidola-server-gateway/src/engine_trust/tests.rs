@@ -753,12 +753,12 @@ fn the_prompt_cache_policy_is_the_configs() {
 fn the_gateway_token_is_a_secret_and_never_measured() {
     let mut tree = Tree::fixture();
     tree.edit_config("      - ENGINE_GATEWAY_TOKEN\n", "");
-    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\"]");
+    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\", ");
 
     // The secret carries the prefix too.
     let mut tree = Tree::fixture();
     tree.edit_config("      - ENGINE_GATEWAY_TOKEN\n", "      - GATEWAY_TOKEN\n");
-    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\"]");
+    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\", ");
 
     for token in ["ENGINE_GATEWAY_TOKEN", "GATEWAY_TOKEN"] {
         let mut tree = Tree::fixture();
@@ -1678,6 +1678,7 @@ fn the_config_uses_only_the_keys_an_engine_needs() {
         ("    command: [\"--serve-something-else\"]\n", "command"),
         ("    privileged: true\n", "privileged"),
         ("    volumes: [\"/:/host\"]\n", "volumes"),
+        ("    ports: [\"8080:8080\"]\n", "ports"),
         ("    no_such_key: 1\n", "no_such_key"),
     ] {
         let mut tree = Tree::fixture();
@@ -1686,7 +1687,6 @@ fn the_config_uses_only_the_keys_an_engine_needs() {
     }
 
     for (extra, key) in [
-        ("networks:\n  egress:\n    egress: open\n", "networks"),
         ("cvm-network:\n  inbound-ports: [22]\n", "cvm-network"),
         ("attested-keys: []\n", "attested-keys"),
     ] {
@@ -1812,16 +1812,21 @@ fn the_weights_dir_is_the_granted_pinned_pack() {
     tree.check().expect("a weights directory inside the pack");
 }
 
-/// Any secret besides the gateway token is refused: it would reach the node
-/// outside the measurement.
+/// The secrets are the gateway token and where the node's telemetry goes,
+/// and nothing else: any other would reach the node outside the measurement.
 #[test]
-fn the_gateway_token_is_the_only_secret() {
+fn the_secrets_are_the_token_and_the_telemetry_endpoint() {
+    let expected = "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\", \
+                    \"ENGINE_OTEL_EXPORTER_OTLP_ENDPOINT\", \"ENGINE_OTEL_EXPORTER_OTLP_HEADERS\"]";
     let mut tree = Tree::fixture();
     tree.edit_config(
         "      - ENGINE_GATEWAY_TOKEN\n",
         "      - ENGINE_GATEWAY_TOKEN\n      - ENGINE_RUST_LOG\n",
     );
-    refused(&tree, "secrets must be exactly [\"ENGINE_GATEWAY_TOKEN\"]");
+    refused(&tree, expected);
+    let mut tree = Tree::fixture();
+    tree.edit_config("      - ENGINE_OTEL_EXPORTER_OTLP_HEADERS\n", "");
+    refused(&tree, expected);
 }
 
 /// The env sets exactly the node's measured variables: a name any dependency
@@ -2039,6 +2044,87 @@ fn the_config_holds_to_tinfoils_decoder_and_validator() {
         let mut tree = Tree::fixture();
         tree.edit_config(from, to);
         refused(&tree, needle);
+    }
+}
+
+/// The engine container may attach to declared networks, egress included,
+/// held to Tinfoil's network rules: one violating value per ported rule,
+/// each refused.
+#[test]
+fn the_engine_may_attach_to_networks_by_tinfoils_rules() {
+    const CONTAINER: &str = "    runtime: nvidia\n";
+    let attach = |networks: &str, attached: &str| {
+        let mut tree = Tree::fixture();
+        tree.edit_config("gpus: 8\n", &format!("gpus: 8\nnetworks:\n{networks}"));
+        tree.edit_config(CONTAINER, &format!("{CONTAINER}    networks: {attached}\n"));
+        tree
+    };
+    let open = "  egress:\n    egress: open\n";
+    attach(open, "[egress]").check().unwrap();
+    attach(
+        "  egress:\n    egress: allowlist\n    allow: [otlp.example.net]\n  quiet:\n    egress: closed\n",
+        "[egress, quiet]",
+    )
+    .check()
+    .unwrap();
+
+    let cases: &[(&str, &str, &str)] = &[
+        // validation.go `validateNetwork`: attached networks are declared,
+        // listed once, not the shim's, and at most one has egress.
+        (open, "[other]", "network \"other\" is not declared"),
+        (
+            open,
+            "[egress, egress]",
+            "network \"egress\" is listed twice",
+        ),
+        (open, "[shim-net]", "network \"shim-net\" is reserved"),
+        (
+            "  egress:\n    egress: open\n  more:\n    egress: open\n",
+            "[egress, more]",
+            "at most one attached network may have egress",
+        ),
+        // validation.go `validateNetworkEntry`: names, modes, allow entries.
+        ("  shim-net:\n    egress: open\n", "[]", "not \"shim-net\""),
+        (
+            "  Egress:\n    egress: open\n",
+            "[]",
+            "a network is named by",
+        ),
+        (
+            "  a-very-long-name:\n    egress: open\n",
+            "[]",
+            "a network is named by",
+        ),
+        (
+            "  egress:\n    egress: wide\n",
+            "[]",
+            "is not one of closed | allowlist | open",
+        ),
+        (
+            "  egress:\n    egress: open\n    allow: [otlp.example.net]\n",
+            "[]",
+            "only valid when egress: allowlist",
+        ),
+        (
+            "  egress:\n    egress: allowlist\n    allow: [\"*.example.net\"]\n",
+            "[]",
+            "is not a DNS hostname",
+        ),
+        (
+            "  egress:\n    egress: allowlist\n    allow: [\"192.0.2.1\"]\n",
+            "[]",
+            "is not a DNS hostname",
+        ),
+        // Our mirror states the mode, where Tinfoil reads none as closed.
+        ("  egress: {}\n", "[]", "missing field `egress`"),
+        (
+            "  egress:\n    egress: open\n    mtu: 1500\n",
+            "[]",
+            "unknown field `mtu`",
+        ),
+    ];
+    for (networks, attached, needle) in cases {
+        refused(&attach(networks, attached), needle);
     }
 }
 

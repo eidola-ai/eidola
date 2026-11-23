@@ -2,7 +2,7 @@
 
 This is the specification of what is pinned at compile time, how schema versions work, and how the verifier walks the chain. For the narrative of how a release becomes trustable, see [releases.md](releases.md). For payload / archive / envelope / installable vocabulary and how to hash a download, see [verification.md](verification.md). For day-to-day operational procedures (rotating keys, updating Sigstore roots, etc.) see [`releases/README.md`](../releases/README.md).
 
-The trust root is the set of values compiled into the Eidola client at build time that determines every trust decision it will make at runtime. The client's verifier consults these values when checking the gateway's attestation, when verifying a release, and when accepting or rejecting a self-update.
+The trust root is the set of values compiled into the Eidola client at build time that determines every trust decision it will make at runtime. The client's verifier consults these values when checking the gateway's attestation, when verifying a release, and when accepting or rejecting a self-update. The mobile app carries the same trust root, compiled into its bundle rather than into its native shell, which makes no trust decision ([the mobile app](mobile.md)).
 
 ## What's pinned
 

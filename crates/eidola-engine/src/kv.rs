@@ -270,6 +270,21 @@ impl HostPool {
     }
 }
 
+/// One pool's blocks by what holds them, at one moment (a count, content-free).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolUsage {
+    /// Blocks on the device, the null block not counted.
+    pub total: u64,
+    /// Blocks a sequence maps.
+    pub in_use: u64,
+    /// Blocks a cache entry holds that no sequence maps.
+    pub idle: u64,
+    /// Blocks in the host tier, the null block not counted; zero without one.
+    pub host_total: u64,
+    /// Host-tier blocks an entry holds, or that a queued promotion still reads.
+    pub host_used: u64,
+}
+
 /// Content-free host-tier counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TierStats {
@@ -453,6 +468,8 @@ pub struct KvManager {
     stripped_states: u64,
     /// States stored at release ([`Maintenance::SaveState`]).
     saved_states: u64,
+    /// Entries dropped from the device pools to make room without a host tier.
+    evictions: u64,
 }
 
 impl KvManager {
@@ -507,6 +524,7 @@ impl KvManager {
             state: spec.state_pool().map(|p| p as usize),
             stripped_states: 0,
             saved_states: 0,
+            evictions: 0,
         }
     }
 
@@ -518,6 +536,40 @@ impl KvManager {
     /// Host-tier counters.
     pub fn tier_stats(&self) -> TierStats {
         self.tier
+    }
+
+    /// Entries dropped (with what their removal cascades to) from the device pools to
+    /// make room, without a host tier. With one, [`TierStats::device_drops`] counts them.
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Every pool's blocks by what holds them now: the KV groups' in order, then the
+    /// state pool's. Walks every block, so it is for a caller that needs it now and
+    /// then, not every step.
+    pub fn pool_usage(&self) -> Vec<PoolUsage> {
+        self.pools
+            .iter()
+            .enumerate()
+            .map(|(g, pool)| {
+                let total = pool.refs.len().saturating_sub(1) as u64;
+                let free = pool.free.len() as u64;
+                let idle = (1..pool.refs.len() as u32)
+                    .filter(|&b| pool.idle(b))
+                    .count() as u64;
+                let (host_total, host_used) = self.host.get(g).map_or((0, 0), |h| {
+                    let total = h.holder.len().saturating_sub(1) as u64;
+                    (total, total.saturating_sub(h.free.len() as u64))
+                });
+                PoolUsage {
+                    total,
+                    in_use: total.saturating_sub(free).saturating_sub(idle),
+                    idle,
+                    host_total,
+                    host_used,
+                }
+            })
+            .collect()
     }
 
     /// Window blocks taken from entries that running sequences' chains keep, because no
@@ -2210,6 +2262,7 @@ impl KvManager {
             return false;
         };
         self.drop_leaf(eid);
+        self.evictions += 1;
         true
     }
 

@@ -1198,7 +1198,7 @@ impl SpaceView {
             // here, and let the event bubble so the one outer scroller does the
             // vertical scroll **natively** — preserving smooth momentum. Every
             // ancestor branch scroller undoes its own step the same way.
-            .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
+            .on_scroll(cx.listener(move |this, ev: &ScrollEvent, window, cx| {
                 let delta = ev.delta.pixel_delta(window.line_height());
                 let moved = !delta.x.is_zero() || !delta.y.is_zero();
                 this.note_scroll_activity(ev.touch_phase, moved, cx);
@@ -1595,7 +1595,7 @@ impl SpaceView {
             // body (`Body`: page scrolls, internal scroll frozen). The built-in
             // listener already scrolled `composer_scroll`; for a body-owned
             // session we restore it to its last-render value so it stays put.
-            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
+            .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
                 if matches!(ev.touch_phase, TouchPhase::Started) {
                     this.scroll_owner = None;
                 }
@@ -1787,7 +1787,7 @@ impl Render for SpaceView {
                     // the root post) for the minimap's show/hide, and claim the
                     // scroll session for the body: reaching the page scroller
                     // means the composer didn't own this gesture.
-                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
+                    .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
                         let delta = ev.delta.pixel_delta(window.line_height());
                         let moved = !delta.x.is_zero() || !delta.y.is_zero();
                         this.note_scroll_activity(ev.touch_phase, moved, cx);

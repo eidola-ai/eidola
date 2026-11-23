@@ -53,6 +53,7 @@ use gpui::{
 };
 use gpui_component::Root;
 use gpui_kit_assets::Assets;
+use gpui_markdown_editor::secondary_key_binding;
 
 use crate::about::AboutView;
 use crate::actions::{
@@ -545,12 +546,12 @@ pub fn install_keybindings(cx: &mut App) {
     // (Hide/Minimize) are macOS concepts — on Wayland the compositor owns
     // window management (Super+H etc.), so they are bound only on macOS.
     cx.bind_keys([
-        KeyBinding::new("secondary-,", OpenSettings, None),
-        KeyBinding::new("secondary-n", NewSpace, None),
-        KeyBinding::new("secondary-l", OpenLibrary, None),
-        KeyBinding::new("secondary-shift-l", OpenRecord, None),
-        KeyBinding::new("secondary-w", CloseWindow, None),
-        KeyBinding::new("secondary-q", Quit, None),
+        secondary_key_binding("secondary-,", OpenSettings, None, cx),
+        secondary_key_binding("secondary-n", NewSpace, None, cx),
+        secondary_key_binding("secondary-l", OpenLibrary, None, cx),
+        secondary_key_binding("secondary-shift-l", OpenRecord, None, cx),
+        secondary_key_binding("secondary-w", CloseWindow, None, cx),
+        secondary_key_binding("secondary-q", Quit, None, cx),
         // gpui-component installs its development inspector on ⌘⌥I (macOS)
         // and Ctrl+Shift+I (Linux). Remove both defaults first: otherwise the
         // upstream action still claims a chord that the space inspector needs.
@@ -566,19 +567,19 @@ pub fn install_keybindings(cx: &mut App) {
         ),
         // ⌥⌘I shows/hides the space window's inspector (Xcode/Finder); the
         // development overlay uses the shifted variant instead.
-        KeyBinding::new("secondary-alt-i", ToggleInspector, None),
+        secondary_key_binding("secondary-alt-i", ToggleInspector, None, cx),
         // ⌘F opens the conversation's find bar (unclaimed by the editor's own
         // keymap, so nothing has to give it up).
-        KeyBinding::new("secondary-f", FindInSpace, None),
-        KeyBinding::new("secondary-alt-shift-i", ToggleElementInspector, None),
+        secondary_key_binding("secondary-f", FindInSpace, None, cx),
+        secondary_key_binding("secondary-alt-shift-i", ToggleElementInspector, None, cx),
         // View → type size. ⌘0 / Ctrl+0 resets; ⌘=/⌘+ zooms in (both the bare
         // `=` and the shifted `+` that shares the key, so either keypress
         // works); ⌘-/Ctrl+- zooms out. Global (no context) so they fire even
         // with the composer focused — the editor keymap binds none of these.
-        KeyBinding::new("secondary-0", ActualSize, None),
-        KeyBinding::new("secondary-=", ZoomIn, None),
-        KeyBinding::new("secondary-+", ZoomIn, None),
-        KeyBinding::new("secondary--", ZoomOut, None),
+        secondary_key_binding("secondary-0", ActualSize, None, cx),
+        secondary_key_binding("secondary-=", ZoomIn, None, cx),
+        secondary_key_binding("secondary-+", ZoomIn, None, cx),
+        secondary_key_binding("secondary--", ZoomOut, None, cx),
         // ⌘↩ (Post) and ⌘⇧↩ (post quietly) are *not* bound here. The
         // composer owns those chords — `gpui_markdown_editor::init` binds them
         // in the `MarkdownEditor` context to `Enter { secondary: true, .. }`,

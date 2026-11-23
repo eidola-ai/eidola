@@ -3,7 +3,7 @@
 //! | Route | Auth | Purpose |
 //! |---|---|---|
 //! | `POST /v1/chat/completions` | gateway token + weights hash | the strict chat subset, answered as a stream |
-//! | `GET /v1/engine/info` | gateway token | model id, weights hash, build, executor, device |
+//! | `GET /v1/engine/info` | gateway token | model id, weights hash, build, executor, device, instance id |
 //! | `GET /healthz` | none | content-free liveness/readiness |
 //!
 //! A chat request is refused, in this order and before anything is admitted: a missing
@@ -35,6 +35,7 @@
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use axum::Router;
@@ -96,6 +97,20 @@ pub struct AppState {
     pub admission: Arc<Admission>,
     /// The read bound: requests whose body is being read or parsed (module docs).
     pub reading: Arc<Admission>,
+    /// Requests refused `overloaded` (no read or admission slot free), since boot.
+    pub overloaded: AtomicU64,
+    /// Requests answered with `engine_unavailable` or an internal error before any
+    /// stream opened, since boot.
+    pub failed: AtomicU64,
+    /// Streams that ended with an error event, since boot.
+    pub streams_failed: AtomicU64,
+}
+
+impl AppState {
+    fn refuse_overloaded(&self) -> ApiError {
+        self.overloaded.fetch_add(1, Ordering::Relaxed);
+        ApiError::Overloaded
+    }
 }
 
 /// The most event bytes a streamed response holds waiting for frames before it stops
@@ -206,7 +221,7 @@ pub fn build_info() -> Value {
 }
 
 async fn engine_info(State(state): State<Arc<AppState>>) -> Response {
-    axum::Json(json!({
+    let answer = axum::Json(json!({
         "model": state.model_id,
         "weights_sha256": state.model.weights_hash(),
         "weights_storage": state.model.storage().as_str(),
@@ -219,8 +234,9 @@ async fn engine_info(State(state): State<Arc<AppState>>) -> Response {
             "sm_count": d.sm_count,
             "memory_bytes": d.memory_bytes,
         })),
-    }))
-    .into_response()
+        "instance_id": crate::telemetry::instance_id(),
+    }));
+    answer.into_response()
 }
 
 fn check_weights_header(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -238,9 +254,15 @@ fn check_weights_header(state: &AppState, headers: &HeaderMap) -> Result<(), Api
 }
 
 async fn chat_completions(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    match chat(state, request).await {
+    match chat(state.clone(), request).await {
         Ok(r) => r,
-        Err(e) => e.into_response(),
+        Err(e) => {
+            // Counted, never logged: a line per request would be a record of it.
+            if matches!(e, ApiError::Unavailable | ApiError::Internal(_)) {
+                state.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            e.into_response()
+        }
     }
 }
 
@@ -250,13 +272,19 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
     // the bodies and parses outside admission are bounded too.
     // `Overloaded` only where nothing has been admitted: a gateway sends it to another
     // node (`eidola_common::engine_protocol::refused_before_admission`).
-    let reading = state.reading.try_acquire().ok_or(ApiError::Overloaded)?;
+    let reading = state
+        .reading
+        .try_acquire()
+        .ok_or_else(|| state.refuse_overloaded())?;
     let body = axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES)
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
     let req = api::parse_request(&body, &state.model_id)?;
     drop(body);
-    let permit = state.admission.try_acquire().ok_or(ApiError::Overloaded)?;
+    let permit = state
+        .admission
+        .try_acquire()
+        .ok_or_else(|| state.refuse_overloaded())?;
     drop(reading);
 
     let id = state.engine.next_id();
@@ -317,7 +345,7 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
     let decoder =
         Decoder::new(state.model.clone(), output, stop, call_prefix).window_bound(window_bound);
     let run = Run {
-        _state: state,
+        state,
         guard,
         events,
         response,
@@ -364,8 +392,9 @@ struct ResponseMeta {
 
 /// One admitted request in flight.
 struct Run {
-    /// Held for the life of the request, so the node it runs in outlives it.
-    _state: Arc<AppState>,
+    /// Held for the life of the request, so the node it runs in outlives it; and
+    /// where a stream that fails is counted.
+    state: Arc<AppState>,
     guard: RequestGuard,
     events: mpsc::Receiver<Output>,
     response: ResponseMeta,
@@ -564,7 +593,11 @@ impl Events {
                 }
             }
             Polled::Failed(e) => {
-                tracing::warn!("stream ended early: {e}");
+                // Counted, never logged: a line per stream would be a record of it.
+                self.run
+                    .state
+                    .streams_failed
+                    .fetch_add(1, Ordering::Relaxed);
                 framer.push(&StreamEvent::Error(e.to_body().to_string()));
             }
         }

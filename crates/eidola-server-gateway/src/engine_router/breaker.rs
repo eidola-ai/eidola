@@ -161,34 +161,42 @@ impl Breaker {
 
     /// A request the upstream failed. Opens a healthy one at the threshold,
     /// and a half-open one at once, its backoff doubled, if the request was
-    /// its trial.
-    pub fn on_failure(&mut self, admitted: Admitted, now: Instant, config: &BreakerConfig) {
+    /// its trial. Returns whether this failure opened it.
+    pub fn on_failure(&mut self, admitted: Admitted, now: Instant, config: &BreakerConfig) -> bool {
         let trial = self.is_trial(admitted);
         match &mut self.state {
             State::Healthy { failures } => {
                 *failures += 1;
                 if *failures >= config.failure_threshold {
                     self.open(now, config.initial_backoff);
+                    return true;
                 }
+                false
             }
             State::HalfOpen { backoff, .. } if trial => {
                 let backoff = (*backoff * 2).min(config.max_backoff);
                 self.open(now, backoff);
+                true
             }
-            State::HalfOpen { .. } | State::Unverified | State::Open { .. } => {}
+            State::HalfOpen { .. } | State::Unverified | State::Open { .. } => false,
         }
     }
 
     /// A refusal that means the upstream is misconfigured (it does not serve
     /// the pinned weights or model, or does not accept the gateway's token):
-    /// open at once, whatever the count.
-    pub fn trip(&mut self, now: Instant, config: &BreakerConfig) {
+    /// open at once, whatever the count. Returns whether this opened it (it
+    /// was not open already).
+    pub fn trip(&mut self, now: Instant, config: &BreakerConfig) -> bool {
         match self.state {
-            State::Open { .. } => {}
+            State::Open { .. } => false,
             State::HalfOpen { backoff, .. } => {
-                self.open(now, (backoff * 2).min(config.max_backoff))
+                self.open(now, (backoff * 2).min(config.max_backoff));
+                true
             }
-            State::Unverified | State::Healthy { .. } => self.open(now, config.initial_backoff),
+            State::Unverified | State::Healthy { .. } => {
+                self.open(now, config.initial_backoff);
+                true
+            }
         }
     }
 
@@ -262,13 +270,28 @@ mod tests {
         b.on_failure(Admitted::Healthy, now, &CONFIG);
         b.on_failure(Admitted::Healthy, now, &CONFIG);
         b.on_success(Admitted::Healthy);
-        b.on_failure(Admitted::Healthy, now, &CONFIG);
-        b.on_failure(Admitted::Healthy, now, &CONFIG);
+        assert!(!b.on_failure(Admitted::Healthy, now, &CONFIG));
+        assert!(!b.on_failure(Admitted::Healthy, now, &CONFIG));
         assert!(b.routable(), "two consecutive failures stay below three");
-        b.on_failure(Admitted::Healthy, now, &CONFIG);
+        assert!(
+            b.on_failure(Admitted::Healthy, now, &CONFIG),
+            "the failure that opens it says so"
+        );
         assert!(!b.routable());
         assert!(!b.probe_due(now + CONFIG.initial_backoff / 2));
         assert!(b.probe_due(now + CONFIG.initial_backoff));
+    }
+
+    /// Opening is reported once, by the call that opened it: a trip or a
+    /// failure while already open changes nothing and says so.
+    #[test]
+    fn only_the_transition_to_open_is_reported() {
+        let now = Instant::now();
+        let mut b = Breaker::new();
+        b.on_probe(true, now, &CONFIG);
+        assert!(b.trip(now, &CONFIG));
+        assert!(!b.trip(now, &CONFIG));
+        assert!(!b.on_failure(Admitted::Healthy, now, &CONFIG));
     }
 
     #[test]
