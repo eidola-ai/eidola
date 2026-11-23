@@ -140,6 +140,10 @@ mobile-bundle *args:
 mobile-bundle-repro *args:
     mobile/bundle-repro.sh {{args}}
 
+# The release app bundle, built in the pinned StageX toolchain (Docker; --no-cache, --out DIR); prints its digest
+mobile-bundle-release *args:
+    mobile/build-bundle-release.sh {{args}}
+
 # The app's headless self-test in the iOS Simulator or Android emulator against local shims
 mobile-self-test platform *args:
     mobile/self-test.sh {{platform}} {{args}}
@@ -152,7 +156,7 @@ mobile-ios-sim *args:
 mobile-ios-test *args:
     mobile/ios/test-sim.sh {{args}}
 
-# Build the Android shell APK (--bundle DIR, --debug, --out DIR)
+# Build the Android shell APK (--bundle DIR, --debug, --aab, --out DIR)
 mobile-android *args:
     mobile/android/build.sh {{args}}
 
@@ -160,7 +164,7 @@ mobile-android *args:
 mobile-android-test *args:
     mobile/android/test-emulator.sh {{args}}
 
-# Two clean Android builds, identical, and a signed APK strips back to them
+# Two clean Android builds, identical (APK and App Bundle), and a signed APK strips back to them
 mobile-android-repro *args:
     mobile/android/repro.sh {{args}}
 
@@ -262,6 +266,7 @@ check:
     ./scripts/test-require-needs-success.sh
     ./scripts/artifact-manifest.sh check-complete
     ./scripts/test-release-assets.sh
+    ./scripts/test-manifest-schema-flip.sh
     ./scripts/test-check-signing-identity.sh
     ./scripts/test-weights-hash.sh
     ./scripts/test-platform-endorsements-drift.sh
@@ -385,6 +390,11 @@ test-shipping-zip:
 test-release-assets:
     ./scripts/test-release-assets.sh
     ./scripts/test-weights-hash.sh
+
+# Run the next manifest schema's emit side over fixtures, with the emitted
+# schema flipped in a copy of the script; --update rewrites its fixture.
+test-manifest-schema-flip *args:
+    ./scripts/test-manifest-schema-flip.sh {{args}}
 
 # Compute enclave measurements from deploy/gateway/tinfoil-config.yml and CVM artifacts
 measure:

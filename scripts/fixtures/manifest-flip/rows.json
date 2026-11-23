@@ -1,0 +1,67 @@
+{
+  "artifacts": {
+    "eidola-billing": {
+      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-cli": {
+      "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-cli-linux-static-amd64": {
+      "platform": "linux/amd64",
+      "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "type": "file"
+    },
+    "eidola-cli-linux-static-arm64": {
+      "platform": "linux/arm64",
+      "sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "type": "file"
+    },
+    "eidola-gui-linux-deb-amd64": {
+      "platform": "linux/amd64",
+      "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "type": "file"
+    },
+    "eidola-gui-linux-deb-arm64": {
+      "platform": "linux/arm64",
+      "sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "type": "file"
+    },
+    "eidola-gui-linux-nix-amd64": {
+      "archiveSha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "narHash": "sha256-AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+      "platform": "linux/amd64",
+      "type": "nix"
+    },
+    "eidola-gui-macos-universal": {
+      "archiveSha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "narHash": "sha256-BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+      "platform": "darwin/universal",
+      "type": "nix"
+    },
+    "eidola-gui-macos-universal-zip": {
+      "platform": "darwin/universal",
+      "sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "type": "file"
+    },
+    "eidola-postgres": {
+      "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-server": {
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-server-engine": {
+      "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "platform": "linux/amd64",
+      "type": "oci"
+    }
+  },
+  "schema_version": 6
+}

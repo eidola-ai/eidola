@@ -450,6 +450,10 @@ pub struct VerifiedAttestation {
     /// the attestation's schema records it. `None` for a schema that
     /// predates those fields.
     pub apple: Option<AppleSignatureAttestation>,
+    /// What the attestant swore about the signed Android APK, when the
+    /// attestation's schema records it. `None` for a schema that predates
+    /// those fields.
+    pub android: Option<AndroidSignatureAttestation>,
     pub fingerprint_hex: String,
     pub rekor_log_index: u64,
     pub attested_at: String,
@@ -476,6 +480,25 @@ pub struct AppleSignatureAttestation {
     /// omitting the fact.
     pub team_id: Option<String>,
     pub signing_identifier: String,
+}
+
+/// The key-dependent facts about the Android APK a release publishes, as a
+/// named human recorded them.
+///
+/// The manifest records the *unsigned* APK, a function of source; the APK
+/// a user installs is that file signed, and a signature is a function of a
+/// key, so its hash and the certificate it is signed with belong here. A
+/// signed APK reduces to the unsigned one once its signing block is
+/// stripped (`mobile/android/tools/strip_apk_signature.py`), and the
+/// certificate's SHA-256 is what Android, and tools such as AppVerifier,
+/// show for an installed app — the identity a user compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndroidSignatureAttestation {
+    /// Lowercase hex sha256 of the signed APK the release publishes.
+    pub signed_apk_sha256: String,
+    /// Lowercase hex sha256 of the DER signing certificate (APK Signature
+    /// Scheme v2/v3), as `apksigner verify --print-certs` prints it.
+    pub signing_certificate_sha256: String,
 }
 
 #[derive(Debug, Clone)]

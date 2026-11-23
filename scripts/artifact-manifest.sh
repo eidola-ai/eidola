@@ -11,6 +11,8 @@ Usage:
   scripts/artifact-manifest.sh build-linux-gui [--output PATH] [--artifact-dir DIR]
   scripts/artifact-manifest.sh build-linux-deb [--output PATH] [--artifact-dir DIR]
   scripts/artifact-manifest.sh extract-cli [--arch amd64|arm64] [--push] [--metadata-file PATH] [--builder NAME] [--ensure-builder] [--output PATH] [--artifact-dir DIR]
+  scripts/artifact-manifest.sh build-mobile [--builder NAME] [--ensure-builder] [--output PATH] [--artifact-dir DIR] [--unsigned-dir DIR]
+  scripts/artifact-manifest.sh record-mobile --bundle-dir DIR --apk PATH [--output PATH] [--artifact-dir DIR]
   scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations] [--server-enclave-output PATH]
   scripts/artifact-manifest.sh check-complete [--manifest PATH]
   scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--config PATH] [--server-enclave PATH] [--output PATH] [--server-enclave-output PATH] [--verify-attestations]
@@ -51,10 +53,19 @@ Options:
                                (default; out of the `cli` image) or `arm64` (out of
                                the `cli-arm64` image).
   --artifact-dir DIR           Copy the files a release publishes (the Nix installable's
-                               `.tar.gz`, each `.deb`, each static Linux CLI) into DIR,
-                               named after the manifest key that records each one. Valid
-                               for `build-macos`, `build-linux-gui`, `build-linux-deb` and
-                               `extract-cli`.
+                               `.tar.gz`, each `.deb`, each static Linux CLI, the mobile
+                               bundle's container) into DIR, named after the manifest key
+                               that records each one. Valid for `build-macos`,
+                               `build-linux-gui`, `build-linux-deb`, `extract-cli`,
+                               `build-mobile` and `record-mobile`.
+  --unsigned-dir DIR           For `build-mobile`: also write the unsigned Android APK
+                               (`eidola-mobile-android-apk.apk`, the file its row records)
+                               and App Bundle (`eidola-mobile-android.aab`) into DIR: the
+                               inputs of the release-time signing step, never published
+                               as they are.
+  --bundle-dir DIR, --apk PATH For `record-mobile`: an already built bundle and unsigned
+                               APK to record (`build-mobile` builds both, then records
+                               them the same way).
 
 `extract-cli` reads the image's digest (`cli` for amd64, `cli-arm64` for
 arm64) from the --metadata-file of the build that produced it, exports that
@@ -64,6 +75,14 @@ unless that is a static ELF executable for the architecture asked for. Its
 partial records the binary from the schema that records it
 (CLI_ARTIFACT_SET_SCHEMA); below that the binary is still extracted, so the
 path is exercised, and the partial is empty.
+
+`build-mobile` builds the release app bundle in the pinned StageX toolchain
+(mobile/build-bundle-release.sh) against this tree's
+releases/trust/server-enclave.json, the unsigned APK and App Bundle over it
+(mobile/android/build.sh), and records both: the bundle's container and row
+(mobile/tools/bundle_container.py) and the APK's sha256. Its partial carries
+the two rows from the schema that records them (MOBILE_ARTIFACT_SET_SCHEMA);
+below that everything is still built and written, and the partial is empty.
   --verify-attestations        Verify the provenance of the CVM release manifest and SEV-SNP
                                IGVM image via Sigstore (requires gh CLI). Fails the command
                                if attestation verification fails.
@@ -136,6 +155,19 @@ CLI_ARTIFACT_SET_SCHEMA=5
 # an operator deploys to a reproducible build of the release's source.
 BILLING_IMAGE_SCHEMA=5
 
+# The schema at which the mobile app is recorded (the same boundary
+# `MOBILE_ARTIFACT_SET_SCHEMA` names on the client side): the app bundle the
+# shells boot, as a `bundle` row (`eidola-mobile-bundle`: its container's
+# sha256, the bundle digest the shells show, and every file), and the
+# Android shell's unsigned APK as a `file` row (`eidola-mobile-android-apk`).
+# Below it both are still built on every CI run, so the build is exercised
+# long before the release that first records them, and the partial is empty.
+# The signed APK a user installs is not a row at any schema: its bytes depend
+# on a key (releases/README.md → the attestation rotation).
+MOBILE_ARTIFACT_SET_SCHEMA=6
+MOBILE_BUNDLE_KEY="eidola-mobile-bundle"
+MOBILE_APK_KEY="eidola-mobile-android-apk"
+
 # The node's Containerfile pins the GPU kernel image it copies the kernels
 # from; this is that line. The bake targets build the input from this tree
 # instead (`engine-kernels`), so a build of the node also checks that build
@@ -171,6 +203,9 @@ required_artifact_keys() {
     keys+=("$(static_cli_key amd64)" "$(static_cli_key arm64)")
   else
     keys+=(eidola-cli-macos-universal)
+  fi
+  if records_mobile_app; then
+    keys+=("$MOBILE_BUNDLE_KEY" "$MOBILE_APK_KEY")
   fi
   if records_current_linux_shape; then
     keys+=(
@@ -252,6 +287,9 @@ CONFIG_FILE="$REPO_ROOT/deploy/gateway/tinfoil-config.yml"
 VERIFY_ATTESTATIONS=0
 PUSH_MODE=0
 ARTIFACT_DIR=""
+UNSIGNED_DIR=""
+MOBILE_BUNDLE_DIR=""
+MOBILE_APK_PATH=""
 TARGETS="all"
 PARTIAL_FILES=()
 BUILDX_SET_ARGS=()
@@ -282,6 +320,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --arch)
       STATIC_CLI_ARCH="$2"
+      shift 2
+      ;;
+    --unsigned-dir)
+      UNSIGNED_DIR="$2"
+      shift 2
+      ;;
+    --bundle-dir)
+      MOBILE_BUNDLE_DIR="$2"
+      shift 2
+      ;;
+    --apk)
+      MOBILE_APK_PATH="$2"
       shift 2
       ;;
     --manifest)
@@ -924,6 +974,135 @@ print_static_cli_manifest() {
         --arg platform "linux/${STATIC_CLI_ARCH}" \
         --arg sha "sha256:${STATIC_CLI_SHA256}" \
         '{ ($key): { type: "file", platform: $platform, sha256: $sha } }'
+    )"
+  fi
+  jq -n \
+    --argjson schema "$MANIFEST_SCHEMA_VERSION" \
+    --argjson rows "$rows" \
+    '{ schema_version: $schema, artifacts: $rows }'
+}
+
+# ── The mobile app ────────────────────────────────────────────────────────────
+
+# Does the emitted schema record the mobile app bundle and the Android APK?
+records_mobile_app() {
+  ((MANIFEST_SCHEMA_VERSION >= MOBILE_ARTIFACT_SET_SCHEMA))
+}
+
+# Build the release app bundle and the unsigned Android APK and App Bundle
+# over it, then record them (`record_mobile_artifacts`).
+#
+# The bundle comes out of the pinned StageX toolchain and compiles in this
+# tree's releases/trust/server-enclave.json, so it is built after that file
+# is final, as the client images are. The APK embeds exactly that bundle; it
+# is built here with the pinned, hash-checked Android tools
+# (mobile/android/tools.sh), which give the same bytes on Linux and macOS
+# with any JDK from 17 up (mobile/AGENTS.md → Reproducibility).
+build_mobile_artifacts() {
+  local work tool
+  local -a bundle_args=()
+  for tool in docker java python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "error: building the mobile app requires $tool" >&2
+      exit 1
+    fi
+  done
+  if [[ "$ENSURE_BUILDER" -eq 1 ]]; then
+    ensure_builder
+    bundle_args=(--builder "$BUILDER_NAME")
+  fi
+  work="$(mktemp -d "${TMPDIR:-/tmp}/eidola-mobile.XXXXXX")"
+
+  if ! "$REPO_ROOT/mobile/build-bundle-release.sh" --out "$work/bundle" \
+    ${bundle_args[@]+"${bundle_args[@]}"} >&2; then
+    rm -rf "$work"
+    echo "error: the release app bundle did not build" >&2
+    exit 1
+  fi
+  if ! "$REPO_ROOT/mobile/android/build.sh" --bundle "$work/bundle" --aab --out "$work/android" >&2; then
+    rm -rf "$work"
+    echo "error: the Android shell did not build over the release bundle" >&2
+    exit 1
+  fi
+
+  MOBILE_BUNDLE_DIR="$work/bundle"
+  MOBILE_APK_PATH="$work/android/eidola-shell-unsigned.apk"
+  record_mobile_artifacts
+  if [[ -n "$UNSIGNED_DIR" ]]; then
+    mkdir -p "$UNSIGNED_DIR"
+    cp "$MOBILE_APK_PATH" "$UNSIGNED_DIR/${MOBILE_APK_KEY}.apk"
+    cp "$work/android/eidola-shell-unsigned.aab" "$UNSIGNED_DIR/eidola-mobile-android.aab"
+  fi
+  rm -rf "$work"
+}
+
+# Record a built bundle (MOBILE_BUNDLE_DIR) and unsigned APK (MOBILE_APK_PATH):
+# the bundle's container, written by the one writer a test holds to the
+# client's (mobile/tools/bundle_container.py), and its row, whose digest must
+# be the one the shells will show for those files (mobile/tools/bundle_digest.py,
+# which also refuses a file no shell would serve); and the APK's sha256.
+# Sets MOBILE_BUNDLE_ROW and MOBILE_APK_SHA256 and, with --artifact-dir,
+# writes the container there under its key. Recording does not depend on the
+# emitted schema; only the partial does (`print_mobile_manifest`).
+record_mobile_artifacts() {
+  local work row shown
+  if [[ -z "$MOBILE_BUNDLE_DIR" || ! -f "$MOBILE_BUNDLE_DIR/index.html" ]]; then
+    echo "error: no bundle to record (--bundle-dir names a directory with an index.html)" >&2
+    exit 1
+  fi
+  if [[ -z "$MOBILE_APK_PATH" || ! -f "$MOBILE_APK_PATH" ]]; then
+    echo "error: no APK to record (--apk)" >&2
+    exit 1
+  fi
+  work="$(mktemp -d "${TMPDIR:-/tmp}/eidola-mobile-record.XXXXXX")"
+  if ! row="$(python3 -I "$REPO_ROOT/mobile/tools/bundle_container.py" \
+    "$MOBILE_BUNDLE_DIR" "$work/${MOBILE_BUNDLE_KEY}.tar")"; then
+    rm -rf "$work"
+    echo "error: the bundle in $MOBILE_BUNDLE_DIR could not be packed" >&2
+    exit 1
+  fi
+  if ! shown="$(python3 -I "$REPO_ROOT/mobile/tools/bundle_digest.py" "$MOBILE_BUNDLE_DIR")"; then
+    rm -rf "$work"
+    echo "error: $MOBILE_BUNDLE_DIR holds a file no shell would serve" >&2
+    exit 1
+  fi
+  MOBILE_BUNDLE_ROW="$(printf '%s\n' "$row" | jq -c .)"
+  if [[ "$(printf '%s\n' "$MOBILE_BUNDLE_ROW" | jq -r .digest)" != "sha256:${shown}" ]]; then
+    rm -rf "$work"
+    echo "error: the bundle row's digest is not the one the shells show for these files (sha256:${shown})" >&2
+    exit 1
+  fi
+  if [[ "$(printf '%s\n' "$MOBILE_BUNDLE_ROW" | jq -r .sha256)" != "$(file_sha256 "$work/${MOBILE_BUNDLE_KEY}.tar")" ]]; then
+    rm -rf "$work"
+    echo "error: the bundle row does not record the container written beside it" >&2
+    exit 1
+  fi
+  MOBILE_APK_SHA256="$(file_sha256_hex "$MOBILE_APK_PATH")"
+  copy_named_artifact "$work/${MOBILE_BUNDLE_KEY}.tar" "${MOBILE_BUNDLE_KEY}.tar"
+  rm -rf "$work"
+  echo "mobile bundle: digest sha256:${shown}, container $(printf '%s\n' "$MOBILE_BUNDLE_ROW" | jq -r .sha256)" >&2
+  echo "unsigned APK:  sha256:${MOBILE_APK_SHA256}" >&2
+}
+
+# The mobile partial: both rows from MOBILE_ARTIFACT_SET_SCHEMA, an empty
+# artifacts object below it.
+print_mobile_manifest() {
+  local rows='{}'
+  if [[ -z "${MOBILE_BUNDLE_ROW:-}" || -z "${MOBILE_APK_SHA256:-}" ]]; then
+    echo "error: print_mobile_manifest called before record_mobile_artifacts" >&2
+    return 1
+  fi
+  if records_mobile_app; then
+    rows="$(
+      jq -n \
+        --arg bundle_key "$MOBILE_BUNDLE_KEY" \
+        --argjson bundle "$MOBILE_BUNDLE_ROW" \
+        --arg apk_key "$MOBILE_APK_KEY" \
+        --arg apk "sha256:${MOBILE_APK_SHA256}" \
+        '{
+          ($bundle_key): $bundle,
+          ($apk_key): { type: "file", platform: "android/universal", sha256: $apk }
+        }'
     )"
   fi
   jq -n \
@@ -1658,7 +1837,10 @@ verify_oci_manifest() {
 #            have to come after phase 2. The *other* platform's desktop
 #            entries are carried over from the committed manifest (no single
 #            host can build both; CI's linux-gui + apple jobs are the
-#            cross-platform authority and verify the full set).
+#            cross-platform authority and verify the full set). From
+#            MOBILE_ARTIFACT_SET_SCHEMA, the mobile app too: the release
+#            bundle (it compiles in the same `server-enclave.json`) and the
+#            unsigned APK over it, built on either host.
 #   Phase 4: from the schema that records each, build the inference node's
 #            image and the billing image. Neither consumes the enclave
 #            measurement and nothing above consumes their digests, so their
@@ -1669,8 +1851,8 @@ verify_oci_manifest() {
 # recorded in the very file the cli build was COPYing into its build context),
 # so `just update-manifest` converges in a single run.
 update_manifest() {
-  local server_oci_partial cli_oci_partial static_cli_partial static_cli_arm64_partial macos_partial linux_gui_partial actual_manifest
-  local server_oci_partial_file cli_oci_partial_file static_cli_partial_file static_cli_arm64_partial_file macos_partial_file linux_gui_partial_file
+  local server_oci_partial cli_oci_partial static_cli_partial static_cli_arm64_partial macos_partial linux_gui_partial mobile_partial actual_manifest
+  local server_oci_partial_file cli_oci_partial_file static_cli_partial_file static_cli_arm64_partial_file macos_partial_file linux_gui_partial_file mobile_partial_file
   local server_metadata cli_metadata cli_arm64_metadata engine_metadata billing_metadata original_metadata original_targets original_arch host_os
 
   if [[ -z "$OUTPUT_FILE" ]]; then
@@ -1749,6 +1931,16 @@ update_manifest() {
     echo "note: darwin narHash/archiveSha256 and the ${other_arch} .deb carried over from committed manifest (not buildable on this host); CI verifies them" >&2
   fi
 
+  # The mobile app, once a schema records it: the bundle compiles in the
+  # server-enclave.json written above, and the APK embeds that bundle. Both
+  # are built on Linux and macOS alike (the bundle in its container), so
+  # neither is ever carried over from the committed manifest.
+  mobile_partial="$(jq -n --argjson schema "$MANIFEST_SCHEMA_VERSION" '{ schema_version: $schema, artifacts: {} }')"
+  if records_mobile_app; then
+    build_mobile_artifacts
+    mobile_partial="$(print_mobile_manifest)"
+  fi
+
   # ── Phase 4: the node's and billing images, once a schema records each ─
   local engine_oci_partial engine_oci_partial_file billing_oci_partial billing_oci_partial_file
   engine_oci_partial="$(jq -n --argjson schema "$MANIFEST_SCHEMA_VERSION" '{ schema_version: $schema, artifacts: {} }')"
@@ -1782,10 +1974,11 @@ update_manifest() {
   billing_oci_partial_file="$(write_temp_file "$billing_oci_partial")"
   macos_partial_file="$(write_temp_file "$macos_partial")"
   linux_gui_partial_file="$(write_temp_file "$linux_gui_partial")"
-  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$static_cli_partial_file" "$static_cli_arm64_partial_file" "$engine_oci_partial_file" "$billing_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file")
+  mobile_partial_file="$(write_temp_file "$mobile_partial")"
+  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$static_cli_partial_file" "$static_cli_arm64_partial_file" "$engine_oci_partial_file" "$billing_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file" "$mobile_partial_file")
 
   actual_manifest="$(merge_partials)"
-  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$static_cli_partial_file" "$static_cli_arm64_partial_file" "$engine_oci_partial_file" "$billing_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
+  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$static_cli_partial_file" "$static_cli_arm64_partial_file" "$engine_oci_partial_file" "$billing_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file" "$mobile_partial_file"
 
   # Nothing is written until the composition is whole. A short manifest is
   # not a smaller version of a good one — every installed client reads the
@@ -1828,6 +2021,14 @@ case "$COMMAND" in
   extract-cli)
     extract_static_cli
     write_output "$(print_static_cli_manifest)"
+    ;;
+  build-mobile)
+    build_mobile_artifacts
+    write_output "$(print_mobile_manifest)"
+    ;;
+  record-mobile)
+    record_mobile_artifacts
+    write_output "$(print_mobile_manifest)"
     ;;
   measure)
     enclave_json="$(compute_measurements)"
