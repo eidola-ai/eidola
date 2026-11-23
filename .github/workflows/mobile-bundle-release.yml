@@ -1,0 +1,89 @@
+name: Mobile release bundle
+
+# The release app bundle is built in the pinned StageX toolchain
+# (oci/eidola-mobile-bundle/Containerfile), so its bytes must not depend on
+# the machine that builds it. This job rebuilds it from scratch on a hosted
+# x86-64 runner and requires the digest committed in
+# mobile/bundle-release.digest, which was computed on another machine (a
+# developer's, usually an arm64 Mac running the stages emulated): every pass
+# is a cross-host equality check. A change to anything the bundle compiles
+# moves the digest, and the failure prints the new one and each file's hash;
+# rebuild locally (`just mobile-bundle-release --update`) and commit it.
+#
+# Path-filtered to the bundle's inputs, which are wide: any crate can be in
+# the app's graph, and app-core compiles in the trust root and the model
+# catalog. The expensive artifact chain builds the same bundle again on
+# `main` and records it in the manifest from schema 6.
+on:
+  push:
+    branches: [mobile]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "models/**"
+      - "releases/trust/server-enclave.json"
+      - "releases/trust/trust-constants.json"
+      - "releases/trust/sigstore-trusted-root.json"
+      - "releases/schema/attestation-templates.json"
+      - "oci/eidola-mobile-bundle/**"
+      - "oci/pallet-rust"
+      - "docker-bake.hcl"
+      - ".dockerignore"
+      - "mobile/build-bundle-release.sh"
+      - "mobile/bundle-release.digest"
+      - "mobile/tools/bundle_digest.py"
+      - ".github/workflows/mobile-bundle-release.yml"
+  pull_request:
+    branches: [mobile]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "models/**"
+      - "releases/trust/server-enclave.json"
+      - "releases/trust/trust-constants.json"
+      - "releases/trust/sigstore-trusted-root.json"
+      - "releases/schema/attestation-templates.json"
+      - "oci/eidola-mobile-bundle/**"
+      - "oci/pallet-rust"
+      - "docker-bake.hcl"
+      - ".dockerignore"
+      - "mobile/build-bundle-release.sh"
+      - "mobile/bundle-release.digest"
+      - "mobile/tools/bundle_digest.py"
+      - ".github/workflows/mobile-bundle-release.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  bundle:
+    name: Release bundle matches its committed digest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        # The pinned buildx and BuildKit the artifact chain builds with. No
+        # layer cache of any kind: the point is a build from scratch.
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.31.1
+          platforms: linux/amd64
+          cache-binary: false
+          driver-opts: |
+            image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
+
+      - name: Build the release bundle and compare with the committed digest
+        run: mobile/build-bundle-release.sh --check
