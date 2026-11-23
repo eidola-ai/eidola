@@ -83,7 +83,7 @@ For each adversary, the question is the same: *given the [privacy guarantees](pr
 
 ### N1. A compromised local environment
 
-If the user's device is compromised — malicious app with sufficient privilege, OS-level surveillance, malware in the Eidola binary's host process — most user-facing privacy properties fall, regardless of what Eidola does. The client's fail-safe defaults and embedded trust root limit *what code runs*, but they cannot prevent an already-trusted process from observing the user. This is named explicitly in [privacy-guarantees.md §8.1](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise).
+If the user's device is compromised — malicious app with sufficient privilege, OS-level surveillance, malware in the Eidola binary's host process — most user-facing privacy properties fall, regardless of what Eidola does. The client's fail-safe defaults and embedded trust root limit *what code runs*, but they cannot prevent an already-trusted process from observing the user. This is named explicitly in [privacy-guarantees.md §8.1](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise). On a phone, this environment includes the native shell around the mobile app, which holds the app's files and decides which code its webview runs ([the mobile app](mobile.md#what-the-shell-is-trusted-with)).
 
 ### N2. A hardware-manufacturer forgery
 
@@ -113,6 +113,7 @@ Every system rests on something it cannot verify from inside itself. Ours is lis
 | **Sigstore Rekor** (Linux Foundation) | The transparency log entry for a release attestation is genuine and never removed | Rekor public keys are pinned in the client via `sigstore-trusted-root.json`, so a WebPKI MITM against `rekor.sigstore.dev` still can't sign valid Rekor responses. If Rekor is unreachable, update verification fails closed. Checkpoint signature verification is a [gap](gaps.md#rekor-checkpoint-signature-verification) |
 | **GitHub OIDC** (Fulcio identity binding) | The release-signing CI workflow ran under the identity it claims | Pinned identity pattern + tag, plus the human attestation requirement makes OIDC compromise alone insufficient. Manual escape via [rotation](../releases/README.md#rotating-the-ci-signing-workflow) |
 | **The user's prior client binary** | Embedded trust root has not been silently subverted before install | Public release record + signed continuity check between releases |
+| **The mobile app's native shell** | Serving the bundle the app verified, and keeping the app's files without reading them | On Android, the published APK reproduces byte for byte from source once its signature is removed. On iOS nothing lowers it: Apple encrypts the shell it distributes, so no installed copy can be compared with a build, and the shell is trusted as the platform is. See [the mobile app](mobile.md#what-can-be-verified) |
 | **The user's hardware and OS** | Process isolation, key storage, code execution integrity | Outside Eidola's scope; named in [N1](#n1-a-compromised-local-environment) |
 
 Each of these is a place where a capable adversary could break the chain. Where mitigations are in progress, they are in [gaps.md](gaps.md).
