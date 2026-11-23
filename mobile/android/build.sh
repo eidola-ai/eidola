@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the Android shell with the SDK's own tools and pinned kotlinc; no Gradle.
 #   build.sh [--bundle DIR] [--debug] [--out DIR]
-# --bundle  the bundle to embed (default: the contract test page)
+# --bundle  the bundle to embed (default: the app, built by ../build-bundle.sh; the tests embed
+#           ../contract-test)
 # --debug   a debuggable APK as ai.eidola.mobile.dev (console in logcat, inspectable WebView);
 #           the default, release, is ai.eidola.mobile
 # --out     output directory (default build/<release|debug>)
@@ -10,7 +11,7 @@
 set -euo pipefail
 export TZ=UTC LC_ALL=C LANG=C
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BUNDLE="$HERE/../contract-test"
+BUNDLE=
 VARIANT=release
 OUT=
 while (($#)); do
@@ -24,6 +25,10 @@ done
 OUT="$(mkdir -p "${OUT:-$HERE/build/$VARIANT}" && cd "${OUT:-$HERE/build/$VARIANT}" && pwd)"
 MIN_SDK=30
 source "$HERE/tools.sh"
+if [[ -z "$BUNDLE" ]]; then
+  "$HERE/../build-bundle.sh" >&2
+  BUNDLE="$HERE/../build/bundle"
+fi
 test -f "$BUNDLE/index.html" || { echo "$BUNDLE has no index.html" >&2; exit 1; }
 # The digest tool refuses a file the shell would not serve; it prints the digest the shell will show.
 DIGEST="$(python3 "$HERE/../tools/bundle_digest.py" "$BUNDLE")"

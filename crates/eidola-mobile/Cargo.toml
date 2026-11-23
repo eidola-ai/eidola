@@ -1,0 +1,46 @@
+[package]
+name = "eidola-mobile"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "GPL-3.0-only"
+
+[lib]
+# `cdylib` is the wasm the bundle loads; `rlib` lets the native tests drive the
+# same client against a shell written in Rust.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The headless self-test (`src/selftest.rs`): only the self-test bundle
+# (`mobile/build-bundle.sh --self-test`) is built with it, so a release bundle
+# carries none of its code.
+self-test = ["dep:futures-util", "dep:sha2"]
+
+[dependencies]
+base64 = "0.23"
+eidola-app-core = { path = "../eidola-app-core", default-features = false }
+futures-util = { version = "0.3", default-features = false, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { version = "0.11", optional = true }
+thiserror = "2"
+tinfoil-verifier = { path = "../tinfoil-verifier" }
+tokio = { version = "1", default-features = false, features = ["io-util", "sync"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+# Self-reference: the self-test's verdict is tested natively
+# (`tests/selftest.rs`); dev-dependency features never reach a bundle build.
+eidola-mobile = { path = ".", features = ["self-test"] }
+hex = "0.4"
+rustls-rustcrypto = "0.1.0-pre.0"
+tempfile = "3"
+tinfoil-shim-mock = { path = "../tinfoil-shim-mock" }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync"] }

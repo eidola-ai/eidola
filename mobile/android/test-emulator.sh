@@ -54,7 +54,7 @@ until [[ "$("${ADB[@]}" shell getprop sys.boot_completed | tr -d '\r')" == 1 ]];
 mkdir -p "$HERE/.keys"
 [[ -f "$HERE/.keys/debug.p12" ]] || keytool -genkeypair -keystore "$HERE/.keys/debug.p12" -storetype PKCS12 \
   -storepass android -alias shell -keyalg EC -groupname secp256r1 -validity 3650 -dname "CN=Eidola shell debug key"
-KEYSTORE="$HERE/.keys/debug.p12" "$HERE/build.sh" --debug
+KEYSTORE="$HERE/.keys/debug.p12" "$HERE/build.sh" --debug --bundle "$HERE/../contract-test"
 # A fresh install, so no earlier run's files or bundles remain.
 "${ADB[@]}" uninstall "$PKG" >/dev/null 2>&1 || true
 "${ADB[@]}" install -r "$HERE/build/debug/eidola-shell-signed.apk" >/dev/null

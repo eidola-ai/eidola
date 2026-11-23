@@ -15,8 +15,8 @@ What to prepare before a shell build goes onto a physical device, and the exact 
 - [ ] `just mobile-ios-test` and `just mobile-android-test` pass on this commit.
 - [ ] Xcode is signed in to an Apple ID on team `7N2X49G865` (Xcode → Settings → Accounts); the build uses automatic signing with the bundle id `ai.eidola.mobile.dev`.
 - [ ] Builds made ahead, one per bundle, each with the digest `build.sh` prints noted:
-  - the contract test page: `mobile/ios/build.sh --device`
-  - a real bundle: `mobile/ios/build.sh --device --bundle DIR`
+  - the contract test page: `mobile/ios/build.sh --device --bundle mobile/contract-test`
+  - the app bundle: `mobile/ios/build.sh --device` (it builds `mobile/build/bundle` first)
 - [ ] The Mac's LAN address noted (`ipconfig getifaddr en0`), and the echo server ready to start on it: `python3 mobile/tools/echo_server.py 7777 0.0.0.0`.
 - [ ] A file `contract-echo.txt` holding `<LAN address>:7777`, for the test page to find the echo server.
 

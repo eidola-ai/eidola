@@ -319,10 +319,11 @@ jobs:
           echo "::remove-matcher owner=rust::"
 
       - name: Clippy for wasm32 without desktop
-        # The mobile app builds eidola-app-core and tinfoil-verifier for
-        # wasm32-unknown-unknown without app-core's `desktop` feature, and no
-        # other gate compiles that build, so it would rot unnoticed. Clippy
-        # compiles everything `cargo check` does, so this is the check too.
+        # The mobile app (eidola-mobile) builds eidola-app-core and
+        # tinfoil-verifier for wasm32-unknown-unknown without app-core's
+        # `desktop` feature, and no other gate compiles that build, so it
+        # would rot unnoticed. Clippy compiles everything `cargo check` does,
+        # so this is the check too; the self-test feature is linted with it.
         # The target is added here rather than in rust-toolchain.toml, whose
         # hash the Nix toolchain pins. Its rustflags come from
         # .cargo/config.toml, which a RUSTFLAGS variable would replace, so
@@ -331,8 +332,10 @@ jobs:
         run: |
           rustup target add wasm32-unknown-unknown
           echo "::add-matcher::.github/rust-problem-matcher.json"
-          cargo clippy -p eidola-app-core -p tinfoil-verifier \
+          cargo clippy -p eidola-app-core -p tinfoil-verifier -p eidola-mobile \
             --target wasm32-unknown-unknown --no-default-features -- -D warnings
+          cargo clippy -p eidola-mobile --target wasm32-unknown-unknown \
+            --features self-test -- -D warnings
           echo "::remove-matcher owner=rust::"
 
       - name: Markdown lint
