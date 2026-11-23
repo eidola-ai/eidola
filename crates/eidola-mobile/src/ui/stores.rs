@@ -12,10 +12,10 @@ use std::rc::Rc;
 use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::error::AppError;
 use eidola_app_core::{AppCore, SpaceInfo};
-use gpui::{App, AppContext as _, Context, Entity, Task, WeakEntity};
+use gpui::{App, AppContext as _, Context, Entity, Subscription, Task, WeakEntity};
 use tokio::sync::broadcast::error::RecvError;
 
-use super::conversation::{Conversation, RowState};
+use super::conversation::{Conversation, Origin, RowState};
 use super::loadable::Loadable;
 
 /// Everything a view is handed.
@@ -49,6 +49,9 @@ pub struct SpacesStore {
     disposals: HashMap<String, Task<()>>,
     /// One entity per open space, shared by every view of it.
     registry: HashMap<String, WeakEntity<Conversation>>,
+    /// Conversations no view shows that still have work in flight, kept alive
+    /// until it settles (the observation releases them).
+    held: HashMap<String, (Entity<Conversation>, Subscription)>,
 }
 
 impl SpacesStore {
@@ -61,6 +64,7 @@ impl SpacesStore {
             reap_after_creation: HashSet::new(),
             disposals: HashMap::new(),
             registry: HashMap::new(),
+            held: HashMap::new(),
         }
     }
 
@@ -104,7 +108,7 @@ impl SpacesStore {
         };
         let core = self.core.clone();
         let id = id.to_string();
-        let entity = cx.new(|cx| Conversation::new(core, id.clone(), row, cx));
+        let entity = cx.new(|cx| Conversation::new(core, id.clone(), row, Origin::Listed, cx));
         self.registry.insert(id, entity.downgrade());
         entity
     }
@@ -116,8 +120,15 @@ impl SpacesStore {
     pub fn create(&mut self, cx: &mut Context<Self>) -> Entity<Conversation> {
         let id = eidola_app_core::new_space_id();
         let core = self.core.clone();
-        let entity =
-            cx.new(|cx| Conversation::new(core.clone(), id.clone(), RowState::Deciding, cx));
+        let entity = cx.new(|cx| {
+            Conversation::new(
+                core.clone(),
+                id.clone(),
+                RowState::Deciding,
+                Origin::Created,
+                cx,
+            )
+        });
         self.registry.insert(id.clone(), entity.downgrade());
         let weak = entity.downgrade();
         let key = id.clone();
@@ -148,17 +159,34 @@ impl SpacesStore {
         entity
     }
 
-    /// The reader left a conversation's screen. A space nobody wrote in goes
-    /// with it — otherwise every "new conversation" tapped and abandoned stays
-    /// in the Library — but **a write this app issued outranks the disposal**:
-    /// a conversation still saving or answering is left alone, and app-core
-    /// decides inside the delete whether anything there is worth keeping.
+    /// The reader left a conversation's screen.
+    ///
+    /// **Navigation never cancels domain work**: a conversation still saving,
+    /// streaming an answer or planning the replies to one is held here — its
+    /// view is gone, and the registry's reference is weak — until that work
+    /// settles, so the save's plan is followed, the answer lands with its
+    /// recovery state, and a reader who comes back joins the same entity and
+    /// its running stream (`open`). Dropping it would cancel exactly the
+    /// continuations that do those things.
+    ///
+    /// A space nobody wrote in goes with its screen — otherwise every "new
+    /// conversation" tapped and abandoned stays in the Library — but a write
+    /// this app issued outranks the disposal: a busy conversation is never
+    /// disposed of, and app-core decides inside the delete whether anything
+    /// there is worth keeping.
     pub fn left(&mut self, conversation: &Entity<Conversation>, cx: &mut Context<Self>) {
         let (id, busy, deciding) = {
             let c = conversation.read(cx);
             (c.id().to_string(), c.is_busy(), c.is_deciding())
         };
         if busy {
+            let key = id.clone();
+            let settled = cx.observe(conversation, move |this, conversation, cx| {
+                if !conversation.read(cx).is_busy() {
+                    this.held.remove(&key);
+                }
+            });
+            self.held.insert(id, (conversation.clone(), settled));
             return;
         }
         if deciding && self.creations.contains_key(&id) {
@@ -200,6 +228,12 @@ impl SpacesStore {
                 .ok();
             }),
         );
+    }
+
+    /// Whether a conversation no view shows is being kept alive for its work
+    /// in flight.
+    pub fn is_held(&self, id: &str) -> bool {
+        self.held.contains_key(id)
     }
 
     /// Dispatch one bus announcement.

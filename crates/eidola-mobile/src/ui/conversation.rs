@@ -118,6 +118,18 @@ pub struct Turn {
     pub landed: Option<Option<String>>,
 }
 
+/// Where an entity's space comes from: what it shows before a read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Minted by this app a moment ago: it has no posts, so the page is
+    /// answered-and-empty from the first frame and nothing is read.
+    Created,
+    /// An existing space (from the Library): its transcript is read, once its
+    /// row is known to stand — after a pending disposal keeps it, if one is
+    /// deciding.
+    Listed,
+}
+
 /// Whether this space's row is known to exist.
 #[derive(Clone, Debug)]
 pub enum RowState {
@@ -177,11 +189,18 @@ pub struct Conversation {
 impl EventEmitter<ConversationEvent> for Conversation {}
 
 impl Conversation {
-    /// A conversation whose row is `row`. A committed one starts loading; one
-    /// still deciding starts answered-and-empty (a new space has no posts)
-    /// and loads once its row settles.
-    pub fn new(core: Rc<AppCore>, id: String, row: RowState, cx: &mut Context<Self>) -> Self {
-        let fresh = matches!(row, RowState::Deciding);
+    /// A conversation whose row is `row`. A space this app just created
+    /// starts answered-and-empty; any other starts its read, which waits for
+    /// a deciding row to settle (`load` → `wait_for_row`), so a space reopened
+    /// while its disposal is pending is read the moment the disposal keeps it.
+    pub fn new(
+        core: Rc<AppCore>,
+        id: String,
+        row: RowState,
+        origin: Origin,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let fresh = origin == Origin::Created;
         let (row, _) = watch::channel(row);
         let mut this = Self {
             core,
@@ -257,9 +276,12 @@ impl Conversation {
         matches!(*self.row.borrow(), RowState::Deciding)
     }
 
-    /// Anything of this conversation's own is still writing.
+    /// Anything of this conversation's own is still in flight: a save, a
+    /// streaming turn, or the cascade planning a finished turn's replies.
+    /// While it is, the entity must outlive every view of it
+    /// (`SpacesStore::left` holds it).
     pub fn is_busy(&self) -> bool {
-        self.post_runner.is_some() || !self.turn_runners.is_empty()
+        self.post_runner.is_some() || !self.turn_runners.is_empty() || !self.plan_tasks.is_empty()
     }
 
     /// A save is in flight: the composer holds its next one.

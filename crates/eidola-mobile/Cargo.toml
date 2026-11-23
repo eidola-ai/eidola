@@ -64,9 +64,13 @@ wasm-bindgen-futures = "0.4"
 eidola-i18n = { path = "../eidola-i18n", default-features = false, features = ["codegen"] }
 
 [dev-dependencies]
-# Self-reference: the self-test's verdict is tested natively
-# (`tests/selftest.rs`); dev-dependency features never reach a bundle build.
-eidola-mobile = { path = ".", features = ["self-test"] }
+# Self-reference: the self-test's verdict (`tests/selftest.rs`) and the
+# development seeding (`tests/ui_lifecycle.rs`) are tested natively;
+# dev-dependency features never reach a bundle build.
+eidola-mobile = { path = ".", features = ["self-test", "dev"] }
+# The interface's store and entity lifecycle under gpui's test app
+# (`tests/ui_lifecycle.rs`).
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
 hex = "0.4"
 reqwest = { version = "0.13", default-features = false }
 rustls-rustcrypto = "0.1.0-pre.0"

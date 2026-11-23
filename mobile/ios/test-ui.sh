@@ -6,7 +6,8 @@
 # kept), Chinese through the Pinyin IME in the app's zh-Hans locale, and a cold relaunch at night.
 # Screenshots and a screen recording go to OUT (default build/ui).
 #   test-ui.sh [OUT] [--bundle DIR]
-# --bundle  a development bundle built for 127.0.0.1:8790 (default: built here)
+# --bundle  a development bundle built for 127.0.0.1:$STUB_PORT (default: built here)
+# STUB_PORT the model stub's port (default 8790), so two runs on one machine stay apart
 # Uses (and creates once) its own simulators, "eidola-phone" and "eidola-phone-zh" (its language
 # Chinese, so Pinyin is its first keyboard); never another device.
 set -euo pipefail
@@ -22,7 +23,7 @@ done
 OUT="$(mkdir -p "${OUT:-$HERE/build/ui}" && cd "${OUT:-$HERE/build/ui}" && pwd)"
 DEVICE_TYPE="${DEVICE_TYPE:-com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro}"
 RUNTIME="${RUNTIME:-com.apple.CoreSimulator.SimRuntime.iOS-27-0}"
-PORT=8790
+PORT="${STUB_PORT:-8790}"
 
 simulator() { # simulator NAME: its udid, created and booted
   local udid

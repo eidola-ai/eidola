@@ -177,7 +177,19 @@ final class PhoneUITests: XCTestCase {
         shot("08-branch-back")
 
         // A long conversation, scrolled.
-        send("Tell me more.", answer: 4)
+        // Back while an answer streams, and straight back in: the same conversation, its answer
+        // still streaming, and landing.
+        tap("composer/field")
+        XCTAssertTrue(keyboardUp(), "the keyboard did not come up")
+        app.typeText("Tell me more.")
+        tap("composer/send")
+        waitFor("conversation/streaming/2", timeout: 30)
+        tap("conversation/back")
+        tap("library/row/0")
+        waitFor("conversation/streaming/2", timeout: 10)
+        shot("08a-rejoined-while-streaming")
+        waitGone("conversation/streaming/2", timeout: 120)
+        waitFor("conversation/post/4")
         send("And the moon?", answer: 6)
         keyboardDown()
         drag(900)

@@ -24,7 +24,7 @@ PORT=5590
 PKG=ai.eidola.mobile.dev
 ADB=("$SDK/platform-tools/adb" -s "emulator-$PORT")
 IMAGE=system-images/android-36.1/google_apis_playstore/arm64-v8a/
-STUB_PORT=8791
+STUB_PORT="${STUB_PORT:-8791}"
 mkdir -p "$HERE/build"
 
 if [[ ! -f "$HOME/.android/avd/$AVD.ini" ]]; then
