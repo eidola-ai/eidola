@@ -2,7 +2,9 @@
 //! answering from an OpenAI-compatible mock: navigation never cancels a
 //! conversation's work, a reader who comes back joins the running entity, and
 //! a conversation reopened while its disposal is being decided is read once
-//! the disposal keeps it.
+//! the disposal keeps it; and linking an account is the account store's
+//! operation, whose refused check rolls the credentials back with no screen
+//! holding it.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -82,6 +84,76 @@ impl Model {
     }
 }
 
+/// A host with no shell behind it: these tests reach none of its calls.
+struct NoShell {
+    hello: eidola_mobile::protocol::Hello,
+}
+
+impl NoShell {
+    fn new() -> Self {
+        Self {
+            hello: eidola_mobile::protocol::Hello {
+                contract: 2,
+                platform: "test".into(),
+                shell: "none".into(),
+                methods: vec![],
+            },
+        }
+    }
+}
+
+impl eidola_mobile::ui::host::Host for NoShell {
+    fn hello(&self) -> &eidola_mobile::protocol::Hello {
+        &self.hello
+    }
+    fn open_external(&self, _: String) -> Unanswered<()> {
+        Box::pin(async { Err("no shell".into()) })
+    }
+    fn bundle_state(&self) -> Unanswered<eidola_app_core::updater::mobile::BundleState> {
+        Box::pin(async { Err("no shell".into()) })
+    }
+    fn check_update(
+        &self,
+        _: Rc<AppCore>,
+    ) -> futures_util::future::LocalBoxFuture<
+        'static,
+        Result<
+            eidola_app_core::updater::mobile::BundleUpdate,
+            eidola_app_core::updater::ReleaseCheckError,
+        >,
+    > {
+        Box::pin(async {
+            Err(eidola_app_core::updater::ReleaseCheckError::Unreachable(
+                "no shell".into(),
+            ))
+        })
+    }
+    fn install(
+        &self,
+        _: Rc<AppCore>,
+        _: eidola_app_core::updater::mobile::PendingBundleUpdate,
+    ) -> futures_util::future::LocalBoxFuture<
+        'static,
+        Result<eidola_app_core::updater::mobile::ActivatedBundle, eidola_app_core::error::AppError>,
+    > {
+        unreachable!("no update is offered")
+    }
+    fn revert(
+        &self,
+    ) -> futures_util::future::LocalBoxFuture<
+        'static,
+        Result<eidola_app_core::updater::mobile::BundleState, eidola_app_core::error::AppError>,
+    > {
+        unreachable!("nothing reverts")
+    }
+    fn reload(&self) {}
+    fn bundle_text(&self, _: &'static str) -> Unanswered<String> {
+        Box::pin(async { Err("no shell".into()) })
+    }
+}
+
+type Unanswered<T> = futures_util::future::LocalBoxFuture<'static, Result<T, String>>;
+
 /// A real core over a temporary profile, its default agent on the mock.
 fn stores(cx: &mut TestAppContext, model: &Model) -> (Stores, tempfile::TempDir) {
     // The core's runtime is real: declare it to the test scheduler.
@@ -94,9 +166,11 @@ fn stores(cx: &mut TestAppContext, model: &Model) -> (Stores, tempfile::TempDir)
         model: "stub".into(),
         appearance: None,
         tint: None,
+        update_fixtures: None,
+        eidola: None,
     };
     core.runtime().block_on(seed(&core, &config)).unwrap();
-    let stores = cx.update(|cx| Stores::new(Rc::new(core), cx));
+    let stores = cx.update(|cx| Stores::new(Rc::new(core), Rc::new(NoShell::new()), cx));
     (stores, dir)
 }
 
@@ -208,4 +282,46 @@ fn a_conversation_reopened_during_its_disposal_is_read_when_kept(cx: &mut TestAp
     wait_until(cx, "the kept conversation is read", |cx| {
         !reopened.read_with(cx, |c, _| c.is_deciding()) && posts(&reopened, cx) == 2
     });
+}
+
+/// A link whose balance check is refused, started with nothing but the store
+/// holding it (the onboarding screen it came from may be gone): the
+/// credentials it set are rolled back and the refusal waits for whoever looks.
+#[gpui::test]
+fn a_refused_link_is_rolled_back_with_no_screen_holding_it(cx: &mut TestAppContext) {
+    let model = Model::start(Duration::ZERO);
+    let (stores, _dir) = stores(cx, &model);
+    let core = stores.core.clone();
+    // Nothing answers here: the check fails.
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1".into()))
+        .unwrap();
+
+    assert!(
+        stores
+            .account
+            .update(cx, |a, cx| a.link("acct_test".into(), "secret".into(), cx))
+    );
+    // Neither another link nor a creation starts while it runs.
+    assert!(stores.account.update(cx, |a, cx| !a.link(
+        "acct_other".into(),
+        "secret".into(),
+        cx
+    )));
+    assert!(stores.account.update(cx, |a, cx| !a.create(Vec::new(), cx)));
+
+    wait_until(cx, "the link settles", |cx| {
+        stores.account.read_with(cx, |a, _| !a.linking())
+    });
+    assert!(
+        stores
+            .account
+            .read_with(cx, |a, _| matches!(a.link_outcome(), Some(Err(_)))),
+        "the refusal is not reported"
+    );
+    let config = core.config_state();
+    assert!(
+        !config.has_account && !config.has_account_secret,
+        "a refused link left its credentials in the profile"
+    );
 }

@@ -6170,6 +6170,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mobile-licences"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

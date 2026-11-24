@@ -1,11 +1,16 @@
-//! The phone interface, on gpui: one window, two screens (the Library and a
-//! conversation), the desktop app's look and voice adapted to a phone.
+//! The phone interface, on gpui: one window, a stack of screens over the
+//! Library, the desktop app's look and voice adapted to a phone.
 //!
-//! - [`app`]: boot, navigation, the frame that avoids the notch and keyboard,
-//!   and the bundle's confirmation after its first frame.
-//! - [`stores`] / [`conversation`]: the domain state (the Library index, one
-//!   entity per space) and the bus bridge that keeps it true.
-//! - [`library`], [`conversation_view`], [`composer`]: the screens.
+//! - [`app`]: boot, the screen stack ([`nav`]), the frame that avoids the
+//!   notch and keyboard, and the bundle's confirmation after its first frame.
+//! - [`stores`] / [`conversation`] / [`account_store`] / [`update_store`]:
+//!   the domain state (the Library index, one entity per space, the account
+//!   and wallet, the self-update) and the bus bridge that keeps it true.
+//! - [`host`]: what the interface asks of the shell and the page.
+//! - [`library`], [`conversation_view`], [`composer`]: the conversations.
+//! - [`onboarding`], [`settings`], [`account_view`], [`purchase`],
+//!   [`appearance`], [`updates_view`], [`about`]: the first run, and
+//!   everything else a reader needs; [`widgets`] their shared pieces.
 //! - [`theme`], [`i18n`]: the shared Circadian look and the compile-time
 //!   locales, wired to this app.
 //! - [`errors`]: typed errors become words at render.
@@ -14,18 +19,30 @@
 //! The interface is target-independent; only its entry point (`crate::web`)
 //! is wasm32.
 
+pub mod about;
+pub mod account_store;
+pub mod account_view;
 pub mod app;
+pub mod appearance;
 pub mod branch;
 pub mod composer;
 pub mod conversation;
 pub mod conversation_view;
 pub mod errors;
+pub mod host;
 pub mod i18n;
 pub mod library;
 pub mod loadable;
+pub mod nav;
+pub mod onboarding;
 pub mod probe;
+pub mod purchase;
+pub mod settings;
 pub mod stores;
 pub mod theme;
+pub mod update_store;
+pub mod updates_view;
+pub mod widgets;
 
 use gpui::{App, AppContext as _, Pixels, SharedString, WindowOptions, px};
 
@@ -41,7 +58,21 @@ pub const TOUCH: Pixels = px(44.);
 // would otherwise fetch them from a CDN, and the shell allows no other origin.
 gpui_kit_assets::icon_assets!(
     pub Icons,
-    [ArrowUp, ChevronDown, ChevronLeft, ChevronRight, Close, Reply, SquarePen]
+    [
+        ArrowUp,
+        Check,
+        ChevronDown,
+        ChevronLeft,
+        ChevronRight,
+        Close,
+        Eye,
+        EyeOff,
+        Minus,
+        Plus,
+        Reply,
+        Settings,
+        SquarePen
+    ]
 );
 
 /// Initialise the libraries, the theme and the source locale. Before the
@@ -56,7 +87,7 @@ pub fn init(cx: &mut App) {
 pub fn open_window(boot: app::Boot, preferred_languages: Vec<String>, cx: &mut App) {
     let opened = cx.open_window(WindowOptions::default(), |window, cx| {
         theme::observe_window_appearance(window);
-        let view = cx.new(|cx| app::AppView::new(boot, preferred_languages, cx));
+        let view = cx.new(|cx| app::AppView::new(boot, preferred_languages, window, cx));
         cx.new(|cx| gpui_component::Root::new(view, window, cx))
     });
     if let Err(e) = opened {

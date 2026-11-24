@@ -7,3 +7,5 @@ library-row-label = { $title }, { $when }
 library-load-failed = Impossible de charger vos conversations.
 library-refresh-failed = Impossible d’actualiser — réessayer
 library-retry = Réessayer
+
+library-settings = Réglages

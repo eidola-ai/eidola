@@ -224,6 +224,7 @@ It opens from the app icon: a long press on the home-screen icon offers **Bundle
 ## Screen and keyboard
 
 - **Android** draws edge to edge, and its WebView reports zero safe-area insets and does not shrink for the soft keyboard. The shell therefore pads the WebView by the system bars, the display cutout and the keyboard: the page's viewport is exactly the visible, unobstructed area, and `env(safe-area-inset-*)` is zero.
+- **Back, on Android.** The system back gesture goes back one step in the webview's session history while it has a step to go back to, and otherwise does what it does in any app (leaves it). An app that wants the gesture pushes history entries of its own (`history.pushState`) and hears the step as `popstate`: a same-document step, no document load and no bundle selection. A shell without this simply leaves the app on back, so it needs no version. iOS offers no system back gesture to a webview, and the shell adds none.
 - **iOS** extends the viewport under the status bar and home indicator when the page's viewport meta has `viewport-fit=cover`; the page reads the insets from `env(safe-area-inset-*)` and follows the keyboard with `visualViewport`. The shell adds nothing. The keyboard's input accessory bar (previous, next, done) stays: hiding it needs a private WebKit class.
 
 ## Storage and data protection

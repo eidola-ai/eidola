@@ -18,3 +18,5 @@ library-load-failed = Couldn’t load your conversations.
 library-refresh-failed = Couldn’t refresh — retry
 # Retry a failed load.
 library-retry = Retry
+# The button that opens Settings (its accessible name).
+library-settings = Settings

@@ -54,9 +54,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use eidola_app_core::updater::mobile::{self, BundleReport, BundleUpdate, PendingBundleUpdate};
-use eidola_app_core::updater::{
-    Fetcher, ReleaseCheckError, ReleaseEvidence, ReleaseIndex, ReleasePins, ReleaseSummary,
-};
+use eidola_app_core::updater::{Fetcher, ReleaseCheckError, ReleasePins};
 
 use crate::boot::{self, BootOptions};
 use crate::client::{ShellClient, TraceEntry, TraceEvent, Transport};
@@ -108,13 +106,7 @@ pub struct UpdateFixtures {
     pub broken: StagedRelease,
 }
 
-/// A release index and its manifest, taken as verified.
-#[derive(Debug, Deserialize)]
-pub struct StagedRelease {
-    pub index: ReleaseIndex,
-    /// The manifest's bytes, base64.
-    pub manifest: String,
-}
+pub use crate::fixture::StagedRelease;
 
 fn default_mib() -> usize {
     16
@@ -488,28 +480,6 @@ async fn update_fixtures(core: &AppCore, url: &str) -> Result<(Fetcher, UpdateFi
     Ok((fetcher, fixtures))
 }
 
-/// A staged release, as `verify_release` would have returned it.
-fn staged_evidence(release: &StagedRelease) -> Result<ReleaseEvidence, String> {
-    let manifest_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&release.manifest)
-        .map_err(|e| e.to_string())?;
-    let index = &release.index;
-    Ok(ReleaseEvidence {
-        summary: ReleaseSummary {
-            version: index.version.clone(),
-            git_commit: index.git_commit.clone(),
-            git_tag: index.git_tag.clone(),
-            released_at: index.released_at.clone(),
-            previous_release: index.previous_release.clone(),
-            attestations: vec![],
-        },
-        manifest_sha256: hex(&Sha256::digest(&manifest_bytes)),
-        manifest_bytes,
-        ci_identity: String::new(),
-        ci_rekor_log_index: 0,
-    })
-}
-
 /// Approve `release` on the shell: its bundle's digest, once activated.
 async fn approve_staged<T: Transport>(
     client: &ShellClient<T>,
@@ -517,7 +487,7 @@ async fn approve_staged<T: Transport>(
     release: &StagedRelease,
     env: &Env,
 ) -> Result<(String, BundleState, f64), String> {
-    let evidence = staged_evidence(release)?;
+    let evidence = crate::fixture::staged_evidence(release)?;
     let pending = match PendingBundleUpdate::from_evidence(&release.index, evidence)
         .map_err(|e| e.to_string())?
     {

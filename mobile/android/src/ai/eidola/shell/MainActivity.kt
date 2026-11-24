@@ -14,6 +14,7 @@ import android.content.pm.ShortcutManager
 import android.content.res.Configuration
 import android.graphics.Typeface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -35,6 +36,8 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import java.io.ByteArrayInputStream
 import java.io.InputStream
 import org.json.JSONObject
@@ -92,6 +95,30 @@ class MainActivity : Activity() {
     private val bridgeThread = HandlerThread("bridge").apply { start() }
     private lateinit var bridge: Bridge
     private var showDigestWhenReady = false
+
+    // The system back gesture goes back in the page's session history while it has somewhere to
+    // go (the app pushes an entry per screen); with nowhere to go, it leaves the app as usual.
+    private val backInPage = if (Build.VERSION.SDK_INT >= 33) OnBackInvokedCallback { web.goBack() } else null
+    private var backRegistered = false
+
+    private fun syncBack() {
+        val callback = backInPage ?: return
+        if (Build.VERSION.SDK_INT < 33) return
+        val want = web.canGoBack()
+        if (want == backRegistered) return
+        if (want) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback)
+        } else {
+            onBackInvokedDispatcher.unregisterOnBackInvokedCallback(callback)
+        }
+        backRegistered = want
+    }
+
+    @Deprecated("Below API 33 only; from 33 the dispatcher above answers")
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (web.canGoBack()) web.goBack() else super.onBackPressed()
+    }
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
@@ -206,6 +233,8 @@ class MainActivity : Activity() {
             val ext = path.substringAfterLast('.', "").lowercase()
             return respond(200, "OK", TYPES[ext] ?: "application/octet-stream", if (ext in CHARSET_TYPES) "utf-8" else null, body)
         }
+
+        override fun doUpdateVisitedHistory(v: WebView, url: String, isReload: Boolean) = syncBack()
 
         override fun onPageFinished(v: WebView, url: String) {
             if (showDigestWhenReady) {

@@ -12414,15 +12414,26 @@ impl AppCore {
     /// signed documents only; nothing is staged. Refused anywhere but in the
     /// mobile app ([`updater::install_kind::InstallKind::MobileBundle`]),
     /// the one install a bundle replaces.
-    pub async fn prepare_bundle_update(&self) -> Result<updater::mobile::BundleUpdate, AppError> {
+    ///
+    /// The error keeps [`updater::ReleaseCheckError`]'s two kinds apart, as
+    /// the desktop's check does (`CheckFailed` against `Unverifiable`): a
+    /// release that arrived and failed a check is evidence the interface must
+    /// show as such, and a feed it could not reach is not. A refusal that
+    /// involves no release at all — this install takes no bundle, or the
+    /// fetcher could not be built — is the quiet kind.
+    pub async fn prepare_bundle_update(
+        &self,
+    ) -> Result<updater::mobile::BundleUpdate, updater::ReleaseCheckError> {
         let kind = updater::install_kind::detect(updater::install_kind::running_program());
         if kind != updater::install_kind::InstallKind::MobileBundle {
-            return Err(AppError::Update {
-                message: format!("this install ({kind:?}) is not updated by an app bundle"),
-            });
+            return Err(updater::ReleaseCheckError::Unreachable(format!(
+                "this install ({kind:?}) is not updated by an app bundle"
+            )));
         }
         let releases_url = self.inner.load_config().update_releases_url();
-        let fetcher = self.update_fetcher()?;
+        let fetcher = self
+            .update_fetcher()
+            .map_err(|e| updater::ReleaseCheckError::Unreachable(e.to_string()))?;
         // No installed commit: as for every install the updater has not yet
         // recorded, continuity is not checked and the next release along the
         // latest's history is offered (`updater::discover_next_release`).
@@ -12434,7 +12445,6 @@ impl AppCore {
             &updater::ReleasePins::embedded(),
         )
         .await
-        .map_err(AppError::from)
     }
 
     /// The user approved `pending`: download its bundle, check every byte,

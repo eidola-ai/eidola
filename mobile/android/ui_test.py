@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """The phone interface's UI test on the Android emulator: real taps and typing through
 `adb shell input`, elements found by probe name in the WebView's accessibility tree
-(`uiautomator dump`), as the iOS test (ios/UITests/PhoneUITests.swift) does with XCUITest.
+(`uiautomator dump`), as the iOS test (ios/UITests/PhoneUITests.swift) does with XCUITest:
+the first run with a new account against the local dev stack and a checkout handed to the
+browser, a whole conversation, settings applied live, the system back gesture, a cold
+relaunch, and the update approved, fallen back from and reverted.
 
   ui_test.py ADB_SERIAL PACKAGE OUT
 
@@ -11,6 +14,7 @@ canvas beneath. Screenshots go to OUT. Exits non-zero on the first failed step.
 """
 
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -156,11 +160,251 @@ def send(text, answer):
     wait_for(f"conversation/post/{answer}", 90)
 
 
-def main():
-    adb("shell", "cmd", "uimode", "night", "no")
+def launch():
     adb("shell", "am", "start", "-W", "-n", f"{PKG}/ai.eidola.shell.MainActivity")
 
-    wait_for("library/new", 90)
+
+def resumed():
+    """The package of the activity in front."""
+    out = adb("shell", "dumpsys", "activity", "activities", capture=True).decode()
+    m = re.search(r"(?:topResumedActivity|mResumedActivity)[^\n]*?\s([a-zA-Z0-9_.]+)/", out)
+    return m.group(1) if m else ""
+
+
+def paper_luminance():
+    """Mean luminance (0..1) of a row near the bottom of the page, above the system bar: the palette in force."""
+    raw = adb("exec-out", "screencap", capture=True)
+    w, h, _fmt = struct.unpack("<III", raw[:12])
+    header = len(raw) - w * h * 4
+    y = h * 9 // 10
+    total, n = 0.0, 0
+    for x in range(w // 10, w * 9 // 10, 7):
+        i = header + (y * w + x) * 4
+        r, g, b = raw[i], raw[i + 1], raw[i + 2]
+        total += (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+        n += 1
+    return total / n
+
+
+def swipe_body(dy):
+    """Scroll a screen's body (not a transcript) by dy pixels (negative: toward the end), in
+    strokes that stay well inside the screen (a stroke from an edge is a system gesture)."""
+    mid = 1200
+    left = dy
+    while abs(left) > 1:
+        step = max(-900, min(900, left))
+        adb("shell", "input", "swipe", "540", str(mid - step // 2), "540", str(mid + step // 2), "500")
+        time.sleep(0.8)
+        left -= step
+
+
+def tap_scrolling(name, tries=8):
+    """Tap a probe on a scrolling screen, scrolling toward the end until it is in view."""
+    for _ in range(tries):
+        nodes, _ = dump()
+        if name in nodes and 200 < nodes[name][1] < 2150:
+            break
+        swipe_body(-500)
+    tap(name)
+
+
+def back():
+    adb("shell", "input", "keyevent", "KEYCODE_BACK")
+    time.sleep(1.0)
+
+
+def introduction(prefix):
+    wait_for("onboarding/cta/understood", 90)
+    shot(f"{prefix}-about")
+    tap("onboarding/cta/understood")
+    wait_for("onboarding/cta/understood")
+    shot(f"{prefix}-responsibility")
+    tap("onboarding/cta/understood")
+    wait_for("onboarding/cta/new-account")
+    shot(f"{prefix}-get-started")
+
+
+def first_run():
+    """A fresh install: a new account under the terms rendered, the plans, the browser."""
+    introduction("20-onboarding")
+    tap("onboarding/cta/new-account")
+    wait_for("onboarding/terms/terms-of-service", 60)
+    wait_for("onboarding/terms/privacy-policy")
+    shot("23-onboarding-consent")
+    tap_scrolling("onboarding/cta/create")
+    time.sleep(2)
+    if exists("onboarding/copy/account-id/copy"):
+        fail("an account was created without agreement")
+    tap_scrolling("onboarding/agree")
+    shot("24-onboarding-agreed")
+    tap_scrolling("onboarding/cta/create")
+    wait_for("onboarding/copy/account-id/copy", 90)
+    shot("25-onboarding-new-account")
+    wait_for("onboarding/terms-standing")
+    swipe_body(-600)
+    shot("25b-onboarding-agreement-not-recorded")
+    tap_scrolling("onboarding/cta/saved")
+    wait_for("onboarding/cta/plans")
+    shot("26-onboarding-add-credit")
+    tap("onboarding/cta/plans")
+    wait_for("purchase/plan/0", 60)
+    shot("27-plans")
+    # Checkout is refused for the unrecorded agreement; the agreement is recorded again.
+    tap("purchase/plan/0")
+    wait_for("purchase/terms-required", 60)
+    shot("27b-checkout-refused-for-the-terms")
+    tap_scrolling("purchase/review-terms")
+    wait_for("onboarding/terms/terms-of-service", 60)
+    tap_scrolling("onboarding/agree")
+    shot("27c-agree-again")
+    tap_scrolling("onboarding/cta/record-agreement")
+    wait_for("onboarding/terms-recorded", 60)
+    shot("27d-agreement-recorded")
+    tap_scrolling("onboarding/cta/continue")
+    wait_for("purchase/plan/0", 60)
+    tap("purchase/plan/0")
+    deadline = time.time() + 30
+    while resumed() in ("", PKG):
+        if time.time() > deadline:
+            fail("the browser did not open")
+        time.sleep(1)
+    time.sleep(4)
+    print(f"checkout opened in {resumed()}", flush=True)
+    shot("28-checkout-in-the-browser")
+    launch()
+    wait_for("purchase/opened", 30)
+    time.sleep(4)
+    shot("29-back-from-the-browser")
+    # The system back gesture pops a screen inside the app.
+    back()
+    wait_for("onboarding/cta/purchase-later")
+    tap("onboarding/cta/purchase-later")
+    wait_for("library/settings", 30)
+    shot("30-library-after-the-first-run")
+    tap("library/settings")
+    wait_for("settings/account")
+    shot("31-settings")
+    tap("settings/account")
+    wait_for("account/balance", 60)
+    wait_for("account/pool/0", 30)
+    shot("32-account")
+    tap_scrolling("account/reset")
+    wait_for("account/reset/warning")
+    shot("34-account-reset-armed")
+    tap_scrolling("account/reset/keep")
+    back()
+    wait_for("settings/account")
+    back()
+    wait_for("library/new")
+
+
+def settings():
+    """Settings applied live, the wallet, About, the licences; back by the system gesture."""
+    tap("library/settings")
+    tap("settings/appearance")
+    wait_for("appearance/day-night/night")
+    time.sleep(1)
+    day = paper_luminance()
+    shot("40-appearance-day")
+    tap("appearance/day-night/night")
+    time.sleep(2)
+    night = paper_luminance()
+    shot("41-appearance-night-live")
+    if not (day > 0.6 and night < 0.3):
+        fail(f"the night palette did not apply live ({day:.2f} -> {night:.2f})")
+    tap("appearance/text-size/larger")
+    tap("appearance/text-size/larger")
+    shot("42-appearance-larger-text-night")
+    tap("appearance/text-size/reset")
+    tap("appearance/day-night/system")
+    time.sleep(2)
+    if paper_luminance() < 0.6:
+        fail("System did not follow the day setting")
+    back()
+    wait_for("settings/wallet")
+    tap("settings/wallet")
+    wait_for("wallet/refresh")
+    time.sleep(2)
+    shot("43-wallet")
+    back()
+    tap("settings/about")
+    wait_for("about/licences")
+    time.sleep(2)
+    shot("44-about")
+    tap_scrolling("about/licences")
+    wait_for("licences/row/0", 30)
+    shot("46-licences")
+    tap("licences/row/0")
+    shot("47-licence-text")
+    back()
+    back()
+    back()
+    wait_for("library/new")
+
+
+def update():
+    """Approved, restarted into and confirmed; a broken one falling back; reverted."""
+    tap("library/settings")
+    tap("settings/updates")
+    wait_for("updates/serving/embedded", 30)
+    deadline = time.time() + 30
+    while time.time() < deadline and not (exists("updates/accept-claims") or exists("updates/approve")):
+        time.sleep(1)
+    if exists("updates/accept-claims"):
+        shot("50-update-claims-changed")
+        tap_scrolling("updates/accept-claims")
+    wait_for("updates/approve", 30)
+    shot("51-update-available")
+    time.sleep(3)
+    if not exists("updates/serving/embedded"):
+        fail("something was staged before the approval")
+    tap_scrolling("updates/approve")
+    wait_for("library/settings", 120)
+    tap("library/settings")
+    tap("settings/updates")
+    wait_for("updates/serving/update-confirmed", 30)
+    swipe_body(-1500)
+    shot("52-update-running-confirmed")
+    swipe_body(1500)
+    deadline = time.time() + 30
+    while time.time() < deadline and not (exists("updates/accept-claims") or exists("updates/approve")):
+        time.sleep(1)
+    if exists("updates/accept-claims"):
+        tap_scrolling("updates/accept-claims")
+    wait_for("updates/approve", 60)
+    tap_scrolling("updates/approve")
+    time.sleep(8)
+    shot("53-broken-update-on-trial")
+    adb("shell", "am", "force-stop", PKG)
+    launch()
+    wait_for("library/settings", 90)
+    tap("library/settings")
+    wait_for("settings/updates")
+    shot("54-settings-update-failed")
+    tap("settings/updates")
+    wait_for("updates/fell-back", 30)
+    wait_for("updates/serving/update-confirmed")
+    time.sleep(2)
+    shot("55-update-fell-back")
+    swipe_body(-6000)
+    shot("55b-update-fell-back-running")
+    tap_scrolling("updates/revert")
+    wait_for("library/settings", 60)
+    tap("library/settings")
+    tap("settings/updates")
+    wait_for("updates/serving/embedded", 30)
+    swipe_body(-1500)
+    shot("56-reverted-to-embedded")
+    back()
+    back()
+    wait_for("library/new")
+
+
+def main():
+    adb("shell", "cmd", "uimode", "night", "no")
+    launch()
+
+    first_run()
     shot("01-library-empty")
 
     tap("library/new")
@@ -242,6 +486,35 @@ def main():
             fail("the conversation did not reopen")
         time.sleep(1)
     shot("14-relaunched")
+    back()
+    wait_for("library/new")
+
+    # The other screens at night.
+    adb("shell", "cmd", "uimode", "night", "yes")
+    time.sleep(2)
+    tap("library/settings")
+    wait_for("settings/account")
+    shot("70-night-settings")
+    tap("settings/account")
+    wait_for("account/balance", 60)
+    shot("71-night-account")
+    tap_scrolling("account/purchase")
+    wait_for("purchase/plan/0", 60)
+    shot("72-night-plans")
+    back()
+    back()
+    tap("settings/updates")
+    wait_for("updates/check")
+    time.sleep(3)
+    shot("74-night-updates")
+    back()
+    back()
+    adb("shell", "cmd", "uimode", "night", "no")
+    time.sleep(2)
+    wait_for("library/new")
+
+    settings()
+    update()
     print("PASS", flush=True)
 
 

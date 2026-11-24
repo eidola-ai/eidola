@@ -132,7 +132,10 @@ RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do
       if grep -q '^\[\[bin\]\]' "$manifest"; then echo 'fn main(){}' > "$dir/main.rs"; fi; \
     done
 
-# Both targets' graphs: build scripts and proc macros run on the x86-64 host.
+# Both targets' graphs: build scripts and proc macros run on the x86-64 host,
+# cargo reads every package the host activates even for the wasm build, and the
+# licences step (below) reads the whole workspace's graph; this fetch is what
+# mobile/build-bundle.sh fetches too.
 RUN cargo fetch --locked --target ${TARGET} --target x86_64-unknown-linux-musl
 
 # The flags mobile/build-bundle.sh passes, for this image's paths: an 8 MiB
@@ -156,6 +159,10 @@ FROM fetch AS build
 COPY crates/ ./crates/
 COPY --parents releases/trust/server-enclave.json releases/trust/trust-constants.json releases/trust/sigstore-trusted-root.json releases/schema/attestation-templates.json ./
 COPY --parents models* ./
+# What the bundle's licences file (crates/mobile-licences) reads beyond the
+# packages: this repository's SPDX texts, and the Kotlin release the Android
+# shell carries.
+COPY --parents LICENSES mobile/android/tools.sh ./
 COPY --from=wasm-bindgen /out/wasm-bindgen /usr/local/bin/wasm-bindgen
 
 RUN find crates/ -name '*.rs' -exec touch {} +
@@ -174,6 +181,8 @@ RUN --network=none <<-'EOF'
 	wasm-bindgen target/${TARGET}/mobile/eidola_mobile.wasm --out-dir /out --target web \
 		--no-typescript --remove-name-section --remove-producers-section
 	cp crates/eidola-mobile/web/index.html crates/eidola-mobile/web/app.css crates/eidola-mobile/web/boot.js /out/
+	# The licences screen's file, from the lockfile, by the generator build-bundle.sh runs.
+	cargo run --frozen -p mobile-licences -- /src > /out/licences.json
 	chmod -R u=rwX,go=rX /out
 	find /out -type f | sort
 EOF

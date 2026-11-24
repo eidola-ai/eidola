@@ -1,5 +1,7 @@
 //! The domain stores (`crates/eidola-gui/STATE.md`): the Library index and the
-//! conversation registry, and the bus bridge that keeps them true.
+//! conversation registry, the account, the wallet and the self-update
+//! (`super::account_store`, `super::update_store`), and the bus bridge that
+//! keeps them true.
 //!
 //! Views never call `AppCore`; they call these, and observe them. Every write
 //! goes through app-core, which announces each commit on its change bus; the
@@ -15,24 +17,41 @@ use eidola_app_core::{AppCore, SpaceInfo};
 use gpui::{App, AppContext as _, Context, Entity, Subscription, Task, WeakEntity};
 use tokio::sync::broadcast::error::RecvError;
 
+use super::account_store::{AccountStore, WalletStore};
 use super::conversation::{Conversation, Origin, RowState};
+use super::host::Host;
 use super::loadable::Loadable;
+use super::update_store::UpdateStore;
 
 /// Everything a view is handed.
 #[derive(Clone)]
 pub struct Stores {
     pub core: Rc<AppCore>,
+    pub host: Rc<dyn Host>,
     pub spaces: Entity<SpacesStore>,
+    pub account: Entity<AccountStore>,
+    pub wallet: Entity<WalletStore>,
+    pub updates: Entity<UpdateStore>,
 }
 
 impl Stores {
-    pub fn new(core: Rc<AppCore>, cx: &mut App) -> Self {
+    pub fn new(core: Rc<AppCore>, host: Rc<dyn Host>, cx: &mut App) -> Self {
         let spaces = cx.new(|cx| {
             let mut store = SpacesStore::new(core.clone());
             store.refresh(cx);
             store
         });
-        Self { core, spaces }
+        let account = cx.new(|cx| AccountStore::new(core.clone(), cx));
+        let wallet = cx.new(|_| WalletStore::new(core.clone()));
+        let updates = cx.new(|cx| UpdateStore::new(core.clone(), host.clone(), cx));
+        Self {
+            core,
+            host,
+            spaces,
+            account,
+            wallet,
+            updates,
+        }
     }
 }
 
@@ -279,6 +298,8 @@ impl SpacesStore {
 pub fn install_bus_bridge(stores: &Stores, preferred_languages: Vec<String>, cx: &mut App) {
     let mut events = stores.core.subscribe_changes();
     let spaces = stores.spaces.downgrade();
+    let account = stores.account.downgrade();
+    let wallet = stores.wallet.downgrade();
     let core = stores.core.clone();
     cx.spawn(async move |cx| {
         loop {
@@ -297,10 +318,28 @@ pub fn install_bus_bridge(stores: &Stores, preferred_languages: Vec<String>, cx:
                             cx,
                         );
                     });
-                    Ok(())
+                    // The account's credentials live in the config too.
+                    account.update(cx, |a, cx| a.on_config_changed(cx))
                 }
+                Ok(ChangeEvent {
+                    change: Change::Backends,
+                    ..
+                }) => account.update(cx, |a, cx| a.refresh_backends(cx)),
+                Ok(ChangeEvent {
+                    change: Change::Wallet | Change::Account,
+                    ..
+                }) => wallet.update(cx, |w, cx| w.on_changed(cx)),
                 Ok(event) => spaces.update(cx, |s, cx| s.on_change(&event, cx)),
-                Err(RecvError::Lagged(_)) => spaces.update(cx, |s, cx| s.on_lagged(cx)),
+                Err(RecvError::Lagged(_)) => {
+                    account
+                        .update(cx, |a, cx| {
+                            a.on_config_changed(cx);
+                            a.refresh_backends(cx);
+                        })
+                        .ok();
+                    wallet.update(cx, |w, cx| w.on_changed(cx)).ok();
+                    spaces.update(cx, |s, cx| s.on_lagged(cx))
+                }
                 Err(RecvError::Closed) => break,
             };
             if dispatched.is_err() {

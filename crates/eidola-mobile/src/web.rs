@@ -27,6 +27,69 @@ extern "C" {
     fn preferred_languages_json() -> String;
 }
 
+#[wasm_bindgen(module = "/js/page.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = reloadPage)]
+    fn reload_page();
+    /// A file of this document's own origin (the bundle the shell served),
+    /// as text.
+    #[wasm_bindgen(js_name = fetchText, catch)]
+    fn fetch_text(path: &str) -> Result<js_sys::Promise, JsValue>;
+    #[wasm_bindgen(js_name = watchVisibility)]
+    fn watch_visibility(on_visible: &Closure<dyn FnMut()>);
+}
+
+#[wasm_bindgen(module = "/js/nav.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = navInit)]
+    fn nav_init(on_back: &Closure<dyn FnMut()>);
+    #[wasm_bindgen(js_name = navPush)]
+    fn nav_push_js();
+    #[wasm_bindgen(js_name = navPopped)]
+    fn nav_popped_js();
+    #[wasm_bindgen(js_name = navReset)]
+    fn nav_reset_js();
+}
+
+pub(crate) fn nav_push() {
+    nav_push_js();
+}
+
+pub(crate) fn nav_popped() {
+    nav_popped_js();
+}
+
+pub(crate) fn nav_reset() {
+    nav_reset_js();
+}
+
+/// Listen for the system's back gesture, and for the page coming back to the
+/// foreground, for the page's lifetime.
+fn listen_for_back() {
+    let on_back = Closure::<dyn FnMut()>::new(crate::ui::nav::system_back);
+    nav_init(&on_back);
+    on_back.forget();
+    let on_visible = Closure::<dyn FnMut()>::new(crate::ui::nav::came_to_foreground);
+    watch_visibility(&on_visible);
+    on_visible.forget();
+}
+
+/// The page's own calls, for the interface's host.
+fn page() -> ui::host::Page {
+    ui::host::Page {
+        reload: Box::new(reload_page),
+        fetch_text: Box::new(|path| {
+            let promise = fetch_text(path);
+            Box::pin(async move {
+                let promise = promise.map_err(|e| describe(&e))?;
+                let text = JsFuture::from(promise).await.map_err(|e| describe(&e))?;
+                text.as_string()
+                    .ok_or_else(|| "the file is not text".to_owned())
+            })
+        }),
+    }
+}
+
 #[cfg(feature = "dev")]
 #[wasm_bindgen(module = "/js/probes.js")]
 extern "C" {
@@ -196,9 +259,20 @@ type DevConfig = std::convert::Infallible;
 fn launch(dev: Option<DevConfig>) -> Result<(), JsValue> {
     // Panics and gpui's log to the console.
     gpui_platform::web_init();
+    listen_for_back();
     let transport = WebTransport::connect().map_err(|e| JsValue::from_str(&e))?;
     let boot: ui::app::Boot = Box::pin(async move {
-        let prepared = boot::prepare(ShellClient::new(transport), BootOptions::default())
+        #[cfg(feature = "dev")]
+        let options = BootOptions {
+            extra_tls_roots: dev
+                .as_ref()
+                .map(|d| d.extra_tls_roots())
+                .unwrap_or_default(),
+            ..BootOptions::default()
+        };
+        #[cfg(not(feature = "dev"))]
+        let options = BootOptions::default();
+        let prepared = boot::prepare(ShellClient::new(transport), options)
             .await
             .map_err(|e| e.to_string())?;
         log(&format!(
@@ -214,6 +288,13 @@ fn launch(dev: Option<DevConfig>) -> Result<(), JsValue> {
         #[cfg(not(feature = "dev"))]
         let _ = dev;
         let client = prepared.client;
+        let host = ui::host::ShellHost::new(client.clone(), prepared.hello, page());
+        #[cfg(feature = "dev")]
+        let host = match dev.as_ref().and_then(|d| d.update_fixtures.clone()) {
+            Some(url) => host.with_update_check(crate::dev::fixture_update_check(url)),
+            None => host,
+        };
+        let host: std::rc::Rc<dyn ui::host::Host> = std::rc::Rc::new(host);
         let confirm: ui::app::Confirm = Box::new(move || {
             Box::pin(async move {
                 boot::confirm(&client)
@@ -224,6 +305,7 @@ fn launch(dev: Option<DevConfig>) -> Result<(), JsValue> {
         });
         Ok(ui::app::Booted {
             core: prepared.core,
+            host,
             confirm,
         })
     });
