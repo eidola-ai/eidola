@@ -712,10 +712,11 @@ jobs:
             || echo "::warning::the committed manifest does not record this billing image; the artifact-manifest job will fail"
 
   # ── Engine pins, re-measured from the platform's images (cheap ubuntu) ──────
-  # Every gateway build holds each engine pin's MRTD to the platform release
-  # manifest its config pins, vendored under releases/trust/cvm-releases/.
-  # This job closes the remaining link: it fetches each TDX image those
-  # manifests name, holds it to the manifest's hash and both files to the
+  # Every gateway build holds each engine pin's launch measurement to the
+  # platform release manifest its config pins, vendored under
+  # releases/trust/cvm-releases/. This job closes the remaining link: it
+  # fetches each image those manifests name for a deployment's TEE (SEV-SNP or
+  # TDX), holds it to the manifest's hash and both files to the
   # provider's build provenance (as `artifact-manifest` does the gateway's),
   # reruns measure-engine-enclaves and requires the committed
   # engine-enclaves.json byte for byte. With no deployment it fetches nothing
@@ -748,7 +749,7 @@ jobs:
       - name: Build the measurer
         run: cargo build --locked -q -p measure-enclave --bin measure-engine-enclaves
 
-      - name: Fetch and verify the TDX images
+      - name: Fetch and verify the release images
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

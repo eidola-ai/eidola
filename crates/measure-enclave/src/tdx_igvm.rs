@@ -252,17 +252,17 @@ pub fn release_pin(
 
     let igvm_sha256 = hex::encode(Sha256::digest(igvm));
     ensure!(
-        igvm_sha256 == launch.igvm_sha256,
+        igvm_sha256 == launch.tdx.igvm_sha256,
         "IGVM image SHA-256 is {igvm_sha256}, but release {} records {}",
         launch.version,
-        launch.igvm_sha256
+        launch.tdx.igvm_sha256
     );
     let mrtd = hex::encode(mrtd_from_igvm(igvm)?);
     ensure!(
-        mrtd == launch.mrtd,
+        mrtd == launch.tdx.measurement,
         "recomputed MRTD {mrtd} disagrees with the MRTD release {} states, {}",
         launch.version,
-        launch.mrtd
+        launch.tdx.measurement
     );
     Ok(TdxLaunchPin {
         cvm_version: launch.version,
@@ -480,7 +480,9 @@ pub(crate) mod tests {
             "root": "00",
             "igvm": {
                 "format_version": 1,
+                "snp": "11".repeat(32),
                 "tdx": hex::encode(Sha256::digest(igvm)),
+                "snp_launch": { "measurement": "44".repeat(48) },
                 "tdx_launch": {
                     "mrtd": mrtd,
                     "rtmr0": rtmr0,
