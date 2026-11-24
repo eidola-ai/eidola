@@ -459,6 +459,37 @@ async fn what_the_format_does_not_have_is_refused() {
     assert_eq!(status, 400, "{v}");
 }
 
+/// A released Qwen3.5 of another size is refused, after the hash and before any weight
+/// is read, even on a `dev-writable` node: the Qwen3.5 dev model's directory with the
+/// configuration of `Qwen/Qwen3.5-4B` (revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`,
+/// `tests/data/qwen3.5-4b.config.json`, byte for byte) in place of its own. The dev model
+/// itself boots (`boot_verifies_the_qwen35_weights_and_its_template`).
+#[test]
+fn a_released_shape_of_another_size_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(qwen35_model_dir()).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with('.') {
+            std::fs::copy(entry.path(), tmp.path().join(&name)).unwrap();
+        }
+    }
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/qwen3.5-4b.config.json"),
+        tmp.path().join("config.json"),
+    )
+    .unwrap();
+    let hash = fixture::weights_hash_of(tmp.path());
+    let e = LoadedModel::load(
+        tmp.path(),
+        &hash,
+        eidola_server_engine::config::WeightsStorage::DevWritable,
+        eidola_server_engine::config::ExecutorKind::Cpu,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("neither Qwen3.5-2B"), "{e}");
+}
+
 /// A full boot from the directory (the weights hash, `config.json` read as Qwen3.5, the
 /// pinned template and tokenizer, no generation config), and a Qwen3.5 directory holding
 /// Qwen3.8's template refused after the hash.

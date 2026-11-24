@@ -47,8 +47,9 @@
 //! The architecture is `config.json`'s `model_type`, read after the hash is checked:
 //! `deepseek_v41` is DeepSeek-V4.1-Flash; `qwen3_5` is a Qwen model, told apart by the
 //! configuration the model crate parses (`qwen_architecture`): FP8 weights are
-//! Qwen3.8-27B, BF16 ones Qwen3.5-0.8B when every dimension is 0.8B's and Qwen3.5-2B
-//! otherwise (the dev models among them); and anything else is read as MiMo-V2.6, whose
+//! Qwen3.8-27B; BF16 ones are Qwen3.5-2B or -0.8B when every dimension is that model's,
+//! a synthetic dev model only on a `dev-writable` node and narrower than every released
+//! Qwen3.5, and refused otherwise; and anything else is read as MiMo-V2.6, whose
 //! configuration parser refuses what it is not.
 //!
 //! What is loaded depends on the executor: the CPU executor runs the reference model,
@@ -62,7 +63,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use eidola_common::architecture::{Architecture, HybridDims, QWEN35_08B_DIMS};
+use eidola_common::architecture::{Architecture, HybridDims, QWEN35_2B_DIMS, QWEN35_08B_DIMS};
 use eidola_common::weights_manifest;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine_chat::mimo::template::CHAT_TEMPLATE_FILE;
@@ -311,7 +312,7 @@ impl LoadedModel {
             .semantic_file(CONFIG_FILE)
             .expect("hashed above")
             .to_vec();
-        let architecture = architecture_of(&config_bytes)?;
+        let architecture = architecture_of(&config_bytes, storage)?;
         for name in weights_manifest::required_files(architecture) {
             if !manifest.contains_key(*name) {
                 return Err(ModelError(format!("{name} is missing")));
@@ -578,8 +579,12 @@ impl LoadedModel {
 }
 
 /// The architecture `config.json` describes, by its `model_type` and, for a Qwen model,
-/// its parsed configuration ([`qwen_architecture`]; module docs).
-fn architecture_of(config_json: &[u8]) -> Result<Architecture, ModelError> {
+/// its parsed configuration and the node's weights storage ([`qwen_architecture`];
+/// module docs).
+fn architecture_of(
+    config_json: &[u8],
+    storage: WeightsStorage,
+) -> Result<Architecture, ModelError> {
     let v: serde_json::Value = serde_json::from_slice(config_json)
         .map_err(|_| ModelError("config.json is not valid JSON".into()))?;
     Ok(
@@ -588,23 +593,50 @@ fn architecture_of(config_json: &[u8]) -> Result<Architecture, ModelError> {
             Some(QWEN3_5_MODEL_TYPE) => qwen_architecture(
                 &QwenConfig::from_json_bytes(config_json, CONFIG_FILE)
                     .map_err(|e| ModelError(format!("config.json: {e}")))?,
-            ),
+                storage,
+            )?,
             _ => Architecture::MimoV26Flash,
         },
     )
 }
 
-/// The Qwen architecture of a parsed `qwen3_5` configuration: its weights' format says
-/// Qwen3.8 (FP8) or Qwen3.5 (BF16), and a Qwen3.5 model is the 0.8B when every dimension
-/// is the 0.8B's and the 2B otherwise. A dev model of other sizes is read as the
-/// architecture of its format, as one of another model type is read as MiMo-V2.6: what
-/// it serves is what its own configuration says.
-pub fn qwen_architecture(config: &QwenConfig) -> Architecture {
-    match config.weights {
+/// The widest hidden size a BF16 `qwen3_5` dev model may have: below every released
+/// Qwen3.5's (the 0.8B's 1,024 is the smallest).
+pub const QWEN35_DEV_HIDDEN_BELOW: u64 = QWEN35_08B_DIMS.hidden;
+
+/// The Qwen architecture of a parsed `qwen3_5` configuration, on a node whose weights
+/// storage is `storage`. FP8 weights are Qwen3.8-27B. BF16 weights are Qwen3.5-2B when
+/// every dimension is the 2B's (`QWEN35_2B_DIMS`) and Qwen3.5-0.8B when every one is the
+/// 0.8B's; any other BF16 shape is refused, so a released checkpoint of another size
+/// (Qwen3.5-4B, -9B) is never served under a name that is not its own. The one exception
+/// is a synthetic dev model: on a `dev-writable` node, a BF16 model narrower than every
+/// released Qwen3.5 (hidden size below [`QWEN35_DEV_HIDDEN_BELOW`]) is read as the 2B's
+/// architecture, as a model of another type is read as MiMo-V2.6: what it serves is what
+/// its own configuration says. Neither condition alone admits it: a pinned deployment is
+/// `verified-readonly`, and no released checkpoint is that narrow.
+pub fn qwen_architecture(
+    config: &QwenConfig,
+    storage: WeightsStorage,
+) -> Result<Architecture, ModelError> {
+    let dims = qwen_dims(config);
+    Ok(match config.weights {
         WeightFormat::Fp8Block128 => Architecture::Qwen38Dense27B,
-        WeightFormat::Bf16 if qwen_dims(config) == QWEN35_08B_DIMS => Architecture::Qwen35Dense08B,
-        WeightFormat::Bf16 => Architecture::Qwen35Dense2B,
-    }
+        WeightFormat::Bf16 if dims == QWEN35_2B_DIMS => Architecture::Qwen35Dense2B,
+        WeightFormat::Bf16 if dims == QWEN35_08B_DIMS => Architecture::Qwen35Dense08B,
+        WeightFormat::Bf16
+            if storage == WeightsStorage::DevWritable && dims.hidden < QWEN35_DEV_HIDDEN_BELOW =>
+        {
+            Architecture::Qwen35Dense2B
+        }
+        WeightFormat::Bf16 => {
+            return Err(ModelError(format!(
+                "config.json: a BF16 qwen3_5 model of hidden size {} that is neither \
+                 Qwen3.5-2B's nor Qwen3.5-0.8B's dimensions (a dev model must be narrower \
+                 than {QWEN35_DEV_HIDDEN_BELOW} on a dev-writable node)",
+                dims.hidden
+            )));
+        }
+    })
 }
 
 /// The dimensions of a Qwen model, as the shared rules count its pools, seats and scratch
@@ -874,46 +906,76 @@ mod tests {
     #[test]
     fn the_architecture_is_the_configs_model_type() {
         assert_eq!(
-            architecture_of(br#"{"model_type": "deepseek_v41"}"#).unwrap(),
+            architecture_of(
+                br#"{"model_type": "deepseek_v41"}"#,
+                WeightsStorage::DevWritable
+            )
+            .unwrap(),
             Architecture::DeepSeekV41Flash
         );
         // A Qwen configuration is read whole: its weights' format and dimensions say
         // which Qwen it is, and one the model crate refuses is refused.
-        let model_crate = |path: &str| {
+        let read = |dir: &str, path: &str| {
             std::fs::read(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../eidola-engine-model/tests")
+                    .join(dir)
                     .join(path),
             )
             .unwrap()
         };
-        for (path, want) in [
-            ("data/qwen3.8-27b.config.json", Architecture::Qwen38Dense27B),
-            (
-                "fixtures/qwen_tiny/config.json",
-                Architecture::Qwen38Dense27B,
-            ),
-            ("data/qwen3.5-2b.config.json", Architecture::Qwen35Dense2B),
-            (
-                "data/qwen3.5-0.8b.config.json",
-                Architecture::Qwen35Dense08B,
-            ),
-            (
-                "fixtures/qwen_tiny_bf16_tied/config.json",
-                Architecture::Qwen35Dense2B,
-            ),
-        ] {
-            assert_eq!(architecture_of(&model_crate(path)).unwrap(), want, "{path}");
+        let model_crate = |path: &str| read("../eidola-engine-model/tests", path);
+        let (dev, verified) = (
+            WeightsStorage::DevWritable,
+            WeightsStorage::VerifiedReadonly,
+        );
+        for storage in [dev, verified] {
+            for (path, want) in [
+                ("data/qwen3.8-27b.config.json", Architecture::Qwen38Dense27B),
+                ("data/qwen3.5-2b.config.json", Architecture::Qwen35Dense2B),
+                (
+                    "data/qwen3.5-0.8b.config.json",
+                    Architecture::Qwen35Dense08B,
+                ),
+            ] {
+                assert_eq!(
+                    architecture_of(&model_crate(path), storage).unwrap(),
+                    want,
+                    "{path} {storage:?}"
+                );
+            }
+            // A released Qwen3.5 of another size is no architecture the engine has,
+            // whatever the storage: the 4B by its dimensions; the 9B, whose config
+            // leaves out the top-level `tie_word_embeddings`, already by the parser.
+            let e = architecture_of(&read("tests", "data/qwen3.5-4b.config.json"), storage)
+                .unwrap_err();
+            assert!(e.0.contains("neither Qwen3.5-2B"), "4B {storage:?}: {e}");
+            assert!(
+                architecture_of(&read("tests", "data/qwen3.5-9b.config.json"), storage).is_err()
+            );
         }
-        assert!(architecture_of(br#"{"model_type": "qwen3_5"}"#).is_err());
+        // The synthetic fixtures: on a dev-writable node only.
+        assert_eq!(
+            architecture_of(&model_crate("fixtures/qwen_tiny/config.json"), dev).unwrap(),
+            Architecture::Qwen38Dense27B
+        );
+        let tiny = model_crate("fixtures/qwen_tiny_bf16_tied/config.json");
+        assert_eq!(
+            architecture_of(&tiny, dev).unwrap(),
+            Architecture::Qwen35Dense2B
+        );
+        assert!(architecture_of(&tiny, verified).is_err());
+        assert!(architecture_of(br#"{"model_type": "qwen3_5"}"#, dev).is_err());
         for other in [
             &br#"{"model_type": "mimo_v2"}"#[..],
             b"{}",
             br#"{"model_type": 5}"#,
         ] {
-            assert_eq!(architecture_of(other).unwrap(), Architecture::MimoV26Flash);
+            assert_eq!(
+                architecture_of(other, WeightsStorage::DevWritable).unwrap(),
+                Architecture::MimoV26Flash
+            );
         }
-        assert!(architecture_of(b"{").is_err());
+        assert!(architecture_of(b"{", WeightsStorage::DevWritable).is_err());
     }
 
     /// Only names the offline `sha256sum` procedure reproduces byte for byte.

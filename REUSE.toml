@@ -158,9 +158,8 @@ precedence = "closest"
 SPDX-FileCopyrightText = ["© Eidola, Inc. and contributors", "© 2026 Alibaba Cloud", "Copyright contributors to the vLLM project"]
 SPDX-License-Identifier = "AGPL-3.0-only AND Apache-2.0"
 
-# Verbatim files from the Qwen3.5-2B and Qwen3.5-0.8B model releases (Hugging
-# Face Qwen/Qwen3.5-2B and Qwen/Qwen3.5-0.8B, declared Apache-2.0), kept as test
-# fixtures and test data.
+# Verbatim files from the Qwen3.5-2B, -0.8B, -4B and -9B model releases (Hugging
+# Face Qwen/Qwen3.5-*, declared Apache-2.0), kept as test fixtures and test data.
 [[annotations]]
 path = [
     "crates/eidola-engine-chat/tests/fixtures/qwen35/chat_template.jinja",
@@ -168,6 +167,8 @@ path = [
     "crates/eidola-engine-chat/tests/fixtures/qwen35/tokenizer.json.gz",
     "crates/eidola-engine-model/tests/data/qwen3.5-2b.config.json",
     "crates/eidola-engine-model/tests/data/qwen3.5-0.8b.config.json",
+    "crates/eidola-server-engine/tests/data/qwen3.5-4b.config.json",
+    "crates/eidola-server-engine/tests/data/qwen3.5-9b.config.json",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "© 2026 Alibaba Cloud"
