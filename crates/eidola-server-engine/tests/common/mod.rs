@@ -178,6 +178,52 @@ pub fn qwen_env_map() -> HashMap<&'static str, String> {
     map
 }
 
+pub const QWEN35_MODEL_ID: &str = "qwen35-test";
+
+/// The Qwen3.5 dev model directory (built once, cached under the target directory).
+pub fn qwen35_model_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("engine-dev-model-qwen35");
+        fixture::ensure_qwen35_dev_model(&dir).expect("build the Qwen3.5 dev model");
+        dir
+    })
+}
+
+/// The Qwen3.5 dev model's weights hash, computed independently of the crate.
+pub fn qwen35_weights_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| fixture::weights_hash_of(qwen35_model_dir()))
+}
+
+/// The Qwen3.5 dev model, verified and loaded once per test binary.
+pub fn qwen35_loaded() -> Arc<LoadedModel> {
+    static MODEL: OnceLock<Arc<LoadedModel>> = OnceLock::new();
+    MODEL
+        .get_or_init(|| {
+            Arc::new(
+                LoadedModel::load(
+                    qwen35_model_dir(),
+                    qwen35_weights_hash(),
+                    WeightsStorage::DevWritable,
+                    ExecutorKind::Cpu,
+                )
+                .unwrap(),
+            )
+        })
+        .clone()
+}
+
+/// A complete, valid environment for the Qwen3.5 dev model: [`env_map`] with its
+/// directory, hash and id.
+pub fn qwen35_env_map() -> HashMap<&'static str, String> {
+    let mut map = env_map();
+    map.insert(env::MODEL_ID, QWEN35_MODEL_ID.to_string());
+    map.insert(env::WEIGHTS_DIR, qwen35_model_dir().display().to_string());
+    map.insert(env::WEIGHTS_SHA256, qwen35_weights_hash().to_string());
+    map
+}
+
 /// A swap list naming no active area, for tests that boot a node the swap check applies
 /// to and assert what happens after it.
 pub fn no_swap_list() -> &'static std::path::Path {
@@ -274,6 +320,18 @@ impl TestNode {
         }
         let config = config_from(&map).unwrap();
         let node = eidola_server_engine::start(config, qwen_loaded()).unwrap();
+        Self::serve(node).await
+    }
+
+    /// Starts a node over the shared Qwen3.5 dev model, with `overrides` applied to
+    /// [`qwen35_env_map`].
+    pub async fn start_qwen35(overrides: &[(&'static str, &str)]) -> TestNode {
+        let mut map = qwen35_env_map();
+        for (k, v) in overrides {
+            map.insert(k, v.to_string());
+        }
+        let config = config_from(&map).unwrap();
+        let node = eidola_server_engine::start(config, qwen35_loaded()).unwrap();
         Self::serve(node).await
     }
 

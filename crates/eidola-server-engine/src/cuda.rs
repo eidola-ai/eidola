@@ -25,7 +25,6 @@ use eidola_engine_cuda::qwen::{
 };
 use eidola_engine_cuda::{Gpu, KernelDir};
 use eidola_engine_model::deepseek::DsConfig;
-use eidola_engine_model::qwen::config::LayerKind;
 use eidola_engine_model::qwen::{QwenConfig, QwenModel};
 use eidola_engine_model::safetensors::WeightSet;
 
@@ -741,29 +740,7 @@ pub fn prepare_deepseek(
 /// bit, is the verification mode.
 pub const QWEN_PROFILE: QwenProfile = QwenProfile::Fast;
 
-/// The dimensions the shared rules count Qwen3.8's pools, seats and scratch from
-/// (`eidola_common::architecture::HybridDims`), of the model loaded: the released
-/// model's are `eidola_common::architecture::QWEN38_DIMS`.
-pub fn qwen_dims(c: &QwenConfig) -> HybridDims {
-    let deltanet = c.layers_of(LayerKind::DeltaNet).count() as u64;
-    let attention = c.layers_of(LayerKind::Attention).count() as u64;
-    let (a, d) = (&c.attention, &c.deltanet);
-    HybridDims {
-        hidden: c.hidden_size as u64,
-        intermediate: c.intermediate_size as u64,
-        vocab: c.vocab_size as u64,
-        attention_layers: attention,
-        deltanet_layers: deltanet,
-        q_heads: a.num_q_heads as u64,
-        kv_heads: a.num_kv_heads as u64,
-        head_dim: a.head_dim as u64,
-        rotary: a.rotary_dim as u64,
-        k_heads: d.num_k_heads as u64,
-        v_heads: d.num_v_heads as u64,
-        k_dim: d.k_head_dim as u64,
-        v_dim: d.v_head_dim as u64,
-    }
-}
+pub use crate::model::qwen_dims;
 
 /// The Qwen3.8 executor's device pools: every KV group (the target's attention layers
 /// and, drafting, the drafter's) `kv_blocks` blocks, and `state_buffers` state buffers,
@@ -887,7 +864,9 @@ pub fn derive_qwen_host_pools(
 /// ([`derive_qwen_host_pools`]); `DRAFT_TOKENS` drafts from the model's MTP layer; the
 /// live state strategy; `graphs` as configured: with `on`, construction captures a graph
 /// for every rung of the decode ladders of that one step shape (draft width 0, and
-/// `DRAFT_TOKENS` when drafting), and uniform decode steps replay them.
+/// `DRAFT_TOKENS` when drafting), and uniform decode steps replay them. A checkpoint the
+/// executor has no kernels for is refused first (`eidola_engine_cuda::qwen::check_supported`:
+/// Qwen3.5's BF16 weights and tied head).
 #[allow(clippy::too_many_arguments)]
 pub fn qwen_config(
     qwen: &QwenConfig,
@@ -898,6 +877,10 @@ pub fn qwen_config(
     graphs: CudaGraphs,
     sampleable_vocab_size: u32,
 ) -> Result<QwenCudaExecutorConfig, BootError> {
+    // Qwen3.5's BF16 weights and tied head have no kernels here: the cpu executor serves
+    // them.
+    eidola_engine_cuda::qwen::check_supported(qwen)
+        .map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
     if sizing.draft_tokens > 0 && qwen.mtp_layers == 0 {
         return Err(BootError(format!(
             "{} ({}) needs the model's MTP layer, and it has none",
@@ -971,7 +954,8 @@ impl QwenPrepared {
     }
 }
 
-/// Qwen3.8's refusals that need no device, in order ([`qwen_config`]: the MTP layer for
+/// Qwen3.8's refusals that need no device, in order ([`qwen_config`]: a checkpoint the
+/// executor has no kernels for (Qwen3.5's), the MTP layer for
 /// the draft width, the pools from the budget and the host tier's), then,
 /// with `gpu_cc` required, the GPUs' confidential-computing state (`crate::gpu_cc`), then
 /// the device, whose memory the budget must be less than. Nothing is allocated on the
@@ -988,7 +972,7 @@ pub fn prepare_qwen(
     gpu_cc: GpuCc,
 ) -> Result<QwenPrepared, BootError> {
     let Served::Qwen { model: qwen, .. } = model.served() else {
-        return Err(BootError("the loaded model is not Qwen3.8".into()));
+        return Err(BootError("the loaded model is not a Qwen model".into()));
     };
     let config = qwen_config(
         qwen.config(),
