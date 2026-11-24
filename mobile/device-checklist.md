@@ -18,6 +18,7 @@ What to prepare before a shell build goes onto a physical device, and the exact 
   - the contract test page: `mobile/ios/build.sh --device --bundle mobile/contract-test`
   - the app bundle: `mobile/ios/build.sh --device` (it builds `mobile/build/bundle` first)
 - [ ] The Mac's LAN address noted (`ipconfig getifaddr en0`), and the echo server ready to start on it: `python3 mobile/tools/echo_server.py 7777 0.0.0.0`.
+- [ ] With the macOS firewall on, incoming connections allowed for `python3` and `tinfoil-shim-mock` (macOS asks the first time each listens on the LAN).
 - [ ] A file `contract-echo.txt` holding `<LAN address>:7777`, for the test page to find the echo server.
 
 ## On the device
@@ -25,6 +26,7 @@ What to prepare before a shell build goes onto a physical device, and the exact 
 - [ ] Developer Mode on (Settings → Privacy & Security), paired and trusted; it shows in `xcrun devicectl list devices` (note its identifier as `DEVICE`).
 - [ ] On the same Wi-Fi as the Mac; Auto-Lock set long for the session.
 - [ ] No other build of `ai.eidola.mobile.dev` installed, or one that may be replaced.
+- [ ] **Local network access** is asked for at the app's first connect to a LAN address after it is installed, and someone taps Allow once. It lasts as long as the app stays installed (a build installed over it keeps it) and an uninstall resets it, so on a test device that runs unattended, keep the dev build installed between sessions.
 
 ## The session
 
@@ -53,11 +55,14 @@ What to prepare before a shell build goes onto a physical device, and the exact 
 5. Long-press the app icon → **Bundle digest**. The sheet's digest equals the page's `serving embedded, digest …` line and the value `build.sh` printed.
 6. Swipe the app away and reopen it: `restart: PASS`.
 7. Lock the device during a fresh run (step 2) and unlock it after a minute: the run resumes and ends in `contract: PASS`. Writes from background work while locked are for the app to prove once it does any; the protection class allows them.
-8. Install the real-bundle build and check what only the device shows: rendering backend (WebGPU), typing with the software keyboard, safe areas.
+8. The app's self-test over the LAN: `IOS_TEAM=… mobile/self-test.sh ios --device "$DEVICE"` (attestation over the pipe and its refusal, the barrier, the profile across a cold relaunch, throughput, the self-update with its fallback and revert; evidence in `mobile/build/self-test/ios-device/`). It installs over the app and starts afresh without uninstalling, so the local network grant holds; on a new install it waits up to three minutes for the Allow.
+9. Install the real-bundle build and check what only the device shows: rendering backend (WebGPU), typing with the software keyboard, safe areas.
+
+The page's console reaches the system log in a debug build: `idevicesyslog -u "$DEVICE" -p EidolaShell` (libimobiledevice) shows it as `console:` lines, with the shell's own.
 
 ## Afterwards
 
-- [ ] `xcrun devicectl device uninstall app --device "$DEVICE" ai.eidola.mobile.dev`, unless the session's owner says to keep it.
+- [ ] `xcrun devicectl device uninstall app --device "$DEVICE" ai.eidola.mobile.dev`, unless the session's owner says to keep it (a dedicated test device keeps it, and with it the local network grant).
 - [ ] Stop the echo server.
 
 ## Android devices

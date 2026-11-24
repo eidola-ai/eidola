@@ -2,7 +2,9 @@
 """Serve the update a development bundle's update check finds (its `update_fixtures`
 URL, `build-bundle.sh --dev-update`), for the phone interface's UI tests.
 
-    update_fixtures.py BUNDLE_DIR WORK_DIR --port 8791 --base http://HOST:8791
+    update_fixtures.py BUNDLE_DIR WORK_DIR --port 8791 --base http://HOST:8791 [--bind 127.0.0.1]
+
+(`--bind 0.0.0.0` for a physical device, which reaches it over the LAN at HOST.)
 
 Two releases, built here into WORK_DIR and served from it over plain HTTP:
 
@@ -58,6 +60,7 @@ def main():
     ap.add_argument("work")
     ap.add_argument("--port", type=int, default=8791)
     ap.add_argument("--base", required=True)
+    ap.add_argument("--bind", default="127.0.0.1")
     args = ap.parse_args()
     work = os.path.abspath(args.work)
     shutil.rmtree(work, ignore_errors=True)
@@ -100,7 +103,7 @@ def main():
                         print(f"fixtures: container of release {i} fetched; next offer {state['next']}", flush=True)
             super().do_GET()
 
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

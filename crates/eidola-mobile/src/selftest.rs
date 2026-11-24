@@ -1,12 +1,16 @@
 //! The headless self-test: the bundle `mobile/build-bundle.sh --self-test`
 //! builds (with this feature; a release bundle has none of it), run by
-//! `mobile/self-test.sh` in the iOS Simulator and the Android emulator against
-//! host-run attested shims.
+//! `mobile/self-test.sh` in the iOS Simulator, the Android emulator or on an iOS
+//! device against host-run attested shims.
 //!
 //! It runs over two launches, telling them apart by a state file it keeps in
 //! the shell's file directory:
 //!
-//! 1. **First launch.** Boot and confirm; point the profile at the shim with
+//! 1. **First launch.** Boot and confirm; remove the bundle versions an
+//!    earlier run stored; wait until the echo server answers
+//!    (a fresh install on a device asks for local network access at its first
+//!    connect, and connects fail until that is answered); point the profile at
+//!    the shim with
 //!    the trusted measurement (base URL, ARK, ASK, measurement — the
 //!    profile's own override surface); then, under a trace of every shell
 //!    call, commit (a new space) and at once send a request: **the barrier**
@@ -309,6 +313,19 @@ async fn first_launch<T: Transport>(
     let Some((core, _)) = boot_core(client, config, env, report).await else {
         return;
     };
+    // A first launch starts from an empty bundle store: a device keeps its
+    // install (and its local network grant) from one run to the next, so the
+    // versions an earlier run stored are removed here.
+    if let Ok(state) = client.bundle_state().await {
+        for stored in state.versions {
+            let _ = client.bundle_remove(&stored.version).await;
+        }
+    }
+    // The device's permission to reach this network may still be undecided
+    // (on iOS, the Local Network prompt a fresh install raises at its first
+    // connect): wait for the echo server before anything uses the network.
+    let reached = network_reachable(client, config, env, NETWORK_WAIT_MS).await;
+    report.measure(env, "network reachable", reached);
 
     let trusted = async {
         core.set_base_url(config.good_url.clone()).await?;
@@ -780,6 +797,45 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
+}
+
+/// How long the first launch waits for the network to become reachable.
+const NETWORK_WAIT_MS: f64 = 180_000.0;
+
+/// Connects to the echo server until it answers or `wait_ms` have passed: how
+/// long that took and how many attempts it needed, or the last refusal.
+pub async fn network_reachable<T: Transport>(
+    client: &ShellClient<T>,
+    config: &Config,
+    env: &Env,
+    wait_ms: f64,
+) -> Result<Value, Value> {
+    let started = (env.now_ms)();
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let error = match ShellDialer::new(client.clone())
+            .connect(&config.echo_host, config.echo_port)
+            .await
+        {
+            Ok(_socket) => {
+                return Ok(json!({
+                    "network_ms": ((env.now_ms)() - started).round(),
+                    "attempts": attempts,
+                }));
+            }
+            Err(e) => e.to_string(),
+        };
+        if (env.now_ms)() - started >= wait_ms {
+            return Err(json!({ "attempts": attempts, "error": error }));
+        }
+        if attempts == 1 {
+            (env.log)(&format!(
+                "self-test: waiting for the network ({error}); allow this app's local network access"
+            ));
+        }
+        (env.sleep_ms)(500).await;
+    }
 }
 
 /// The pipe's and the file API's transfers, alone, with the verdict `run`

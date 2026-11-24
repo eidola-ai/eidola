@@ -16,28 +16,47 @@
 # since no manifest recording a bundle can be signed outside a release.
 # Reports, logs and screenshots go to OUT (default build/self-test/PLATFORM).
 #   self-test.sh ios|android [--out DIR]
-# Uses its own simulator ("eidola-bridge") or AVD ("eidola-bridge"), created once; never a device.
+#   self-test.sh ios --device UDID [--host ADDRESS] [--out DIR]
+# Uses its own simulator ("eidola-bridge") or AVD ("eidola-bridge"), created once; never another.
+# --device runs it on that physical iOS device instead (mobile/device-checklist.md): a debug shell
+# signed by the team (IOS_TEAM overrides the project's), reaching the shims and the echo server
+# over the LAN at ADDRESS (default this Mac's en0 address), which their certificates name. It
+# installs over the app already there, which keeps its local network permission, and starts the
+# self-test afresh by blanking its state file and reports (the self-test removes the bundle
+# versions an earlier run stored). On a device without the app, the first launch asks for local
+# network access; the self-test waits up to three minutes for it to be allowed.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PLATFORM="${1:-}"
 [[ "$PLATFORM" == ios || "$PLATFORM" == android ]] || { echo "usage: self-test.sh ios|android [--out DIR]" >&2; exit 2; }
 shift
-OUT="$HERE/build/self-test/$PLATFORM"
+OUT=
+DEVICE=
+HOST=
 while (($#)); do
   case "$1" in
     --out) OUT="$2"; shift 2 ;;
+    --device) DEVICE="$2"; shift 2 ;;
+    --host) HOST="$2"; shift 2 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
+[[ -z "$DEVICE" || $PLATFORM == ios ]] || { echo "--device is for ios" >&2; exit 2; }
+OUT="${OUT:-$HERE/build/self-test/$PLATFORM${DEVICE:+-device}}"
 rm -rf "$OUT" && mkdir -p "$OUT" && OUT="$(cd "$OUT" && pwd)"
 T="$(mktemp -d)"
 PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done; rm -rf "$T"; }
 trap cleanup EXIT
 
-# The address the app reaches this machine at.
-if [[ $PLATFORM == ios ]]; then HOST=127.0.0.1; else HOST=10.0.2.2; fi
+# The address the app reaches this machine at, and the one the peers listen on.
+if [[ -n "$DEVICE" ]]; then
+  HOST="${HOST:-$(ipconfig getifaddr en0)}"
+  BIND=0.0.0.0
+  [[ -n "$HOST" ]] || { echo "no LAN address (pass --host)" >&2; exit 2; }
+elif [[ $PLATFORM == ios ]]; then HOST=127.0.0.1; BIND=127.0.0.1
+else HOST=10.0.2.2; BIND=127.0.0.1; fi
 GOOD="$(printf '6b%.0s' $(seq 48))"
 BAD="$(printf '11%.0s' $(seq 48))"
 ZERO="$(printf '0%.0s' $(seq 64))"
@@ -49,11 +68,11 @@ mkdir -p "$T/www/v1" "$T/certs"
 echo '{"documents":[]}' >"$T/www/v1/terms"
 python3 -m http.server 18080 --bind 127.0.0.1 --directory "$T/www" >"$OUT/upstream.log" 2>&1 &
 PIDS+=($!)
-python3 "$HERE/tools/echo_server.py" 7777 >"$OUT/echo.log" 2>&1 &
+python3 "$HERE/tools/echo_server.py" 7777 "$BIND" >"$OUT/echo.log" 2>&1 &
 PIDS+=($!)
 shim() { # shim PORT MEASUREMENT NAME
-  CERT_DIR="$T/certs" LISTEN_ADDR="127.0.0.1:$1" UPSTREAM_URL=http://127.0.0.1:18080 DEV_MEASUREMENT="$2" \
-    EXTRA_TLS_NAMES=10.0.2.2 "$SHIM" >"$OUT/$3.log" 2>&1 &
+  CERT_DIR="$T/certs" LISTEN_ADDR="$BIND:$1" UPSTREAM_URL=http://127.0.0.1:18080 DEV_MEASUREMENT="$2" \
+    EXTRA_TLS_NAMES="10.0.2.2${DEVICE:+,$HOST}" "$SHIM" >"$OUT/$3.log" 2>&1 &
   PIDS+=($!)
   for _ in $(seq 50); do nc -z 127.0.0.1 "$1" 2>/dev/null && return 0; sleep 0.2; done
   echo "shim on $1 did not start" >&2; return 1
@@ -83,14 +102,18 @@ echo "the self-update's target bundle" >"$T/update/update-marker.txt"
 mkdir -p "$T/broken"
 echo '<!doctype html><title>a bundle that never confirms</title>' >"$T/broken/index.html"
 FIXTURES="$ROOT/crates/eidola-app-core/tests/fixtures/v0.0.8"
-mkdir -p "$T/www/latest/download" "$T/www/download/v0.0.8" "$T/www/download/v0.0.9" "$T/www/download/v0.0.10"
+# The broken release's version is this run's own: the shell remembers the last version that failed
+# its trial, and the app refuses to install that one again, so a device that keeps its install
+# from one run to the next must be offered a new one.
+BROKEN="0.0.$(date +%s)"
+mkdir -p "$T/www/latest/download" "$T/www/download/v0.0.8" "$T/www/download/v0.0.9" "$T/www/download/v$BROKEN"
 cp "$FIXTURES"/artifact-manifest.json "$FIXTURES"/artifact-manifest.json.sigstore \
   "$FIXTURES"/attestation-throwaway.json "$FIXTURES"/attestation-throwaway.bundle.json "$T/www/download/v0.0.8/"
 python3 "$HERE/tools/bundle_container.py" "$T/update" "$T/www/download/v0.0.9/eidola-mobile-bundle.tar" >"$T/update-row.json"
-python3 "$HERE/tools/bundle_container.py" "$T/broken" "$T/www/download/v0.0.10/eidola-mobile-bundle.tar" >"$T/broken-row.json"
-python3 - "$T" "https://$HOST:18443" >"$T/www/selftest-update.json" <<'PY'
+python3 "$HERE/tools/bundle_container.py" "$T/broken" "$T/www/download/v$BROKEN/eidola-mobile-bundle.tar" >"$T/broken-row.json"
+python3 - "$T" "https://$HOST:18443" "$BROKEN" >"$T/www/selftest-update.json" <<'PY'
 import base64, json, sys
-t, base = sys.argv[1:]
+t, base, broken = sys.argv[1:]
 v8 = f"{base}/download/v0.0.8"
 with open(f"{t}/www/latest/download/release.json", "w") as f:
     json.dump({
@@ -118,7 +141,7 @@ print(json.dumps({
     "attestant_fingerprint": "9f2103792a8007816eb963d1b284d139ac3cf69f3d6ab7cb93878bb654d70915",
     "ci_identity_pattern": "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*",
     "good": staged("0.0.9", json.load(open(f"{t}/update-row.json"))),
-    "broken": staged("0.0.10", json.load(open(f"{t}/broken-row.json"))),
+    "broken": staged(broken, json.load(open(f"{t}/broken-row.json"))),
 }, indent=1))
 PY
 UPDATE_DIGEST="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["digest"][7:])' "$T/update-row.json")"
@@ -130,7 +153,40 @@ wait_for() { # wait_for SECONDS COMMAND...: until COMMAND succeeds
   return 1
 }
 
-if [[ $PLATFORM == ios ]]; then
+if [[ -n "$DEVICE" ]]; then
+  "$HERE/ios/build.sh" --device --bundle "$T/bundle" | tail -2
+  APP="$HERE/ios/build/DerivedData/Build/Products/Debug-iphoneos/EidolaShell.app"
+  PKG=ai.eidola.mobile.dev
+  # devicectl takes its options before an app's bundle id or path.
+  dev() { local verb=("$1" "$2" "$3"); shift 3; timeout 120 xcrun devicectl "${verb[@]}" --device "$DEVICE" -q "$@"; }
+  dev device install app "$APP"
+  # The page's console, which the debug shell writes to the system log.
+  idevicesyslog -u "$DEVICE" -p EidolaShell >"$OUT/console.log" 2>&1 &
+  PIDS+=($!)
+  FILES="Library/Application Support/Eidola/files"
+  report() { # an empty report is an earlier run's, blanked below
+    rm -f "$T/report.json"
+    dev device copy from --domain-type appDataContainer --domain-identifier "$PKG" \
+      --source "$FILES/selftest-$1.json" --destination "$T/report.json" >/dev/null 2>&1 &&
+      [[ -s "$T/report.json" ]] && cat "$T/report.json"
+  }
+  sheet() { :; } # opened from a home-screen quick action, which only XCUITest reaches
+  launch() { dev device process launch --terminate-existing "$PKG" >/dev/null; }
+  kill_app() { # the shell's process, found by its executable
+    local pid
+    pid="$(dev device info processes -j - |
+      python3 -c 'import json,sys; print(" ".join(str(p["processIdentifier"]) for p in json.load(sys.stdin)["result"]["runningProcesses"] if p.get("executable","").endswith("/EidolaShell.app/EidolaShell")))')"
+    for p in $pid; do dev device process terminate --kill --pid "$p" >/dev/null; done
+  }
+  shot() { dev device capture screenshot --destination "$OUT/$1.png" >/dev/null 2>&1 || true; }
+  files() { dev device info files --domain-type appDataContainer --domain-identifier "$PKG" --subdirectory "$FILES"; }
+  # A fresh start without reinstalling: no state (the next launch is a first one), no reports.
+  : >"$T/empty"
+  for f in selftest-state.json selftest-1.json selftest-2.json selftest-3.json; do
+    dev device copy to --domain-type appDataContainer --domain-identifier "$PKG" \
+      --source "$T/empty" --destination "$FILES/$f" >/dev/null 2>&1 || true # none yet on a new install
+  done
+elif [[ $PLATFORM == ios ]]; then
   # DEVICE_TYPE, RUNTIME: see ios/simulator.sh (default the newest installed iOS runtime).
   source "$HERE/ios/simulator.sh"
   UDID="$(simulator_udid eidola-bridge)"
@@ -216,7 +272,7 @@ fi
 
 # 3. Phase 1, a kill, phase 2.
 launch
-wait_for 180 report 1 >/dev/null || { echo "phase 1 reported nothing" >&2; }
+wait_for 300 report 1 >/dev/null || { echo "phase 1 reported nothing" >&2; }
 sleep 1
 shot 1-first-launch
 report 1 >"$OUT/selftest-1.json" || true

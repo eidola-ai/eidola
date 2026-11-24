@@ -112,3 +112,38 @@ async fn an_echo_that_cannot_connect_fails_the_verdict() {
     let (pass, report) = selftest::transfers(&ShellClient::new(shell), &config(port), &env()).await;
     assert!(!pass, "{report}");
 }
+
+#[tokio::test]
+async fn the_first_launch_waits_for_the_network_to_answer() {
+    // Nothing listens until a moment after the self-test first tries (as while
+    // a device's local network prompt is up), then the echo server does.
+    let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = free.local_addr().unwrap().port();
+    drop(free);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+    let shell = FakeShell::default();
+    let reached =
+        selftest::network_reachable(&ShellClient::new(shell), &config(port), &env(), 10_000.0)
+            .await
+            .expect("the network answered within the wait");
+    assert!(reached["attempts"].as_u64().unwrap() > 1, "{reached}");
+}
+
+#[tokio::test]
+async fn a_network_that_never_answers_fails_after_the_wait() {
+    let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = free.local_addr().unwrap().port();
+    drop(free);
+    let shell = FakeShell::default();
+    let refused =
+        selftest::network_reachable(&ShellClient::new(shell), &config(port), &env(), 1_000.0)
+            .await
+            .expect_err("nothing ever listened");
+    assert!(refused["attempts"].as_u64().unwrap() > 1, "{refused}");
+}
