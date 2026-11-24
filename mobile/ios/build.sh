@@ -3,7 +3,7 @@
 #   build.sh [--bundle DIR] [--release] [--device]
 # --bundle  the bundle to embed (default: the app, built by ../build-bundle.sh; the tests embed
 #           ../contract-test)
-# --release the Release configuration, as ai.eidola.mobile (default Debug, as ai.eidola.mobile.dev:
+# --release the Release configuration, as ai.eidola.app.ios (default Debug, as ai.eidola.app.ios.dev:
 #           console in the system log, inspectable)
 # --device  an iPhoneOS build signed by the team in the project (needs that Apple ID in Xcode),
 #           or by the team IOS_TEAM names; default is an unsigned Simulator build.

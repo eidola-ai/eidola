@@ -16,7 +16,7 @@ UDID="$(simulator_udid "$NAME")"
 echo "simulator $NAME: $UDID ($RUNTIME)"
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 # A fresh install, so no earlier run's files or bundles remain.
-xcrun simctl uninstall "$UDID" ai.eidola.mobile.dev || true
+xcrun simctl uninstall "$UDID" ai.eidola.app.ios.dev || true
 
 python3 "$HERE/../tools/echo_server.py" 7777 &
 ECHO=$!

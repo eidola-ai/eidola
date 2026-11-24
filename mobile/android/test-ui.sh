@@ -20,7 +20,7 @@ SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 # stub's and update fixtures' ports (default 8791, 8792), for a second checkout running at once.
 AVD="${UI_AVD:-eidola-shell}"
 PORT="${UI_PORT:-5590}"
-PKG=ai.eidola.mobile.dev
+PKG=ai.eidola.app.android.dev
 ADB=("$SDK/platform-tools/adb" -s "emulator-$PORT")
 IMAGE=system-images/android-36.1/google_apis_playstore/arm64-v8a/
 STUB_PORT="${STUB_PORT:-8791}"

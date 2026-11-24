@@ -58,8 +58,8 @@ echo "simulators: $SIM $UDID, $SIM-zh $ZH"
 xcrun simctl ui "$UDID" appearance light
 xcrun simctl ui "$ZH" appearance light
 # Fresh installs: no earlier run's conversations.
-xcrun simctl uninstall "$UDID" ai.eidola.mobile.dev || true
-xcrun simctl uninstall "$ZH" ai.eidola.mobile.dev || true
+xcrun simctl uninstall "$UDID" ai.eidola.app.ios.dev || true
+xcrun simctl uninstall "$ZH" ai.eidola.app.ios.dev || true
 
 python3 "$HERE/../tools/openai_stub.py" --port "$PORT" --delay 0.08 >"$OUT/stub.log" 2>&1 &
 STUB=$!

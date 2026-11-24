@@ -156,7 +156,7 @@ wait_for() { # wait_for SECONDS COMMAND...: until COMMAND succeeds
 if [[ -n "$DEVICE" ]]; then
   "$HERE/ios/build.sh" --device --bundle "$T/bundle" | tail -2
   APP="$HERE/ios/build/DerivedData/Build/Products/Debug-iphoneos/EidolaShell.app"
-  PKG=ai.eidola.mobile.dev
+  PKG=ai.eidola.app.ios.dev
   # devicectl takes its options before an app's bundle id or path.
   dev() { local verb=("$1" "$2" "$3"); shift 3; timeout 120 xcrun devicectl "${verb[@]}" --device "$DEVICE" -q "$@"; }
   dev device install app "$APP"
@@ -194,7 +194,7 @@ elif [[ $PLATFORM == ios ]]; then
   timeout 180 xcrun simctl bootstatus "$UDID" -b >/dev/null
   "$HERE/ios/build.sh" --bundle "$T/bundle" | tail -2
   APP="$HERE/ios/build/DerivedData/Build/Products/Debug-iphonesimulator/EidolaShell.app"
-  PKG=ai.eidola.mobile.dev
+  PKG=ai.eidola.app.ios.dev
   xcrun simctl uninstall "$UDID" "$PKG" 2>/dev/null || true
   xcrun simctl install "$UDID" "$APP"
   xcrun simctl spawn "$UDID" log stream --style compact --level debug \
@@ -251,7 +251,7 @@ CONFIG
     -storetype PKCS12 -storepass android -alias shell -keyalg EC -groupname secp256r1 -validity 3650 \
     -dname "CN=Eidola shell debug key"
   KEYSTORE="$HERE/android/.keys/debug.p12" "$HERE/android/build.sh" --debug --bundle "$T/bundle" --out "$T/apk" | tail -2
-  PKG=ai.eidola.mobile.dev
+  PKG=ai.eidola.app.android.dev
   "${ADB[@]}" uninstall "$PKG" >/dev/null 2>&1 || true
   "${ADB[@]}" install -r "$T/apk/eidola-shell-signed.apk" >/dev/null
   "${ADB[@]}" logcat -c

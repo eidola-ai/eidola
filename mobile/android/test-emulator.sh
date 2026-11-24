@@ -12,7 +12,7 @@ SHOTS="$(mkdir -p "${1:-$HERE/build/shots}" && cd "${1:-$HERE/build/shots}" && p
 SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 AVD=eidola-shell
 PORT=5590
-PKG=ai.eidola.mobile.dev
+PKG=ai.eidola.app.android.dev
 ADB=("$SDK/platform-tools/adb" -s "emulator-$PORT")
 IMAGE=system-images/android-36.1/google_apis_playstore/arm64-v8a/
 
