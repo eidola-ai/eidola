@@ -2,7 +2,7 @@
 
 The CPU reference executors of the engine, one module per architecture: `src/mimo/`, `src/deepseek/` and `src/qwen/`. The shared modules are `page.rs`, the page-owned buffers (`PageBuf`) every pool is built from and the row tags (`Tag`) they carry, and `pool.rs`, the per-layer K|V block pool MiMo-V2.6 and Qwen3.8 page their KV in. `CpuExecutor` (`src/mimo/`) implements the serving core's `Executor` (`eidola-engine`) for MiMo-V2.6 with the model crate's f32 reference numerics (`eidola-engine-model`), over paged KV, with MTP drafting and sampling inside the step. `DsCpuExecutor` (`src/deepseek/`) does the same for DeepSeek-V4.1, with KV in the model's packed formats and the model split across two logical devices; it has its own section, [DeepSeek-V4.1](#deepseek-v41). `QwenCpuExecutor` (`src/qwen/`) does it for Qwen3.8, with the DeltaNet layers' recurrent state kept as the serving core's state buffers; its section is [Qwen3.8](#qwen38). Everything before those sections is about MiMo's. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
 
-It is not a serving backend. It exists for two reasons:
+It is not built to serve fast (a gateway may pin a deployment on it, a GPU-free one, but that is not why it exists). It exists for two reasons:
 
 - **It is the oracle for every other executor.** A GPU executor is diffed against it row for row: same step inputs, same tokens, logits equal within that executor's documented tolerance.
 - **It proves the contract can be met exactly.** Paged, chunked, prefix-cached, preempted and speculative execution through the real scheduler reproduces the dense reference forward bit for bit.

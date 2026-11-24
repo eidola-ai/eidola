@@ -8,8 +8,9 @@
 //! pin's machine policy is re-derived from the vendored platform endorsements
 //! its deployment names (`releases/trust/platform-endorsements/<tag>/`),
 //! verified offline against `releases/trust/sigstore-trusted-root.json`, and
-//! its MRTD must be the one the platform release manifest its config pins
-//! states (vendored under `releases/trust/cvm-releases/`); every file read is
+//! every pin's launch measurement (MRTD, or the SEV-SNP launch digest) must be
+//! the one the platform release manifest its config pins states for its
+//! TEE's image (vendored under `releases/trust/cvm-releases/`); every file read is
 //! a `rerun-if-changed` input, and nothing reads the network.
 //!
 //! The model catalog, at the workspace root, is `models/<family>/<label>.toml`:

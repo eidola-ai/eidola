@@ -1331,6 +1331,7 @@ fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
 
     let mut trust = eidola_trust();
     trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
+        platform: eidola_app_core::MeasurementPlatform::SevSnp,
         measurement: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f89d2bb3ef58af1e7c0c12f3b4a5d6e7f8".into(),
         host_data: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         guest_policy: "0x30133".into(),
@@ -2793,6 +2794,7 @@ fn eidola_trust() -> eidola_app_core::EidolaTrust {
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
         pinned_measurement: eidola_app_core::MeasurementInfo {
+            platform: eidola_app_core::MeasurementPlatform::SevSnp,
             measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
             host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
             guest_policy: "0x30133".into(),

@@ -17,6 +17,13 @@ use std::process::ExitCode;
 
 use eidola_server_engine::config::Config;
 use eidola_server_engine::telemetry;
+use eidola_server_engine::zeroing::ZeroOnFree;
+
+/// Every heap block is zeroed before it is freed, so no request-derived data the node or
+/// its executor computed on the host outlives the memory that held it
+/// (`eidola_server_engine::zeroing`).
+#[global_allocator]
+static ALLOCATOR: ZeroOnFree<std::alloc::System> = ZeroOnFree(std::alloc::System);
 
 fn main() -> ExitCode {
     telemetry::install_crypto_provider();

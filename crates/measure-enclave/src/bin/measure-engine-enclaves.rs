@@ -8,12 +8,13 @@
 //!     --output releases/trust/engine-enclaves.json
 //!
 //! `--release-dir` holds, for every `cvm-version` a deployment selects, the
-//! platform provider's `tinfoil-tdx-v<version>.igvm`. The release's manifest
+//! platform provider's IGVM image for the TEE its `deployment.json` names
+//! (`tinfoil-snp-v<version>.igvm` or `tinfoil-tdx-v<version>.igvm`). The release's manifest
 //! is read from where it is vendored,
 //! `releases/trust/cvm-releases/v<tag>/tinfoil-inference-v<version>-manifest.json`:
 //! it must hash to the pin in the config's `cvm-version`, and the image to
 //! the manifest's record of it.
-//! Each deployment's TDX machine policy is derived from the platform
+//! A TDX deployment's machine policy is derived from the platform
 //! endorsements release its `deployment.json` names, vendored under
 //! `releases/trust/platform-endorsements/` and verified offline.
 //! Release-time work, like `just update-manifest`: nothing here downloads.
@@ -35,7 +36,8 @@ struct Cli {
     /// The workspace root.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    /// Directory holding each selected release's TDX IGVM image.
+    /// Directory holding each selected release's IGVM image, for the TEE
+    /// each deployment names.
     #[arg(long, required_unless_present = "images")]
     release_dir: Option<PathBuf>,
     /// Where to write the file (stdout when absent).
@@ -64,8 +66,9 @@ fn main() -> Result<()> {
                 format!("deploy/engine/{group_name}/{variant_name}/tinfoil-config.yml");
             let config = read(&variant.join("tinfoil-config.yml"))?;
             let sidecar = read(&variant.join("deployment.json"))?;
-            let files = engine_enclaves::release_files(&config, &workspace_file)
-                .with_context(|| config_path.clone())?;
+            let files =
+                engine_enclaves::release_files(&config_path, &config, &sidecar, &workspace_file)
+                    .with_context(|| config_path.clone())?;
             if cli.images {
                 images.insert(files);
                 continue;

@@ -804,9 +804,17 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                 }
             );
             for m in &trust.trusted_measurements {
-                println!("  - sev_snp.measurement = {}", m.measurement);
-                println!("    sev_snp.host_data = {}", m.host_data);
-                println!("    sev_snp.guest_policy = {}", m.guest_policy);
+                match m.platform {
+                    eidola_app_core::MeasurementPlatform::SevSnp => {
+                        println!("  - sev_snp.measurement = {}", m.measurement);
+                        println!("    sev_snp.host_data = {}", m.host_data);
+                        println!("    sev_snp.guest_policy = {}", m.guest_policy);
+                    }
+                    eidola_app_core::MeasurementPlatform::Tdx => {
+                        println!("  - tdx.mrtd = {}", m.measurement);
+                        println!("    tdx.config_sha256 = {}", m.host_data);
+                    }
+                }
             }
             println!(
                 "hardware_root_ca: {}",
@@ -906,23 +914,18 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                     hardware_intermediate_ca.unwrap_or_default()
                 );
             }
-            if let Some(m) = trust_entry {
-                let added = core
-                    .trust_measurement(
-                        m.measurement.clone(),
-                        m.host_data.clone(),
-                        m.guest_policy.clone(),
-                    )
-                    .await?;
+            if let (Some(m), Some(spec)) = (trust_entry, trust_measurement.as_deref()) {
+                let added = core.trust_measurement_spec(spec.to_string()).await?;
+                let (measurement, config_hash) = m.identity();
                 if added {
                     println!(
-                        "added trusted measurement: measurement={}, host_data={}, guest_policy={}",
-                        m.measurement, m.host_data, m.guest_policy,
+                        "added trusted measurement: measurement={measurement}, \
+                         config_hash={config_hash}"
                     );
                 } else {
                     println!(
-                        "measurement already trusted (measurement={}, host_data={})",
-                        m.measurement, m.host_data
+                        "measurement already trusted (measurement={measurement}, \
+                         config_hash={config_hash})"
                     );
                 }
             }

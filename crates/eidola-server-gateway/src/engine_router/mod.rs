@@ -8,9 +8,10 @@
 //!   deployments this build pins. Availability only, never trust.
 //! - **Whether an engine is the one it claims to be** — the attesting client:
 //!   every upstream's `reqwest::Client` is `tinfoil_verifier`'s, built over
-//!   its model's compiled-in pins (`engine_trust::accepted_deployments`, TDX
-//!   pins with `expected_gpus`, so the verifier also requires exactly that
-//!   many NVIDIA GPU evidence items bound to each handshake's nonce). Every
+//!   its model's compiled-in pins (`engine_trust::accepted_deployments`, each
+//!   on its deployment's TEE, with `expected_gpus` for a GPU deployment, so
+//!   the verifier also requires exactly that many NVIDIA GPU evidence items
+//!   bound to each handshake's nonce). Every
 //!   new connection is attested; requests on a pooled connection ride on its
 //!   attestation, and every GPU-enclave handshake makes the node collect fresh
 //!   SPDM reports, so keep-alive pooling is what keeps handshakes rare. One
