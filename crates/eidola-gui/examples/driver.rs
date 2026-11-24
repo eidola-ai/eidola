@@ -1733,6 +1733,7 @@ mod driver {
             trusted_measurements: Vec::new(),
             trusted_measurements_are_override: false,
             pinned_measurement: eidola_app_core::MeasurementInfo {
+                platform: eidola_app_core::MeasurementPlatform::SevSnp,
                 measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
                 host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
                     .into(),
