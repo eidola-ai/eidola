@@ -190,8 +190,9 @@ impl Tokenizer {
         eos_file: &str,
         sha256: String,
     ) -> Result<Tokenizer, ChatError> {
-        let inner = tokenizers::Tokenizer::from_bytes(tokenizer_json)
+        let mut inner = tokenizers::Tokenizer::from_bytes(tokenizer_json)
             .map_err(|e| ChatError::InvalidArtifact(format!("tokenizer.json: {e}")))?;
+        without_word_cache(&mut inner);
 
         let char_bytes = byte_level_decoder_table();
         let vocab = inner.get_vocab(true);
@@ -477,6 +478,20 @@ fn normalizer_is_identity(tokenizer_json: &[u8]) -> Result<bool, ChatError> {
                     .is_some_and(|n| n.is_empty())
         }
     })
+}
+
+/// The tokenizer's model with no word cache. `tokenizers`' BPE (and Unigram) model
+/// caches, per thread, every word it has merged, keyed by the word's text and never freed:
+/// across requests that is every word of every past prompt, live in memory between them,
+/// where no zeroing of freed memory reaches it (a cleared cache keeps its entries
+/// unreachable but in place). With capacity 0 nothing is ever inserted: a word is merged
+/// again each time it is encoded, and what the encoding allocated is freed with its result
+/// (`tests/tokenizer_memory.rs`). The model is replaced by a clone, whose cache is a fresh
+/// one with nothing in it, resized to 0 before any word is encoded.
+fn without_word_cache(inner: &mut tokenizers::Tokenizer) {
+    let mut model = inner.get_model().clone();
+    model.resize_cache(0);
+    inner.with_model(model);
 }
 
 fn tokenization_failed(e: impl std::fmt::Display) -> ChatError {
@@ -1383,5 +1398,56 @@ mod reference_tests {
                 );
             }
         }
+    }
+
+    /// The cost of encoding without the word cache (ignored; release build):
+    ///
+    ///     cargo test --release -p eidola-engine-chat --lib word_cache_cost -- --ignored --nocapture
+    ///
+    /// A long prompt (every Qwen3.5 fixture prompt joined, about 530 KB of text) encoded
+    /// by `tokenizers` as loaded, its cache warm from the same text, and by this crate's
+    /// tokenizer, which has none.
+    #[test]
+    #[ignore = "a measurement"]
+    fn word_cache_cost() {
+        let dir = fixtures_dir().join("qwen35");
+        let compressed = std::fs::read(dir.join("tokenizer.json.gz")).unwrap();
+        let mut json = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut json)
+            .unwrap();
+        let config = std::fs::read(dir.join(CONFIG_FILE)).unwrap();
+        let ours = Tokenizer::for_format(ChatFormat::Qwen3_5, &json, &config).unwrap();
+        let cached = tokenizers::Tokenizer::from_bytes(&json).unwrap();
+        let cases: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("template_cases.json")).unwrap(),
+        )
+        .unwrap();
+        let text: String = cases["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["expected"].as_str())
+            .collect();
+        let time = |f: &dyn Fn() -> usize| {
+            f();
+            let runs = 5;
+            let t0 = std::time::Instant::now();
+            let mut n = 0;
+            for _ in 0..runs {
+                n = f();
+            }
+            (t0.elapsed().as_secs_f64() / runs as f64, n)
+        };
+        let (with, n) = time(&|| cached.encode(text.as_str(), false).unwrap().len());
+        let (without, m) = time(&|| ours.encode(&text).unwrap().len());
+        assert_eq!(n, m);
+        println!(
+            "{} bytes, {n} tokens: {:.1} ms with a warm word cache, {:.1} ms without ({:.2}x)",
+            text.len(),
+            with * 1e3,
+            without * 1e3,
+            without / with
+        );
     }
 }
