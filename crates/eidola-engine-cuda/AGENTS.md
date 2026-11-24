@@ -277,6 +277,8 @@ None of it has run on a device. The node runs the form its configuration fixes (
 
 ## Qwen3.8
 
+**Qwen3.5 is refused** (`qwen::check_supported`, first in `QwenCudaExecutor::new`, and the node's `cuda::qwen_config` before it opens a device): its BF16 projections and its head tied to the embedding have no kernels here; the CPU executor serves it (`crates/eidola-engine/architectures/qwen3.5.md`).
+
 `src/qwen/` is Qwen3.8-27B's module tree, a sibling of `src/mimo/` and `src/deepseek/`; it shares the root modules, and in the fast profile MiMo's CUTLASS GEMM wrapper (`mimo::gemm::Gemm`), whose kernels it runs as they are. `QwenCudaExecutor<D: QwenDevice>` implements the seam for the hybrid model as the CPU reference executor does (`eidola-engine-cpu/AGENTS.md` → Qwen3.8): the same groups, state pool, tails, drafter rows, draft chain, canonical rewrite, taps and kept normed states, the same maintenance (`SaveState` included), and **state images byte for byte the reference executor's** (per DeltaNet layer its conv history then `S`, f32, then the tag; plaintext and ciphertext alike, since the cipher pieces are the same).
 
 **Two profiles** (`QwenProfile`, fixed when the device is opened; one deployment runs one profile for every step, whatever the batch):

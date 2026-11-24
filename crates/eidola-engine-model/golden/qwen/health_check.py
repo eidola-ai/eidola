@@ -1,13 +1,14 @@
 """Health: is this the released model?
 
-    uv run python health_check.py --dir <checkpoint dir> [--tokens-only] [--mode pinned|native|released] [--device cpu|cuda]
+    uv run python health_check.py --dir <checkpoint dir> [--model qwen3.8-27b|qwen3.5-2b|qwen3.5-0.8b] \
+        [--tokens-only] [--mode pinned|native|released] [--device cpu|cuda]
 
 Agreement with the reference shows that a forward computes what the
 modelling code computes on the files both were given; it says nothing about
 the files. This checks them, and the reference's run of them, against facts
 outside this tooling (`qwen_golden/health.py`):
 
-- every checkpoint file is the recorded upstream one (`upstream-sha256.json`);
+- every checkpoint file is the recorded upstream one (the model's list);
 - next-token accuracy over the first 1,024 tokens of the checkpoint's own
   `LICENSE` (the Apache-2.0 text) is at least 0.95 (the released model served
   by vLLM measured 0.998);
@@ -47,9 +48,14 @@ def main() -> int:
     ap.add_argument("--mode", choices=["pinned", "native", "released"], default="pinned",
                     help="as in real_golden.py: pinned and native on the CPU, released on a GPU")
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--layers", type=int, default=64, help="fewer only to exercise the script on a truncation")
+    ap.add_argument("--model", choices=sorted(upstream.MODELS), default=upstream.DEFAULT_MODEL)
+    ap.add_argument("--layers", type=int, help="fewer than all only to exercise the script on a truncation")
     a = ap.parse_args()
-    upstream.check_dir(a.dir, "full" if a.layers == 64 else "prefix")
+    upstream.use(a.model)
+    upstream.check_file(a.dir / "config.json")  # read below, before the rest is checked
+    total = reference.text_config(a.dir).num_hidden_layers
+    a.layers = total if a.layers is None else a.layers
+    upstream.check_dir(a.dir, "full" if a.layers == total else upstream.truncation_for(a.layers))
     log("checkpoint files match the recorded hashes")
     seqs = health.sequences(a.dir)
     out = {k: st.entry(torch.tensor(v, dtype=torch.int32)) for k, v in seqs.items()}

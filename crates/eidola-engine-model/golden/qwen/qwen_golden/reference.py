@@ -3,9 +3,12 @@ built from a checkpoint directory, run on a CPU with the unspecified
 operations pinned (`pinned_ops`).
 
 The text model is `Qwen3_5ForCausalLM` exactly as Transformers v5.23.0
-defines it, its FP8 projections Transformers' own `FP8Linear` modules holding
-the checkpoint's E4M3 weights and block scales; only `fp8_linear`, the hub
-kernel those modules call, is replaced by the pinned emulation. The weights are
+defines it. For an FP8 checkpoint (Qwen3.8-27B-FP8) its projections are
+Transformers' own `FP8Linear` modules holding the checkpoint's E4M3 weights and
+block scales, and only `fp8_linear`, the hub kernel those modules call, is
+replaced by the pinned emulation; for a BF16 one (Qwen3.5) they are the model
+code's own `nn.Linear`s, whose `F.linear` is pinned like every other. A tied
+head (`tie_word_embeddings`) is the embedding's tensor. The weights are
 assigned directly from the safetensors files (Transformers' FP8 quantiser,
 which needs a GPU, is not involved).
 
@@ -50,7 +53,7 @@ def text_config(directory: Path, layers: list[int] | None = None):
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 
     raw = json.loads((directory / "config.json").read_text())
-    raw.pop("quantization_config")
+    raw.pop("quantization_config", None)
     cfg = Qwen3_5Config.from_dict(raw).text_config
     if layers is not None:
         assert layers == list(range(len(layers))), "a truncation keeps the first layers"
@@ -59,6 +62,12 @@ def text_config(directory: Path, layers: list[int] | None = None):
     cfg._attn_implementation = "eager"
     cfg.dtype = torch.bfloat16
     return cfg
+
+
+def is_fp8(directory: Path) -> bool:
+    """Whether the checkpoint stores its projections in FP8 (a
+    `quantization_config`); otherwise they are BF16 `nn.Linear`s as built."""
+    return "quantization_config" in json.loads((directory / "config.json").read_text())
 
 
 def _fp8_modules(module: nn.Module) -> None:
@@ -111,12 +120,14 @@ def load(directory: Path, layers: list[int] | None = None, mtp: bool = True):
     from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
 
     cfg = text_config(directory, layers)
+    fp8 = is_fp8(directory)
     with torch.device("meta"):
         model = mq.Qwen3_5ForCausalLM(cfg)
-        _fp8_modules(model)
         drafter = Mtp(cfg) if mtp else None
-        if drafter is not None:
-            _fp8_modules(drafter)
+        if fp8:
+            _fp8_modules(model)
+            if drafter is not None:
+                _fp8_modules(drafter)
     entries: dict[str, st.Entry] = {}
     for file in sorted(directory.glob("*.safetensors")):
         if file.name != "golden.safetensors":
@@ -137,11 +148,22 @@ def load(directory: Path, layers: list[int] | None = None, mtp: bool = True):
         for k in list(d):
             if k.endswith("weight_scale_inv"):
                 d[k] = d[k].float()
+            elif d[k].dtype == torch.float32:
+                # `from_pretrained` builds the model in the config's dtype and loads every
+                # parameter into it (Qwen3.5 stores `A_log` and the gated norm's weight in
+                # F32), as vLLM's loader does: rounded to BF16, ties to even.
+                d[k] = d[k].to(cfg.dtype)
+    if cfg.tie_word_embeddings:
+        # A tied checkpoint has no head of its own: the model's head is the
+        # embedding's tensor.
+        assert "lm_head.weight" not in sd, "a tied checkpoint with a head of its own"
+        sd["lm_head.weight"] = sd["model.embed_tokens.weight"]
     model.load_state_dict(sd, strict=True, assign=True)
     # Non-persistent buffers were built on the meta device: rebuild the RoPE
     # frequencies (under the pins) on the CPU.
     model.model.rotary_emb = mq.Qwen3_5TextRotaryEmbedding(config=cfg)
-    assert model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
+    tied = model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+    assert tied == bool(cfg.tie_word_embeddings), (tied, cfg.tie_word_embeddings)
     model.eval()
     if drafter is not None:
         drafter.load_state_dict(mtp_sd, strict=True, assign=True)

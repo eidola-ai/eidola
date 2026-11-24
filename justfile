@@ -174,7 +174,7 @@ run system *args:
       engine-server)
         # An inference node on 127.0.0.1:8090 serving the synthetic dev model (random
         # weights, gibberish output) through the CPU executor: MiMo-V2.6's, or with
-        # `qwen` as the first argument Qwen3.8's. Gateway token: `dev-gateway-token`;
+        # `qwen` (`qwen35`) as the first argument Qwen3.8's (Qwen3.5's). Gateway token: `dev-gateway-token`;
         # the weights hash is printed below and served by GET /v1/engine/info. No
         # EIDOLA_ENV_PREFIX, so the names are read as written. See
         # crates/eidola-server-engine/AGENTS.md.
@@ -182,6 +182,9 @@ run system *args:
         dir=target/engine-dev-model id=mimo-dev family=
         if [ "${1:-}" = qwen ]; then
           dir=target/engine-dev-model-qwen id=qwen-dev family=--qwen
+          shift
+        elif [ "${1:-}" = qwen35 ]; then
+          dir=target/engine-dev-model-qwen35 id=qwen35-dev family=--qwen35
           shift
         fi
         hash=$(cargo run -q -p eidola-server-engine --example dev_model -- ${family:+"$family"} "$dir")

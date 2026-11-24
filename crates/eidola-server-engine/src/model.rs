@@ -15,10 +15,12 @@
 //! The names are `eidola_common::weights_manifest`'s, the same for every architecture;
 //! which of them must be present is the served architecture's
 //! (`weights_manifest::required_files`): MiMo-V2.6 and Qwen3.8 read all three chat
-//! artifacts, while
+//! artifacts; Qwen3.5 reads its template and tokenizer and its EOS id from `config.json`
+//! (its checkpoints ship no generation config); and
 //! DeepSeek-V4.1 encodes its prompt with a compiled-in encoder and reads its EOS id from
-//! `config.json`, so it needs only the tokenizer (and reads `generation_config.json` when
-//! there is one). A covered file the node does not read is hashed all the same.
+//! `config.json`, so it needs only the tokenizer. Qwen3.5 and DeepSeek-V4.1 read
+//! `generation_config.json` when there is one. A covered file the node does not read is
+//! hashed all the same.
 //!
 //! The **manifest** is one line per file, `<sha256 hex, lowercase>  <file name>\n` (two
 //! spaces, as `sha256sum` prints), sorted by file name in byte order. The weights hash is
@@ -43,8 +45,12 @@
 //! is dequantised or copied to a device.
 //!
 //! The architecture is `config.json`'s `model_type`, read after the hash is checked:
-//! `deepseek_v41` is DeepSeek-V4.1-Flash, `qwen3_5` is Qwen3.8-27B, and anything else is
-//! read as MiMo-V2.6, whose configuration parser refuses what it is not.
+//! `deepseek_v41` is DeepSeek-V4.1-Flash; `qwen3_5` is a Qwen model, told apart by the
+//! configuration the model crate parses (`qwen_architecture`): FP8 weights are
+//! Qwen3.8-27B and BF16 ones Qwen3.5-2B or -0.8B when every dimension is that model's,
+//! a synthetic dev model only on a `dev-writable` node and narrower than every released
+//! one, and refused otherwise; and anything else is read as MiMo-V2.6, whose
+//! configuration parser refuses what it is not.
 //!
 //! What is loaded depends on the executor: the CPU executor runs the reference model,
 //! built here (MiMo's dequantised to f32; DeepSeek's from the model crate's DeepSeek
@@ -57,7 +63,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use eidola_common::architecture::Architecture;
+use eidola_common::architecture::{
+    Architecture, HybridDims, QWEN35_2B_DIMS, QWEN35_08B_DIMS, QWEN38_DIMS,
+};
 use eidola_common::weights_manifest;
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine_chat::mimo::template::CHAT_TEMPLATE_FILE;
@@ -67,7 +75,8 @@ use eidola_engine_chat::tokenizer::{CONFIG_FILE, GENERATION_CONFIG_FILE, TOKENIZ
 use eidola_engine_chat::{ChatFormat, Tokenizer};
 use eidola_engine_model::deepseek::{DsConfig, DsLoadOptions, DsModel, DsWeights};
 use eidola_engine_model::mimo::{LoadOptions, ModelConfig, ModelWeights, ReferenceModel};
-use eidola_engine_model::qwen::{QwenConfig, QwenModel, QwenWeights};
+use eidola_engine_model::qwen::config::LayerKind;
+use eidola_engine_model::qwen::{QwenConfig, QwenModel, QwenWeights, WeightFormat};
 use eidola_engine_model::safetensors::{SEMANTIC_FILES, WeightSet};
 use sha2::{Digest, Sha256};
 
@@ -79,8 +88,8 @@ pub const CHAT_FILES: [&str; 3] = [TOKENIZER_FILE, CHAT_TEMPLATE_FILE, GENERATIO
 /// `config.json`'s `model_type` for DeepSeek-V4.1.
 pub const DEEPSEEK_V4_1_MODEL_TYPE: &str = "deepseek_v41";
 
-/// `config.json`'s `model_type` for Qwen3.8 (Transformers' `qwen3_5`).
-pub const QWEN3_8_MODEL_TYPE: &str = "qwen3_5";
+/// `config.json`'s `model_type` for Qwen3.8 and Qwen3.5 (Transformers' `qwen3_5`).
+pub const QWEN3_5_MODEL_TYPE: &str = "qwen3_5";
 
 /// A tensor of DeepSeek-V4.1's Engram compressed-vocabulary map (one `int32` or `int64`
 /// per token id). The node derives the map from the tokenizer, as the reference does
@@ -148,6 +157,19 @@ impl GenerationDefaults {
         top_k: 0,
     };
 
+    /// Qwen3.5's defaults when its checkpoint ships no `generation_config.json` (the
+    /// released 2B and 0.8B do not): the model card's recommendation for text without
+    /// thinking, temperature 1.0, `top_p` 1.0, `top_k` 20 and `min_p` 0. Its
+    /// `presence_penalty` 2.0 and `repetition_penalty` 1.0 have no counterpart in the
+    /// engine's sampler and are not applied. Nothing is written into the weights
+    /// directory, whose files the weights hash covers: the defaults are the node's, for
+    /// the architecture.
+    pub const QWEN3_5_MODEL_CARD: GenerationDefaults = GenerationDefaults {
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: 20,
+    };
+
     fn parse(bytes: &[u8]) -> Result<Self, ModelError> {
         let bad = |m: &str| ModelError(format!("{GENERATION_CONFIG_FILE}: {m}"));
         let v: serde_json::Value =
@@ -199,8 +221,9 @@ pub enum Served {
         token_map: Option<Vec<u32>>,
         model: Option<Arc<DsModel>>,
     },
-    /// Qwen3.8-27B, text only: the reference model over the verified mapping (its large
-    /// weights left there, as both executors read them) and the model's chat template.
+    /// Qwen3.8-27B or Qwen3.5-2B or -0.8B, text only: the reference model over the
+    /// verified mapping (its large weights left there, as both executors read them) and
+    /// the model's chat template, whose kind names the format.
     Qwen {
         model: Arc<QwenModel>,
         template: qwen::ChatTemplate,
@@ -304,7 +327,7 @@ impl LoadedModel {
             .semantic_file(CONFIG_FILE)
             .expect("hashed above")
             .to_vec();
-        let architecture = architecture_of(&config_bytes)?;
+        let architecture = architecture_of(&config_bytes, storage)?;
         for name in weights_manifest::required_files(architecture) {
             if !manifest.contains_key(*name) {
                 return Err(ModelError(format!("{name} is missing")));
@@ -356,21 +379,35 @@ impl LoadedModel {
                     defaults,
                 )
             }
-            Architecture::Qwen38Dense27B => {
+            Architecture::Qwen38Dense27B
+            | Architecture::Qwen35Dense2B
+            | Architecture::Qwen35Dense08B => {
                 let config = eidola_engine_model::qwen::config_of(&store)
                     .map_err(|e| ModelError(format!("config.json: {e}")))?;
-                let tokenizer = Tokenizer::for_format(
-                    ChatFormat::Qwen3_8,
-                    &chat[TOKENIZER_FILE],
-                    &chat[GENERATION_CONFIG_FILE],
-                )
-                .map_err(|e| ModelError(e.to_string()))?;
+                // Qwen3.8 names its end-of-sequence ids and sampling defaults in its
+                // generation config; Qwen3.5's checkpoints ship none, and name the id in
+                // `config.json` (`ChatFormat::Qwen3_5`).
+                let format = match architecture {
+                    Architecture::Qwen38Dense27B => ChatFormat::Qwen3_8,
+                    _ => ChatFormat::Qwen3_5,
+                };
+                let eos_config = match format.eos_config_file() {
+                    CONFIG_FILE => &config_bytes,
+                    file => &chat[file],
+                };
+                let tokenizer = Tokenizer::for_format(format, &chat[TOKENIZER_FILE], eos_config)
+                    .map_err(|e| ModelError(e.to_string()))?;
                 let template_source =
                     String::from_utf8(chat.remove(CHAT_TEMPLATE_FILE).expect("required"))
                         .map_err(|_| ModelError(format!("{CHAT_TEMPLATE_FILE} is not UTF-8")))?;
-                let template = qwen::ChatTemplate::from_source(template_source)
+                let template = qwen::ChatTemplate::for_format(format, template_source)
                     .map_err(|e| ModelError(e.to_string()))?;
-                let defaults = GenerationDefaults::parse(&chat[GENERATION_CONFIG_FILE])?;
+                // Qwen3.8 requires its generation config; a Qwen3.5 directory without
+                // one gets the model card's defaults.
+                let defaults = match chat.get(GENERATION_CONFIG_FILE) {
+                    Some(bytes) => GenerationDefaults::parse(bytes)?,
+                    None => GenerationDefaults::QWEN3_5_MODEL_CARD,
+                };
                 if tokenizer.vocab_size() > config.vocab_size {
                     return Err(ModelError(format!(
                         "the tokenizer defines {} ids but the model's head has only {} rows",
@@ -467,10 +504,10 @@ impl LoadedModel {
 
     /// The chat format of the architecture served.
     pub fn format(&self) -> ChatFormat {
-        match self.served {
+        match &self.served {
             Served::Mimo { .. } => ChatFormat::MimoV2_6,
             Served::DeepSeek { .. } => ChatFormat::DeepSeekV4_1,
-            Served::Qwen { .. } => ChatFormat::Qwen3_8,
+            Served::Qwen { template, .. } => template.kind().format(),
         }
     }
 
@@ -486,9 +523,9 @@ impl LoadedModel {
 
     /// The token ids the model may emit (the engine's `sampleable_vocab_size`): the
     /// tokenizer's ids, and for DeepSeek-V4.1 only those below its image token, which the
-    /// text model cannot embed (the ids from it on are the vision tower's). Qwen3.8's
-    /// vision placeholders sit among its added tokens, so its whole vocabulary is
-    /// sampleable.
+    /// text model cannot embed (the ids from it on are the vision tower's). The Qwen
+    /// models' vision placeholders sit among their added tokens, so the whole vocabulary
+    /// is sampleable.
     pub fn sampleable_vocab_size(&self) -> u32 {
         let vocab = self.tokenizer.vocab_size() as u32;
         match &self.served {
@@ -508,7 +545,7 @@ impl LoadedModel {
         match &self.served {
             Served::Mimo { config, .. } => config,
             Served::DeepSeek { .. } => panic!("a DeepSeek-V4.1 model has no MiMo configuration"),
-            Served::Qwen { .. } => panic!("a Qwen3.8 model has no MiMo configuration"),
+            Served::Qwen { .. } => panic!("a Qwen model has no MiMo configuration"),
         }
     }
 
@@ -534,17 +571,18 @@ impl LoadedModel {
     ///
     /// # Panics
     ///
-    /// For another architecture (DeepSeek-V4.1's prompt encoder is compiled in; Qwen3.8's
-    /// template is [`Served::Qwen`]'s).
+    /// For another architecture (DeepSeek-V4.1's prompt encoder is compiled in; a Qwen
+    /// model's template is [`Served::Qwen`]'s).
     pub fn template(&self) -> &ChatTemplate {
         match &self.served {
             Served::Mimo { template, .. } => template,
             Served::DeepSeek { .. } => panic!("a DeepSeek-V4.1 model has no chat template"),
-            Served::Qwen { .. } => panic!("a Qwen3.8 model has no MiMo chat template"),
+            Served::Qwen { .. } => panic!("a Qwen model has no MiMo chat template"),
         }
     }
 
-    /// Qwen3.8's configuration (`config.json`'s text model, verified), when serving it.
+    /// A Qwen model's configuration (`config.json`'s text model, verified), when serving
+    /// one.
     pub fn qwen_config(&self) -> Option<&QwenConfig> {
         match &self.served {
             Served::Qwen { model, .. } => Some(model.config()),
@@ -557,17 +595,101 @@ impl LoadedModel {
     }
 }
 
-/// The architecture `config.json` describes, by its `model_type` (module docs).
-fn architecture_of(config_json: &[u8]) -> Result<Architecture, ModelError> {
+/// The architecture `config.json` describes, by its `model_type` and, for a Qwen model,
+/// its parsed configuration and the node's weights storage ([`qwen_architecture`];
+/// module docs).
+fn architecture_of(
+    config_json: &[u8],
+    storage: WeightsStorage,
+) -> Result<Architecture, ModelError> {
     let v: serde_json::Value = serde_json::from_slice(config_json)
         .map_err(|_| ModelError("config.json is not valid JSON".into()))?;
     Ok(
         match v.get("model_type").and_then(serde_json::Value::as_str) {
             Some(DEEPSEEK_V4_1_MODEL_TYPE) => Architecture::DeepSeekV41Flash,
-            Some(QWEN3_8_MODEL_TYPE) => Architecture::Qwen38Dense27B,
+            Some(QWEN3_5_MODEL_TYPE) => qwen_architecture(
+                &QwenConfig::from_json_bytes(config_json, CONFIG_FILE)
+                    .map_err(|e| ModelError(format!("config.json: {e}")))?,
+                storage,
+            )?,
             _ => Architecture::MimoV26Flash,
         },
     )
+}
+
+/// The hidden size every `qwen3_5` dev model is narrower than: below every released
+/// Qwen3.5's and Qwen3.8's (the 0.8B's 1,024 is the smallest).
+pub const QWEN_DEV_HIDDEN_BELOW: u64 = QWEN35_08B_DIMS.hidden;
+
+/// The Qwen architecture of a parsed `qwen3_5` configuration, on a node whose weights
+/// storage is `storage`, by its weights' format and its exact dimensions:
+///
+/// - FP8 weights are Qwen3.8-27B when every dimension is its (`QWEN38_DIMS`). An
+///   architecture names a shape and the weights hash names the model, so another FP8
+///   checkpoint of exactly that shape (Qwen3.5-27B's or Qwen3.6-27B's) is that
+///   architecture too.
+/// - BF16 weights are Qwen3.5-2B when every dimension is the 2B's (`QWEN35_2B_DIMS`) and
+///   Qwen3.5-0.8B when every one is the 0.8B's.
+///
+/// Any other shape is refused, so a released checkpoint of another size (Qwen3.5-4B,
+/// -9B) is never served under a name that is not its own. The one exception is a
+/// synthetic dev model: on a `dev-writable` node, a model narrower than every released
+/// one (hidden size below [`QWEN_DEV_HIDDEN_BELOW`]) is read as its format's architecture
+/// (Qwen3.8-27B's for FP8, Qwen3.5-2B's for BF16), as a model of another type is read as
+/// MiMo-V2.6: what it serves is what its own configuration says. Neither condition alone
+/// admits it: a pinned deployment is `verified-readonly`, and no released checkpoint is
+/// that narrow.
+pub fn qwen_architecture(
+    config: &QwenConfig,
+    storage: WeightsStorage,
+) -> Result<Architecture, ModelError> {
+    let dims = qwen_dims(config);
+    let dev = storage == WeightsStorage::DevWritable && dims.hidden < QWEN_DEV_HIDDEN_BELOW;
+    Ok(match config.weights {
+        WeightFormat::Fp8Block128 if dims == QWEN38_DIMS || dev => Architecture::Qwen38Dense27B,
+        WeightFormat::Fp8Block128 => {
+            return Err(ModelError(format!(
+                "config.json: an FP8 qwen3_5 model of hidden size {} without Qwen3.8-27B's \
+                 dimensions (a dev model must be narrower than {QWEN_DEV_HIDDEN_BELOW} on a \
+                 dev-writable node)",
+                dims.hidden
+            )));
+        }
+        WeightFormat::Bf16 if dims == QWEN35_2B_DIMS => Architecture::Qwen35Dense2B,
+        WeightFormat::Bf16 if dims == QWEN35_08B_DIMS => Architecture::Qwen35Dense08B,
+        WeightFormat::Bf16 if dev => Architecture::Qwen35Dense2B,
+        WeightFormat::Bf16 => {
+            return Err(ModelError(format!(
+                "config.json: a BF16 qwen3_5 model of hidden size {} that is neither \
+                 Qwen3.5-2B's nor Qwen3.5-0.8B's dimensions (a dev model must be narrower \
+                 than {QWEN_DEV_HIDDEN_BELOW} on a dev-writable node)",
+                dims.hidden
+            )));
+        }
+    })
+}
+
+/// The dimensions of a Qwen model, as the shared rules count its pools, seats and scratch
+/// from them (`eidola_common::architecture::HybridDims`).
+pub fn qwen_dims(c: &QwenConfig) -> HybridDims {
+    let deltanet = c.layers_of(LayerKind::DeltaNet).count() as u64;
+    let attention = c.layers_of(LayerKind::Attention).count() as u64;
+    let (a, d) = (&c.attention, &c.deltanet);
+    HybridDims {
+        hidden: c.hidden_size as u64,
+        intermediate: c.intermediate_size as u64,
+        vocab: c.vocab_size as u64,
+        attention_layers: attention,
+        deltanet_layers: deltanet,
+        q_heads: a.num_q_heads as u64,
+        kv_heads: a.num_kv_heads as u64,
+        head_dim: a.head_dim as u64,
+        rotary: a.rotary_dim as u64,
+        k_heads: d.num_k_heads as u64,
+        v_heads: d.num_v_heads as u64,
+        k_dim: d.k_head_dim as u64,
+        v_dim: d.v_head_dim as u64,
+    }
 }
 
 /// DeepSeek-V4.1's reference model over the verified shards, with its Engram map
@@ -814,21 +936,102 @@ mod tests {
     #[test]
     fn the_architecture_is_the_configs_model_type() {
         assert_eq!(
-            architecture_of(br#"{"model_type": "deepseek_v41"}"#).unwrap(),
+            architecture_of(
+                br#"{"model_type": "deepseek_v41"}"#,
+                WeightsStorage::DevWritable
+            )
+            .unwrap(),
             Architecture::DeepSeekV41Flash
         );
-        assert_eq!(
-            architecture_of(br#"{"model_type": "qwen3_5"}"#).unwrap(),
-            Architecture::Qwen38Dense27B
+        // A Qwen configuration is read whole: its weights' format and dimensions say
+        // which Qwen it is, and one the model crate refuses is refused.
+        let read = |dir: &str, path: &str| {
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(dir)
+                    .join(path),
+            )
+            .unwrap()
+        };
+        let model_crate = |path: &str| read("../eidola-engine-model/tests", path);
+        let (dev, verified) = (
+            WeightsStorage::DevWritable,
+            WeightsStorage::VerifiedReadonly,
         );
+        for storage in [dev, verified] {
+            for (path, want) in [
+                ("data/qwen3.8-27b.config.json", Architecture::Qwen38Dense27B),
+                ("data/qwen3.5-2b.config.json", Architecture::Qwen35Dense2B),
+                (
+                    "data/qwen3.5-0.8b.config.json",
+                    Architecture::Qwen35Dense08B,
+                ),
+            ] {
+                assert_eq!(
+                    architecture_of(&model_crate(path), storage).unwrap(),
+                    want,
+                    "{path} {storage:?}"
+                );
+            }
+            // A released Qwen3.5 of another size is no architecture the engine has,
+            // whatever the storage: the 4B by its dimensions; the 9B, whose config
+            // leaves out the top-level `tie_word_embeddings`, already by the parser.
+            let e = architecture_of(&read("tests", "data/qwen3.5-4b.config.json"), storage)
+                .unwrap_err();
+            assert!(e.0.contains("neither Qwen3.5-2B"), "4B {storage:?}: {e}");
+            assert!(
+                architecture_of(&read("tests", "data/qwen3.5-9b.config.json"), storage).is_err()
+            );
+        }
+        // An FP8 checkpoint of another shape: Qwen3.8-27B's configuration with the 2B's
+        // text dimensions put in, under either storage.
+        let mut other: serde_json::Value =
+            serde_json::from_slice(&model_crate("data/qwen3.8-27b.config.json")).unwrap();
+        let small: serde_json::Value =
+            serde_json::from_slice(&model_crate("data/qwen3.5-2b.config.json")).unwrap();
+        for key in [
+            "hidden_size",
+            "intermediate_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "linear_num_value_heads",
+            "num_hidden_layers",
+            "layer_types",
+        ] {
+            other["text_config"][key] = small["text_config"][key].clone();
+        }
+        let other = serde_json::to_vec(&other).unwrap();
+        for storage in [dev, verified] {
+            let e = architecture_of(&other, storage).unwrap_err();
+            assert!(e.0.contains("without Qwen3.8-27B's"), "{storage:?}: {e}");
+        }
+        // The synthetic fixtures, FP8 and BF16: on a dev-writable node only.
+        for fixture in ["qwen_tiny", "qwen_tiny256"] {
+            let fp8 = model_crate(&format!("fixtures/{fixture}/config.json"));
+            assert_eq!(
+                architecture_of(&fp8, dev).unwrap(),
+                Architecture::Qwen38Dense27B
+            );
+            assert!(architecture_of(&fp8, verified).is_err(), "{fixture}");
+        }
+        let tiny = model_crate("fixtures/qwen_tiny_bf16_tied/config.json");
+        assert_eq!(
+            architecture_of(&tiny, dev).unwrap(),
+            Architecture::Qwen35Dense2B
+        );
+        assert!(architecture_of(&tiny, verified).is_err());
+        assert!(architecture_of(br#"{"model_type": "qwen3_5"}"#, dev).is_err());
         for other in [
             &br#"{"model_type": "mimo_v2"}"#[..],
             b"{}",
             br#"{"model_type": 5}"#,
         ] {
-            assert_eq!(architecture_of(other).unwrap(), Architecture::MimoV26Flash);
+            assert_eq!(
+                architecture_of(other, WeightsStorage::DevWritable).unwrap(),
+                Architecture::MimoV26Flash
+            );
         }
-        assert!(architecture_of(b"{").is_err());
+        assert!(architecture_of(b"{", WeightsStorage::DevWritable).is_err());
     }
 
     /// Only names the offline `sha256sum` procedure reproduces byte for byte.

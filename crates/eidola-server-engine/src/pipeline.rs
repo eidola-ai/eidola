@@ -1,7 +1,7 @@
 //! From a validated request to engine tokens, and from engine tokens to OpenAI output.
 //!
 //! In: the chat crate renders the prompt in the served model's format (MiMo-V2.6 and
-//! Qwen3.8: the model's own template; DeepSeek-V4.1: the compiled-in encoder; byte-exact to
+//! Qwen3.8 and Qwen3.5: the model's own template; DeepSeek-V4.1: the compiled-in encoder; byte-exact to
 //! the reference every way), tokenizes it (request data never as a control token), and the
 //! request becomes an engine [`Request`] with checked
 //! [`SamplingParams`] and a [`CacheScope`]: the client's key turned into its lineage (the
@@ -222,14 +222,21 @@ fn render_deepseek(
     ))
 }
 
-/// Qwen3.8's template options for a request. The node's subset carries no thinking
+/// A Qwen model's template options for a request. The node's subset carries no thinking
 /// switch, `reasoning_effort` or `preserve_thinking`, so each is left undefined, as for
-/// MiMo-V2.6, and the template's defaults hold: thinking on, at its default effort
-/// (`xhigh`), and every past turn's reasoning kept. Keeping it is what makes a new turn's
-/// prompt this turn's prompt and output followed by more, the token prefix a client
-/// declares cached (`eidola-engine-chat/AGENTS.md` → Qwen3.8 → Prefix across turns);
-/// with `preserve_thinking` false the reasoning before the last user message is dropped,
-/// and no later turn would extend an earlier one.
+/// MiMo-V2.6, and the template's defaults hold.
+///
+/// - **Qwen3.8**: thinking on, at its default effort (`xhigh`), and every past turn's
+///   reasoning kept. Keeping it is what makes a new turn's prompt this turn's prompt and
+///   output followed by more, the token prefix a client declares cached
+///   (`eidola-engine-chat/AGENTS.md` → Qwen3.8 → Prefix across turns); with
+///   `preserve_thinking` false the reasoning before the last user message is dropped, and
+///   no later turn would extend an earlier one.
+/// - **Qwen3.5**: thinking off (its template thinks only when `enable_thinking` is true).
+///   Its template renders the reasoning only of turns after the last user message, so a
+///   tool loop's next prompt extends this one and its output, and a new user message's
+///   extends the user turn's first request only to its generation header, four tokens
+///   before its end (`eidola-engine-chat/AGENTS.md` → Qwen3.5 → Prefix across turns).
 pub fn qwen_options() -> qwen::RenderOptions {
     qwen::RenderOptions {
         add_generation_prompt: true,
@@ -239,10 +246,10 @@ pub fn qwen_options() -> qwen::RenderOptions {
     }
 }
 
-/// Qwen3.8: the model's template over the request (string tool-call arguments decoded by
-/// the template's own rule), opening a new assistant turn. The template trims the field a
-/// continuation would continue, so none of its answers is continuable and a continuation
-/// is refused, as for DeepSeek-V4.1.
+/// A Qwen model: its template over the request (string tool-call arguments decoded by
+/// the template's own rule), opening a new assistant turn, and its output parsed in the
+/// template's format. The template trims the field a continuation would continue, so none
+/// of its answers is continuable and a continuation is refused, as for DeepSeek-V4.1.
 fn render_qwen(
     template: &qwen::ChatTemplate,
     messages: Json,
@@ -265,10 +272,11 @@ fn render_qwen(
     let prompt = template
         .render_prompt(&input, &options)
         .map_err(|e| ApiError::invalid(e.to_string()))?;
-    Ok((
-        prompt,
-        OutputConfig::qwen3_8(options.enable_thinking, schemas),
-    ))
+    let output = match template.kind() {
+        qwen::TemplateKind::Qwen3_8 => OutputConfig::qwen3_8(options.enable_thinking, schemas),
+        qwen::TemplateKind::Qwen3_5 => OutputConfig::qwen3_5(options.enable_thinking, schemas),
+    };
+    Ok((prompt, output))
 }
 
 fn random_seed() -> u64 {

@@ -17,6 +17,14 @@ checkpoint's storage formats: FP8 E4M3 projections with a BF16 scale per
 Some `dt_bias` values sit near softplus's threshold of 20, and the norm weights
 are zero-centred random values (the gated norm's plain ones around 0.85), so
 each of the quirks the forward must get right changes its output.
+
+`qwen35(tied)` turns the description into a Qwen3.5 checkpoint's (Qwen3.5-2B
+and -0.8B): every projection BF16 and no `quantization_config`, `A_log` and
+the gated norm's weight F32 (values a BF16 cannot hold), the config
+keys those checkpoints carry and not the ones they lack, the released
+groupings (one value head per key head; four query heads per KV head), and,
+when `tied`, a head tied to the embedding (drawn at the head's scale) and no
+`lm_head.weight`.
 """
 
 from __future__ import annotations
@@ -115,6 +123,27 @@ CONFIG = {
 }
 
 
+# How the projections are stored: "fp8" (Qwen3.8-27B-FP8) or "bf16" (Qwen3.5).
+FORMAT = {"weights": "fp8"}
+
+
+def qwen35(tied: bool) -> None:
+    """A Qwen3.5 checkpoint's config and storage at the fixture's sizes (see the
+    module docstring). Its DeltaNet key and value dims stay unequal."""
+    FORMAT["weights"] = "bf16"
+    del CONFIG["quantization_config"]
+    del CONFIG["language_model_only"]
+    CONFIG["tie_word_embeddings"] = tied
+    for key in ("output_gate_type", "partial_rotary_factor", "bos_token_id", "pad_token_id"):
+        del TEXT_CONFIG[key]
+    TEXT_CONFIG["mlp_only_layers"] = []
+    TEXT_CONFIG["tie_word_embeddings"] = tied
+    TEXT_CONFIG["linear_num_key_heads"] = 6
+    TEXT_CONFIG["linear_num_value_heads"] = 6
+    TEXT_CONFIG["num_attention_heads"] = 8
+    TEXT_CONFIG["num_key_value_heads"] = 2
+
+
 def head_dim_256() -> None:
     """The released attention geometry at the fixture's sizes: 256-wide heads, 12 query
     heads over 2 KV heads (the released grouping of 6), a rotary width of 64 with the
@@ -137,10 +166,17 @@ class Gen:
     def bf16(self, t: torch.Tensor) -> tuple:
         return st.entry(t.to(torch.bfloat16))
 
-    def fp8(self, out: dict, name: str, rows: int, cols: int) -> None:
-        """`name.weight` E4M3 and `name.weight_scale_inv` BF16 from a random
-        weight of standard deviation `cols^-½`, per 128×128 block."""
+    def f32(self, t: torch.Tensor) -> tuple:
+        return st.entry(t.to(torch.float32))
+
+    def projection(self, out: dict, name: str, rows: int, cols: int) -> None:
+        """A large projection from a random weight of standard deviation
+        `cols^-½`: `name.weight` E4M3 and `name.weight_scale_inv` BF16 per
+        128×128 block, or with BF16 storage `name.weight` BF16."""
         w = self.normal((rows, cols), cols**-0.5)
+        if FORMAT["weights"] == "bf16":
+            out[f"{name}.weight"] = self.bf16(w)
+            return
         blocks = w.view(rows // 128, 128, cols // 128, 128)
         scale = (blocks.abs().amax(dim=(1, 3)) / 448.0).to(torch.bfloat16).float()
         codes = pinned_ops.round_e4m3(blocks / scale[:, None, :, None]).view(rows, cols)
@@ -150,9 +186,9 @@ class Gen:
 
 def _mlp(g: Gen, out: dict, p: str) -> None:
     h, i = TEXT_CONFIG["hidden_size"], TEXT_CONFIG["intermediate_size"]
-    g.fp8(out, f"{p}.mlp.gate_proj", i, h)
-    g.fp8(out, f"{p}.mlp.up_proj", i, h)
-    g.fp8(out, f"{p}.mlp.down_proj", h, i)
+    g.projection(out, f"{p}.mlp.gate_proj", i, h)
+    g.projection(out, f"{p}.mlp.up_proj", i, h)
+    g.projection(out, f"{p}.mlp.down_proj", h, i)
 
 
 def _norms(g: Gen, out: dict, p: str) -> None:
@@ -164,10 +200,10 @@ def _norms(g: Gen, out: dict, p: str) -> None:
 def _attention(g: Gen, out: dict, p: str) -> None:
     c = TEXT_CONFIG
     h, d, nq, nkv = c["hidden_size"], c["head_dim"], c["num_attention_heads"], c["num_key_value_heads"]
-    g.fp8(out, f"{p}.self_attn.q_proj", 2 * nq * d, h)
-    g.fp8(out, f"{p}.self_attn.k_proj", nkv * d, h)
-    g.fp8(out, f"{p}.self_attn.v_proj", nkv * d, h)
-    g.fp8(out, f"{p}.self_attn.o_proj", h, nq * d)
+    g.projection(out, f"{p}.self_attn.q_proj", 2 * nq * d, h)
+    g.projection(out, f"{p}.self_attn.k_proj", nkv * d, h)
+    g.projection(out, f"{p}.self_attn.v_proj", nkv * d, h)
+    g.projection(out, f"{p}.self_attn.o_proj", h, nq * d)
     out[f"{p}.self_attn.q_norm.weight"] = g.bf16(g.normal((d,), 0.2))
     out[f"{p}.self_attn.k_norm.weight"] = g.bf16(g.normal((d,), 0.2))
 
@@ -179,18 +215,20 @@ def _deltanet(g: Gen, out: dict, p: str) -> None:
     kd, vd = c["linear_key_head_dim"], c["linear_value_head_dim"]
     conv_dim = 2 * nk * kd + nv * vd
     q = f"{p}.linear_attn"
-    g.fp8(out, f"{q}.in_proj_qkv", conv_dim, h)
-    g.fp8(out, f"{q}.in_proj_z", nv * vd, h)
+    g.projection(out, f"{q}.in_proj_qkv", conv_dim, h)
+    g.projection(out, f"{q}.in_proj_z", nv * vd, h)
     out[f"{q}.in_proj_b.weight"] = g.bf16(g.normal((nv, h), h**-0.5))
     out[f"{q}.in_proj_a.weight"] = g.bf16(g.normal((nv, h), 2.0 * h**-0.5))
     out[f"{q}.conv1d.weight"] = g.bf16(g.normal((conv_dim, 1, 4), 0.4))
-    out[f"{q}.A_log"] = g.bf16(g.uniform((nv,), -5.0, -1.0))
+    # Qwen3.5's checkpoints store `A_log` and the gated norm's weight in F32.
+    small = g.f32 if FORMAT["weights"] == "bf16" else g.bf16
+    out[f"{q}.A_log"] = small(g.uniform((nv,), -5.0, -1.0))
     # Two heads straddle softplus's threshold: a + dt_bias crosses 20.
     dt = g.uniform((nv,), -3.0, 3.0)
     dt[1], dt[4] = 19.25, 20.5
     out[f"{q}.dt_bias"] = g.bf16(dt)
-    out[f"{q}.norm.weight"] = g.bf16(g.uniform((vd,), 0.7, 1.0))
-    g.fp8(out, f"{q}.out_proj", h, nv * vd)
+    out[f"{q}.norm.weight"] = small(g.uniform((vd,), 0.7, 1.0))
+    g.projection(out, f"{q}.out_proj", h, nv * vd)
 
 
 def weights() -> dict:
@@ -198,8 +236,13 @@ def weights() -> dict:
     c = TEXT_CONFIG
     h = c["hidden_size"]
     out: dict = {}
-    out["model.language_model.embed_tokens.weight"] = g.bf16(g.normal((VOCAB, h), 1.0))
-    out["lm_head.weight"] = g.bf16(g.normal((VOCAB, h), h**-0.5))
+    # A tied head reads the embedding, so a tied fixture's embedding has the
+    # head's scale; the logits are then as spread as an untied fixture's.
+    tied = c["tie_word_embeddings"]
+    out["model.language_model.embed_tokens.weight"] = g.bf16(g.normal((VOCAB, h), h**-0.5 if tied else 1.0))
+    head = g.bf16(g.normal((VOCAB, h), h**-0.5))
+    if not tied:
+        out["lm_head.weight"] = head
     out["model.language_model.norm.weight"] = g.bf16(g.normal((h,), 0.15))
     for i, kind in enumerate(c["layer_types"]):
         p = f"model.language_model.layers.{i}"

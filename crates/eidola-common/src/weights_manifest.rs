@@ -54,6 +54,13 @@ pub const OPTIONAL_FILES: [&str; 1] = ["model.safetensors.index.json"];
 /// checkpoint does not).
 pub const DEEPSEEK_V4_1_REQUIRED_FILES: [&str; 2] = ["config.json", "tokenizer.json"];
 
+/// The files a Qwen3.5 manifest must list besides its shards: the
+/// configuration (which also names its end-of-sequence id), the tokenizer
+/// and its own template. Its sampling defaults are a `generation_config.json`
+/// when the directory holds one (the released checkpoints do not).
+pub const QWEN3_5_REQUIRED_FILES: [&str; 3] =
+    ["config.json", "tokenizer.json", "chat_template.jinja"];
+
 /// The covered files a manifest of `architecture` must list besides its
 /// shards: those its node reads whatever else the directory holds.
 pub fn required_files(architecture: Architecture) -> &'static [&'static str] {
@@ -65,6 +72,7 @@ pub fn required_files(architecture: Architecture) -> &'static [&'static str] {
             &REQUIRED_FILES
         }
         Architecture::DeepSeekV41Flash => &DEEPSEEK_V4_1_REQUIRED_FILES,
+        Architecture::Qwen35Dense2B | Architecture::Qwen35Dense08B => &QWEN3_5_REQUIRED_FILES,
     }
 }
 
@@ -273,6 +281,12 @@ mod tests {
         let ds = Architecture::DeepSeekV41Flash;
         assert_eq!(required_files(ds), ["config.json", "tokenizer.json"]);
         assert_eq!(required_files(Architecture::MimoV26Flash), REQUIRED_FILES);
+        for qwen35 in [Architecture::Qwen35Dense2B, Architecture::Qwen35Dense08B] {
+            assert_eq!(
+                required_files(qwen35),
+                ["config.json", "tokenizer.json", "chat_template.jinja"]
+            );
+        }
         for arch in Architecture::ALL {
             for name in required_files(arch) {
                 assert!(is_covered(name), "{arch}: {name}");

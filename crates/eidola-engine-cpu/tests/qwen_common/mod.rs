@@ -1,6 +1,10 @@
-//! Shared harness: the serving core's engine over the Qwen3.8 CPU executor on the model
-//! crate's committed synthetic fixture, with every row, every draft draw and every stored
+//! Shared harness: the serving core's engine over the Qwen CPU executor on the model
+//! crate's committed synthetic fixtures, with every row, every draft draw and every stored
 //! state checked against the dense oracle, and the memory checked after every step.
+//!
+//! The fixture a test runs on is its thread's ([`on_fixture`]): Qwen3.8's FP8 storage
+//! (`qwen_tiny`) or Qwen3.5's BF16 storage with a tied head (`qwen_tiny_bf16_tied`).
+//! [`on_each_fixture!`] runs a test function on each, in a module of the fixture's name.
 
 #![allow(dead_code)]
 
@@ -70,15 +74,58 @@ pub fn salt(n: u8) -> Lineage {
     SaltDeriver::with_boot_key(BootKey::from_bytes([0; 32])).lineage(&CacheKey::from_bytes([n; 32]))
 }
 
-/// The committed synthetic fixture: three DeltaNet layers and one gated attention layer
-/// at hidden size 128, one MTP layer, a vocabulary of 512 (500 is end-of-sequence, 508
-/// on vision placeholders).
+/// The fixtures the tests run on.
+pub const FIXTURES: [&str; 2] = ["qwen_tiny", "qwen_tiny_bf16_tied"];
+
+std::thread_local! {
+    static FIXTURE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("qwen_tiny") };
+}
+
+/// Runs `test` with [`fixture`] the committed fixture named `name`.
+pub fn on_fixture(name: &'static str, test: impl FnOnce()) {
+    assert!(FIXTURES.contains(&name), "fixture {name}");
+    FIXTURE.with(|f| f.set(name));
+    test();
+}
+
+/// Each test function named, on each of [`FIXTURES`]: `qwen_tiny::<test>` and
+/// `qwen_tiny_bf16_tied::<test>`.
+#[macro_export]
+macro_rules! on_each_fixture {
+    ($($test:ident),* $(,)?) => {
+        $crate::on_each_fixture!(@one qwen_tiny [$($test),*]);
+        $crate::on_each_fixture!(@one qwen_tiny_bf16_tied [$($test),*]);
+    };
+    (@one $fixture:ident [$($test:ident),*]) => {
+        mod $fixture {
+            $(
+                #[test]
+                fn $test() {
+                    super::qwen_common::on_fixture(stringify!($fixture), super::$test)
+                }
+            )*
+        }
+    };
+}
+
+/// The thread's committed synthetic fixture ([`on_fixture`]): three DeltaNet layers and
+/// one gated attention layer at hidden size 128, one MTP layer, a vocabulary of 512 (500
+/// is end-of-sequence, 510 and 511 the vision placeholders); FP8 projections and its own
+/// head, or BF16 projections and the head tied to the embedding.
 pub fn fixture() -> Arc<QwenModel> {
-    static MODEL: OnceLock<Arc<QwenModel>> = OnceLock::new();
-    MODEL
-        .get_or_init(|| {
+    static MODELS: OnceLock<std::sync::Mutex<HashMap<&'static str, Arc<QwenModel>>>> =
+        OnceLock::new();
+    let name = FIXTURE.with(|f| f.get());
+    let mut models = MODELS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    models
+        .entry(name)
+        .or_insert_with(|| {
             let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../eidola-engine-model/tests/fixtures/qwen_tiny");
+                .join("../eidola-engine-model/tests/fixtures")
+                .join(name);
             Arc::new(load_reference(&dir, Ok).unwrap())
         })
         .clone()
@@ -429,7 +476,12 @@ impl Harness {
                 continue;
             }
             let want = idle.contains(&(*g, *b));
-            let device = exec.block_is_encrypted(*g, *b);
+            // The next step's maintenance runs a block's queued zero before its crypt (and
+            // a state saved into it between them): a buffer taken back from an idle
+            // snapshot and given at once to a sequence's continuation point is zeroed,
+            // written and encrypted in that order, its old ciphertext still on the device
+            // until then.
+            let device = exec.block_is_encrypted(*g, *b) && !pending.contains(&(*g, *b));
             match crypts.get(&(*g, *b)) {
                 Some(&encrypt) => assert!(
                     encrypt == want && device != want,

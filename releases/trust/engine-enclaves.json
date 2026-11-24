@@ -84,6 +84,32 @@
           "sha256": "4fc667ee21b46b0f7127370ea42c8766988e62433a7737b7eb434f77b93035e1"
         }
       }
+    ],
+    "b6e06fb21d798d6fd4c165e268c23bea65ad52776342c1b004c0caab062ead27": [
+      {
+        "config": "deploy/engine/qwen3.5-2b/cpu16/tinfoil-config.yml",
+        "config_sha256": "6362087afe0b74da6804edf8257bfbaa6b51faca0f7002d221881ce7077488e1",
+        "cvm_version": "0.15.4-rc.2@sha256:689c945f62d8f8507d5051dfdc97abc019e7ea5c9cc153557fe8b6850db45dc2",
+        "pin": {
+          "platform": {
+            "sev_snp": {
+              "guest_policy": "0x30133",
+              "host_data": "6362087afe0b74da6804edf8257bfbaa6b51faca0f7002d221881ce7077488e1",
+              "measurement": "cea56f9f4f8440ae96e6e6528a7571f4179a062e7a0919b1021c98dd3bc9f44eeeda321568407130745f80057533c015"
+            }
+          }
+        },
+        "prompt_cache": {
+          "enabled": false,
+          "idle_ttl_secs": 900,
+          "max_age_secs": 7200
+        },
+        "weights": {
+          "repo": "Qwen/Qwen3.5-2B",
+          "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+          "sha256": "b6e06fb21d798d6fd4c165e268c23bea65ad52776342c1b004c0caab062ead27"
+        }
+      }
     ]
   },
   "schema_version": 1

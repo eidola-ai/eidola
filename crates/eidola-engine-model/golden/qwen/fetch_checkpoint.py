@@ -1,10 +1,12 @@
 """Fetch the checkpoint's files at the pinned revision, each checked against
 `upstream-sha256.json` before it gets the name anything loads.
 
-    uv run python fetch_checkpoint.py --dir <dir> [--truncation prefix|full]
+    uv run python fetch_checkpoint.py --dir <dir> [--model qwen3.8-27b|qwen3.5-2b|qwen3.5-0.8b] [--truncation prefix|full]
 
-`prefix` is checkpoint layers 0-3, the drafter and the file holding the
-embedding and head (about 8 GB); `full` is every shard (about 31 GB). Each file
+For Qwen3.8-27B-FP8 (the default) `prefix` is checkpoint layers 0-3, the
+drafter and the file holding the embedding and head (about 8 GB), and `full`
+is every shard (about 31 GB). Qwen3.5-2B (4.5 GB) and -0.8B (1.7 GB) are one
+shard each, fetched whole. Each file
 is downloaded whole, from its first byte, under a name nothing loads, hashed
 while it streams, and renamed only when its size and SHA-256 are the recorded
 ones. A partial download is never resumed: a failed attempt is deleted and the
@@ -71,10 +73,14 @@ def fetch_one(name: str, dest: Path, attempts: int) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", type=Path, required=True)
-    ap.add_argument("--truncation", choices=sorted(upstream.TRUNCATIONS), default="prefix")
+    ap.add_argument("--model", choices=sorted(upstream.MODELS), default=upstream.DEFAULT_MODEL)
+    ap.add_argument("--truncation", choices=["prefix", "full"], help="default: prefix where there is one")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--attempts", type=int, default=4)
     a = ap.parse_args()
+    upstream.use(a.model)
+    a.truncation = a.truncation or upstream.truncation_for(4)
+    assert a.truncation in upstream.TRUNCATIONS, f"{a.model} has no {a.truncation} truncation"
     a.dir.mkdir(parents=True, exist_ok=True)
     for stale in a.dir.glob(".*.partial-*"):
         stale.unlink()

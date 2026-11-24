@@ -1,5 +1,7 @@
-//! The released model's linear layers: FP8 block-scaled GEMMs with dynamic
-//! per-token activation quantisation, and plain BF16 products.
+//! The released models' linear layers: FP8 block-scaled GEMMs with dynamic
+//! per-token activation quantisation, and plain BF16 products. A projection
+//! is a [`Linear`] of the checkpoint's format: FP8 in Qwen3.8-27B-FP8, BF16 in
+//! Qwen3.5's checkpoints, and [`linear_rows`] runs either.
 //!
 //! Weights stay in the memory-mapped checkpoint and are decoded one output
 //! row at a time as a product reads them, so a model whose f32 weights would
@@ -16,12 +18,17 @@
 //! (`kernels-community/finegrained-fp8`: `_fp8_act_quant_kernel` and
 //! `w8a8_block_fp8_matmul_kernel`) with what its source leaves open (the
 //! accumulation inside a block, the cast's rounding) fixed.
+//!
+//! **BF16 product** (every BF16 weight, and every projection of a BF16
+//! checkpoint): f32 dot products of the BF16 input and weight in the crate's
+//! pinned order ([`crate::tensor::dot`]), each rounded once to BF16. That is
+//! `F.linear` of two BF16 tensors with its summation order fixed.
 
 use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use super::config::QUANT_BLOCK;
+use super::config::{QUANT_BLOCK, WeightFormat};
 use super::numeric::{bf16_round, round_e4m3};
 use crate::error::{Error, Result};
 use crate::numeric::{bf16_to_f32, fp8_e4m3_to_f32};
@@ -198,6 +205,58 @@ impl Fp8Linear {
     }
 }
 
+/// A projection as the checkpoint stores it: `<prefix>.weight` FP8 with its
+/// block scales, or BF16.
+#[derive(Clone, Debug)]
+pub enum Linear {
+    Fp8(Fp8Linear),
+    Bf16(Bf16Matrix),
+}
+
+impl Linear {
+    /// `<prefix>.weight` (and, for FP8, `<prefix>.weight_scale_inv`) as
+    /// `format` stores it, `[rows, cols]`.
+    pub fn open(
+        store: &Arc<WeightSet>,
+        prefix: &str,
+        rows: usize,
+        cols: usize,
+        format: WeightFormat,
+    ) -> Result<Self> {
+        Ok(match format {
+            WeightFormat::Fp8Block128 => Linear::Fp8(Fp8Linear::open(store, prefix, rows, cols)?),
+            WeightFormat::Bf16 => Linear::Bf16(Bf16Matrix::open(
+                store,
+                &format!("{prefix}.weight"),
+                rows,
+                cols,
+            )?),
+        })
+    }
+
+    pub fn rows(&self) -> usize {
+        match self {
+            Linear::Fp8(w) => w.rows,
+            Linear::Bf16(w) => w.rows,
+        }
+    }
+
+    pub fn cols(&self) -> usize {
+        match self {
+            Linear::Fp8(w) => w.cols,
+            Linear::Bf16(w) => w.cols,
+        }
+    }
+
+    /// The FP8 weight, for an executor that runs only those.
+    pub fn as_fp8(&self) -> Option<&Fp8Linear> {
+        match self {
+            Linear::Fp8(w) => Some(w),
+            Linear::Bf16(_) => None,
+        }
+    }
+}
+
 const E4M3_F64: [f64; 256] = {
     let mut t = [0.0f64; 256];
     let mut i = 0;
@@ -349,6 +408,15 @@ pub fn lin8_rows(x: &Matrix, w: &Fp8Linear) -> Matrix {
             }
         },
     )
+}
+
+/// The projection `w` over every row of `x` (BF16 values), in its stored
+/// format's arithmetic: [`lin8_rows`] or [`linear_bf16_rows`].
+pub fn linear_rows(x: &Matrix, w: &Linear) -> Matrix {
+    match w {
+        Linear::Fp8(w) => lin8_rows(x, w),
+        Linear::Bf16(w) => linear_bf16_rows(x, w),
+    }
 }
 
 /// A BF16 weight on BF16 input: f32 dot products in the pinned order

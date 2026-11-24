@@ -1,9 +1,9 @@
-//! [`QwenCpuExecutor`]: the serving core's [`Executor`] for Qwen3.8 over the model crate's
-//! reference numerics.
+//! [`QwenCpuExecutor`]: the serving core's [`Executor`] for Qwen3.8 and Qwen3.5 over the
+//! model crate's reference numerics.
 //!
 //! Every computation is the model crate's: the DeltaNet's per-token core
-//! (`deltanet::token_core`), its projections (`linear::lin8_rows`,
-//! `linear::linear_bf16_dense`), the norms and residual adds, the attention layer
+//! (`deltanet::token_core`), its projections (`linear::linear_rows`, FP8 or BF16 as the
+//! checkpoint stores them, and `linear::linear_bf16_dense`), the norms and residual adds, the attention layer
 //! (`QwenModel::layer_forward` over the KV gathered from the pages), the MLP, the head
 //! and the drafter (`QwenModel::mtp_forward`). The executor only decides what runs where,
 //! and keeps what the seam says it keeps.
@@ -24,7 +24,7 @@ use eidola_engine_model::Matrix;
 use eidola_engine_model::qwen::config::LayerKind;
 use eidola_engine_model::qwen::deltanet::{CoreWeights, token_core};
 use eidola_engine_model::qwen::forward::{residual_add, rms_norm_zc_rows};
-use eidola_engine_model::qwen::linear::{lin8_rows, linear_bf16_dense};
+use eidola_engine_model::qwen::linear::{linear_bf16_dense, linear_rows};
 use eidola_engine_model::qwen::weights::{LayerWeights, MixerWeights};
 use eidola_engine_model::qwen::{DeltaNetState, KvCache, LayerState, LogitRows, QwenModel};
 
@@ -145,7 +145,7 @@ impl Hiddens {
     }
 }
 
-/// The CPU executor for Qwen3.8.
+/// The CPU executor for Qwen3.8 and Qwen3.5.
 pub struct QwenCpuExecutor {
     model: Arc<QwenModel>,
     cfg: QwenCpuExecutorConfig,
@@ -650,8 +650,8 @@ impl QwenCpuExecutor {
                 (LayerKind::DeltaNet, MixerWeights::DeltaNet(dw)) => {
                     // The model's DeltaNet layer, its projections kept for the tail.
                     let x = rms_norm_zc_rows(&h, &lw.input_norm, eps);
-                    let mixed = lin8_rows(&x, &dw.in_proj_qkv);
-                    let z = lin8_rows(&x, &dw.in_proj_z);
+                    let mixed = linear_rows(&x, &dw.in_proj_qkv);
+                    let z = linear_rows(&x, &dw.in_proj_z);
                     let b = linear_bf16_dense(&x, &dw.in_proj_b);
                     let a = linear_bf16_dense(&x, &dw.in_proj_a);
                     let core = CoreWeights {
@@ -682,7 +682,7 @@ impl QwenCpuExecutor {
                                 .push(states[di].clone());
                         }
                     }
-                    let mix = lin8_rows(&o, &dw.out_proj);
+                    let mix = linear_rows(&o, &dw.out_proj);
                     let mut h2 = h.clone();
                     residual_add(&mut h2, &mix);
                     let x2 = rms_norm_zc_rows(&h2, &lw.post_norm, eps);

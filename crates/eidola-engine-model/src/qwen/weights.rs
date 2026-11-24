@@ -1,16 +1,20 @@
-//! Checkpoint tensors → the Qwen3.8 reference weights.
+//! Checkpoint tensors → the Qwen3.8 and Qwen3.5 reference weights.
 //!
-//! The large weights (every FP8 projection, the embedding, the head and the
-//! drafter's input projection) stay in the memory-mapped checkpoint and are
-//! decoded one row at a time as a product reads them; the whole model in f32
-//! would be about 108 GB. Norm weights, the DeltaNet's convolution, gates and
-//! small projections, and every FP8 block scale are decoded at load. Vision
-//! tensors are never read.
+//! The large weights (every projection, FP8 or BF16 as the checkpoint stores
+//! them, the embedding, the head and the drafter's input projection) stay in
+//! the memory-mapped checkpoint and are decoded one row at a time as a product
+//! reads them; Qwen3.8-27B in f32 would be about 108 GB. Norm weights, the
+//! DeltaNet's convolution, gates and small projections, and every FP8 block
+//! scale are decoded at load; one of those stored in F32 is held in BF16, as the
+//! released stacks hold it. A tied head is the embedding's own tensor
+//! (`QwenConfig::tie_word_embeddings`), and a tied checkpoint that also
+//! carries an `lm_head.weight` is refused. Vision tensors are never read.
 
 use std::sync::Arc;
 
 use super::config::{LayerKind, QwenConfig};
-use super::linear::{Bf16Matrix, Fp8Linear};
+use super::linear::{Bf16Matrix, Linear};
+use super::numeric::bf16_round_slice;
 use crate::error::{Error, Result};
 use crate::safetensors::{Dtype, WeightSet};
 use crate::tensor::Matrix;
@@ -23,14 +27,14 @@ const PREFIX: &str = "model.language_model";
 pub struct ZcNorm(pub Vec<f32>);
 
 pub struct MlpWeights {
-    pub gate: Fp8Linear,
-    pub up: Fp8Linear,
-    pub down: Fp8Linear,
+    pub gate: Linear,
+    pub up: Linear,
+    pub down: Linear,
 }
 
 pub struct DeltaNetWeights {
-    pub in_proj_qkv: Fp8Linear,
-    pub in_proj_z: Fp8Linear,
+    pub in_proj_qkv: Linear,
+    pub in_proj_z: Linear,
     /// `[value heads, hidden]`, BF16 values.
     pub in_proj_b: Matrix,
     pub in_proj_a: Matrix,
@@ -40,16 +44,16 @@ pub struct DeltaNetWeights {
     pub dt_bias: Vec<f32>,
     /// The gated norm's plain weight, `[value head dim]`.
     pub norm: Vec<f32>,
-    pub out_proj: Fp8Linear,
+    pub out_proj: Linear,
 }
 
 pub struct AttentionWeights {
     /// `[heads · 2 · head_dim, hidden]`: per head `h`, rows `2h·d..(2h+1)·d`
     /// are its query and the next `d` its output gate.
-    pub q_proj: Fp8Linear,
-    pub k_proj: Fp8Linear,
-    pub v_proj: Fp8Linear,
-    pub o_proj: Fp8Linear,
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub o_proj: Linear,
     pub q_norm: ZcNorm,
     pub k_norm: ZcNorm,
 }
@@ -79,16 +83,30 @@ pub struct QwenWeights {
     pub config: QwenConfig,
     pub store: Arc<WeightSet>,
     pub embed: Bf16Matrix,
+    /// The output head: `lm_head.weight`, or with a tied head the embedding's
+    /// tensor itself.
     pub head: Bf16Matrix,
     pub final_norm: ZcNorm,
     pub layers: Vec<LayerWeights>,
     pub mtp: Vec<MtpWeights>,
 }
 
+/// A small tensor in f32, holding BF16 values. One stored in F32 (Qwen3.5's `A_log` and
+/// the DeltaNet's gated-norm weight) is rounded to BF16, ties to even: the released
+/// stacks build the model in its configuration's dtype (`bfloat16`) and load every
+/// parameter into it, Transformers' `from_pretrained` and vLLM's loader alike.
 fn small(store: &WeightSet, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
     let t = store.get(name)?;
-    t.expect(name, Dtype::Bf16, shape)?;
-    let v = t.to_f32(name)?;
+    let stored = if t.dtype == Dtype::F32 {
+        Dtype::F32
+    } else {
+        Dtype::Bf16
+    };
+    t.expect(name, stored, shape)?;
+    let mut v = t.to_f32(name)?;
+    if stored == Dtype::F32 {
+        bf16_round_slice(&mut v);
+    }
     if let Some(bad) = v.iter().find(|x| !x.is_finite()) {
         return Err(Error::layout(name, format!("value {bad} is not finite")));
     }
@@ -104,12 +122,23 @@ fn zc_norm(store: &WeightSet, name: &str, n: usize) -> Result<ZcNorm> {
     ))
 }
 
+/// A large projection in the checkpoint's format.
+fn linear(
+    store: &Arc<WeightSet>,
+    prefix: &str,
+    rows: usize,
+    cols: usize,
+    c: &QwenConfig,
+) -> Result<Linear> {
+    Linear::open(store, prefix, rows, cols, c.weights)
+}
+
 fn mlp(store: &Arc<WeightSet>, p: &str, c: &QwenConfig) -> Result<MlpWeights> {
     let (h, i) = (c.hidden_size, c.intermediate_size);
     Ok(MlpWeights {
-        gate: Fp8Linear::open(store, &format!("{p}.mlp.gate_proj"), i, h)?,
-        up: Fp8Linear::open(store, &format!("{p}.mlp.up_proj"), i, h)?,
-        down: Fp8Linear::open(store, &format!("{p}.mlp.down_proj"), h, i)?,
+        gate: linear(store, &format!("{p}.mlp.gate_proj"), i, h, c)?,
+        up: linear(store, &format!("{p}.mlp.up_proj"), i, h, c)?,
+        down: linear(store, &format!("{p}.mlp.down_proj"), h, i, c)?,
     })
 }
 
@@ -118,25 +147,34 @@ fn attention(store: &Arc<WeightSet>, p: &str, c: &QwenConfig) -> Result<Attentio
     let h = c.hidden_size;
     let p = format!("{p}.self_attn");
     Ok(AttentionWeights {
-        q_proj: Fp8Linear::open(
+        q_proj: linear(
             store,
             &format!("{p}.q_proj"),
             2 * a.num_q_heads * a.head_dim,
             h,
+            c,
         )?,
-        k_proj: Fp8Linear::open(
+        k_proj: linear(
             store,
             &format!("{p}.k_proj"),
             a.num_kv_heads * a.head_dim,
             h,
+            c,
         )?,
-        v_proj: Fp8Linear::open(
+        v_proj: linear(
             store,
             &format!("{p}.v_proj"),
             a.num_kv_heads * a.head_dim,
             h,
+            c,
         )?,
-        o_proj: Fp8Linear::open(store, &format!("{p}.o_proj"), h, a.num_q_heads * a.head_dim)?,
+        o_proj: linear(
+            store,
+            &format!("{p}.o_proj"),
+            h,
+            a.num_q_heads * a.head_dim,
+            c,
+        )?,
         q_norm: zc_norm(store, &format!("{p}.q_norm.weight"), a.head_dim)?,
         k_norm: zc_norm(store, &format!("{p}.k_norm.weight"), a.head_dim)?,
     })
@@ -151,8 +189,8 @@ fn deltanet(store: &Arc<WeightSet>, p: &str, c: &QwenConfig) -> Result<DeltaNetW
         Ok(Matrix::from_vec(rows, h, small(store, name, &[rows, h])?))
     };
     Ok(DeltaNetWeights {
-        in_proj_qkv: Fp8Linear::open(store, &format!("{p}.in_proj_qkv"), d.conv_dim(), h)?,
-        in_proj_z: Fp8Linear::open(store, &format!("{p}.in_proj_z"), d.value_dim(), h)?,
+        in_proj_qkv: linear(store, &format!("{p}.in_proj_qkv"), d.conv_dim(), h, c)?,
+        in_proj_z: linear(store, &format!("{p}.in_proj_z"), d.value_dim(), h, c)?,
         in_proj_b: bf16_matrix(&format!("{p}.in_proj_b.weight"), nv)?,
         in_proj_a: bf16_matrix(&format!("{p}.in_proj_a.weight"), nv)?,
         conv: small(
@@ -163,7 +201,7 @@ fn deltanet(store: &Arc<WeightSet>, p: &str, c: &QwenConfig) -> Result<DeltaNetW
         a_log: small(store, &format!("{p}.A_log"), &[nv])?,
         dt_bias: small(store, &format!("{p}.dt_bias"), &[nv])?,
         norm: small(store, &format!("{p}.norm.weight"), &[d.v_head_dim])?,
-        out_proj: Fp8Linear::open(store, &format!("{p}.out_proj"), h, d.value_dim())?,
+        out_proj: linear(store, &format!("{p}.out_proj"), h, d.value_dim(), c)?,
     })
 }
 
@@ -203,9 +241,21 @@ impl QwenWeights {
                 norm: zc_norm(&store, "mtp.norm.weight", h)?,
             });
         }
+        let embed_name = format!("{PREFIX}.embed_tokens.weight");
+        let head = if config.tie_word_embeddings {
+            if store.contains("lm_head.weight") {
+                return Err(Error::layout(
+                    "lm_head.weight",
+                    "the head is tied to the embedding, and the checkpoint has one of its own",
+                ));
+            }
+            Bf16Matrix::open(&store, &embed_name, v, h)?
+        } else {
+            Bf16Matrix::open(&store, "lm_head.weight", v, h)?
+        };
         Ok(QwenWeights {
-            embed: Bf16Matrix::open(&store, &format!("{PREFIX}.embed_tokens.weight"), v, h)?,
-            head: Bf16Matrix::open(&store, "lm_head.weight", v, h)?,
+            embed: Bf16Matrix::open(&store, &embed_name, v, h)?,
+            head,
             final_norm: zc_norm(&store, &format!("{PREFIX}.norm.weight"), h)?,
             layers,
             mtp,

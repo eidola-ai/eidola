@@ -1,9 +1,9 @@
-//! The Qwen3.8 CPU executor's memory on real bytes: idle state snapshots and KV blocks
+//! The Qwen CPU executor's memory on real bytes: idle state snapshots and KV blocks
 //! held as ciphertext and a hit after them exact, recomputed snapshots the same bytes,
 //! the host tier round trip, expiry zeroing snapshots, and a randomized workload under
 //! the harness's per-step checks (every free block and state buffer zero, every reset
 //! slot empty, every idle block and snapshot ciphertext), every row and every stored state
-//! against the dense oracle.
+//! against the dense oracle. Every test runs on each committed fixture (`qwen_common::FIXTURES`).
 
 mod qwen_common;
 
@@ -12,7 +12,6 @@ use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
 use qwen_common::*;
 
-#[test]
 fn idle_snapshots_are_ciphertext_and_a_hit_after_them_is_exact() {
     let g = SamplingParams::greedy();
     let mut h = Harness::fixture(256, 32, 3, sched(true));
@@ -67,7 +66,6 @@ fn idle_snapshots_are_ciphertext_and_a_hit_after_them_is_exact() {
 /// The state at a boundary is the same bytes whichever request computes it, in whatever
 /// chunks: two lineages store equal plaintext states, which encrypt to different
 /// ciphertext (another key and another attachment).
-#[test]
 fn a_recomputed_snapshot_is_the_same_bytes() {
     let g = SamplingParams::greedy();
     let prompt = TestRng(2).tokens(19, VOCAB);
@@ -96,7 +94,6 @@ fn a_recomputed_snapshot_is_the_same_bytes() {
     assert_ne!(images[0].1, images[1].1, "ciphertext under two keys");
 }
 
-#[test]
 fn the_host_tier_round_trips_snapshots() {
     let _guard = memlock_guard();
     let g = SamplingParams::greedy();
@@ -135,7 +132,6 @@ fn the_host_tier_round_trips_snapshots() {
     h.check_all(true);
 }
 
-#[test]
 fn expired_snapshots_are_zeroed() {
     let mut s = sched(false);
     s.cache = CachePolicy {
@@ -164,7 +160,6 @@ fn expired_snapshots_are_zeroed() {
     h.check_all(false);
 }
 
-#[test]
 fn a_randomized_workload_keeps_every_invariant() {
     let _guard = memlock_guard();
     for seed in 0..4u64 {
@@ -223,3 +218,11 @@ fn a_randomized_workload_keeps_every_invariant() {
         }
     }
 }
+
+on_each_fixture!(
+    idle_snapshots_are_ciphertext_and_a_hit_after_them_is_exact,
+    a_recomputed_snapshot_is_the_same_bytes,
+    the_host_tier_round_trips_snapshots,
+    expired_snapshots_are_zeroed,
+    a_randomized_workload_keeps_every_invariant,
+);

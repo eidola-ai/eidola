@@ -1,17 +1,24 @@
-//! Qwen3.8's chat-template rendering, byte-identical to Python
+//! Qwen3.8's and Qwen3.5's chat-template rendering, byte-identical to Python
 //! `transformers`.
 //!
-//! The template is the model's own `chat_template.jinja`, executed by
-//! minijinja in the environment the crate's `jinja` module builds, plus what this
-//! template needs of Python's semantics:
+//! The template is the model's own `chat_template.jinja`, one of the pinned
+//! files ([`TemplateKind`]: Qwen3.8-27B's, or the one Qwen3.5-2B and -0.8B
+//! share), executed by minijinja in the environment the crate's `jinja`
+//! module builds, plus what the template needs of Python's semantics:
 //!
-//! - **`{% generation %}`** is `transformers`' own tag (it records which
-//!   tokens are the assistant's, and otherwise renders its body as is). It is
-//!   not Jinja, so its two tags are rewritten to `{% if true %}` /
+//! - **`{% generation %}`** (Qwen3.8's) is `transformers`' own tag (it records
+//!   which tokens are the assistant's, and otherwise renders its body as is).
+//!   It is not Jinja, so its two tags are rewritten to `{% if true %}` /
 //!   `{% endif %}` before compiling, which renders the body the same way.
 //! - **`trim`** is Python's `str.strip()`, which strips more characters than
 //!   Rust's `trim` (U+001C to U+001F).
-//! - **`startswith` / `endswith`** are Python's string methods.
+//! - **`startswith` / `endswith`** are Python's string methods, and so, for
+//!   Qwen3.5's reading of reasoning out of a `</think>` in an assistant's
+//!   content, are **`split`**, **`lstrip`** and **`rstrip`** with one string
+//!   argument.
+//! - **`string`** (Qwen3.5's, for a tool-call argument that is neither a
+//!   string, an object nor an array) is Python's `str()`: `True`, `False`,
+//!   `None`, integers in full and floats as `float.__repr__` writes them.
 //!
 //! Inputs are validated against the domain where the two engines agree
 //! ([`validate`]); images and videos are a typed refusal
@@ -19,9 +26,13 @@
 //!
 //! The template trims every message's content and reasoning, and branches on
 //! what a user message's trimmed content starts with. A marked render (which
-//! finds the request data) therefore treats
-//! the marks as absent in those three operations, so that it takes the same
-//! branches as the plain render.
+//! finds the request data) therefore treats the marks as absent in those
+//! string operations, so that it takes the same branches as the plain render;
+//! a string a method makes of marked text (a piece of a `split`, a stripped
+//! copy) is request data whole, and is marked whole. Qwen3.5's `in` test for
+//! `</think>` is minijinja's: content whose parts spell `</think>` only across
+//! a boundary between two of them takes another branch marked than plain, and
+//! the render is refused rather than told apart wrongly.
 
 use std::path::Path;
 
@@ -29,8 +40,9 @@ use minijinja::value::{Value, ValueKind};
 use minijinja::{Environment, Error as JinjaError, ErrorKind, State};
 
 use crate::error::ChatError;
+use crate::format::ChatFormat;
 use crate::jinja::{self, data_marks, mark, mark_in_place, to_value};
-use crate::json::{self, Json};
+use crate::json::{self, Json, py_float_repr};
 use crate::prompt::{ChatInput, Prompt, sha256_hex};
 use crate::pysem::is_py_space;
 
@@ -40,8 +52,56 @@ pub use crate::mimo::template::CHAT_TEMPLATE_FILE;
 pub const QWEN3_8_CHAT_TEMPLATE_SHA256: &str =
     "af16f654968d47d09a6c604e00370b12dbc21f76456f59c9e98b82e84d9f6375";
 
+/// SHA-256 of the chat template Qwen3.5-2B and Qwen3.5-0.8B share.
+pub const QWEN3_5_CHAT_TEMPLATE_SHA256: &str =
+    "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80";
+
 /// Every Qwen template this crate will execute.
-pub const PINNED_TEMPLATE_SHA256: &[&str] = &[QWEN3_8_CHAT_TEMPLATE_SHA256];
+pub const PINNED_TEMPLATE_SHA256: &[&str] =
+    &[QWEN3_8_CHAT_TEMPLATE_SHA256, QWEN3_5_CHAT_TEMPLATE_SHA256];
+
+/// Which pinned template a [`ChatTemplate`] runs. Their formats differ:
+///
+/// - **Qwen3.8** thinks unless `enable_thinking` is `false`, writes the
+///   `reasoning_effort`'s instructions into a system turn, and keeps every
+///   past turn's reasoning unless `preserve_thinking` is `false`.
+/// - **Qwen3.5** thinks only when `enable_thinking` is `true`, reads neither
+///   `reasoning_effort` nor `preserve_thinking` (setting either is refused),
+///   renders the reasoning only of assistant turns after the last user query,
+///   reads reasoning out of an assistant's content up to a `</think>` when it
+///   has no `reasoning_content` string, and writes a non-string, non-container
+///   argument value with Python's `str()` (where Qwen3.8 writes JSON).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplateKind {
+    Qwen3_8,
+    Qwen3_5,
+}
+
+impl TemplateKind {
+    fn of_sha256(sha256: &str) -> Option<TemplateKind> {
+        match sha256 {
+            QWEN3_8_CHAT_TEMPLATE_SHA256 => Some(TemplateKind::Qwen3_8),
+            QWEN3_5_CHAT_TEMPLATE_SHA256 => Some(TemplateKind::Qwen3_5),
+            _ => None,
+        }
+    }
+
+    /// The chat format of the models this template is pinned for.
+    pub fn format(self) -> ChatFormat {
+        match self {
+            TemplateKind::Qwen3_8 => ChatFormat::Qwen3_8,
+            TemplateKind::Qwen3_5 => ChatFormat::Qwen3_5,
+        }
+    }
+
+    /// Whether a prompt rendered with `enable_thinking` opens the reasoning.
+    pub fn thinks(self, enable_thinking: Option<bool>) -> bool {
+        match self {
+            TemplateKind::Qwen3_8 => enable_thinking != Some(false),
+            TemplateKind::Qwen3_5 => enable_thinking == Some(true),
+        }
+    }
+}
 
 const TEMPLATE_NAME: &str = "chat_template";
 
@@ -59,21 +119,26 @@ pub struct RenderOptions {
     /// (`<|im_start|>assistant\n<think>\n`, or with thinking off
     /// `<|im_start|>assistant\n<think>\n\n</think>\n\n`).
     pub add_generation_prompt: bool,
-    /// `enable_thinking`; `None` leaves it undefined, which means on. Thinking
-    /// on also writes the reasoning effort's instructions into a system turn.
+    /// `enable_thinking`; `None` leaves it undefined, which means on for
+    /// Qwen3.8 and off for Qwen3.5 ([`TemplateKind::thinks`]). Qwen3.8's
+    /// thinking also writes the reasoning effort's instructions into a system
+    /// turn.
     pub enable_thinking: Option<bool>,
-    /// `preserve_thinking`; `None` leaves it undefined, which means on: every
-    /// past assistant turn keeps its reasoning. `Some(false)` drops the
-    /// reasoning of turns before the last user query.
+    /// `preserve_thinking` (Qwen3.8's; refused for Qwen3.5); `None` leaves it
+    /// undefined, which means on: every past assistant turn keeps its
+    /// reasoning. `Some(false)` drops the reasoning of turns before the last
+    /// user query.
     pub preserve_thinking: Option<bool>,
-    /// `reasoning_effort`, passed as given: the template accepts `xhigh` (its
-    /// default), `medium` and `low`, and raises on anything else.
+    /// `reasoning_effort` (Qwen3.8's; refused for Qwen3.5), passed as given:
+    /// the template accepts `xhigh` (its default), `medium` and `low`, and
+    /// raises on anything else.
     pub reasoning_effort: Option<String>,
 }
 
-/// A pinned Qwen3.8 chat template, ready to render.
+/// A pinned Qwen chat template, ready to render.
 pub struct ChatTemplate {
     env: Environment<'static>,
+    kind: TemplateKind,
     sha256: String,
 }
 
@@ -99,27 +164,50 @@ impl ChatTemplate {
     /// Compiles template source, refusing anything whose hash is not pinned.
     pub fn from_source(source: String) -> Result<ChatTemplate, ChatError> {
         let sha256 = sha256_hex(source.as_bytes());
-        if !PINNED_TEMPLATE_SHA256.contains(&sha256.as_str()) {
+        let Some(kind) = TemplateKind::of_sha256(&sha256) else {
             return Err(ChatError::UnpinnedArtifact {
                 what: "chat template",
                 sha256,
             });
-        }
+        };
         let mut source = source;
-        for (tag, replacement) in GENERATION_TAGS {
-            if source.matches(tag).count() != 1 {
-                return Err(ChatError::InvalidArtifact(format!(
-                    "chat template: expected one {tag}"
-                )));
+        if kind == TemplateKind::Qwen3_8 {
+            for (tag, replacement) in GENERATION_TAGS {
+                if source.matches(tag).count() != 1 {
+                    return Err(ChatError::InvalidArtifact(format!(
+                        "chat template: expected one {tag}"
+                    )));
+                }
+                source = source.replace(tag, replacement);
             }
-            source = source.replace(tag, replacement);
         }
         let mut env = jinja::transformers_environment()?;
         env.add_filter("trim", py_trim);
+        if kind == TemplateKind::Qwen3_5 {
+            env.add_filter("string", py_str);
+        }
         env.set_unknown_method_callback(py_string_method);
         env.add_template_owned(TEMPLATE_NAME, source)
             .map_err(|e| ChatError::Template(e.to_string()))?;
-        Ok(ChatTemplate { env, sha256 })
+        Ok(ChatTemplate { env, kind, sha256 })
+    }
+
+    /// [`Self::from_source`], refusing a pinned template of another format than
+    /// `format` (Qwen3.8-27B's template for a Qwen3.5 model, or the reverse).
+    pub fn for_format(format: ChatFormat, source: String) -> Result<ChatTemplate, ChatError> {
+        let template = ChatTemplate::from_source(source)?;
+        if template.kind.format() != format {
+            return Err(ChatError::InvalidArtifact(format!(
+                "chat template: pinned for {:?}, not {format:?}",
+                template.kind.format()
+            )));
+        }
+        Ok(template)
+    }
+
+    /// Which pinned template this is.
+    pub fn kind(&self) -> TemplateKind {
+        self.kind
     }
 
     /// Hex SHA-256 of the template source.
@@ -144,9 +232,21 @@ impl ChatTemplate {
         input: &ChatInput,
         options: &RenderOptions,
     ) -> Result<Prompt, ChatError> {
+        if self.kind == TemplateKind::Qwen3_5 {
+            for (set, name) in [
+                (options.preserve_thinking.is_some(), "preserve_thinking"),
+                (options.reasoning_effort.is_some(), "reasoning_effort"),
+            ] {
+                if set {
+                    return Err(ChatError::InvalidInput(format!(
+                        "this model's template has no {name}"
+                    )));
+                }
+            }
+        }
         let mut messages = input.messages.clone();
         decode_tool_call_arguments(&mut messages)?;
-        validate(&messages, input.tools.as_ref())?;
+        validate_for(self.kind, &messages, input.tools.as_ref())?;
         jinja::render_prompt(|marks| match marks {
             None => self.render_messages(&messages, input.tools.as_ref(), options, None),
             Some(marks) => self.render_messages(
@@ -341,6 +441,17 @@ fn marked_messages(messages: &Json, marks: (char, char)) -> Json {
 /// breaks the template's own rules (a system message after the first, no user
 /// query, a reasoning effort it does not know), both engines raise.
 pub fn validate(messages: &Json, tools: Option<&Json>) -> Result<(), ChatError> {
+    validate_for(TemplateKind::Qwen3_8, messages, tools)
+}
+
+/// [`validate`] for the template `kind`. Qwen3.5's also refuses `arguments`
+/// that are the empty string, on which its template raises (it iterates them
+/// as a mapping), where Qwen3.8's renders no parameters.
+pub fn validate_for(
+    kind: TemplateKind,
+    messages: &Json,
+    tools: Option<&Json>,
+) -> Result<(), ChatError> {
     let invalid = |msg: String| Err(ChatError::InvalidInput(msg));
     match tools {
         None | Some(Json::Null) => {}
@@ -379,7 +490,7 @@ pub fn validate(messages: &Json, tools: Option<&Json>) -> Result<(), ChatError> 
                 None | Some(Json::Null) => {}
                 Some(Json::Array(calls)) => {
                     for (c, call) in calls.iter().enumerate() {
-                        validate_tool_call(call, &format!("messages[{i}].tool_calls[{c}]"))?;
+                        validate_tool_call(kind, call, &format!("messages[{i}].tool_calls[{c}]"))?;
                     }
                 }
                 Some(_) => return invalid(format!("messages[{i}].tool_calls must be an array")),
@@ -421,7 +532,7 @@ fn validate_content(content: &Json, path: &str) -> Result<(), ChatError> {
     }
 }
 
-fn validate_tool_call(call: &Json, path: &str) -> Result<(), ChatError> {
+fn validate_tool_call(kind: TemplateKind, call: &Json, path: &str) -> Result<(), ChatError> {
     let invalid = |msg: String| Err(ChatError::InvalidInput(msg));
     let Json::Object(_) = call else {
         return invalid(format!("{path} must be an object"));
@@ -438,7 +549,7 @@ fn validate_tool_call(call: &Json, path: &str) -> Result<(), ChatError> {
     };
     match body.get("arguments") {
         None | Some(Json::Object(_)) => Ok(()),
-        Some(Json::Str(s)) if s.is_empty() => Ok(()),
+        Some(Json::Str(s)) if s.is_empty() && kind == TemplateKind::Qwen3_8 => Ok(()),
         Some(_) => invalid(format!("{path}.arguments must be a JSON object")),
     }
 }
@@ -477,26 +588,72 @@ fn py_trim(state: &State, value: &Value) -> Result<Value, JinjaError> {
     Ok(Value::from(out))
 }
 
-/// Python's `str.startswith` and `str.endswith` with one string argument,
-/// seeing through the marks of a marked render.
+/// Python's `str.startswith`, `str.endswith`, `str.split`, `str.lstrip` and
+/// `str.rstrip` with one string argument, seeing through the marks of a marked
+/// render: each is computed on the text without its marks, and a string it
+/// makes of marked text is marked whole (an empty one stays empty, and false).
 fn py_string_method(
     state: &mut State,
     value: &Value,
     method: &str,
     args: &[Value],
 ) -> Result<Value, JinjaError> {
-    let (Some(text), [affix]) = (value.as_str(), args) else {
+    let (Some(text), [arg]) = (value.as_str(), args) else {
         return Err(JinjaError::from(ErrorKind::UnknownMethod));
     };
-    let (Some(affix), true) = (affix.as_str(), affix.kind() == ValueKind::String) else {
+    let (Some(arg), true) = (arg.as_str(), arg.kind() == ValueKind::String) else {
         return Err(JinjaError::from(ErrorKind::UnknownMethod));
     };
-    let text = unmarked(text, data_marks(state));
+    let marks = data_marks(state);
+    let was_marked = marks.is_some_and(|(open, close)| text.contains([open, close]));
+    let plain = unmarked(text, marks);
+    let piece = |s: &str| match marks {
+        Some(marks) if was_marked => Value::from(mark(s, marks)),
+        _ => Value::from(s),
+    };
     match method {
-        "startswith" => Ok(Value::from(text.starts_with(affix))),
-        "endswith" => Ok(Value::from(text.ends_with(affix))),
+        "startswith" => Ok(Value::from(plain.starts_with(arg))),
+        "endswith" => Ok(Value::from(plain.ends_with(arg))),
+        "split" if arg.is_empty() => Err(JinjaError::new(
+            ErrorKind::InvalidOperation,
+            "empty separator",
+        )),
+        "split" => Ok(Value::from(
+            plain.split(arg).map(piece).collect::<Vec<Value>>(),
+        )),
+        "lstrip" => Ok(piece(plain.trim_start_matches(|c| arg.contains(c)))),
+        "rstrip" => Ok(piece(plain.trim_end_matches(|c| arg.contains(c)))),
         _ => Err(JinjaError::from(ErrorKind::UnknownMethod)),
     }
+}
+
+/// Jinja2's `string` filter, Python's `str()`, over the values a JSON request
+/// holds that are neither objects nor arrays: a string as it is, `None`,
+/// `True` and `False`, an integer in full and a float as `float.__repr__`
+/// writes it. In a marked render what it writes of a value that is not a
+/// string is request data, and goes between the marks (a string carries its
+/// own).
+fn py_str(state: &State, value: &Value) -> Result<String, JinjaError> {
+    let text = match value.kind() {
+        ValueKind::String => return Ok(value.as_str().unwrap_or_default().to_string()),
+        ValueKind::Undefined => return Ok(String::new()),
+        ValueKind::None => "None".to_string(),
+        ValueKind::Bool => if value.is_true() { "True" } else { "False" }.to_string(),
+        ValueKind::Number if value.is_integer() => i128::try_from(value.clone())?.to_string(),
+        ValueKind::Number => py_float_repr(f64::try_from(value.clone())?),
+        // An integer beyond `i128` (`jinja::to_value`): its digits.
+        ValueKind::Plain => value.to_string(),
+        other => {
+            return Err(JinjaError::new(
+                ErrorKind::InvalidOperation,
+                format!("str() of a {other} is not in the template's domain"),
+            ));
+        }
+    };
+    Ok(match data_marks(state) {
+        Some(marks) => mark(&text, marks),
+        None => text,
+    })
 }
 
 #[cfg(test)]
