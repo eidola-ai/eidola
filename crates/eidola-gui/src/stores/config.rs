@@ -172,9 +172,8 @@ impl ConfigStore {
     /// `Change::Backends`.
     pub fn trust_measurement(&mut self, spec: String, cx: &mut Context<Self>) {
         self.write(cx, |c| {
-            let m = eidola_app_core::config::parse_trust_measurement(spec.trim())?;
             c.runtime()
-                .block_on(c.trust_measurement(m.measurement, m.host_data, m.guest_policy))
+                .block_on(c.trust_measurement_spec(spec.trim().to_string()))
                 .map(|_| ())
         });
     }

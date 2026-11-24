@@ -180,18 +180,17 @@ pub mod caps {
     pub const KV_BLOCK_SIZE: u32 = 1024;
     /// Device memory for the CUDA executor's KV pools on each device: less
     /// than the supported GPU's memory ([`super::SUPPORTED_GPU_MEMORY_BYTES`]), as the
-    /// node itself refuses a value not less than its device's. What a pinned
+    /// node itself refuses a value not less than its device's. What a
     /// deployment may give the pools, beside its weights and the executor's
-    /// own reserve, is held separately ([`super::check_resources`]).
+    /// own reserve, is [`super::check_resources`]' to say.
     pub const KV_DEVICE_BYTES: u64 = super::SUPPORTED_GPU_MEMORY_BYTES - 1;
-    /// Host memory for the prefix cache's host tier: at most the largest VM
-    /// memory a deployment may have ([`super::MAX_MEMORY_MIB`], 2 TiB). What
-    /// a pinned deployment's VM must hold besides is held separately
-    /// ([`super::check_resources`]).
-    pub const KV_HOST_BYTES: u64 = super::MAX_MEMORY_MIB << 20;
+    /// Host memory for the prefix cache's host tier: at most 2 TiB, more than
+    /// any VM the platform launches. Whether a sizing leaves the VM room for
+    /// the rest is [`super::check_resources`]' to say.
+    pub const KV_HOST_BYTES: u64 = 2 << 40;
     /// Blocks per KV group (the `cpu` executor's): the device block tables are `i32`
-    /// (`kv::GroupGeometry::validate`). The device bytes they cost are held
-    /// to the attached GPUs separately ([`super::check_resources`]).
+    /// (`kv::GroupGeometry::validate`). The bytes they cost are
+    /// [`super::check_resources`]' to size.
     pub const KV_BLOCKS: u32 = i32::MAX as u32;
     /// Sequences per step, which is also the state slots: the sampler's
     /// scratch is rows × the 152,576-entry vocabulary × 4 bytes (625 MB at
@@ -212,8 +211,8 @@ pub mod caps {
     /// MiMo-V2.6-Flash's three, `eidola-engine-cuda` `support::MTP_LAYERS`).
     pub const CUDA_DRAFT_TOKENS: u32 = 3;
     /// Admission slots: each may hold a request body of up to
-    /// `engine_protocol::MAX_REQUEST_BODY_BYTES` and its parse, held to the
-    /// VM's memory separately ([`super::check_resources`]).
+    /// `engine_protocol::MAX_REQUEST_BODY_BYTES` and its parse, which
+    /// [`super::check_resources`] sizes against the VM's memory.
     pub const MAX_REQUESTS: u32 = 4096;
 }
 
@@ -236,10 +235,9 @@ pub const SUPPORTED_GPU: &str = "NVIDIA B300 SXM6 AC";
 /// on that part): about 267.7 GiB, not the 288 GB of HBM it is sold with.
 pub const SUPPORTED_GPU_MEMORY_BYTES: u64 = 287_428_640_768;
 
-/// A GPU a deployment may run the CUDA executor on: the name its driver
-/// reports and its device memory as the driver reports it. A deployment's
-/// `deployment.json` names one (`gpu`), and [`check_resources`] holds what
-/// the node allocates on each device to its memory.
+/// A GPU the CUDA executor runs on: the name its driver reports and its
+/// device memory as the driver reports it, which [`check_resources`] sizes a
+/// deployment's device allocations against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SupportedGpu {
     pub name: &'static str,
@@ -263,11 +261,6 @@ impl SupportedGpu {
 
     /// Every supported GPU.
     pub const ALL: [SupportedGpu; 2] = [SupportedGpu::B300, SupportedGpu::B200];
-
-    /// The supported GPU its driver names `name`, if there is one.
-    pub fn from_name(name: &str) -> Option<SupportedGpu> {
-        Self::ALL.into_iter().find(|g| g.name == name)
-    }
 }
 
 /// Device memory the CUDA executor holds whatever its sizing: the CUDA
@@ -974,9 +967,12 @@ pub fn cuda_kv_host_min_bytes(
     u64::try_from((2 * device).div_ceil(smallest)).unwrap_or(u64::MAX)
 }
 
-/// Whether the deployment's VM and GPUs hold what its configuration
-/// allocates, as far as configuration alone fixes it. Host memory (`memory`,
-/// MiB) holds [`host_memory_bytes`], the prefix cache's host tier
+/// A sizing aid: whether a VM of `memory_mib` and `gpus` of `gpu` hold what a
+/// configuration allocates, as far as configuration alone fixes it. No pin
+/// check calls it: the platform attests neither the VM's memory nor which GPU
+/// it attaches, and a node sized past its machine refuses to boot or serves
+/// less, which is liveness, not privacy. The node's own boot derivations it
+/// is built from are held equal to it by the node's tests. Host memory holds [`host_memory_bytes`], the prefix cache's host tier
 /// (`kv_host_bytes`, `KV_HOST_BYTES`: page-locked, so it can never be paged
 /// out to make room), plus, for the `cpu` executor, its KV cache
 /// (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`Shape::kv_bytes_per_position`]). For the
@@ -1061,9 +1057,10 @@ pub fn check_resources(
     Ok(())
 }
 
-/// Whether a deployment of an architecture split across devices (`devices`,
-/// one [`Shape`] per device, [`crate::architecture::Architecture::devices`])
-/// fits its VM and GPUs, as far as configuration alone fixes it: the rule of
+/// A sizing aid, as [`check_resources`] is (no pin check calls it): whether
+/// a deployment of an architecture split across devices (`devices`, one
+/// [`Shape`] per device, [`crate::architecture::Architecture::devices`]) fits
+/// a VM and its GPUs, as far as configuration alone fixes it: the rule of
 /// [`check_resources`] on every device, with each device's own weights.
 ///
 /// - The `cuda` executor runs device `d` on GPU `d`, so the VM attaches at
@@ -1208,36 +1205,29 @@ pub fn check_device_resources(
     Ok(())
 }
 
-/// Fewest vCPUs a deployment may give its VM.
-pub const MIN_CPUS: u64 = 1;
-/// Most vCPUs a deployment may give its VM.
-pub const MAX_CPUS: u64 = 256;
-/// Smallest VM memory, in MiB.
-pub const MIN_MEMORY_MIB: u64 = 8192;
-/// Largest VM memory, in MiB.
-pub const MAX_MEMORY_MIB: u64 = 2 * 1024 * 1024;
+/// The trusted execution environment a deployment runs in. The platform
+/// provider's IGVM releases publish every image for both (a release
+/// manifest's `igvm.snp` and `igvm.tdx`, each with its own launch
+/// measurement), so either may run the gateway or an engine; which one a
+/// deployment is pinned on is its sidecar's statement
+/// (`deployment::DeploymentPlatform`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tee {
+    /// AMD SEV-SNP.
+    SevSnp,
+    /// Intel TDX.
+    Tdx,
+}
 
-/// Whether the VM's `cpus` and `memory` (MiB) are a shape worth pinning:
-/// `cpus` from [`MIN_CPUS`] to [`MAX_CPUS`], and `memory` a whole number of
-/// GiB from [`MIN_MEMORY_MIB`] (8 GiB) to [`MAX_MEMORY_MIB`] (2 TiB). The
-/// platform's production GPU shapes include sizes that are not powers of two
-/// (768 GiB), so the rule asks only for whole GiB. These bounds are ours: they
-/// keep an obviously unlaunchable shape from being pinned, and are not a
-/// security property, since `memory` is part of the measured configuration
-/// either way. The same rule holds for every `cvm-version` an engine pins.
-pub fn check_vm_resources(cpus: u64, memory_mib: u64) -> Result<(), String> {
-    if !(MIN_CPUS..=MAX_CPUS).contains(&cpus) {
-        return Err(format!(
-            "cpus must be from {MIN_CPUS} to {MAX_CPUS} (got {cpus})"
-        ));
+impl Tee {
+    /// The image-name spelling the platform provider publishes an IGVM image
+    /// under (`tinfoil-<name>-v<version>.igvm`).
+    pub fn image_name(self) -> &'static str {
+        match self {
+            Tee::SevSnp => "snp",
+            Tee::Tdx => "tdx",
+        }
     }
-    if !memory_mib.is_multiple_of(1024) || !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&memory_mib)
-    {
-        return Err(format!(
-            "memory must be a whole number of GiB from {MIN_MEMORY_MIB} to {MAX_MEMORY_MIB} MiB (got {memory_mib})"
-        ));
-    }
-    Ok(())
 }
 
 /// Which executor the configuration selects. Whether a given node build can
@@ -2021,9 +2011,9 @@ pub const CUDA_GPU_COUNTS: core::ops::RangeInclusive<u64> = 1..=8;
 /// - the `cuda` executor needs GPUs, a count in [`CUDA_GPU_COUNTS`], and a pin
 ///   requiring all of them, or its accelerators would go unattested (or, with
 ///   no `gpus`, every handshake would fail for want of evidence);
-/// - the `cpu` executor attaches none and requires none. A pinned deployment
-///   never takes this branch (the deployment check refuses `cpu` first); it
-///   stays so the rule is total over the grammar's executors.
+/// - the `cpu` executor attaches none and requires none: its pin asks for no
+///   GPU evidence, and its image (the release's CPU image, [`check_cvm_image`])
+///   refuses a config that attaches a GPU.
 ///
 /// `gpus` and `expected_gpus` are `None` when absent; `0` reads as absent.
 pub fn check_gpu_attestation(
@@ -2150,15 +2140,16 @@ pub const GPU_IMAGE_TAG: &str = "gpu";
 
 /// Whether a `cvm-version` names the image its executor needs.
 ///
-/// Each platform release publishes two TDX images with different MRTDs: the
-/// CPU image (`X`) and the GPU image (`X+gpu`). Only the GPU image carries the
-/// NVIDIA driver, and its measured boot opens the GPUs to work only after it
-/// has checked their device IDs and NVIDIA's local verifier has passed for
-/// exactly `gpus` of them (cvmimage `tinfoil/cmd/boot/gpu.go`,
-/// `gpuattest.go`); the CPU image refuses a config that attaches any
-/// (`tinfoil/cmd/boot/gpu_disabled.go`). So the `cuda` executor needs `X+gpu`,
-/// and the `cpu` executor, which attaches no GPUs ([`check_gpu_attestation`]),
-/// needs the plain `X`, with no build tag.
+/// Each platform release publishes two images, the CPU image (`X`) and the
+/// GPU image (`X+gpu`), each as one IGVM file per TEE ([`Tee`]) with its own
+/// launch measurement. Only the GPU image carries the NVIDIA driver, and its
+/// measured boot opens the GPUs to work only after it has checked their
+/// device IDs and NVIDIA's local verifier has passed for exactly `gpus` of
+/// them (cvmimage `tinfoil/cmd/boot/gpu.go`, `gpuattest.go`); the CPU image
+/// refuses a config that attaches any (`tinfoil/cmd/boot/gpu_disabled.go`).
+/// So the `cuda` executor needs `X+gpu`, and the `cpu` executor, which
+/// attaches no GPUs ([`check_gpu_attestation`]), needs the plain `X`, with no
+/// build tag, whichever TEE either runs in.
 pub fn check_cvm_image(executor: Executor, release: &CvmVersion<'_>) -> Result<(), String> {
     let tag = release.version.split_once('+').map(|(_, tag)| tag);
     match (executor, tag) {
@@ -3325,29 +3316,6 @@ mod tests {
         for bad in ["ENGINE", "engine_", "_ENGINE_", "ENGINE-"] {
             let err = deployment_env(&env_of(Some(bad))).unwrap_err();
             assert!(err.contains("EIDOLA_ENV_PREFIX must be"), "{bad}: {err}");
-        }
-    }
-
-    #[test]
-    fn vm_resources_are_a_launchable_shape() {
-        assert!(check_vm_resources(16, 65536).is_ok());
-        assert!(check_vm_resources(1, 8192).is_ok());
-        assert!(check_vm_resources(MAX_CPUS, MAX_MEMORY_MIB).is_ok());
-        // The platform's 768 GiB GPU shape, and other whole-GiB sizes.
-        assert!(check_vm_resources(32, 786_432).is_ok());
-        assert!(check_vm_resources(16, 9216).is_ok());
-        for (cpus, memory) in [
-            (0, 65536),
-            (MAX_CPUS + 1, 65536),
-            (16, 1),
-            (16, 4096),
-            (16, 7168),
-            (16, 65535),
-            (16, 65000),
-            (16, MAX_MEMORY_MIB + 1024),
-            (16, MAX_MEMORY_MIB * 2),
-        ] {
-            assert!(check_vm_resources(cpus, memory).is_err(), "{cpus} {memory}");
         }
     }
 

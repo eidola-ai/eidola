@@ -13,6 +13,8 @@
 //!   sequences, reasoning and tool calls out.
 //! * [`worker`] — the engine's step loop on its own thread, and the bridge to it.
 //! * [`http`] — the routes.
+//! * [`zeroing`] — the binary's global allocator, which zeroes every heap block before it
+//!   is freed.
 //!
 //! Doctrine lives in this crate's `AGENTS.md`.
 
@@ -30,6 +32,7 @@ pub mod storage;
 pub mod swap;
 pub mod telemetry;
 pub mod worker;
+pub mod zeroing;
 
 use std::sync::Arc;
 use std::time::Duration;

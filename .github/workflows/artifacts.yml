@@ -712,10 +712,11 @@ jobs:
             || echo "::warning::the committed manifest does not record this billing image; the artifact-manifest job will fail"
 
   # ── Engine pins, re-measured from the platform's images (cheap ubuntu) ──────
-  # Every gateway build holds each engine pin's MRTD to the platform release
-  # manifest its config pins, vendored under releases/trust/cvm-releases/.
-  # This job closes the remaining link: it fetches each TDX image those
-  # manifests name, holds it to the manifest's hash and both files to the
+  # Every gateway build holds each engine pin's launch measurement to the
+  # platform release manifest its config pins, vendored under
+  # releases/trust/cvm-releases/. This job closes the remaining link: it
+  # fetches each image those manifests name for a deployment's TEE (SEV-SNP or
+  # TDX), holds it to the manifest's hash and both files to the
   # provider's build provenance (as `artifact-manifest` does the gateway's),
   # reruns measure-engine-enclaves and requires the committed
   # engine-enclaves.json byte for byte. With no deployment it fetches nothing
@@ -748,7 +749,7 @@ jobs:
       - name: Build the measurer
         run: cargo build --locked -q -p measure-enclave --bin measure-engine-enclaves
 
-      - name: Fetch and verify the TDX images
+      - name: Fetch and verify the release images
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -776,6 +777,75 @@ jobs:
             --release-dir "$RUNNER_TEMP/cvm-images" \
             --output "$RUNNER_TEMP/engine-enclaves.json"
           diff -u releases/trust/engine-enclaves.json "$RUNNER_TEMP/engine-enclaves.json"
+
+  # ── Shipped crates' tests, built as they ship (cheap ubuntu runner) ─────────
+  # rust-checks runs one workspace-wide `cargo test`, and Cargo compiles each
+  # shared dependency once with every feature any workspace member enables. A
+  # release image builds its crate alone (`cargo build -p <crate>`), with only
+  # the features its own graph enables, so a test can pass in the workspace
+  # run only because some other member turned a feature on. Each step here
+  # tests one image's code in its own invocation, with the features its
+  # Containerfile builds with, so the tests hold for the build that ships.
+  # Dev-dependencies and the image's target still differ from the release
+  # build; what this closes is other members' features.
+  shipped-crate-tests:
+    name: Test shipped crates as they are built
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free up disk space
+        # Three separate dependency graphs, each compiled with its tests,
+        # share one target directory; reclaim the preinstalled toolchains
+        # this job never uses, as rust-checks does.
+        run: |
+          before=$(df --output=avail -BG / | tail -1)
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift \
+            /usr/local/share/powershell \
+            /usr/share/miniconda \
+            /usr/lib/jvm \
+            /opt/microsoft \
+            /opt/az
+          echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
+        # Skipped on v* release tags, as in `artifact-manifest`, so a release
+        # tests from a clean cargo state.
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test the gateway (the server image's crate)
+        run: cargo test --locked -p eidola-server-gateway
+
+      - name: Test the inference node with its image's features
+        # The image builds with `cuda`. Its tests need no GPU: those that do
+        # skip themselves, and the rest check that the node fails closed
+        # without a device.
+        run: cargo test --locked -p eidola-server-engine --features cuda
+
+      - name: Test billing (the billing image's crates)
+        # The image builds `eidola-billing-cli`, and its billing logic lives in
+        # `eidola-billing`, so both are tested, together and with nothing else.
+        run: cargo test --locked -p eidola-billing-cli -p eidola-billing
 
   # ── Apple (expensive macOS runner) ───────────────────────────────────────────
   # This uses https://github.com/khoi/sand to provision a runner from a known image:
@@ -1115,6 +1185,7 @@ jobs:
       - oci-engine
       - oci-billing
       - engine-enclaves
+      - shipped-crate-tests
       - apple
       - linux-gui
       - linux-deb-arm64

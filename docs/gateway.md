@@ -57,11 +57,11 @@ This policy does not help when few accounts issue under a key, as early in the d
 
 ## What runs in confidential compute
 
-The gateway runs inside a **Tinfoil Container** on confidential-compute hardware (AMD SEV-SNP; TDX values are recorded in the trust root but the client refuses a TDX presentation of the gateway — see [gaps.md](gaps.md#tdx-acceptance)). The relevant properties:
+The gateway runs inside a **Tinfoil Container** on confidential-compute hardware: AMD SEV-SNP today. The client pins the gateway on the one TEE its release names and refuses a presentation on any other, and it reads a release that names Intel TDX instead, so the gateway can move between them without the client's trust model changing (see [gaps.md](gaps.md#tdx-acceptance)). The relevant properties:
 
 - **TLS termination is inside the enclave.** The Tinfoil shim's self-contained v3 attestation endorses the TLS certificate's SPKI and an HPKE public key; its fresh hardware report binds those exact endorsed bytes and the client's nonce. The certificate is issued by a public CA via ACME, so any client can validate the chain; the *binding to the enclave* is what the Eidola verifier checks beyond the basic WebPKI chain.
 - **Secrets are supplied by the operator, not measured.** The gateway's credentials for the services it depends on outside its enclave (its database, the payment processor, its telemetry collector, the website it reads the current legal documents from) and `CREDENTIAL_MASTER_KEY`, which encrypts issuer keys at rest, are secrets supplied at deployment. The operator knows them, and the hosting platform can read them while it deploys. The configuration names them but does not measure their values: each is a credential for a party outside the enclave that is trusted as Eidola is, and what the gateway sends to each is fixed by its measured image.
-- **The enclave measurement is a function of source.** The client's pinned launch identity is computed from the platform's hash-pinned release image (its SEV-SNP launch digest) and the committed `deploy/gateway/tinfoil-config.yml` (its SHA-256, which the enclave reports as HOST_DATA). See [trust-root.md](trust-root.md#whats-pinned).
+- **The enclave measurement is a function of source.** The client's pinned launch identity is computed from the platform's hash-pinned release image (its launch measurement: the SEV-SNP launch digest today) and the committed `deploy/gateway/tinfoil-config.yml` (its SHA-256, which the enclave reports as HOST_DATA on SEV-SNP, or in MRCONFIGID on TDX). See [trust-root.md](trust-root.md#whats-pinned).
 
 The gateway image is `FROM scratch` with a statically linked binary, runs as non-root, and ships no shell or package manager.
 

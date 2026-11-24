@@ -67,8 +67,8 @@ const RETENTION_POINTS: u64 = 3;
 /// bytes are the executor's own (`GroupGeometry::block_bytes`). The rule reads only
 /// measured values, never the device, so the same configuration derives the same counts
 /// on every node. Its least accepted budget is
-/// `eidola_common::engine_deployment::cuda_kv_min_bytes`, which the gateway's build
-/// holds every pinned deployment to; the two are kept equal by a test here.
+/// `eidola_common::engine_deployment::cuda_kv_min_bytes`, the sizing aid's; the two are
+/// kept equal by a test here.
 /// The executor's bytes per block of group `g` (`GroupGeometry::block_bytes`: BF16 K and
 /// V of every layer, and a drafter block's boundary tap of `hidden` f32 per depth).
 fn group_block_bytes(g: &KvGroupSpec, sizing: &Sizing, hidden: u32) -> Result<u64, BootError> {
@@ -99,12 +99,12 @@ fn group_block_bytes(g: &KvGroupSpec, sizing: &Sizing, hidden: u32) -> Result<u6
 /// pools' mix (`device`, as [`derive_kv_blocks`] gave it) scaled to the budget, so each
 /// group `g` with `n_g` device blocks of `b_g` bytes gets `floor(n_g × H / Σ n_h b_h)`
 /// host blocks (`H` = `kv_host_bytes`), the null block among them. The blocks' bytes then
-/// sum to at most `H`, which the gateway's build charges to the VM's memory
+/// sum to at most `H`, which the sizing aid charges to the VM's memory
 /// (`engine_deployment::check_resources`). The host tier takes what the device pools hold
 /// when they run short, in the same mix. 0 gives no host tier; a budget too small for two
 /// blocks in every group is refused. The least accepted budget is
-/// `eidola_common::engine_deployment::cuda_kv_host_min_bytes`, which the gateway's build
-/// holds every pinned deployment to; the two are kept equal by a test here.
+/// `eidola_common::engine_deployment::cuda_kv_host_min_bytes`, the sizing aid's; the two
+/// are kept equal by a test here.
 pub fn derive_host_blocks(
     spec: &ModelSpec,
     hidden: u32,
@@ -1292,7 +1292,7 @@ mod tests {
         }
     }
 
-    /// The gateway's build holds a pinned deployment's budget to
+    /// The sizing aid holds a deployment's budget to
     /// `cuda_kv_min_bytes`; it is exactly the least this derivation accepts, across
     /// block sizes, seats, step sizes, the cache switch and the draft width.
     #[test]
@@ -1325,7 +1325,7 @@ mod tests {
         }
     }
 
-    /// The gateway's build holds a pinned deployment's non-zero host tier to
+    /// The sizing aid holds a deployment's non-zero host tier to
     /// `cuda_kv_host_min_bytes`; it is exactly the least the host derivation accepts
     /// for the device pools the same configuration derives, across block sizes, seats,
     /// step sizes, the draft width and device budgets.
@@ -1501,7 +1501,7 @@ mod tests {
         ],
     ];
 
-    /// The gateway's build holds a pinned DeepSeek-V4.1 deployment's per-device budgets
+    /// The sizing aid holds a DeepSeek-V4.1 deployment's per-device budgets
     /// to `cuda_kv_min_bytes` and its host tier to the devices' `cuda_kv_host_min_bytes`
     /// summed. Over the released configuration (the shared `DEEPSEEK_V41_FLASH` shapes)
     /// and the dev model's (`DEV_GROUPS`, window 48), across block sizes, context lengths,
@@ -1709,7 +1709,7 @@ mod tests {
         }
     }
 
-    /// The gateway's build bounds each device's step scratch by
+    /// The sizing aid bounds each device's step scratch by
     /// `engine_deployment::step_scratch_bytes` of the released shapes
     /// (`DEEPSEEK_V41_FLASH`'s `step_scratch`). Across contexts, step sizes (below and
     /// above a draft pass's rows), seats and draft widths, laid out by the executor
@@ -1769,7 +1769,7 @@ mod tests {
         }
     }
 
-    /// A gateway never pins a DeepSeek-V4.1 deployment the node cannot lay out. At its
+    /// The sizing aid admits no DeepSeek-V4.1 sizing the node cannot lay out. At its
     /// whole 2^20-position window, with each device's budget the most the shared check
     /// accepts (`check_device_resources`: the budget, `device_weights_bytes` and
     /// `cuda_device_reserve_bytes` exactly a B300's memory; one byte more is refused),

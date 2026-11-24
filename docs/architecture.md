@@ -76,7 +76,7 @@ Each line links to its section below, and each part to the page that describes i
 - **Eidola app** — the GUI and CLI, built on one shared core. It holds your conversations, your account secret and your anonymous credit locally, and it is the only place your account and your requests meet ([client.md](client.md#what-the-client-does-locally-by-design)).
 - **Browser** — your own browser, which the app opens for Stripe's checkout and billing pages.
 - **Gateway** — the service the app connects to. It runs the account surface and the inference surface side by side and keeps them apart, and it routes each inference request to an engine ([gateway.md](gateway.md#linked-vs-unlinked)).
-- **Engines** — Eidola's own inference engine, one model per deployment, in confidential VMs with confidential-computing GPUs ([engine.md](engine.md#where-the-model-runs)).
+- **Engines** — Eidola's own inference engine, one model per deployment, in confidential VMs, with confidential-computing GPUs when it computes on them ([engine.md](engine.md#where-the-model-runs)).
 - **Postgres** — the one shared database, outside every enclave. It holds account and billing records, and one record per spend of anonymous credit that cannot be traced to the account that paid ([anonymous-credits.md](anonymous-credits.md#what-postgres-may-hold)).
 - **Webhook receiver** — a small process that accepts Stripe's notifications and queues them.
 - **Billing worker** — a process that works through that queue, asks Stripe for the facts behind each notification, and applies purchases, refunds and disputes to the account records ([anonymous-credits.md](anonymous-credits.md#payment-reversals)).
