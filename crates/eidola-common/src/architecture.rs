@@ -46,15 +46,24 @@ pub enum Architecture {
     /// Qwen3.8-27B, text only: a dense model of 48 Gated DeltaNet and 16
     /// gated full-attention layers, with one MTP layer, on one GPU.
     Qwen38Dense27B,
+    /// Qwen3.5-2B, text only: Qwen3.8-27B's architecture at 24 layers (18
+    /// Gated DeltaNet, 6 gated full attention) of hidden size 2,048, with one
+    /// MTP layer; BF16 weights and a head tied to the embedding. Served by the
+    /// CPU executor.
+    Qwen35Dense2B,
+    /// Qwen3.5-0.8B: Qwen3.5-2B's layers at hidden size 1,024.
+    Qwen35Dense08B,
 }
 
 impl Architecture {
     /// Every architecture, implemented or not.
-    pub const ALL: [Architecture; 4] = [
+    pub const ALL: [Architecture; 6] = [
         Architecture::MimoV26Flash,
         Architecture::MimoV26Pro,
         Architecture::DeepSeekV41Flash,
         Architecture::Qwen38Dense27B,
+        Architecture::Qwen35Dense2B,
+        Architecture::Qwen35Dense08B,
     ];
 
     /// The spelling the catalog and `deployment.json` use.
@@ -64,6 +73,8 @@ impl Architecture {
             Architecture::MimoV26Pro => "MimoV26Pro",
             Architecture::DeepSeekV41Flash => "DeepSeekV41Flash",
             Architecture::Qwen38Dense27B => "Qwen38Dense27B",
+            Architecture::Qwen35Dense2B => "Qwen35Dense2B",
+            Architecture::Qwen35Dense08B => "Qwen35Dense08B",
         }
     }
 
@@ -80,6 +91,8 @@ impl Architecture {
             Architecture::MimoV26Pro => false,
             Architecture::DeepSeekV41Flash => true,
             Architecture::Qwen38Dense27B => true,
+            Architecture::Qwen35Dense2B => true,
+            Architecture::Qwen35Dense08B => true,
         }
     }
 
@@ -101,6 +114,8 @@ impl Architecture {
             ),
             Architecture::DeepSeekV41Flash => &DEEPSEEK_V41_FLASH,
             Architecture::Qwen38Dense27B => core::slice::from_ref(&QWEN38_DENSE_27B),
+            Architecture::Qwen35Dense2B => core::slice::from_ref(&QWEN35_DENSE_2B),
+            Architecture::Qwen35Dense08B => core::slice::from_ref(&QWEN35_DENSE_08B),
         }
     }
 
@@ -545,6 +560,55 @@ pub const QWEN38_DENSE_27B: Shape = Shape {
     recurrent: Some(QWEN38_DIMS),
 };
 
+/// Qwen3.5-2B's dimensions (the released `config.json`'s `text_config`): 24
+/// layers, every fourth gated full attention, Qwen3.8-27B's heads but 8 query
+/// and 2 KV heads and 16 DeltaNet value heads.
+pub const QWEN35_2B_DIMS: HybridDims = HybridDims {
+    hidden: 2048,
+    intermediate: 6144,
+    vocab: 248_320,
+    attention_layers: 6,
+    deltanet_layers: 18,
+    q_heads: 8,
+    kv_heads: 2,
+    head_dim: 256,
+    // `partial_rotary_factor` 0.25 of the 256.
+    rotary: 64,
+    k_heads: 16,
+    v_heads: 16,
+    k_dim: 128,
+    v_dim: 128,
+};
+
+/// Qwen3.5-0.8B's dimensions: Qwen3.5-2B's at hidden size 1,024 and
+/// intermediate size 3,584.
+pub const QWEN35_08B_DIMS: HybridDims = HybridDims {
+    hidden: 1024,
+    intermediate: 3584,
+    ..QWEN35_2B_DIMS
+};
+
+/// A Qwen3.5 model's numbers on one device, laid out as Qwen3.8-27B's are
+/// ([`QWEN38_DENSE_27B`]) from its dimensions. Its BF16 weights and tied head
+/// have no CUDA executor (`eidola-server-engine` refuses a `cuda` node on
+/// them before opening a device); the shape is what the shared deployment
+/// rules read for the architecture.
+const fn qwen35_shape(dims: HybridDims) -> Shape {
+    Shape {
+        global_kv_bytes_per_position: dims.kv_bytes_per_position(),
+        drafter_kv_bytes_per_position: dims.drafter_kv_bytes_per_position(),
+        rope_device_bytes_per_position: dims.rope_bytes_per_position(),
+        recurrent: Some(dims),
+        ..QWEN38_DENSE_27B
+    }
+}
+
+/// Qwen3.5-2B's numbers on one device.
+pub const QWEN35_DENSE_2B: Shape = qwen35_shape(QWEN35_2B_DIMS);
+
+/// Qwen3.5-0.8B's numbers on one device.
+pub const QWEN35_DENSE_08B: Shape = qwen35_shape(QWEN35_08B_DIMS);
+
 /// One window-KV cell of DeepSeek-V4.1: 512 FP8 codes and an E8M0 scale per
 /// 32 (`eidola-engine-cpu` → DeepSeek-V4.1 → Memory images).
 const DS_WINDOW_CELL: u64 = 512 + 512 / 32;
@@ -823,5 +887,29 @@ mod tests {
         assert_eq!(dims.rope_bytes_per_position(), 512);
         assert_eq!(shape.weights_bytes, None);
         assert_eq!(qwen.mtp_layers(), 3);
+    }
+
+    /// Qwen3.5-2B and -0.8B on one device, at the released configurations'
+    /// sizes: 6 attention layers of 2 KV heads (12 KiB of target KV a
+    /// position), the drafter's 2 KiB, and 18 DeltaNet layers of 16 value
+    /// heads in the state image.
+    #[test]
+    fn qwen35_is_one_device_with_a_recurrent_state() {
+        for (arch, hidden) in [
+            (Architecture::Qwen35Dense2B, 2048),
+            (Architecture::Qwen35Dense08B, 1024),
+        ] {
+            assert!(arch.is_implemented());
+            assert_eq!(arch.devices().len(), 1);
+            let shape = arch.shape();
+            let dims = shape.recurrent.expect("a recurrent state");
+            assert_eq!(dims.hidden, hidden);
+            assert_eq!(shape.kv_bytes_per_position(), 6 * 2 * 512 * 2);
+            assert_eq!(shape.drafter_kv_bytes_per_position, 2048);
+            assert_eq!(dims.tap_bytes(), hidden * 2);
+            assert_eq!(dims.tail_bytes_per_position(), 18 * (6144 + 32) * 4);
+            assert_eq!(shape.weights_bytes, None);
+            assert_eq!(arch.mtp_layers(), 3);
+        }
     }
 }
