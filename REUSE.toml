@@ -38,17 +38,33 @@ SPDX-License-Identifier = "AGPL-3.0-only"
 # App layer.
 [[annotations]]
 path = [
-    "crates/eidola-app-core/**",
     "crates/eidola-cli/**",
     "crates/eidola-gui/**",
     "crates/eidola-notepad/**",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
+SPDX-License-Identifier = "GPL-3.0-only"
+
+# The app layer's crates the mobile app bundle is built from: GPL-3.0-only with
+# Eidola, Inc.'s additional permission under section 7 for distribution
+# through app stores. The licence file holds the GPL text followed by the
+# permission, the single licence reference SPDX 2 prescribes for an exception
+# that is not on the SPDX list (REUSE 3.3 admits no other spelling); it becomes
+# `GPL-3.0-only WITH AdditionRef-…` once the REUSE tooling reads SPDX 3. Each
+# crate's Cargo.toml keeps `license = "GPL-3.0-only"` (Cargo takes SPDX list
+# identifiers only) and names this reference under
+# `[package.metadata.eidola] licence`, which crates/mobile-licences checks.
+[[annotations]]
+path = [
+    "crates/eidola-app-core/**",
     "crates/eidola-mobile/**",
     "crates/eidola-theme/**",
     "crates/eidola-i18n/**",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
-SPDX-License-Identifier = "GPL-3.0-only"
+SPDX-License-Identifier = "LicenseRef-Eidola-GPL-3.0-only-with-app-store-permission"
 
 # Cross-platform detached Apple-signature contract (explicitly permissive
 # because it is intended for independent verifiers and downstream consumers).
@@ -68,6 +84,14 @@ precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
 
+# The Kotlin compiler distribution's Apache-2.0 NOTICE, copied verbatim for the
+# Kotlin standard library the Android shell carries (crates/mobile-licences).
+[[annotations]]
+path = "crates/mobile-licences/notices/kotlin-*-NOTICE.txt"
+precedence = "closest"
+SPDX-FileCopyrightText = "2010-2024 JetBrains s.r.o and respective authors and developers"
+SPDX-License-Identifier = "Apache-2.0"
+
 # Documentation and website content (the site generator crate stays under the
 # repository default above).
 [[annotations]]
@@ -75,6 +99,17 @@ path = ["docs/**", "www/**"]
 precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
 SPDX-License-Identifier = "CC-BY-4.0"
+
+# The Newsreader faces the apps embed and the website serves (after the
+# website's annotation, which they override).
+[[annotations]]
+path = [
+    "crates/eidola-theme/assets/fonts/**",
+    "www/static/fonts/newsreader-*.woff2",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2020 The Newsreader Project Authors"
+SPDX-License-Identifier = "OFL-1.1"
 
 # Legal instruments of Eidola, Inc.: published for transparency, not reuse.
 [[annotations]]

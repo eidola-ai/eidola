@@ -5,6 +5,8 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
+# With Eidola, Inc.'s additional permission for app stores, named below
+# (LICENSE.md → App stores).
 license = "GPL-3.0-only"
 
 # The look the desktop and mobile apps share: the Circadian palettes, the
@@ -20,3 +22,8 @@ gpui-markdown-editor = { path = "../gpui-markdown-editor" }
 # The persisted appearance settings the palettes and schedule speak.
 eidola-app-core = { path = "../eidola-app-core", default-features = false }
 serde_json = "1"
+
+# The licence REUSE.toml declares for this crate: Cargo takes SPDX list
+# identifiers only. crates/mobile-licences reads it for the app's licences.
+[package.metadata.eidola]
+licence = "LicenseRef-Eidola-GPL-3.0-only-with-app-store-permission"

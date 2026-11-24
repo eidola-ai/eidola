@@ -19,13 +19,14 @@ about-sheet-pointer = The shell shows the digest in a sheet of its own, outside 
 about-section-source = Source
 about-licences = Licences
 about-licences-detail = Everything this app is built from
-about-source-note = Eidola’s source is available on GitHub.
+about-source-note = Eidola is free software under the GNU General Public License, version 3, with an additional permission that lets it be distributed through app stores. Its complete source code is available on GitHub, under the same licence.
 about-source = View the source ↗
 
 licences-title = Licences
 licences-intro = Eidola for phones is built from the components below, under their own licences. Tap one for its licence text.
 licences-loading = Loading…
 licences-failed = Couldn’t read the licences: { $reason }
+licences-kind-app = this app
 licences-kind-crate = Rust crate
 licences-kind-font = font
 licences-kind-icons = icons

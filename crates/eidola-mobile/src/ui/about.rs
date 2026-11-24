@@ -9,9 +9,12 @@
 //!
 //! **The licences** are the bundle's own file, `licences.json`, generated
 //! when the bundle is built (`crates/mobile-licences`) from the wasm build's
-//! dependency graph and the assets it embeds, with every licence text in it:
-//! read from this document's own origin, which the shell serves from the
-//! bundle, so nothing is fetched from anywhere else.
+//! dependency graph and the assets it embeds, with every licence text in it,
+//! the app's own first: GPL-3.0-only with the app store permission, whose
+//! clause 2(c) asks the app to tell its users so and where its source is,
+//! which About's source note also does. The file is read from this
+//! document's own origin, which the shell serves from the bundle, so nothing
+//! is fetched from anywhere else.
 
 use gpui::{
     Context, EventEmitter, InteractiveElement as _, IntoElement, ListAlignment, ListState,
@@ -208,7 +211,8 @@ pub struct Component {
     pub version: Option<String>,
     /// The licence as the component declares it (an SPDX expression).
     pub licence: String,
-    /// What it is: a crate in the wasm build, or an asset it embeds.
+    /// What it is: the app itself, a crate in the wasm build, an asset it
+    /// embeds, or the Android shell's dependency.
     pub kind: String,
     /// Indices into [`Licences::texts`].
     pub texts: Vec<usize>,
@@ -281,6 +285,7 @@ impl LicencesView {
             None => component.name.clone(),
         };
         let kind = match component.kind.as_str() {
+            "app" => msg::licences_kind_app(cx),
             "crate" => msg::licences_kind_crate(cx),
             "font" => msg::licences_kind_font(cx),
             "icons" => msg::licences_kind_icons(cx),
