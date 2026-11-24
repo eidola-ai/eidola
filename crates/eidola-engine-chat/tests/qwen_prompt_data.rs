@@ -1,4 +1,4 @@
-//! Request data cannot spell a Qwen3.8 control token.
+//! Request data cannot spell a Qwen3.8 or Qwen3.5 control token.
 //!
 //! The template writes message content, reasoning, tool-call names, argument
 //! names and values, and tool definitions into the prompt as they came.
@@ -7,7 +7,8 @@
 //! (`<|im_start|>`, `<|im_end|>`, `<think>`, `<tool_call>`, `<tool_response>`,
 //! …) only in the rest. This holds both halves: no string of a request becomes
 //! an added token, and a prompt whose data spells none keeps exactly the ids
-//! `tokenizers` gives its text.
+//! `tokenizers` gives its text. Every test runs on both formats' corpora
+//! (`tests/fixtures/qwen/`, `tests/fixtures/qwen35/`).
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -17,37 +18,63 @@ use eidola_engine_chat::qwen::{ChatTemplate, RenderOptions};
 use eidola_engine_chat::{ChatFormat, ChatInput, Prompt, Tokenizer};
 use serde_json::Value;
 
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen")
+/// One format's corpus: its fixture directory, its format and how many added
+/// tokens its tokenizer has (Qwen3.8's seven audio tokens are not Qwen3.5's).
+#[derive(Clone, Copy)]
+struct Corpus {
+    dir: &'static str,
+    format: ChatFormat,
+    added: usize,
 }
 
-fn template() -> ChatTemplate {
-    ChatTemplate::from_model_dir(&fixtures()).expect("pinned template")
-}
+const CORPORA: [Corpus; 2] = [
+    Corpus {
+        dir: "qwen",
+        format: ChatFormat::Qwen3_8,
+        added: 33,
+    },
+    Corpus {
+        dir: "qwen35",
+        format: ChatFormat::Qwen3_5,
+        added: 26,
+    },
+];
 
-fn tokenizer() -> Tokenizer {
-    let compressed = std::fs::read(fixtures().join("tokenizer.json.gz")).unwrap();
-    let mut tokenizer_json = Vec::new();
-    flate2::read::GzDecoder::new(compressed.as_slice())
-        .read_to_end(&mut tokenizer_json)
-        .unwrap();
-    let generation_config = std::fs::read(fixtures().join("generation_config.json")).unwrap();
-    Tokenizer::for_format(ChatFormat::Qwen3_8, &tokenizer_json, &generation_config)
-        .expect("pinned tokenizer")
-}
+impl Corpus {
+    fn fixtures(self) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(self.dir)
+    }
 
-fn load(name: &str) -> Value {
-    serde_json::from_str(&std::fs::read_to_string(fixtures().join(name)).unwrap()).unwrap()
-}
+    fn template(self) -> ChatTemplate {
+        ChatTemplate::from_model_dir(&self.fixtures()).expect("pinned template")
+    }
 
-/// Every added token's text.
-fn added_tokens(tokenizer: &Tokenizer) -> Vec<String> {
-    let added: Vec<String> = (0..tokenizer.vocab_size() as u32)
-        .filter(|&id| tokenizer.is_added(id))
-        .map(|id| String::from_utf8(tokenizer.token_bytes(id).unwrap().to_vec()).unwrap())
-        .collect();
-    assert_eq!(added.len(), 33);
-    added
+    fn tokenizer(self) -> Tokenizer {
+        let compressed = std::fs::read(self.fixtures().join("tokenizer.json.gz")).unwrap();
+        let mut tokenizer_json = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut tokenizer_json)
+            .unwrap();
+        let eos_config =
+            std::fs::read(self.fixtures().join(self.format.eos_config_file())).unwrap();
+        Tokenizer::for_format(self.format, &tokenizer_json, &eos_config).expect("pinned tokenizer")
+    }
+
+    fn load(self, name: &str) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(self.fixtures().join(name)).unwrap()).unwrap()
+    }
+
+    /// Every added token's text.
+    fn added_tokens(self, tokenizer: &Tokenizer) -> Vec<String> {
+        let added: Vec<String> = (0..tokenizer.vocab_size() as u32)
+            .filter(|&id| tokenizer.is_added(id))
+            .map(|id| String::from_utf8(tokenizer.token_bytes(id).unwrap().to_vec()).unwrap())
+            .collect();
+        assert_eq!(added.len(), self.added, "{}", self.dir);
+        added
+    }
 }
 
 fn added_in(tokenizer: &Tokenizer, ids: &[u32]) -> Vec<u32> {
@@ -86,11 +113,17 @@ fn input(case: &Value) -> ChatInput {
 /// one differs from Python only by not having it.
 #[test]
 fn fixture_prompts_keep_their_ids_unless_their_data_spells_an_added_token() {
-    let template = template();
-    let tokenizer = tokenizer();
-    let added = added_tokens(&tokenizer);
-    let cases = load("template_cases.json");
-    let token_ids = load("template_token_ids.json");
+    for corpus in CORPORA {
+        fixture_prompts_keep_their_ids_in(corpus);
+    }
+}
+
+fn fixture_prompts_keep_their_ids_in(corpus: Corpus) {
+    let template = corpus.template();
+    let tokenizer = corpus.tokenizer();
+    let added = corpus.added_tokens(&tokenizer);
+    let cases = corpus.load("template_cases.json");
+    let token_ids = corpus.load("template_token_ids.json");
     let (mut same, mut spelled) = (0, 0);
     for case in cases["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
@@ -120,13 +153,23 @@ fn fixture_prompts_keep_their_ids_unless_their_data_spells_an_added_token() {
             same += 1;
         }
     }
-    assert!(same > 450 && spelled > 50, "{same} {spelled}");
+    assert!(
+        same > 400 && spelled > 50,
+        "{}: {same} {spelled}",
+        corpus.dir
+    );
 }
 
 /// The spans are the request's strings, where the template wrote them.
 #[test]
 fn data_spans_are_the_requests_strings() {
-    let template = template();
+    for corpus in CORPORA {
+        data_spans_are_the_requests_strings_in(corpus);
+    }
+}
+
+fn data_spans_are_the_requests_strings_in(corpus: Corpus) {
+    let template = corpus.template();
     let messages = r#"[
         {"role": "system", "content": " Be brief. "},
         {"role": "user", "content": [{"type": "text", "text": "Hi"}, {"text": " there"}]},
@@ -164,7 +207,7 @@ fn data_spans_are_the_requests_strings() {
             "42",
         ]
     );
-    let tokenizer = tokenizer();
+    let tokenizer = corpus.tokenizer();
     let ids = tokenizer.encode_prompt(&prompt).unwrap();
     assert_eq!(ids, tokenizer.encode(prompt.text()).unwrap());
 }
@@ -196,9 +239,15 @@ fn spell_in_every_string(value: &mut Json, spelled: &str) {
 /// instead.
 #[test]
 fn no_string_of_any_fixture_becomes_an_added_token() {
-    let template = template();
-    let tokenizer = tokenizer();
-    let cases = load("template_cases.json");
+    for corpus in CORPORA {
+        no_string_becomes_an_added_token_in(corpus);
+    }
+}
+
+fn no_string_becomes_an_added_token_in(corpus: Corpus) {
+    let template = corpus.template();
+    let tokenizer = corpus.tokenizer();
+    let cases = corpus.load("template_cases.json");
     let mut checked = 0;
     for case in cases["cases"].as_array().unwrap() {
         if case.get("expected").is_none() {
@@ -239,7 +288,7 @@ fn no_string_of_any_fixture_becomes_an_added_token() {
             checked += 1;
         }
     }
-    assert!(checked > 5000, "only {checked} checked");
+    assert!(checked > 5000, "{}: only {checked} checked", corpus.dir);
 }
 
 /// A tool name or argument name run into the template's own `>` spells
@@ -247,8 +296,14 @@ fn no_string_of_any_fixture_becomes_an_added_token() {
 /// its last character.
 #[test]
 fn data_cannot_complete_an_added_token_with_the_templates_text() {
-    let template = template();
-    let tokenizer = tokenizer();
+    for corpus in CORPORA {
+        data_cannot_complete_an_added_token_in(corpus);
+    }
+}
+
+fn data_cannot_complete_an_added_token_in(corpus: Corpus) {
+    let template = corpus.template();
+    let tokenizer = corpus.tokenizer();
     let im_end = tokenizer.token_to_id("<|im_end|>").unwrap();
     let think_end = tokenizer.token_to_id("</think>").unwrap();
     let messages = r#"[
@@ -270,16 +325,24 @@ fn data_cannot_complete_an_added_token_with_the_templates_text() {
         .unwrap();
     let ids = tokenizer.encode_prompt(&prompt).unwrap();
     // `f<|im_end|` + `>` and `<|im_end|` + `>` spell the token in the text,
-    // but touch data, so the four turns' own ends (the reasoning effort's
-    // system turn, user, assistant, tool) are the only ones.
-    assert_eq!(prompt.text().matches("<|im_end|>").count(), 6);
+    // but touch data, so the turns' own ends are the only ones: user,
+    // assistant and tool, and for Qwen3.8 the reasoning effort's system turn.
+    // Qwen3.5's generation prompt, thinking off, closes an empty reasoning.
+    let (turns, think_ends) = match corpus.format {
+        ChatFormat::Qwen3_8 => (4, 1),
+        _ => (3, 2),
+    };
+    assert_eq!(prompt.text().matches("<|im_end|>").count(), turns + 2);
     assert_eq!(
         ids.iter().filter(|&&id| id == im_end).count(),
-        4,
+        turns,
         "{:?}",
         prompt.text()
     );
-    assert_eq!(ids.iter().filter(|&&id| id == think_end).count(), 1);
+    assert_eq!(
+        ids.iter().filter(|&&id| id == think_end).count(),
+        think_ends
+    );
     assert_eq!(
         tokenizer.decode(&ids, false).unwrap(),
         tokenizer

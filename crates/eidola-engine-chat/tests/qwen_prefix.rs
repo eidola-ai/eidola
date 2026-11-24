@@ -24,12 +24,19 @@
 //!   the prompt less its last token.
 //! - A changed thinking switch or reasoning effort changes the system turn the
 //!   prompt starts with.
+//!
+//! Qwen3.5's template renders the reasoning only of the turns after the last
+//! user query, so it behaves as Qwen3.8's with `preserve_thinking` off: within
+//! a user turn (a tool loop) the next prompt extends this one and its output,
+//! and a new user message's prompt extends the turn's first request only to its
+//! generation header (two tokens before its end with thinking on, four with it
+//! off, its default).
 
 use std::io::Read;
 use std::path::PathBuf;
 
 use eidola_engine_chat::json;
-use eidola_engine_chat::qwen::{ChatTemplate, RenderOptions};
+use eidola_engine_chat::qwen::{ChatTemplate, RenderOptions, TemplateKind};
 use eidola_engine_chat::{
     ChatDelta, ChatFormat, ChatInput, OutputConfig, OutputParser, PrefixedCallIds, StopCause,
     Tokenizer, ToolSchemas,
@@ -38,24 +45,31 @@ use serde_json::{Value, json};
 
 const TOOLS: &str = r#"[{"type": "function", "function": {"name": "bash", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}}}}]"#;
 
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen")
+fn fixtures(format: ChatFormat) -> PathBuf {
+    let dir = match format {
+        ChatFormat::Qwen3_8 => "qwen",
+        _ => "qwen35",
+    };
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(dir)
 }
 
-fn tokenizer() -> Tokenizer {
-    let compressed = std::fs::read(fixtures().join("tokenizer.json.gz")).unwrap();
+fn tokenizer(format: ChatFormat) -> Tokenizer {
+    let compressed = std::fs::read(fixtures(format).join("tokenizer.json.gz")).unwrap();
     let mut tokenizer_json = Vec::new();
     flate2::read::GzDecoder::new(compressed.as_slice())
         .read_to_end(&mut tokenizer_json)
         .unwrap();
-    let config = std::fs::read(fixtures().join("generation_config.json")).unwrap();
-    Tokenizer::for_format(ChatFormat::Qwen3_8, &tokenizer_json, &config).unwrap()
+    let config = std::fs::read(fixtures(format).join(format.eos_config_file())).unwrap();
+    Tokenizer::for_format(format, &tokenizer_json, &config).unwrap()
 }
 
 struct Session {
     template: ChatTemplate,
     tokenizer: Tokenizer,
     options: RenderOptions,
+    format: ChatFormat,
 }
 
 /// What the model writes in a turn.
@@ -75,16 +89,29 @@ fn reply(reasoning: &'static str, content: &'static str, calls: &[Value]) -> Rep
 
 impl Session {
     fn new(thinking: Option<bool>, preserve: Option<bool>) -> Session {
+        Session::of(ChatFormat::Qwen3_8, thinking, preserve)
+    }
+
+    fn qwen35(thinking: Option<bool>) -> Session {
+        Session::of(ChatFormat::Qwen3_5, thinking, None)
+    }
+
+    fn of(format: ChatFormat, thinking: Option<bool>, preserve: Option<bool>) -> Session {
         Session {
-            template: ChatTemplate::from_model_dir(&fixtures()).unwrap(),
-            tokenizer: tokenizer(),
+            template: ChatTemplate::from_model_dir(&fixtures(format)).unwrap(),
+            tokenizer: tokenizer(format),
             options: RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: thinking,
                 preserve_thinking: preserve,
                 reasoning_effort: None,
             },
+            format,
         }
+    }
+
+    fn thinks(&self) -> bool {
+        self.template.kind().thinks(self.options.enable_thinking)
     }
 
     fn input(messages: &[Value]) -> ChatInput {
@@ -103,7 +130,7 @@ impl Session {
     /// The text the model writes after `messages`' generation prompt: the
     /// template's rendering of `reply`, without the end-of-turn token.
     fn output(&self, messages: &[Value], reply: &Reply) -> String {
-        let thinking = self.options.enable_thinking != Some(false);
+        let thinking = self.thinks();
         let mut assistant = json!({"role": "assistant", "content": reply.content});
         if thinking {
             assistant["reasoning_content"] = reply.reasoning.into();
@@ -127,13 +154,12 @@ impl Session {
 
     /// The assistant message a client sends back: what the parser gave out.
     fn history(&self, output: &str, with_reasoning: bool) -> Value {
-        let mut parser = OutputParser::new(
-            OutputConfig::qwen3_8(
-                self.options.enable_thinking,
-                Some(ToolSchemas::from_tools(&json::parse(TOOLS).unwrap())),
-            ),
-            PrefixedCallIds("call_".into()),
-        );
+        let tools = Some(ToolSchemas::from_tools(&json::parse(TOOLS).unwrap()));
+        let config = match self.template.kind() {
+            TemplateKind::Qwen3_8 => OutputConfig::qwen3_8(self.options.enable_thinking, tools),
+            TemplateKind::Qwen3_5 => OutputConfig::qwen3_5(self.options.enable_thinking, tools),
+        };
+        let mut parser = OutputParser::new(config, PrefixedCallIds("call_".into()));
         let mut d = parser.push_text(output);
         let rest = parser.finish(StopCause::EndOfSequence).0;
         d.reasoning_content.push_str(&rest.reasoning_content);
@@ -156,11 +182,7 @@ impl Session {
 
     /// The generation prompt's tokens a later render may change.
     fn header_tail(&self) -> usize {
-        if self.options.enable_thinking == Some(false) {
-            4
-        } else {
-            2
-        }
+        if self.thinks() { 2 } else { 4 }
     }
 }
 
@@ -375,4 +397,57 @@ fn changing_the_thinking_switch_changes_the_system_turn() {
         .count();
     assert_eq!(&on[..shared], "<|im_start|>system\n");
     assert!(on[shared..].starts_with("Reasoning effort is set to xhigh."));
+}
+
+/// Qwen3.5, thinking off (its default) and on: a tool loop's next prompt
+/// extends this one and its output; a new user message's extends the user
+/// turn's first request to its generation header.
+#[test]
+fn qwen35_the_next_prompt_extends_this_one_only_within_a_user_turn() {
+    for thinking in [None, Some(true)] {
+        let session = Session::qwen35(thinking);
+        assert_eq!(session.format, ChatFormat::Qwen3_5);
+        let start = vec![
+            json!({"role": "system", "content": "You are terse."}),
+            user("What is in this directory?"),
+        ];
+        converse(
+            &session,
+            start,
+            agentic_conversation(true, thinking != Some(true)),
+            true,
+        );
+    }
+}
+
+/// Qwen3.5 with thinking on: a client that drops the reasoning in a tool loop
+/// keeps the prompt less its last token; with thinking off there is none to
+/// drop.
+#[test]
+fn qwen35_a_client_that_drops_the_reasoning_keeps_only_the_prompt() {
+    let session = Session::qwen35(Some(true));
+    let start = [
+        user("List it."),
+        json!({"role": "assistant", "content": "", "tool_calls": [bash("ls")]}),
+        tool("a"),
+    ];
+    let (prompt, ids) = session.prompt(&start);
+    let output = session.output(&start, &reply("Read a.", "", &[bash("cat a")]));
+    let mut messages = start.to_vec();
+    messages.push(session.history(&output, false));
+    messages.push(tool("A"));
+    let (next, next_ids) = session.prompt(&messages);
+    assert!(next.starts_with(&prompt) && !next.starts_with(&format!("{prompt}{output}")));
+    assert_eq!(common_prefix(&ids, &next_ids), ids.len() - 1);
+
+    converse(
+        &Session::qwen35(None),
+        vec![user("Hi")],
+        vec![(
+            reply("", "Let me look.", &[bash("ls")]),
+            vec![tool("a")],
+            Extends::Whole,
+        )],
+        false,
+    );
 }

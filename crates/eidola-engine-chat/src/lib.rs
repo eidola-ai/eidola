@@ -30,10 +30,11 @@
 //! [`Tokenizer`] loaded with [`Tokenizer::for_format`], and an
 //! [`OutputParser`] configured with [`OutputConfig::deepseek_v4_1`].
 //!
-//! A Qwen3.8 request takes MiMo's steps through [`qwen`]: the model's own
-//! template ([`qwen::ChatTemplate`], which decodes string tool-call arguments
-//! itself), a [`Tokenizer`] loaded with [`Tokenizer::for_format`], and an
-//! [`OutputParser`] configured with [`OutputConfig::qwen3_8`].
+//! A Qwen3.8 or Qwen3.5 request takes MiMo's steps through [`qwen`]: the
+//! model's own template ([`qwen::ChatTemplate`], which decodes string
+//! tool-call arguments itself), a [`Tokenizer`] loaded with
+//! [`Tokenizer::for_format`], and an [`OutputParser`] configured with
+//! [`OutputConfig::qwen3_8`] or [`OutputConfig::qwen3_5`].
 
 pub mod args;
 pub mod deepseek;

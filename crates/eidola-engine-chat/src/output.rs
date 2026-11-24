@@ -129,6 +129,19 @@ impl OutputConfig {
         }
     }
 
+    /// The configuration for a Qwen3.5 response to a prompt rendered with
+    /// [`crate::qwen::RenderOptions::enable_thinking`] as `enable_thinking`:
+    /// Qwen3.8's markup and parsers, the output in the reasoning only when the
+    /// prompt opened it (`Some(true)`; Qwen3.5 does not think by default). A
+    /// Qwen3.5 response is never continuable.
+    pub fn qwen3_5(enable_thinking: Option<bool>, tools: Option<ToolSchemas>) -> OutputConfig {
+        OutputConfig {
+            thinking: enable_thinking == Some(true),
+            format: ChatFormat::Qwen3_5,
+            ..OutputConfig::new(enable_thinking, tools)
+        }
+    }
+
     /// The same configuration for the output of a prompt rendered with
     /// `continue_final_message` set to `field`.
     pub fn continuing_in(mut self, field: Option<&'static str>) -> OutputConfig {
@@ -263,10 +276,10 @@ impl OutputParser {
         OutputParser {
             detok: Detokenizer::new(config.skip_special_tokens),
             reasoning: match (config.format, config.continuing) {
-                (ChatFormat::MimoV2_6 | ChatFormat::Qwen3_8, None) => {
+                (ChatFormat::MimoV2_6 | ChatFormat::Qwen3_8 | ChatFormat::Qwen3_5, None) => {
                     Reasoning::Think(ReasoningParser::new(config.thinking))
                 }
-                (ChatFormat::MimoV2_6 | ChatFormat::Qwen3_8, Some(field)) => {
+                (ChatFormat::MimoV2_6 | ChatFormat::Qwen3_8 | ChatFormat::Qwen3_5, Some(field)) => {
                     Reasoning::Think(ReasoningParser::resuming(field == "reasoning_content"))
                 }
                 (ChatFormat::DeepSeekV4_1, None) => {
@@ -278,7 +291,7 @@ impl OutputParser {
             },
             tools: config.tools.map(|schemas| match config.format {
                 ChatFormat::MimoV2_6 => Tools::Xml(ToolCallParser::new(schemas, ids)),
-                ChatFormat::Qwen3_8 => {
+                ChatFormat::Qwen3_8 | ChatFormat::Qwen3_5 => {
                     Tools::Xml(ToolCallParser::in_markup(Markup::Newlines, schemas, ids))
                 }
                 ChatFormat::DeepSeekV4_1 => Tools::DeepSeek(DsmlParser::new(schemas, ids)),

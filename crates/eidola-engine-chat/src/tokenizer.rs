@@ -50,6 +50,17 @@ pub const QWEN3_8_TOKENIZER_SHA256: &str =
 /// Every Qwen3.8 `tokenizer.json` this crate will load.
 pub const PINNED_QWEN3_8_TOKENIZER_SHA256: &[&str] = &[QWEN3_8_TOKENIZER_SHA256];
 
+/// SHA-256 of the `tokenizer.json` Qwen3.5-2B and Qwen3.5-0.8B share:
+/// Qwen3.8-27B's vocabulary and merges without its seven audio tokens.
+pub const QWEN3_5_TOKENIZER_SHA256: &str =
+    "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42";
+
+/// Every Qwen3.5 `tokenizer.json` this crate will load.
+pub const PINNED_QWEN3_5_TOKENIZER_SHA256: &[&str] = &[QWEN3_5_TOKENIZER_SHA256];
+
+/// The token that ends every turn of the Qwen formats' templates.
+const QWEN_TURN_END: &str = "<|im_end|>";
+
 /// The tokenizer of a MiMo model: [`Tokenizer`] loaded through its MiMo
 /// constructors.
 pub type MimoTokenizer = Tokenizer;
@@ -130,7 +141,33 @@ impl Tokenizer {
                 sha256,
             });
         }
-        Tokenizer::build(tokenizer_json, eos_config_json, sha256)
+        match format {
+            ChatFormat::Qwen3_5 => {
+                // The checkpoint's `config.json` names `<|endoftext|>`; the template
+                // ends every turn with `<|im_end|>`, which the tokenizer's own config
+                // names as its end of sequence and serving stacks stop on.
+                let config = parse_eos_at(eos_config_json, CONFIG_FILE, &["text_config"])?;
+                let mut t = Tokenizer::build(tokenizer_json, config, CONFIG_FILE, sha256)?;
+                let turn_end = t
+                    .inner
+                    .token_to_id(QWEN_TURN_END)
+                    .filter(|&id| t.is_special(id))
+                    .ok_or_else(|| {
+                        ChatError::InvalidArtifact(format!(
+                            "tokenizer.json: no special {QWEN_TURN_END} token"
+                        ))
+                    })?;
+                if !t.eos.contains(&turn_end) {
+                    t.eos.insert(0, turn_end);
+                }
+                Ok(t)
+            }
+            _ => {
+                let file = format.eos_config_file();
+                let eos = parse_eos_at(eos_config_json, file, &[])?;
+                Tokenizer::build(tokenizer_json, eos, file, sha256)
+            }
+        }
     }
 
     /// Like [`MimoTokenizer::from_bytes`] without the pin, for synthetic test
@@ -141,17 +178,20 @@ impl Tokenizer {
         generation_config_json: &[u8],
     ) -> Result<MimoTokenizer, ChatError> {
         let sha256 = sha256_hex(tokenizer_json);
-        Tokenizer::build(tokenizer_json, generation_config_json, sha256)
+        let eos = parse_eos_at(generation_config_json, GENERATION_CONFIG_FILE, &[])?;
+        Tokenizer::build(tokenizer_json, eos, GENERATION_CONFIG_FILE, sha256)
     }
 
+    /// The tokenizer of `tokenizer_json` with end-of-sequence ids `eos`, read from
+    /// `eos_file`.
     fn build(
         tokenizer_json: &[u8],
-        generation_config_json: &[u8],
+        eos: Vec<u32>,
+        eos_file: &str,
         sha256: String,
     ) -> Result<Tokenizer, ChatError> {
         let inner = tokenizers::Tokenizer::from_bytes(tokenizer_json)
             .map_err(|e| ChatError::InvalidArtifact(format!("tokenizer.json: {e}")))?;
-        let eos = parse_eos(generation_config_json)?;
 
         let char_bytes = byte_level_decoder_table();
         let vocab = inner.get_vocab(true);
@@ -213,7 +253,7 @@ impl Tokenizer {
         for &id in &eos {
             if id as usize >= size {
                 return Err(ChatError::InvalidArtifact(format!(
-                    "generation_config.json: eos id {id} is outside the vocabulary"
+                    "{eos_file}: eos id {id} is outside the vocabulary"
                 )));
             }
         }
@@ -443,10 +483,17 @@ fn tokenization_failed(e: impl std::fmt::Display) -> ChatError {
     ChatError::InvalidInput(format!("tokenization failed: {e}"))
 }
 
-fn parse_eos(generation_config_json: &[u8]) -> Result<Vec<u32>, ChatError> {
-    let invalid = |m: &str| ChatError::InvalidArtifact(format!("generation_config.json: {m}"));
-    let config: serde_json::Value =
-        serde_json::from_slice(generation_config_json).map_err(|e| invalid(&e.to_string()))?;
+/// The `eos_token_id` of `file` (its contents `json`), under the members `path`.
+fn parse_eos_at(json: &[u8], file: &str, path: &[&str]) -> Result<Vec<u32>, ChatError> {
+    let invalid = |m: &str| ChatError::InvalidArtifact(format!("{file}: {m}"));
+    let mut config: serde_json::Value =
+        serde_json::from_slice(json).map_err(|e| invalid(&e.to_string()))?;
+    for member in path {
+        config = config
+            .get_mut(*member)
+            .map(serde_json::Value::take)
+            .ok_or_else(|| invalid(&format!("missing {member}")))?;
+    }
     let as_id = |v: &serde_json::Value| {
         v.as_u64()
             .and_then(|n| u32::try_from(n).ok())
@@ -1180,32 +1227,52 @@ mod reference_tests {
         assert_eq!(t.decode(&served, false).unwrap(), text);
     }
 
-    fn qwen() -> Tokenizer {
-        let dir = fixtures_dir().join("qwen");
+    /// The Qwen formats' fixture directories, formats, added-token counts and
+    /// vocabulary sizes: Qwen3.8-27B's tokenizer is Qwen3.5's with seven audio
+    /// tokens added.
+    const QWEN: [(&str, ChatFormat, usize, usize); 2] = [
+        ("qwen", ChatFormat::Qwen3_8, 33, 248_077),
+        ("qwen35", ChatFormat::Qwen3_5, 26, 248_070),
+    ];
+
+    fn qwen_in(dir: &str, format: ChatFormat) -> Tokenizer {
+        let dir = fixtures_dir().join(dir);
         let compressed = std::fs::read(dir.join("tokenizer.json.gz")).unwrap();
         let mut tokenizer_json = Vec::new();
         flate2::read::GzDecoder::new(compressed.as_slice())
             .read_to_end(&mut tokenizer_json)
             .unwrap();
-        let config = std::fs::read(dir.join(GENERATION_CONFIG_FILE)).unwrap();
+        let config = std::fs::read(dir.join(format.eos_config_file())).unwrap();
         // Each format's pin refuses the others' tokenizers.
-        for other in [ChatFormat::MimoV2_6, ChatFormat::DeepSeekV4_1] {
-            assert!(matches!(
-                Tokenizer::for_format(other, &tokenizer_json, &config),
-                Err(ChatError::UnpinnedArtifact { .. })
-            ));
+        for other in [
+            ChatFormat::MimoV2_6,
+            ChatFormat::DeepSeekV4_1,
+            ChatFormat::Qwen3_8,
+            ChatFormat::Qwen3_5,
+        ] {
+            if other != format {
+                assert!(matches!(
+                    Tokenizer::for_format(other, &tokenizer_json, &config),
+                    Err(ChatError::UnpinnedArtifact { .. })
+                ));
+            }
         }
-        Tokenizer::for_format(ChatFormat::Qwen3_8, &tokenizer_json, &config)
-            .expect("pinned tokenizer")
+        Tokenizer::for_format(format, &tokenizer_json, &config).expect("pinned tokenizer")
     }
 
-    /// Every Qwen3.8 fixture prompt and a few hundred strings encode to
-    /// Python's ids, and request data's plain encoding is Python's wherever it
-    /// spells no added token.
+    /// Every Qwen3.8 and Qwen3.5 fixture prompt and a few hundred strings
+    /// encode to Python's ids, and request data's plain encoding is Python's
+    /// wherever it spells no added token.
     #[test]
     fn qwen_encodes_like_python_tokenizers() {
-        let t = qwen();
-        let dir = fixtures_dir().join("qwen");
+        for (dir, format, added, _) in QWEN {
+            qwen_encodes_like_python_in(dir, format, added);
+        }
+    }
+
+    fn qwen_encodes_like_python_in(dir: &str, format: ChatFormat, added_tokens: usize) {
+        let t = qwen_in(dir, format);
+        let dir = fixtures_dir().join(dir);
         let fixtures: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("template_token_ids.json")).unwrap(),
         )
@@ -1236,7 +1303,7 @@ mod reference_tests {
             .filter(|&id| t.is_added(id))
             .map(|id| t.decode(&[id], false).unwrap())
             .collect();
-        assert_eq!(added.len(), 33);
+        assert_eq!(added.len(), added_tokens);
         let mut strings = 0;
         for pair in fixtures["strings"].as_array().unwrap() {
             let text = pair[0].as_str().unwrap();
@@ -1259,18 +1326,26 @@ mod reference_tests {
         assert!(prompts > 500 && strings > 400, "{prompts} {strings}");
     }
 
-    /// The vocabulary is dense: 248,044 base ids and 33 added tokens; the
-    /// model's head is padded past them. Both end-of-sequence ids are special,
-    /// and the format's markers are not, so they reach the parsers as text.
+    /// The vocabulary is dense: 248,044 base ids and 33 added tokens (26 for
+    /// Qwen3.5); the model's head is padded past them. Both end-of-sequence
+    /// ids are special (Qwen3.5's `<|im_end|>` from the format, its
+    /// `<|endoftext|>` from `config.json`), and the format's markers are not,
+    /// so they reach the parsers as text.
     #[test]
     fn qwen_vocabulary_and_decode_table() {
-        let t = qwen();
-        assert_eq!(t.vocab_size(), 248_077);
+        for (dir, format, _, vocab) in QWEN {
+            qwen_vocabulary_in(dir, format, vocab);
+        }
+    }
+
+    fn qwen_vocabulary_in(dir: &str, format: ChatFormat, vocab: usize) {
+        let t = qwen_in(dir, format);
+        assert_eq!(t.vocab_size(), vocab);
         assert_eq!(t.eos_token_ids(), &[248_046, 248_044]);
         assert_eq!(t.token_to_id("<|im_end|>"), Some(248_046));
         assert_eq!(t.token_to_id("<|endoftext|>"), Some(248_044));
         assert!(t.is_special(248_046) && t.is_special(248_044));
-        assert_eq!(t.token_bytes(248_077), None);
+        assert_eq!(t.token_bytes(vocab as u32), None);
         for marker in [
             "<think>",
             "</think>",
