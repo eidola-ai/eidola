@@ -288,6 +288,7 @@ pub struct LedgerEntry {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_key_id: Option<String>,
+    /// This ledger row's contribution to an issuance, which may span multiple purchase lots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_credits: Option<i64>,
 }
@@ -341,7 +342,7 @@ pub(crate) fn missing_documents<'a>(
 
 /// Gate for purchases and credential issuance: the account must have
 /// accepted every required document at (or above) the cluster-wide
-/// required version (the `required_document` table, advanced by the
+/// required version (the `required_document_version` table, advanced by the
 /// terms-feed poller and/or the startup env seed). A no-op when the table
 /// is empty (gate disabled).
 pub(crate) async fn ensure_terms_accepted(

@@ -732,7 +732,7 @@ impl SpaceView {
             return true;
         }
         match self.stores.space_settings.read(cx).settings(id).value() {
-            Some(settings) => settings.notebook_participant_id.is_some(),
+            Some(settings) => settings.notebook_owner_participant_id.is_some(),
             None => false,
         }
     }

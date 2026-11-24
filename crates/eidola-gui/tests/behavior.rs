@@ -17249,7 +17249,7 @@ fn inspector_a_notebook_offers_no_grant_door(cx: &mut TestAppContext) {
         stores.space_settings.read_with(cx, |s, _| {
             s.settings(&notebook)
                 .value()
-                .is_some_and(|s| s.notebook_participant_id.is_some())
+                .is_some_and(|s| s.notebook_owner_participant_id.is_some())
         })
     });
     assert!(
@@ -17434,7 +17434,7 @@ fn inspector_withholds_the_grant_door_until_the_settings_say_what_this_space_is(
         stores.space_settings.read_with(cx, |s, _| {
             s.settings(&notebook)
                 .value()
-                .is_some_and(|s| s.notebook_participant_id.is_some())
+                .is_some_and(|s| s.notebook_owner_participant_id.is_some())
         })
     });
     draw_window(cx, window);
@@ -18100,7 +18100,7 @@ fn a_watching_reader_may_quote_elsewhere_but_not_here(cx: &mut TestAppContext) {
         s.space_settings = Some((
             "s".to_string(),
             eidola_app_core::SpaceSettings {
-                notebook_participant_id: None,
+                notebook_owner_participant_id: None,
                 ..Default::default()
             },
         ));

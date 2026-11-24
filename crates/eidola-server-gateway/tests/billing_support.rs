@@ -90,7 +90,7 @@ impl TestDb {
             .unwrap()
             .to_string();
         self.pool.get().await.unwrap().execute(
-            "INSERT INTO account (id, secret_hash, stripe_customer_id, billing_state) VALUES ($1,$2,$3,$4)",
+            "INSERT INTO account (id, secret_hash, stripe_customer_id, billing_state, billing_close_requested_at) VALUES ($1,$2,$3,$4,CASE WHEN $4 = 'open' THEN NULL ELSE clock_timestamp() END)",
             &[&id,&hash,&customer,&state],
         ).await.unwrap();
         id
@@ -117,6 +117,115 @@ fn auth(account: Uuid) -> String {
         "Basic {}",
         base64::engine::general_purpose::STANDARD.encode(format!("{account}:{ACCOUNT_SECRET}"))
     )
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn acceptance_is_bound_to_the_exact_document_version_and_keeps_history() {
+    use eidola_server_gateway::db::{self, RequiredDocumentRow};
+
+    let fixture = TestDb::new().await;
+    let account = fixture.account("cus_terms", "open").await;
+    let first = RequiredDocumentRow {
+        document: "terms_of_service".into(),
+        version: 1,
+        sha256: "a".repeat(64),
+        url: "https://example.test/terms".into(),
+    };
+    db::record_required_document(&fixture.pool, &first)
+        .await
+        .unwrap();
+    for (document, version, hash) in [
+        ("terms_of_service", 2, first.sha256.clone()),
+        ("terms_of_service", 1, "b".repeat(64)),
+        ("privacy_policy", 1, first.sha256.clone()),
+    ] {
+        assert!(
+            db::insert_acceptance(&fixture.pool, account, document, version, &hash)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        db::get_accepted_versions(&fixture.pool, account)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let app = router(fixture.state(None));
+    let accept = |hash: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/account/terms")
+            .header("authorization", auth(account))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"document":"terms_of_service","sha256":hash}).to_string(),
+            ))
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone()
+            .oneshot(accept(&first.sha256))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let c = fixture.pool.get().await.unwrap();
+    let read = "SELECT accepted_at FROM account_acceptance WHERE account_id=$1 AND version=1";
+    let accepted: SystemTime = c.query_one(read, &[&account]).await.unwrap().get(0);
+    assert_eq!(
+        app.clone()
+            .oneshot(accept(&first.sha256))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        c.query_one(read, &[&account])
+            .await
+            .unwrap()
+            .get::<_, SystemTime>(0),
+        accepted
+    );
+
+    let second = RequiredDocumentRow {
+        version: 2,
+        sha256: "b".repeat(64),
+        ..first.clone()
+    };
+    db::record_required_document(&fixture.pool, &second)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(accept(&first.sha256))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.oneshot(accept(&second.sha256)).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        db::get_accepted_versions(&fixture.pool, account)
+            .await
+            .unwrap(),
+        [("terms_of_service".into(), 2)]
+    );
+    assert_eq!(
+        c.query_one(read, &[&account])
+            .await
+            .unwrap()
+            .get::<_, SystemTime>(0),
+        accepted
+    );
+    drop(c);
+    fixture.finish().await;
 }
 
 #[derive(Debug, Clone)]
@@ -217,7 +326,7 @@ async fn repair_is_durable_without_stripe_and_survives_terms_closure_and_gateway
     let own = db.account("cus_own", "open").await;
     let other = db.account("cus_other", "open").await;
     db.pool.get().await.unwrap().execute(
-        "INSERT INTO required_document(document,version,sha256,url) VALUES ('terms_of_service',2,$1,'https://example.test/terms')",
+        "INSERT INTO required_document_version(document,version,sha256,url) VALUES ('terms_of_service',2,$1,'https://example.test/terms')",
         &[&"ab".repeat(32)],
     ).await.unwrap();
     for (index, state) in ["open", "closed"].into_iter().enumerate() {
@@ -226,7 +335,7 @@ async fn repair_is_durable_without_stripe_and_survives_terms_closure_and_gateway
             .await
             .unwrap()
             .execute(
-                "UPDATE account SET billing_state=$2 WHERE id=$1",
+                "UPDATE account SET billing_state=$2, billing_close_requested_at=CASE WHEN $2='open' THEN NULL ELSE COALESCE(billing_close_requested_at,clock_timestamp()) END WHERE id=$1",
                 &[&own, &state],
             )
             .await
@@ -446,7 +555,7 @@ async fn checkout_snapshots_the_selected_grant_and_closure_refuses_new_checkout(
         .await
         .unwrap()
         .execute(
-            "UPDATE account SET billing_state='closed' WHERE id=$1",
+            "UPDATE account SET billing_state='closed', billing_close_requested_at=clock_timestamp() WHERE id=$1",
             &[&own],
         )
         .await

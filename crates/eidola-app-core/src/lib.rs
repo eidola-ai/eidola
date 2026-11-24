@@ -460,7 +460,7 @@ pub struct SpaceSettings {
     /// surface needs before it can render the roster honestly: that agent's
     /// membership is structural, so no Remove may be offered beside it — an
     /// affordance that could only ever be refused.
-    pub notebook_participant_id: Option<String>,
+    pub notebook_owner_participant_id: Option<String>,
     /// The agent that **owns this sub-space**, if it is one — the other
     /// structural membership, carried for the same reason and read the same
     /// way. It records who is answerable for the delegation, whose live-room
@@ -475,7 +475,7 @@ impl Default for SpaceSettings {
         Self {
             cascade_limit: DEFAULT_CASCADE_LIMIT,
             router_model: None,
-            notebook_participant_id: None,
+            notebook_owner_participant_id: None,
             subspace_owner_participant_id: None,
         }
     }
@@ -6709,7 +6709,7 @@ impl Inner {
         Ok(SpaceSettings {
             cascade_limit,
             router_model: db::space_router_model(&conn, space_id).await?,
-            notebook_participant_id: db::notebook_participant_of(&conn, space_id).await?,
+            notebook_owner_participant_id: db::notebook_owner_of(&conn, space_id).await?,
             subspace_owner_participant_id: db::subspace_owner_of(&conn, space_id).await?,
         })
     }
@@ -14728,7 +14728,7 @@ struct IssueCredentialsResponse {
     issuer_key_id: String,
     credits: i64,
     #[allow(dead_code)]
-    ledger_entry_id: String,
+    issuance_id: String,
 }
 
 #[derive(Deserialize)]
