@@ -5,6 +5,8 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
+# With Eidola, Inc.'s additional permission for app stores, named below
+# (LICENSE.md → App stores).
 license = "GPL-3.0-only"
 
 [features]
@@ -175,3 +177,8 @@ required-features = ["desktop"]
 name = "updater_install_stage"
 path = "tests/updater_install_stage.rs"
 required-features = ["desktop"]
+
+# The licence REUSE.toml declares for this crate: Cargo takes SPDX list
+# identifiers only. crates/mobile-licences reads it for the app's licences.
+[package.metadata.eidola]
+licence = "LicenseRef-Eidola-GPL-3.0-only-with-app-store-permission"
