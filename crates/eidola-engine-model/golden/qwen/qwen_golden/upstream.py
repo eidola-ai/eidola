@@ -21,18 +21,64 @@ import hashlib
 import json
 from pathlib import Path
 
-LIST = json.loads((Path(__file__).resolve().parent.parent / "upstream-sha256.json").read_text())
-REPO = LIST["repository"]
-REVISION = LIST["revision"]
-assert (REPO, REVISION) == ("Qwen/Qwen3.8-27B-FP8", "c3a462cc3d38cf351f3b26cbd763469eeb74ef81")
+HERE = Path(__file__).resolve().parent.parent
 
 # The small files every run reads beside the weights.
 SMALL = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "LICENSE"]
-SHARDS = [f"layers-{i}.safetensors" for i in range(64)] + ["mtp.safetensors", "outside.safetensors"]
-# Checkpoint layers 0-3 (three DeltaNet layers and one attention layer), the
-# drafter, and the file holding the embedding, the head and the final norm.
-PREFIX = [f"layers-{i}.safetensors" for i in range(4)] + ["mtp.safetensors", "outside.safetensors"]
-TRUNCATIONS = {"prefix": PREFIX, "full": SHARDS + ["model.safetensors.index.json"]}
+
+_QWEN38_SHARDS = [f"layers-{i}.safetensors" for i in range(64)] + ["mtp.safetensors", "outside.safetensors"]
+_QWEN35_SHARD = "model.safetensors-00001-of-00001.safetensors"
+
+# Per checkpoint: its recorded list, the repository and revision the list must
+# name, and its truncations (sets of whole upstream files). Qwen3.8-27B-FP8's
+# `prefix` is checkpoint layers 0-3 (three DeltaNet layers and one attention
+# layer), the drafter, and the file holding the embedding, the head and the
+# final norm. Qwen3.5's checkpoints are one shard each, so only whole.
+MODELS = {
+    "qwen3.8-27b": (
+        "upstream-sha256.json",
+        ("Qwen/Qwen3.8-27B-FP8", "c3a462cc3d38cf351f3b26cbd763469eeb74ef81"),
+        {
+            "prefix": [f"layers-{i}.safetensors" for i in range(4)] + ["mtp.safetensors", "outside.safetensors"],
+            "full": _QWEN38_SHARDS + ["model.safetensors.index.json"],
+        },
+    ),
+    "qwen3.5-2b": (
+        "upstream-qwen3.5-2b-sha256.json",
+        ("Qwen/Qwen3.5-2B", "15852e8c16360a2fea060d615a32b45270f8a8fc"),
+        {"full": [_QWEN35_SHARD, "model.safetensors.index.json"]},
+    ),
+    "qwen3.5-0.8b": (
+        "upstream-qwen3.5-0.8b-sha256.json",
+        ("Qwen/Qwen3.5-0.8B", "2fc06364715b967f1860aea9cf38778875588b17"),
+        {"full": [_QWEN35_SHARD, "model.safetensors.index.json"]},
+    ),
+}
+DEFAULT_MODEL = "qwen3.8-27b"
+
+LIST: dict = {}
+REPO = REVISION = ""
+TRUNCATIONS: dict[str, list[str]] = {}
+
+
+def use(model: str) -> None:
+    """Make `model`'s recorded list the one every check below reads."""
+    global LIST, REPO, REVISION, TRUNCATIONS
+    path, pinned, truncations = MODELS[model]
+    LIST = json.loads((HERE / path).read_text())
+    REPO, REVISION = LIST["repository"], LIST["revision"]
+    assert (REPO, REVISION) == pinned, (path, REPO, REVISION)
+    TRUNCATIONS = truncations
+
+
+def truncation_for(layers: int | None) -> str:
+    """The truncation a run of the first `layers` layers (None: all) reads."""
+    if "prefix" in TRUNCATIONS and layers is not None and layers <= 4:
+        return "prefix"
+    return "full"
+
+
+use(DEFAULT_MODEL)
 
 
 class Mismatch(Exception):

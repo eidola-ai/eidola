@@ -2,9 +2,13 @@
 checkpoint (layers 0-3, the drafter, the embedding and head), or the whole
 model.
 
-    uv run python real_golden.py --dir <checkpoint dir> [--layers 4|64] [--mode pinned|native|released] [--device cpu|cuda]
+    uv run python real_golden.py --dir <checkpoint dir> [--model qwen3.8-27b|qwen3.5-2b|qwen3.5-0.8b] \
+        [--layers N] [--mode pinned|native|released] [--device cpu|cuda]
 
-Every file the run reads is first checked against `upstream-sha256.json`. The
+Every file the run reads is first checked against the model's recorded list
+(`upstream-sha256.json` for Qwen3.8-27B-FP8, `upstream-qwen3.5-*-sha256.json`
+for Qwen3.5). `--layers` keeps checkpoint layers 0..N-1 (default 4 for
+Qwen3.8-27B-FP8, the whole model for Qwen3.5). The
 passage (`qwen_golden/passage.py`) is tokenised with the checkpoint's own
 tokenizer, no special tokens. Writes `<dir>/golden/reference-<name>.safetensors`:
 
@@ -12,7 +16,7 @@ tokenizer, no special tokens. Writes `<dir>/golden/reference-<name>.safetensors`
   (`qwen_golden/pinned_ops.py`). Our forward equals it bit for bit.
 - `native` (CPU): PyTorch's own arithmetic, its default attention and the
   model code's chunked DeltaNet prefill; only the FP8 GEMM is emulated (its
-  kernel is CUDA-only). Name `native`.
+  kernel is CUDA-only; a BF16 checkpoint has none). Name `native`.
 - `released` (CUDA): nothing pinned or emulated. Transformers dispatches the FP8
   GEMM to its own kernels and, when `flash-linear-attention` is installed, the
   DeltaNet to FLA's. Name `gpu-released`, or `--name`.
@@ -49,7 +53,8 @@ def bf16(t: torch.Tensor) -> tuple:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", type=Path, required=True)
-    ap.add_argument("--layers", type=int, default=4, help="checkpoint layers 0..N-1 (64: the whole model)")
+    ap.add_argument("--model", choices=sorted(upstream.MODELS), default=upstream.DEFAULT_MODEL)
+    ap.add_argument("--layers", type=int, help="checkpoint layers 0..N-1 (default: 4 for Qwen3.8, all for Qwen3.5)")
     ap.add_argument("--mode", choices=["pinned", "native", "released"], default="pinned")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--name", help="the golden's name (default by mode)")
@@ -62,7 +67,11 @@ def main() -> int:
     if a.torch_deltanet:
         sys.modules["fla"] = None  # an import of it now fails, and Transformers falls back
     began = time.time()
-    upstream.check_dir(a.dir, "prefix" if a.layers <= 4 else "full")
+    upstream.use(a.model)
+    upstream.check_file(a.dir / "config.json")  # read below, before the rest is checked
+    if a.layers is None:
+        a.layers = 4 if "prefix" in upstream.TRUNCATIONS else reference.text_config(a.dir).num_hidden_layers
+    upstream.check_dir(a.dir, upstream.truncation_for(a.layers))
     print(f"[{time.time() - began:.0f}s] checkpoint files match the recorded hashes", flush=True)
     name = a.name or {"pinned": "pinned", "native": "native", "released": "gpu-released"}[a.mode]
     if a.mode == "pinned":

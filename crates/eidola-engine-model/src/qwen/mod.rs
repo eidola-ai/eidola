@@ -1,4 +1,4 @@
-//! Qwen3.8 (text): configuration, weight loading and the dense reference
+//! Qwen3.8 and Qwen3.5 (text): configuration, weight loading and the dense reference
 //! forward.
 //!
 //! - [`config`] reads `config.json` into a typed per-layer table.
@@ -24,7 +24,7 @@ pub mod weights;
 use std::path::Path;
 use std::sync::Arc;
 
-pub use config::{LayerKind, QwenConfig};
+pub use config::{LayerKind, QwenConfig, WeightFormat};
 pub use deltanet::DeltaNetState;
 pub use forward::{
     KvCache, LayerState, LogitRows, MtpOutput, QwenForwardOptions, QwenForwardOutput, QwenModel,

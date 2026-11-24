@@ -1,4 +1,4 @@
-//! The Qwen3.8 reference forward.
+//! The Qwen3.8 and Qwen3.5 reference forward.
 //!
 //! The residual stream is BF16. Each layer is
 //!
@@ -9,8 +9,10 @@
 //! with zero-centred RMSNorms (`bf16(x · rsqrt(mean(x²) + eps) · (1 + w))`, one
 //! rounding), the mixer a Gated DeltaNet ([`super::deltanet`]) or gated full
 //! attention ([`super::attention`]), and the MLP
-//! `down(bf16(bf16(silu(gate(x))) · up(x)))`. After the last layer the final
-//! norm, then the untied head, its logits rounded to BF16.
+//! `down(bf16(bf16(silu(gate(x))) · up(x)))`, every projection in the
+//! checkpoint's format ([`super::linear::linear_rows`]). After the last layer
+//! the final norm, then the head (its own, or the embedding when tied), its
+//! logits rounded to BF16.
 //!
 //! [`QwenModel::layer_forward`] runs one layer over a contiguous range of
 //! positions from the state the positions before it left, so the full forward,
@@ -22,7 +24,7 @@ use rayon::prelude::*;
 use super::attention::{apply_rope, attend, inv_freq, rope_cos_sin};
 use super::config::{LayerKind, QwenConfig};
 use super::deltanet::{CoreWeights, DeltaNetState, token_core};
-use super::linear::{lin8_rows, linear_bf16_dense, linear_bf16_rows};
+use super::linear::{linear_bf16_dense, linear_bf16_rows, linear_rows};
 use super::numeric::{bf16_round, rsqrt32, sigmoid32, silu32};
 use super::weights::{
     AttentionWeights, LayerWeights, MixerWeights, MlpWeights, QwenWeights, ZcNorm,
@@ -206,9 +208,9 @@ impl QwenModel {
                 cache.len(width)
             )));
         }
-        let qg = lin8_rows(x, &w.q_proj);
-        let k = lin8_rows(x, &w.k_proj);
-        let v = lin8_rows(x, &w.v_proj);
+        let qg = linear_rows(x, &w.q_proj);
+        let k = linear_rows(x, &w.k_proj);
+        let v = linear_rows(x, &w.v_proj);
         let t = x.rows;
         let mut q = Matrix::zeros(t, nq * d);
         let mut gate = Matrix::zeros(t, nq * d);
@@ -249,7 +251,7 @@ impl QwenModel {
                 *o = bf16_round(*o * bf16_round(sigmoid32(gv)));
             }
         });
-        Ok(lin8_rows(&y, &w.o_proj))
+        Ok(linear_rows(&y, &w.o_proj))
     }
 
     /// The Gated DeltaNet mixer over normed rows: the projections for every
@@ -263,8 +265,8 @@ impl QwenModel {
     ) -> Matrix {
         let spec = &self.config().deltanet;
         let eps = self.config().rms_norm_eps;
-        let mixed = lin8_rows(x, &w.in_proj_qkv);
-        let z = lin8_rows(x, &w.in_proj_z);
+        let mixed = linear_rows(x, &w.in_proj_qkv);
+        let z = linear_rows(x, &w.in_proj_z);
         let b = linear_bf16_dense(x, &w.in_proj_b);
         let a = linear_bf16_dense(x, &w.in_proj_a);
         let core = CoreWeights {
@@ -287,16 +289,16 @@ impl QwenModel {
             );
             n.row_mut(r).copy_from_slice(&o);
         }
-        lin8_rows(&n, &w.out_proj)
+        linear_rows(&n, &w.out_proj)
     }
 
     pub fn mlp(&self, w: &MlpWeights, x: &Matrix) -> Matrix {
-        let g = lin8_rows(x, &w.gate);
-        let mut u = lin8_rows(x, &w.up);
+        let g = linear_rows(x, &w.gate);
+        let mut u = linear_rows(x, &w.up);
         for (uv, &gv) in u.data.iter_mut().zip(&g.data) {
             *uv = bf16_round(bf16_round(silu32(gv)) * *uv);
         }
-        lin8_rows(&u, &w.down)
+        linear_rows(&u, &w.down)
     }
 
     fn run_layer(
