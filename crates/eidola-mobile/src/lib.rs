@@ -11,6 +11,7 @@
 //! - [`update`]: the shell's bundle store as app-core's
 //!   [`eidola_app_core::updater::mobile::BundleStore`], and the self-update
 //!   on it.
+//! - [`ui`]: the phone interface on gpui.
 //! - `web` (wasm32): the webview's bridge, and the bundle's entry point.
 //!
 //! Everything but `web` is target-independent, so the native tests drive it
@@ -18,11 +19,14 @@
 
 pub mod boot;
 pub mod client;
+#[cfg(feature = "dev")]
+pub mod dev;
 pub mod files;
 pub mod protocol;
 #[cfg(feature = "self-test")]
 pub mod selftest;
 pub mod socket;
+pub mod ui;
 pub mod update;
 #[cfg(target_family = "wasm")]
 mod web;

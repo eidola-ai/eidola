@@ -16,9 +16,14 @@
 //! whole path from a tap on the icon to a core that can serve the user. The
 //! network is no part of it, so a bundle booted offline (or against a
 //! gateway that is down) still confirms; a bundle that cannot open the
-//! profile never confirms, and the shell falls back at the next launch. The
-//! interface that comes next moves the confirmation after its first frame,
-//! so a bundle that cannot draw falls back too.
+//! profile never confirms, and the shell falls back at the next launch.
+//!
+//! **The interface confirms after it has drawn.** [`prepare`] is steps 1–4 and
+//! [`confirm`] is step 5, so the app (`crate::ui`) can open its window between
+//! them and confirm only once the first frame showing the booted app has been
+//! drawn: a bundle that boots but cannot draw never confirms either, and falls
+//! back the same way. [`boot`] is the two in a row, for a host with nothing to
+//! draw (the self-test, the native tests).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,23 +77,51 @@ pub struct Booted<T> {
     pub bundle: BundleState,
 }
 
+/// A prepared app: the shell checked, the profile open and durable, the
+/// bundle not yet confirmed.
+pub struct Prepared<T> {
+    pub core: AppCore,
+    pub hello: Hello,
+    pub client: ShellClient<T>,
+}
+
 /// Boot on `client`'s shell, and confirm the bundle once healthy.
 pub async fn boot<T: Transport>(
     client: ShellClient<T>,
     options: BootOptions,
 ) -> Result<Booted<T>, BootError> {
+    let prepared = prepare(client, options).await?;
+    let bundle = confirm(&prepared.client).await?;
+    Ok(Booted {
+        core: prepared.core,
+        hello: prepared.hello,
+        client: prepared.client,
+        bundle,
+    })
+}
+
+/// Steps 1–4: the shell's contract, the profile, the database, and a flush
+/// of whatever opening it wrote. Everything boot health asks but the
+/// confirmation.
+pub async fn prepare<T: Transport>(
+    client: ShellClient<T>,
+    options: BootOptions,
+) -> Result<Prepared<T>, BootError> {
     let hello = client.hello().await?;
     hello.check()?;
     let core = open(&client, options).await?;
     core.open_database().await?;
     core.flush_storage().await?;
-    let bundle = client.bundle_confirm().await.map_err(BootError::Confirm)?;
-    Ok(Booted {
+    Ok(Prepared {
         core,
         hello,
         client,
-        bundle,
     })
+}
+
+/// Step 5: tell the shell this bundle is healthy (`bundle.confirm`).
+pub async fn confirm<T: Transport>(client: &ShellClient<T>) -> Result<BundleState, BootError> {
+    client.bundle_confirm().await.map_err(BootError::Confirm)
 }
 
 /// Load the profile from the shell's files and open a core on it, its

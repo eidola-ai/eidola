@@ -18,6 +18,7 @@ This repository contains several components under different licenses. This file 
 | `eidola-gui` | [GPL-3.0-only](LICENSES/GPL-3.0-only.txt) |
 | `eidola-notepad` | [GPL-3.0-only](LICENSES/GPL-3.0-only.txt) |
 | `eidola-mobile` | [GPL-3.0-only](LICENSES/GPL-3.0-only.txt) |
+| `eidola-theme`, `eidola-i18n` (shared by the GUI and the mobile app) | [GPL-3.0-only](LICENSES/GPL-3.0-only.txt) |
 | `eidola-apple` | [MIT](LICENSES/MIT.txt) OR [Apache-2.0](LICENSES/Apache-2.0.txt) |
 | all other crates | [MIT](LICENSES/MIT.txt) OR [Apache-2.0](LICENSES/Apache-2.0.txt) |
 

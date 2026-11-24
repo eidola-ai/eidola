@@ -15,6 +15,9 @@ on:
     paths:
       - "mobile/**"
       - "crates/eidola-mobile/**"
+      - "crates/eidola-theme/**"
+      - "crates/eidola-i18n/**"
+      - "crates/gpui-markdown-editor/**"
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/config.toml"
@@ -24,6 +27,9 @@ on:
     paths:
       - "mobile/**"
       - "crates/eidola-mobile/**"
+      - "crates/eidola-theme/**"
+      - "crates/eidola-i18n/**"
+      - "crates/gpui-markdown-editor/**"
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/config.toml"

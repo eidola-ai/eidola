@@ -14,7 +14,8 @@
 //! mistyped id is a missing function and a changed argument set is a changed
 //! signature, so both are compile errors. The build-time rules (malformed FTL in
 //! *any* locale, a translation reading a variable English never passes, a
-//! translation inventing an id) live in `build_support/codegen.rs`.
+//! translation inventing an id) live in `eidola-i18n`'s `codegen`, shared with
+//! the mobile app, as are the runtime rules below ([`eidola_i18n::runtime`]).
 //!
 //! **A missing translation is not an error, and the fallback is structural.**
 //! Each locale's bundle is built as the English resource *overridden by* that
@@ -41,7 +42,6 @@ use std::sync::Arc;
 use eidola_app_core::ConfigState;
 use fluent_bundle::{FluentBundle, FluentResource};
 use gpui::{App, Entity, Global, SharedString};
-use unic_langid::LanguageIdentifier;
 
 use crate::stores::ConfigStore;
 
@@ -53,13 +53,7 @@ pub type Arg<'a> = fluent_bundle::FluentValue<'a>;
 /// The argument bag a generated accessor builds for its message.
 pub type Args<'a> = fluent_bundle::FluentArgs<'a>;
 
-/// The source locale — the one every accessor is generated from and every other
-/// locale falls back to.
-pub const SOURCE_LOCALE: &str = "en";
-/// Simplified Chinese: the target for `zh-CN`, `zh-SG` and a bare `zh`.
-pub const ZH_HANS: &str = "zh-Hans";
-/// Traditional Chinese: the target for `zh-TW`, `zh-HK` and `zh-MO`.
-pub const ZH_HANT: &str = "zh-Hant";
+pub use eidola_i18n::runtime::{SOURCE_LOCALE, ZH_HANS, ZH_HANT};
 
 /// Every locale this binary ships, in tag order.
 pub fn available_locales() -> impl Iterator<Item = &'static str> {
@@ -68,10 +62,7 @@ pub fn available_locales() -> impl Iterator<Item = &'static str> {
 
 /// The shipped locale matching `tag` exactly (case-insensitively), if any.
 fn shipped(tag: &str) -> Option<&'static str> {
-    LOCALES
-        .iter()
-        .find(|(t, _)| t.eq_ignore_ascii_case(tag))
-        .map(|(t, _)| *t)
+    eidola_i18n::runtime::shipped(LOCALES, tag)
 }
 
 // ---------------------------------------------------------------------------
@@ -107,79 +98,20 @@ impl Localization {
     }
 
     fn format(&self, id: &str, args: Option<&Args>) -> SharedString {
-        if let Some(pattern) = self.bundle.get_message(id).and_then(|m| m.value()) {
-            let mut errors = Vec::new();
-            let formatted = self.bundle.format_pattern(pattern, args, &mut errors);
-            // Not a case to recover from — a formatting error means the
-            // build-time contract was violated, and `build_support/codegen.rs`
-            // refuses every shape that can produce one (an unresolvable
-            // reference, a cycle, a variable the accessor does not pass). The
-            // assertion is how that claim stays true as the rules change.
-            debug_assert!(
-                errors.is_empty(),
-                "localization: `{id}` in `{}` formatted with errors: {errors:?}",
-                self.tag
-            );
-            return SharedString::from(formatted.into_owned());
-        }
-        // Unreachable through a generated accessor: every id it names exists in
-        // the source locale, which every bundle contains. Answer with the id
-        // rather than panicking — a chrome string is never worth a crash, and
-        // the id is a legible thing to see in a screenshot.
-        debug_assert!(
-            false,
-            "localization: the `{}` bundle has no `{id}`",
-            self.tag
-        );
-        SharedString::from(id.to_string())
+        SharedString::from(eidola_i18n::runtime::format(
+            &self.bundle,
+            self.tag,
+            id,
+            args,
+        ))
     }
 }
 
-/// Build one locale's bundle: **the English resource, then the locale's own
-/// overriding it.**
-///
-/// Fallback has to live *inside* the bundle rather than in a chain of them,
-/// because Fluent resolves a message reference against one bundle only: a
-/// translated message that says `{ about-title }` reaches nothing if its own
-/// bundle lacks `about-title`, and `format_pattern` then answers with the
-/// reference's error text (`关于 {about-title}`) rather than deferring to a
-/// fallback bundle the chain would have tried next. Merging makes the promised
-/// fallback true by construction — an untranslated message *is* in this bundle,
-/// as English — and leaves no runtime error branch for it to depend on.
-///
-/// The accepted cost: the bundle's locale is the active one, and fluent-bundle
-/// takes plural rules from `locales[0]`, so an *untranslated* message carrying a
-/// plural selector selects with the active locale's categories rather than
-/// English's. That only reaches a string already showing in the wrong language,
-/// and the cure for it is to translate the string.
+/// Build one locale's bundle: the English resource, then the locale's own
+/// overriding it — the fallback is structural, see
+/// [`eidola_i18n::runtime::bundle_for`].
 fn bundle_for(tag: &'static str) -> FluentBundle<Arc<FluentResource>> {
-    // The tag is a directory name we ship and every locale's FTL parsed at build
-    // time, so neither of these can fail; a failure would mean the generated
-    // file and this module disagree, which is a bug and not a user-facing state.
-    let langid: LanguageIdentifier = tag.parse().unwrap_or_default();
-    let mut bundle = FluentBundle::new(vec![langid]);
-    // No Unicode isolation marks around placeables: they are invisible
-    // directional controls for bidirectional text, we ship no RTL locale, and
-    // gpui would have to shape them.
-    bundle.set_use_isolating(false);
-    if let Some(source) = resource_for(SOURCE_LOCALE) {
-        bundle.add_resource(source).ok();
-    }
-    if tag != SOURCE_LOCALE
-        && let Some(translation) = resource_for(tag)
-    {
-        // Whole-message override: this locale's `about-version-label` replaces
-        // English's, while every message it did not translate stays.
-        bundle.add_resource_overriding(translation);
-    }
-    bundle
-}
-
-fn resource_for(tag: &str) -> Option<Arc<FluentResource>> {
-    let (_, source) = LOCALES.iter().find(|(t, _)| *t == tag)?;
-    FluentResource::try_new((*source).to_string())
-        .ok()
-        .map(Arc::new)
+    eidola_i18n::runtime::bundle_for(LOCALES, tag)
 }
 
 thread_local! {
@@ -302,54 +234,16 @@ pub fn preference(stored: Option<&str>) -> LanguagePreference {
     }
 }
 
-/// Pick a shipped locale for one OS-reported language tag.
-///
-/// Chinese is mapped by script rather than by exact tag, because the platforms
-/// report a region and we ship the two writing systems: an explicit `Hans`/`Hant`
-/// subtag wins; otherwise `TW`/`HK`/`MO` are Traditional and everything else
-/// (including a bare `zh`) is Simplified. Every other language matches on its
-/// language subtag alone — a French speaker in Canada gets French.
+/// Pick a shipped locale for one OS-reported language tag (Chinese by script;
+/// see [`eidola_i18n::runtime::match_locale`]).
 fn match_locale(tag: &str) -> Option<&'static str> {
-    let lower = tag.trim().to_ascii_lowercase();
-    let parts: Vec<&str> = lower
-        .split(['-', '_', '.'])
-        .filter(|p| !p.is_empty())
-        .collect();
-    let language = *parts.first()?;
-
-    if language == "zh" {
-        let script = parts[1..]
-            .iter()
-            .find(|p| **p == "hans" || **p == "hant")
-            .copied();
-        let region = parts[1..]
-            .iter()
-            .find(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic()))
-            .copied();
-        let wanted = match (script, region) {
-            (Some("hant"), _) => ZH_HANT,
-            (Some(_), _) => ZH_HANS,
-            (None, Some("tw" | "hk" | "mo")) => ZH_HANT,
-            (None, _) => ZH_HANS,
-        };
-        return shipped(wanted).or_else(|| shipped(ZH_HANS));
-    }
-
-    available_locales().find(|available| {
-        available
-            .split('-')
-            .next()
-            .is_some_and(|l| l.eq_ignore_ascii_case(language))
-    })
+    eidola_i18n::runtime::match_locale(LOCALES, tag)
 }
 
 /// Choose a locale from the operating system's preferred-language list, in the
 /// order the OS reports it. Nothing matching falls back to the source locale.
 pub fn negotiate(preferred: &[String]) -> &'static str {
-    preferred
-        .iter()
-        .find_map(|tag| match_locale(tag))
-        .unwrap_or(SOURCE_LOCALE)
+    eidola_i18n::runtime::negotiate(LOCALES, preferred)
 }
 
 /// The whole resolution, as one pure function: the stored override decides, and
@@ -425,6 +319,7 @@ pub fn apply(tag: &str, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unic_langid::LanguageIdentifier;
 
     #[test]
     fn the_source_locale_and_both_chinese_scripts_are_shipped() {

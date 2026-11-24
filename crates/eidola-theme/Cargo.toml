@@ -1,0 +1,22 @@
+[package]
+name = "eidola-theme"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "GPL-3.0-only"
+
+# The look the desktop and mobile apps share: the Circadian palettes, the
+# Newsreader faces and the prose typography. Pure, and wasm-compatible: no
+# platform crate, no clock, no file system (each host supplies those).
+
+[dependencies]
+# The same exact pins as eidola-gui (see its AGENTS.md → gpui / gpui-component
+# pinning), so the workspace resolves one gpui.
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui-component = "=0.10.0"
+gpui-markdown-editor = { path = "../gpui-markdown-editor" }
+# The persisted appearance settings the palettes and schedule speak.
+eidola-app-core = { path = "../eidola-app-core", default-features = false }
+serde_json = "1"

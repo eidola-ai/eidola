@@ -45,13 +45,18 @@ gpui-kit-assets = "=0.10.0"
 
 eidola-app-core = { path = "../eidola-app-core" }
 gpui-markdown-editor = { path = "../gpui-markdown-editor" }
-# Localization (see `src/i18n.rs`). `fluent-bundle` formats the messages;
-# `unic-langid` supplies the locale identifiers a bundle is built with;
-# `sys-locale` reads the OS's preferred-language list for negotiation. All
-# three are pure Rust (sys-locale reaches CoreFoundation/`libc` through plain
-# extern declarations, no C to compile), which is what the cross-compilation
-# convention requires. The FTL itself is embedded at build time — nothing here
-# ever reads a translation from disk.
+# The Circadian palettes, the Newsreader faces and the prose typography,
+# shared with the mobile app (`src/theme.rs` wires them to this app's config).
+eidola-theme = { path = "../eidola-theme" }
+# Localization (see `src/i18n.rs`). `eidola-i18n`'s runtime holds the rules
+# shared with the mobile app (the merged-bundle fallback, negotiation);
+# `fluent-bundle` is the bundle type it builds; `unic-langid` supplies locale
+# identifiers; `sys-locale` reads the OS's preferred-language list for
+# negotiation. All pure Rust (sys-locale reaches CoreFoundation/`libc` through
+# plain extern declarations, no C to compile), which is what the
+# cross-compilation convention requires. The FTL itself is embedded at build
+# time — nothing here ever reads a translation from disk.
+eidola-i18n = { path = "../eidola-i18n", features = ["runtime"] }
 fluent-bundle = "0.16"
 sys-locale = "0.3"
 unic-langid = "0.9"
@@ -95,21 +100,18 @@ objc2-service-management = { version = "0.3", features = ["SMAppService"] }
 
 [build-dependencies]
 # `build.rs` parses every locale's FTL and generates the typed accessors from
-# the English source (see `build_support/codegen.rs`). `unic-langid` is the same
-# parser the runtime builds bundles with, used here to refuse a locale directory
-# whose name is not a canonical language tag.
-fluent-syntax = "0.12"
-unic-langid = "0.9"
+# the English source (`eidola-i18n`'s codegen, shared with the mobile app).
+eidola-i18n = { path = "../eidola-i18n", default-features = false, features = ["codegen"] }
 
 [dev-dependencies]
 # app-core's test seams for behavior tests over a real core (a fixture model
 # catalog, `AppCore::test_set_model_catalog`). Dev-only, so no release build
 # of the GUI links them.
 eidola-app-core = { path = "../eidola-app-core", features = ["test-support"] }
-# The same parser the build script uses: `tests/i18n.rs` includes
-# `build_support/codegen.rs` directly, so the build-error contract is asserted
-# by tests rather than by committing deliberately-broken FTL.
-fluent-syntax = "0.12"
+# The codegen the build script runs: `tests/i18n.rs` drives it directly, so
+# the build-error contract is asserted by tests rather than by committing
+# deliberately-broken FTL.
+eidola-i18n = { path = "../eidola-i18n", features = ["codegen", "runtime"] }
 # Pulls in `VisualTestAppContext` and `Window::render_to_image`. Cargo unifies
 # this with the regular `gpui` dep, so feature flags merge for dev/test builds
 # — and for examples, which is how `examples/driver.rs` reaches the visual

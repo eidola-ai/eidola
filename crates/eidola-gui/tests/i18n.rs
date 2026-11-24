@@ -2,18 +2,14 @@
 //! contract.
 //!
 //! The build-error rules are asserted against the codegen module directly
-//! (`build_support/codegen.rs`, the same file `build.rs` includes) rather than
+//! (`eidola-i18n`'s `codegen`, the same one `build.rs` runs) rather than
 //! by committing malformed FTL — a locales tree that fails to build would fail
 //! every other test in the crate too.
 
 use eidola_gui::i18n::{self, LanguagePreference, msg};
 use gpui::TestAppContext;
 
-// Only the rule-checking half is exercised here; `build.rs` is the other
-// caller and uses the rest.
-#[allow(dead_code)]
-#[path = "../build_support/codegen.rs"]
-mod codegen;
+use eidola_i18n::codegen;
 
 fn tags(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()

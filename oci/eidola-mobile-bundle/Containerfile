@@ -173,7 +173,7 @@ RUN --network=none <<-'EOF'
 	mkdir -p /out
 	wasm-bindgen target/${TARGET}/mobile/eidola_mobile.wasm --out-dir /out --target web \
 		--no-typescript --remove-name-section --remove-producers-section
-	cp crates/eidola-mobile/web/index.html crates/eidola-mobile/web/boot.js /out/
+	cp crates/eidola-mobile/web/index.html crates/eidola-mobile/web/app.css crates/eidola-mobile/web/boot.js /out/
 	chmod -R u=rwX,go=rX /out
 	find /out -type f | sort
 EOF
