@@ -66,7 +66,7 @@ The published per-file manifest lets you check one file at a time, and its sizes
 
 The hash pins **the bytes of the weights**, and with them the tokenizer, the chat template where the engine reads one, and the default sampling settings. A prompt format compiled into the engine (DeepSeek-V4.1's) is pinned with the engine build, below. A node refuses a request naming any other hash before the request is admitted, and the gateway names the hash on every request it sends.
 
-It does **not** pin exact behaviour. The engine's code and version, its numerics (the kernels, the order floating-point work is done in, the batch a request shares) and the sampling seed are outside it. The engine build is pinned separately, by the deployment's launch identity ([Inference engine](engine.md#what-pins-the-engine)); two engines serving the same hash run the same model, not necessarily to the same bit.
+It does **not** pin exact behaviour. The engine's code and version, its numerics (the kernels, the order floating-point work is done in, the batch a request shares) and the sampling seed are outside it. The engine build is pinned separately, by the deployment's launch identity ([The engine](engine.md#what-pins-the-engine)); two engines serving the same hash run the same model, not necessarily to the same bit.
 
 **Every quantization Eidola serves is its own set of standard-format files**: safetensors shards with their own hash and their own catalog entry, never a transform applied when the weights are loaded. So the files you can download and hash are the files the engine computes with.
 

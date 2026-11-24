@@ -20,9 +20,10 @@ pages = [
 [[sections]]
 title = "Design pieces"
 pages = [
+    ["architecture.md", "Architecture"],
     ["client.md", "The client"],
     ["gateway.md", "The gateway"],
-    ["engine.md", "Inference engine"],
+    ["engine.md", "The engine"],
     ["model-identity.md", "Model identity"],
     ["anonymous-credits.md", "Anonymous credits"],
 ]

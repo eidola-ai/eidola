@@ -44,9 +44,10 @@ These docs may be incomplete, and may drift from the code. The code is the sourc
 
 - [Privacy guarantees](privacy-guarantees.md) — the specific commitments in each release.
 - [Threat model](threat-model.md) — who you're trusting and who you're not.
+- [Architecture](architecture.md) — every part and connection, and what each connection reveals.
 - [The client](client.md) — the trust root and what the client refuses.
 - [The gateway](gateway.md) — what runs in confidential compute, and what is deliberately kept apart from it.
-- [Inference engine](engine.md) — where models run, and how that layer is pinned.
+- [The engine](engine.md) — where models run, and how that layer is pinned.
 - [Releases](releases.md) — how a new binary becomes trustable.
 - [Verification](verification.md) — payload, archive, envelope, installable, and the hashes a user checks.
 - [Known gaps](gaps.md) — what we don't yet defend against.

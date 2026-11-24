@@ -21,6 +21,7 @@
 
 pub mod circadian;
 pub mod content;
+pub mod diagram;
 pub mod markdown;
 pub mod render;
 pub mod serve;
@@ -89,7 +90,8 @@ fn load_page(path: &Path, kind: PageKind, route: String, source_dir: &str) -> Re
     let src = fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let (matter, body) =
         split_front_matter(&src).map_err(|e| format!("{}: {e}", path.display()))?;
-    let rendered = markdown::render(body, source_dir);
+    let rendered =
+        markdown::render(body, source_dir).map_err(|e| format!("{}: {e}", path.display()))?;
     let title = matter
         .title
         .or(rendered.first_heading)
