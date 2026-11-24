@@ -4,22 +4,16 @@
 # quick action) against the page's digest, and a cold relaunch. Screenshots go to SHOTS
 # (default build/shots).
 #   test-sim.sh [SHOTS]
-# Uses (and creates once) its own simulator, "eidola-shell"; never another device.
+# Uses (and creates once per runtime) its own simulator, "eidola-shell"; never another device.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SHOTS="$(mkdir -p "${1:-$HERE/build/shots}" && cd "${1:-$HERE/build/shots}" && pwd)"
 NAME=eidola-shell
-DEVICE_TYPE="${DEVICE_TYPE:-com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro}"
-RUNTIME="${RUNTIME:-com.apple.CoreSimulator.SimRuntime.iOS-27-0}"
+# DEVICE_TYPE, RUNTIME: see simulator.sh (default the newest installed iOS runtime).
+source "$HERE/simulator.sh"
 
-UDID="$(xcrun simctl list devices -j | python3 -c '
-import json, sys
-for devices in json.load(sys.stdin)["devices"].values():
-    for d in devices:
-        if d["name"] == sys.argv[1] and d["isAvailable"]:
-            print(d["udid"]); raise SystemExit' "$NAME")"
-[[ -n "$UDID" ]] || UDID="$(xcrun simctl create "$NAME" "$DEVICE_TYPE" "$RUNTIME")"
-echo "simulator $NAME: $UDID"
+UDID="$(simulator_udid "$NAME")"
+echo "simulator $NAME: $UDID ($RUNTIME)"
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 # A fresh install, so no earlier run's files or bundles remain.
 xcrun simctl uninstall "$UDID" ai.eidola.mobile.dev || true

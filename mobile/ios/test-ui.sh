@@ -18,39 +18,36 @@
 #   test-ui.sh [OUT]
 # STUB_PORT, UPDATE_PORT  the model stub's and the update fixtures' ports on this machine
 #                         (default 8790, 8791), so two runs on one machine stay apart
-# Uses (and creates once) its own simulators, "eidola-phone" and "eidola-phone-zh" (its language
-# Chinese, so Pinyin is its first keyboard), or the pair UI_SIMULATOR names; never another device.
+# Uses (and creates once per runtime) its own simulators, "eidola-phone" and "eidola-phone-zh" (its
+# language Chinese, so Pinyin is its first keyboard), or the pair UI_SIMULATOR names; never another
+# device.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-}"
 OUT="$(mkdir -p "${OUT:-$HERE/build/ui}" && cd "${OUT:-$HERE/build/ui}" && pwd)"
-DEVICE_TYPE="${DEVICE_TYPE:-com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro}"
-RUNTIME="${RUNTIME:-com.apple.CoreSimulator.SimRuntime.iOS-27-0}"
+# DEVICE_TYPE, RUNTIME: see simulator.sh (default the newest installed iOS runtime).
+source "$HERE/simulator.sh"
 PORT="${STUB_PORT:-8790}"
 UPDATE_PORT="${UPDATE_PORT:-8791}"
 
 simulator() { # simulator NAME: its udid, created and booted
   local udid
-  udid="$(xcrun simctl list devices -j | python3 -c '
-import json, sys
-for devices in json.load(sys.stdin)["devices"].values():
-    for d in devices:
-        if d["name"] == sys.argv[1] and d["isAvailable"]:
-            print(d["udid"]); raise SystemExit' "$1")"
-  if [[ -z "$udid" ]]; then
-    udid="$(xcrun simctl create "$1" "$DEVICE_TYPE" "$RUNTIME")"
-    if [[ "$1" == *-zh ]]; then
-      xcrun simctl boot "$udid"
-      xcrun simctl bootstatus "$udid" -b >/dev/null
-      xcrun simctl spawn "$udid" defaults write -g AppleLanguages -array zh-Hans-CN en-US
-      xcrun simctl spawn "$udid" defaults write -g AppleLocale -string zh_CN
-      xcrun simctl spawn "$udid" defaults write -g AppleKeyboards -array \
-        "zh_Hans-Pinyin@sw=Pinyin;hw=Automatic" "en_US@sw=QWERTY;hw=Automatic" "emoji@sw=Emoji"
-      xcrun simctl shutdown "$udid"
-    fi
-  fi
+  udid="$(simulator_udid "$1")"
   xcrun simctl boot "$udid" 2>/dev/null || true
   xcrun simctl bootstatus "$udid" -b >/dev/null
+  # The -zh simulator's language is Chinese, so Pinyin is its first keyboard; set once, and it
+  # takes effect from the next boot.
+  local languages
+  languages="$(xcrun simctl spawn "$udid" defaults read -g AppleLanguages 2>/dev/null || true)"
+  if [[ "$1" == *-zh && "$languages" != *zh-Hans* ]]; then
+    xcrun simctl spawn "$udid" defaults write -g AppleLanguages -array zh-Hans-CN en-US
+    xcrun simctl spawn "$udid" defaults write -g AppleLocale -string zh_CN
+    xcrun simctl spawn "$udid" defaults write -g AppleKeyboards -array \
+      "zh_Hans-Pinyin@sw=Pinyin;hw=Automatic" "en_US@sw=QWERTY;hw=Automatic" "emoji@sw=Emoji"
+    xcrun simctl shutdown "$udid" >&2
+    xcrun simctl boot "$udid" >&2
+    xcrun simctl bootstatus "$udid" -b >/dev/null
+  fi
   echo "$udid"
 }
 # UI_SIMULATOR names another pair (NAME and NAME-zh), for a second checkout running at once.

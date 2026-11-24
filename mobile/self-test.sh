@@ -131,14 +131,9 @@ wait_for() { # wait_for SECONDS COMMAND...: until COMMAND succeeds
 }
 
 if [[ $PLATFORM == ios ]]; then
-  UDID="$(xcrun simctl list devices -j | python3 -c '
-import json, sys
-for devices in json.load(sys.stdin)["devices"].values():
-    for d in devices:
-        if d["name"] == "eidola-bridge" and d["isAvailable"]:
-            print(d["udid"]); raise SystemExit')"
-  [[ -n "$UDID" ]] || UDID="$(xcrun simctl create eidola-bridge com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro \
-    com.apple.CoreSimulator.SimRuntime.iOS-27-0)"
+  # DEVICE_TYPE, RUNTIME: see ios/simulator.sh (default the newest installed iOS runtime).
+  source "$HERE/ios/simulator.sh"
+  UDID="$(simulator_udid eidola-bridge)"
   xcrun simctl boot "$UDID" 2>/dev/null || true
   timeout 180 xcrun simctl bootstatus "$UDID" -b >/dev/null
   "$HERE/ios/build.sh" --bundle "$T/bundle" | tail -2
