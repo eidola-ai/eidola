@@ -164,6 +164,7 @@ mod tests {
             "credits",
             "depth",
             "description",
+            "documents",
             "failed",
             "generation",
             "id",

@@ -43,3 +43,6 @@ plans-credits-recurring =
        *[other] { $credits } créditos, caducan al final de cada periodo de facturación
     }
 plans-credits-described = { $line } — { $description }
+
+purchase-terms-required = Se rechazó el pago: esta cuenta no ha aceptado los términos vigentes. Revísalos y acéptalos, y vuelve a intentarlo.
+purchase-review-terms = Revisar los términos…

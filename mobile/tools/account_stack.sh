@@ -63,7 +63,9 @@ env -i PATH="$PATH" HOME="$HOME" \
   "$BIN/eidola-server-gateway" >"$DIR/gateway.log" 2>&1 &
 echo $! >>"$DIR/pids"
 wait_port "$GATEWAY_PORT"
-python3 "$HERE/billing_edge_stub.py" --port "$EDGE_PORT" --upstream "http://127.0.0.1:$GATEWAY_PORT" \
+# The first acceptance submission is refused, so the first run meets an account created with its
+# agreement unrecorded (and a checkout refused for it) and records it again.
+python3 "$HERE/billing_edge_stub.py" --port "$EDGE_PORT" --upstream "http://127.0.0.1:$GATEWAY_PORT" --refuse-terms 1 \
   >"$DIR/edge.log" 2>&1 &
 echo $! >>"$DIR/pids"
 wait_port "$EDGE_PORT"

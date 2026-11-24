@@ -107,6 +107,17 @@ VIDEO=$!
 set +e
 run_test "$UDID" testOnboardingAccount
 FIRST=$?
+# The account secret, copied while masked on screen: the clipboard holds the secret itself.
+if [[ $FIRST -eq 0 ]]; then
+  WANT="$(curl -fsS http://127.0.0.1:18081/_stub/secret-sha256 | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha256"])')"
+  GOT="$(xcrun simctl pbpaste "$UDID" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+  if [[ -n "$WANT" && "$WANT" == "$GOT" ]]; then
+    echo "clipboard: the masked secret's Copy copied the secret"
+  else
+    echo "clipboard: the masked secret's Copy did not copy the secret" >&2
+    FIRST=1
+  fi
+fi
 run_test "$UDID" testConversation
 STATUS=$?
 run_test "$UDID" testSettings

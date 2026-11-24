@@ -398,12 +398,30 @@ final class PhoneUITests: XCTestCase {
         waitFor("onboarding/copy/account-id/copy", timeout: 90)
         waitFor("onboarding/copy/account-secret/copy")
         shot("25-onboarding-new-account")
+        // The stand-in refused the creation's agreement: the page says so and offers it again.
+        waitFor("onboarding/terms-standing")
+        scrollBody(-600)
+        shot("25b-onboarding-agreement-not-recorded")
         tapScrolling("onboarding/cta/saved")
         waitFor("onboarding/cta/plans")
         shot("26-onboarding-add-credit")
         tap("onboarding/cta/plans")
         waitFor("purchase/plan/0", timeout: 60)
         shot("27-plans")
+
+        // Checkout is refused for the unrecorded agreement; the agreement is recorded again.
+        tap("purchase/plan/0")
+        waitFor("purchase/terms-required", timeout: 60)
+        shot("27b-checkout-refused-for-the-terms")
+        tapScrolling("purchase/review-terms")
+        waitFor("onboarding/terms/terms-of-service", timeout: 60)
+        tapScrolling("onboarding/agree")
+        shot("27c-agree-again")
+        tapScrolling("onboarding/cta/record-agreement")
+        waitFor("onboarding/terms-recorded", timeout: 60)
+        shot("27d-agreement-recorded")
+        tapScrolling("onboarding/cta/continue")
+        waitFor("purchase/plan/0", timeout: 60)
 
         // Checkout leaves for the system browser.
         tap("purchase/plan/0")
@@ -437,6 +455,10 @@ final class PhoneUITests: XCTestCase {
         sleep(1)
         shot("33-account-secret-shown")
         tap("account/secret/reveal")
+        // Copied while masked: the clipboard gets the secret, not the dots (ios/test-ui.sh compares
+        // it with the secret the stand-in last saw).
+        tap("account/secret/copy")
+        sleep(1)
         tapScrolling("account/reset")
         waitFor("account/reset/warning")
         shot("34-account-reset-armed")

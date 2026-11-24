@@ -220,14 +220,16 @@ pub fn error_note(name: impl Into<SharedString>, text: SharedString, cx: &App) -
 }
 
 /// A labelled value with a Copy verb (an account id, a secret, a digest).
+/// What is shown and what is copied are separate: a masked secret shows its
+/// mask and copies the secret.
 pub fn copy_row(
     key: &'static str,
     label: SharedString,
     value: SharedString,
+    to_copy: String,
     cx: &App,
 ) -> impl IntoElement {
     let theme = cx.theme();
-    let to_copy = value.to_string();
     let copy_label = msg::nav_copy_label(cx, label.to_string());
     div()
         .px(GUTTER)

@@ -2,7 +2,9 @@
 //! answering from an OpenAI-compatible mock: navigation never cancels a
 //! conversation's work, a reader who comes back joins the running entity, and
 //! a conversation reopened while its disposal is being decided is read once
-//! the disposal keeps it.
+//! the disposal keeps it; and linking an account is the account store's
+//! operation, whose refused check rolls the credentials back with no screen
+//! holding it.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -280,4 +282,46 @@ fn a_conversation_reopened_during_its_disposal_is_read_when_kept(cx: &mut TestAp
     wait_until(cx, "the kept conversation is read", |cx| {
         !reopened.read_with(cx, |c, _| c.is_deciding()) && posts(&reopened, cx) == 2
     });
+}
+
+/// A link whose balance check is refused, started with nothing but the store
+/// holding it (the onboarding screen it came from may be gone): the
+/// credentials it set are rolled back and the refusal waits for whoever looks.
+#[gpui::test]
+fn a_refused_link_is_rolled_back_with_no_screen_holding_it(cx: &mut TestAppContext) {
+    let model = Model::start(Duration::ZERO);
+    let (stores, _dir) = stores(cx, &model);
+    let core = stores.core.clone();
+    // Nothing answers here: the check fails.
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1".into()))
+        .unwrap();
+
+    assert!(
+        stores
+            .account
+            .update(cx, |a, cx| a.link("acct_test".into(), "secret".into(), cx))
+    );
+    // Neither another link nor a creation starts while it runs.
+    assert!(stores.account.update(cx, |a, cx| !a.link(
+        "acct_other".into(),
+        "secret".into(),
+        cx
+    )));
+    assert!(stores.account.update(cx, |a, cx| !a.create(Vec::new(), cx)));
+
+    wait_until(cx, "the link settles", |cx| {
+        stores.account.read_with(cx, |a, _| !a.linking())
+    });
+    assert!(
+        stores
+            .account
+            .read_with(cx, |a, _| matches!(a.link_outcome(), Some(Err(_)))),
+        "the refusal is not reported"
+    );
+    let config = core.config_state();
+    assert!(
+        !config.has_account && !config.has_account_secret,
+        "a refused link left its credentials in the profile"
+    );
 }

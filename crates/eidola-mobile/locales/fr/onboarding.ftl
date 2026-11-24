@@ -121,3 +121,16 @@ onboarding-cta-skip-account = Continuer sans compte.
 onboarding-cta-plans = Choisir une formule…
 onboarding-create-failed = Impossible de créer le compte : { $reason }
 onboarding-verify-failed = Impossible de vérifier ce compte : { $reason }
+
+onboarding-accept-terms-body =
+    ## Accepter les conditions
+
+    Les achats sur ce compte nécessitent son acceptation des { -fixed-terms-of-service } et de la { -fixed-privacy-policy } en vigueur. Veuillez les lire.
+onboarding-cta-review-terms = Lire et accepter les conditions…
+onboarding-cta-record-agreement = Enregistrer mon acceptation.
+onboarding-cta-record-agreement-pending = Enregistrement de votre acceptation…
+onboarding-terms-recorded = Votre acceptation est enregistrée.
+onboarding-cta-continue = Continuer.
+onboarding-accept-failed = Impossible d'enregistrer l'acceptation : { $reason }
+onboarding-terms-outstanding = L'acceptation de { $documents } par ce compte n'est pas enregistrée ; ses achats seront refusés tant qu'elle ne le sera pas.
+onboarding-terms-unknown = Impossible de confirmer que l'acceptation des conditions par ce compte a été enregistrée ({ $reason }) ; un achat pourrait être refusé.

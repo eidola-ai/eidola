@@ -29,7 +29,7 @@
 //! - **Failures are held as values** and worded at render.
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{BalancesResult, TermsDocument};
+use eidola_app_core::{TermsAcceptance, TermsDocument};
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, Render, Role, ScrollHandle, SharedString,
@@ -62,6 +62,9 @@ pub enum OnboardingStart {
     Welcome,
     /// From Settings ▸ Account: at the choice.
     Choose,
+    /// From a checkout the server refused for want of the terms: at the
+    /// agreement, for the account already configured.
+    AcceptTerms,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,13 +76,9 @@ pub enum Page {
     NewAccount,
     ExistingAccount,
     Purchase,
-}
-
-/// Why a link was refused before or by the server.
-#[derive(Debug)]
-pub enum VerifyFailure {
-    MissingCredentials,
-    Refused(AppError),
+    /// The agreement to the current documents, recorded for the account this
+    /// profile already holds.
+    AcceptTerms,
 }
 
 pub struct OnboardingView {
@@ -91,13 +90,13 @@ pub struct OnboardingView {
     scroll: ScrollHandle,
     /// The `(document, sha256)` pairs on screen when the box was ticked.
     agreed_to: Option<Vec<(String, String)>>,
-    creating: Option<Task<()>>,
-    create_error: Option<AppError>,
-    created: Option<(SharedString, SharedString)>,
+    /// This screen asked for the creation the store is running, and moves
+    /// to the new account's page when it lands.
+    awaiting_create: bool,
     id_field: Entity<TextField>,
     secret_field: Entity<TextField>,
-    verifying: Option<Task<()>>,
-    verify_result: Option<Result<i64, VerifyFailure>>,
+    /// A link was refused before any request: a field was empty.
+    missing_credentials: bool,
     leaving: Option<Task<()>>,
     open_task: Option<Task<()>>,
     open_error: Option<String>,
@@ -122,10 +121,36 @@ impl OnboardingView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.observe(&stores.account, |_, _, cx| cx.notify()).detach();
+        // The account operations are the store's (navigation cancels none of
+        // them); this screen follows their outcomes.
+        cx.observe(&stores.account, |this, account, cx| {
+            if matches!(account.read(cx).link_outcome(), Some(Ok(_)))
+                && !this.secret_field.read(cx).value(cx).is_empty()
+            {
+                this.secret_field.update(cx, |f, cx| f.clear(cx));
+            }
+            if this.awaiting_create && matches!(account.read(cx).create_outcome(), Some(Ok(_))) {
+                this.awaiting_create = false;
+                // The new account's credentials, wherever in the account
+                // steps the reader is now: they are what to save.
+                if this.page() != Page::NewAccount {
+                    this.pages.push(Page::NewAccount);
+                }
+            }
+            cx.notify();
+        })
+        .detach();
+        stores.account.update(cx, |a, cx| {
+            a.forget_settled_outcomes();
+            if start == OnboardingStart::AcceptTerms {
+                a.refresh_terms(cx);
+            }
+        });
+        let creating = stores.account.read(cx).creating();
         let first = match start {
             OnboardingStart::Welcome => Page::About,
             OnboardingStart::Choose => Page::GetStarted,
+            OnboardingStart::AcceptTerms => Page::AcceptTerms,
         };
         Self {
             prose: cx.new(|cx| Prose::new(window, cx)),
@@ -136,11 +161,9 @@ impl OnboardingView {
             pages: vec![first],
             scroll: ScrollHandle::new(),
             agreed_to: None,
-            creating: None,
-            create_error: None,
-            created: None,
-            verifying: None,
-            verify_result: None,
+            // A creation still running from an earlier visit lands here.
+            awaiting_create: creating,
+            missing_credentials: false,
             leaving: None,
             open_task: None,
             open_error: None,
@@ -152,8 +175,12 @@ impl OnboardingView {
     }
 
     fn go(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
-        if page == Page::CreateAccount {
-            self.stores.account.update(cx, |a, cx| a.refresh_terms(cx));
+        if matches!(page, Page::CreateAccount | Page::AcceptTerms) {
+            self.agreed_to = None;
+            self.stores.account.update(cx, |a, cx| {
+                a.refresh_terms(cx);
+                a.forget_accept_outcome();
+            });
         }
         self.pages.push(page);
         self.open_error = None;
@@ -176,7 +203,7 @@ impl OnboardingView {
     /// Whether there is anywhere to go back to: a page before this one, or
     /// (from Settings) the screen this was opened from.
     fn can_go_back(&self) -> bool {
-        self.pages.len() > 1 || self.start == OnboardingStart::Choose
+        self.pages.len() > 1 || self.start != OnboardingStart::Welcome
     }
 
     /// The first run is over: to the Library at launch, back where it was
@@ -184,7 +211,7 @@ impl OnboardingView {
     fn finish(&mut self, cx: &mut Context<Self>) {
         cx.emit(match self.start {
             OnboardingStart::Welcome => NavEvent::Home,
-            OnboardingStart::Choose => NavEvent::Back,
+            OnboardingStart::Choose | OnboardingStart::AcceptTerms => NavEvent::Back,
         });
     }
 
@@ -231,92 +258,62 @@ impl OnboardingView {
         (*agreed_to == consent_fingerprint(&documents)).then_some(documents)
     }
 
-    fn unsaved_on_screen(&self) -> bool {
-        matches!(self.create_error, Some(AppError::AccountNotSaved { .. }))
+    fn unsaved_on_screen(&self, cx: &App) -> bool {
+        matches!(
+            self.stores.account.read(cx).create_outcome(),
+            Some(Err(AppError::AccountNotSaved { .. }))
+        )
     }
 
     fn begin_create(&mut self, cx: &mut Context<Self>) {
         // An account created but not saved is on screen with the only copy of
         // its secret; another attempt would replace it.
-        if self.creating.is_some() || self.unsaved_on_screen() {
+        if self.stores.account.read(cx).identity_busy() || self.unsaved_on_screen(cx) {
             return;
         }
         let Some(accepted) = self.consented_terms(cx) else {
             return;
         };
-        self.create_error = None;
-        let create = self.stores.account.read(cx).request_create(accepted);
-        let enable = self.stores.account.read(cx).set_eidola_enabled(true);
-        self.creating = Some(cx.spawn(async move |this, cx| {
-            let result = create.await;
-            if result.is_ok()
-                && let Err(e) = enable.await
-            {
-                log::error!("could not turn the Eidola backend on: {e}");
-            }
-            this.update(cx, |this, cx| {
-                this.creating = None;
-                match result {
-                    Ok(created) => {
-                        this.created = Some((created.id.into(), created.secret.into()));
-                        this.stores
-                            .account
-                            .update(cx, |a, cx| a.identity_changed(cx));
-                        this.pages.push(Page::NewAccount);
-                    }
-                    Err(e) => this.create_error = Some(e),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
+        if self
+            .stores
+            .account
+            .update(cx, |a, cx| a.create(accepted, cx))
+        {
+            self.awaiting_create = true;
+        }
     }
 
     fn begin_verify(&mut self, cx: &mut Context<Self>) {
-        if self.verifying.is_some() {
+        if self.stores.account.read(cx).identity_busy() {
             return;
         }
         self.id_field.update(cx, |f, cx| f.commit(cx));
         self.secret_field.update(cx, |f, cx| f.commit(cx));
         let id = self.id_field.read(cx).value(cx);
         let secret = self.secret_field.read(cx).value(cx);
-        if id.is_empty() || secret.is_empty() {
-            self.verify_result = Some(Err(VerifyFailure::MissingCredentials));
+        self.missing_credentials = id.is_empty() || secret.is_empty();
+        if self.missing_credentials {
             cx.notify();
             return;
         }
-        self.verify_result = None;
-        let verify = self.stores.account.read(cx).request_verify(id, secret);
-        let enable = self.stores.account.read(cx).set_eidola_enabled(true);
-        self.verifying = Some(cx.spawn(async move |this, cx| {
-            let result = verify.await;
-            if result.is_ok()
-                && let Err(e) = enable.await
-            {
-                log::error!("could not turn the Eidola backend on: {e}");
-            }
-            this.update(cx, |this, cx| this.finish_verify(result, cx))
-                .ok();
-        }));
+        self.stores
+            .account
+            .update(cx, |a, cx| a.link(id, secret, cx));
         cx.notify();
     }
 
-    fn finish_verify(&mut self, result: Result<BalancesResult, AppError>, cx: &mut Context<Self>) {
-        self.verifying = None;
-        match result {
-            Ok(balances) => {
-                let available = balances.available;
-                self.stores.account.update(cx, |a, cx| {
-                    a.identity_changed(cx);
-                    a.set_balances(balances, cx);
-                });
-                self.secret_field.update(cx, |f, cx| f.clear(cx));
-                self.verify_result = Some(Ok(available));
-            }
-            Err(e) => self.verify_result = Some(Err(VerifyFailure::Refused(e))),
+    /// Record the agreement to the documents on screen for the account this
+    /// profile holds.
+    fn begin_accept(&mut self, cx: &mut Context<Self>) {
+        if self.stores.account.read(cx).accepting() {
+            return;
         }
-        cx.notify();
+        let Some(presented) = self.consented_terms(cx) else {
+            return;
+        };
+        self.stores
+            .account
+            .update(cx, |a, cx| a.accept_terms(presented, cx));
     }
 
     fn open(&mut self, url: String, cx: &mut Context<Self>) {
@@ -347,6 +344,7 @@ impl OnboardingView {
             Page::NewAccount => msg::onboarding_new_account_body(cx),
             Page::ExistingAccount => msg::onboarding_existing_account_body(cx),
             Page::Purchase => msg::onboarding_purchase_body(cx),
+            Page::AcceptTerms => msg::onboarding_accept_terms_body(cx),
         }
     }
 }
@@ -494,12 +492,19 @@ impl OnboardingView {
             }
             Page::CreateAccount => out.extend(self.render_create(cx)),
             Page::NewAccount => {
-                if let Some((id, secret)) = self.created.clone() {
+                let created = match self.stores.account.read(cx).create_outcome() {
+                    Some(Ok(created)) => Some(created.clone()),
+                    _ => None,
+                };
+                if let Some(created) = &created {
+                    let (id, secret): (SharedString, SharedString) =
+                        (created.id.clone().into(), created.secret.clone().into());
                     out.push(
                         copy_row(
                             "onboarding/copy/account-id",
                             msg::onboarding_account_id(cx),
-                            id,
+                            id.clone(),
+                            id.to_string(),
                             cx,
                         )
                         .into_any_element(),
@@ -508,13 +513,34 @@ impl OnboardingView {
                         copy_row(
                             "onboarding/copy/account-secret",
                             msg::onboarding_account_secret(cx),
-                            secret,
+                            secret.clone(),
+                            secret.to_string(),
                             cx,
                         )
                         .into_any_element(),
                     );
                 }
                 out.push(note(msg::onboarding_new_account_note(cx), cx).into_any_element());
+                // The account exists either way; whether its agreement to the
+                // terms was recorded is what the server reported back. A
+                // purchase is refused until it is, so say so here, and offer
+                // the agreement again for the documents current now.
+                if let Some(created) = &created
+                    && let Some(line) = terms_standing(&created.terms, cx)
+                {
+                    out.push(error_note("onboarding/terms-standing", line, cx).into_any_element());
+                    out.push(
+                        self.cta(
+                            "onboarding/cta/review-terms",
+                            msg::onboarding_cta_review_terms(cx),
+                            Pill::Primary,
+                            true,
+                            |this, window, cx| this.go(Page::AcceptTerms, window, cx),
+                            cx,
+                        )
+                        .into_any_element(),
+                    );
+                }
                 out.push(
                     self.cta(
                         "onboarding/cta/saved",
@@ -528,6 +554,7 @@ impl OnboardingView {
                 );
             }
             Page::ExistingAccount => out.extend(self.render_existing(cx)),
+            Page::AcceptTerms => out.extend(self.render_accept(cx)),
             Page::Purchase => {
                 out.push(note(msg::onboarding_purchase_checkout_note(cx), cx).into_any_element());
                 out.push(
@@ -567,7 +594,9 @@ impl OnboardingView {
         out
     }
 
-    fn render_create(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// The documents in hand, each linked, and the agreement bound to them:
+    /// the consent the creation and a later agreement both submit.
+    fn render_consent(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out: Vec<AnyElement> = Vec::new();
         let terms = self.stores.account.read(cx).terms().clone();
         let documents = terms.value().cloned();
@@ -697,9 +726,14 @@ impl OnboardingView {
                 )
                 .into_any_element(),
         );
+        out
+    }
 
-        let creating = self.creating.is_some();
-        let unsaved = self.unsaved_on_screen();
+    fn render_create(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out = self.render_consent(cx);
+        let agreed = self.consented_terms(cx).is_some();
+        let creating = self.stores.account.read(cx).creating();
+        let unsaved = self.unsaved_on_screen(cx);
         out.push(
             self.cta(
                 "onboarding/cta/create",
@@ -709,14 +743,15 @@ impl OnboardingView {
                     msg::onboarding_cta_create(cx)
                 },
                 Pill::Primary,
-                agreed && !creating && !unsaved,
+                agreed && !self.stores.account.read(cx).identity_busy() && !unsaved,
                 |this, _, cx| this.begin_create(cx),
                 cx,
             )
             .into_any_element(),
         );
 
-        match &self.create_error {
+        let outcome = self.stores.account.read(cx).create_outcome().cloned();
+        match outcome.as_ref().and_then(|o| o.as_ref().err()) {
             Some(AppError::AccountNotSaved { account, reason }) => {
                 out.push(
                     error_note(
@@ -731,6 +766,7 @@ impl OnboardingView {
                         "onboarding/copy/unsaved-account-id",
                         msg::onboarding_account_id(cx),
                         account.account_id.clone().into(),
+                        account.account_id.clone(),
                         cx,
                     )
                     .into_any_element(),
@@ -740,6 +776,7 @@ impl OnboardingView {
                         "onboarding/copy/unsaved-account-secret",
                         msg::onboarding_account_secret(cx),
                         account.secret.expose().to_string().into(),
+                        account.secret.expose().to_string(),
                         cx,
                     )
                     .into_any_element(),
@@ -770,7 +807,8 @@ impl OnboardingView {
 
     fn render_existing(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out: Vec<AnyElement> = Vec::new();
-        let linked = matches!(self.verify_result, Some(Ok(_)));
+        let outcome = self.stores.account.read(cx).link_outcome().cloned();
+        let linked = matches!(outcome, Some(Ok(_)));
         if !linked {
             out.push(
                 text_field(
@@ -792,7 +830,7 @@ impl OnboardingView {
                 )
                 .into_any_element(),
             );
-            let verifying = self.verifying.is_some();
+            let verifying = self.stores.account.read(cx).linking();
             out.push(
                 self.cta(
                     "onboarding/cta/verify",
@@ -802,14 +840,24 @@ impl OnboardingView {
                         msg::onboarding_cta_verify(cx)
                     },
                     Pill::Primary,
-                    !verifying,
+                    !self.stores.account.read(cx).identity_busy(),
                     |this, _, cx| this.begin_verify(cx),
                     cx,
                 )
                 .into_any_element(),
             );
         }
-        match &self.verify_result {
+        if self.missing_credentials && !linked {
+            out.push(
+                error_note(
+                    "onboarding/error/verify",
+                    msg::onboarding_verify_missing_credentials(cx),
+                    cx,
+                )
+                .into_any_element(),
+            );
+        }
+        match &outcome {
             Some(Ok(available)) => {
                 let line =
                     msg::onboarding_verified_balance(cx, *available, format_credits(*available));
@@ -847,15 +895,7 @@ impl OnboardingView {
                     .into_any_element(),
                 );
             }
-            Some(Err(VerifyFailure::MissingCredentials)) => out.push(
-                error_note(
-                    "onboarding/error/verify",
-                    msg::onboarding_verify_missing_credentials(cx),
-                    cx,
-                )
-                .into_any_element(),
-            ),
-            Some(Err(VerifyFailure::Refused(e))) => {
+            Some(Err(e)) if !self.missing_credentials => {
                 let text = match e {
                     // The server answers "no such account" and "wrong
                     // secret" alike, so the words name both.
@@ -866,9 +906,106 @@ impl OnboardingView {
                 };
                 out.push(error_note("onboarding/error/verify", text, cx).into_any_element());
             }
+            _ => {}
+        }
+        out
+    }
+
+    /// The agreement again, for the account this profile holds: the documents
+    /// current now, the box bound to them, and what the server then reports.
+    fn render_accept(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out = self.render_consent(cx);
+        let agreed = self.consented_terms(cx).is_some();
+        let account = self.stores.account.read(cx);
+        let accepting = account.accepting();
+        let outcome = account.accept_outcome().cloned();
+        let complete = matches!(outcome, Some(Ok(TermsAcceptance::Complete)));
+        if !complete {
+            out.push(
+                self.cta(
+                    "onboarding/cta/record-agreement",
+                    if accepting {
+                        msg::onboarding_cta_record_agreement_pending(cx)
+                    } else {
+                        msg::onboarding_cta_record_agreement(cx)
+                    },
+                    Pill::Primary,
+                    agreed && !accepting,
+                    |this, _, cx| this.begin_accept(cx),
+                    cx,
+                )
+                .into_any_element(),
+            );
+        }
+        match &outcome {
+            Some(Ok(TermsAcceptance::Complete)) => {
+                let line = msg::onboarding_terms_recorded(cx);
+                out.push(
+                    div()
+                        .id("onboarding-terms-recorded")
+                        .probe("onboarding/terms-recorded", Role::Label, line.clone())
+                        .child(note(line, cx))
+                        .into_any_element(),
+                );
+                // Back to adding credit: in the first run, its page; from a
+                // refused checkout, the plans it came from.
+                let from_first_run = self.pages.len() > 1;
+                out.push(
+                    self.cta(
+                        "onboarding/cta/continue",
+                        msg::onboarding_cta_continue(cx),
+                        Pill::Primary,
+                        true,
+                        move |this, window, cx| {
+                            if from_first_run {
+                                this.go(Page::Purchase, window, cx)
+                            } else {
+                                this.finish(cx)
+                            }
+                        },
+                        cx,
+                    )
+                    .into_any_element(),
+                );
+            }
+            Some(Ok(standing)) => {
+                if let Some(line) = terms_standing(standing, cx) {
+                    out.push(error_note("onboarding/terms-standing", line, cx).into_any_element());
+                }
+            }
+            Some(Err(e)) => out.push(
+                error_note(
+                    "onboarding/error/accept",
+                    msg::onboarding_accept_failed(cx, e.to_string()),
+                    cx,
+                )
+                .into_any_element(),
+            ),
             None => {}
         }
         out
+    }
+}
+
+/// What a standing short of complete means for the reader: `None` when
+/// everything required is accepted.
+fn terms_standing(standing: &TermsAcceptance, cx: &App) -> Option<SharedString> {
+    match standing {
+        TermsAcceptance::Complete => None,
+        TermsAcceptance::Outstanding { documents } => {
+            let names: Vec<String> = documents
+                .iter()
+                .map(|d| match d.as_str() {
+                    "terms_of_service" => msg::onboarding_link_terms_of_service(cx).to_string(),
+                    "privacy_policy" => msg::onboarding_link_privacy_policy(cx).to_string(),
+                    other => other.replace('_', " "),
+                })
+                .collect();
+            Some(msg::onboarding_terms_outstanding(cx, names.join(", ")))
+        }
+        TermsAcceptance::Unknown { error } => {
+            Some(msg::onboarding_terms_unknown(cx, error.to_string()))
+        }
     }
 }
 

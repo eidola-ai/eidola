@@ -35,3 +35,6 @@ plans-price-cadence =
 plans-credits-one-time = { $credits } 点额度，自购买之日起一年后过期
 plans-credits-recurring = { $credits } 点额度，在每个计费周期结束时过期
 plans-credits-described = { $line } —— { $description }
+
+purchase-terms-required = 结账被拒绝：此账户尚未同意现行条款。请查看并同意后重试。
+purchase-review-terms = 查看条款…

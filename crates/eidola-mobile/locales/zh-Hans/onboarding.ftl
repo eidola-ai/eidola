@@ -117,3 +117,16 @@ onboarding-cta-skip-account = 不使用账户继续。
 onboarding-cta-plans = 选择方案…
 onboarding-create-failed = 无法创建账户：{ $reason }
 onboarding-verify-failed = 无法核验该账户：{ $reason }
+
+onboarding-accept-terms-body =
+    ## 同意条款
+
+    在此账户上购买，需要它同意现行的 { -fixed-terms-of-service } 和 { -fixed-privacy-policy }。请先阅读。
+onboarding-cta-review-terms = 查看并同意条款…
+onboarding-cta-record-agreement = 记录我的同意。
+onboarding-cta-record-agreement-pending = 正在记录你的同意…
+onboarding-terms-recorded = 你的同意已记录。
+onboarding-cta-continue = 继续。
+onboarding-accept-failed = 无法记录同意：{ $reason }
+onboarding-terms-outstanding = 此账户对 { $documents } 的同意尚未记录，因此在记录之前，它的购买会被拒绝。
+onboarding-terms-unknown = 无法确认此账户对条款的同意是否已记录（{ $reason }），因此购买可能会被拒绝。

@@ -43,3 +43,6 @@ plans-credits-recurring =
        *[other] { $credits } crédits, expirent à la fin de chaque période de facturation
     }
 plans-credits-described = { $line } — { $description }
+
+purchase-terms-required = Le paiement a été refusé : ce compte n'a pas accepté les conditions en vigueur. Lisez-les et acceptez-les, puis réessayez.
+purchase-review-terms = Lire les conditions…

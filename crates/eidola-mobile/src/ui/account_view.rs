@@ -480,7 +480,13 @@ impl Render for AccountView {
                 };
                 body = body
                     .child(section(msg::account_section_credentials(cx), cx))
-                    .child(copy_row("account/id", msg::account_id(cx), id.into(), cx))
+                    .child(copy_row(
+                        "account/id",
+                        msg::account_id(cx),
+                        id.clone().into(),
+                        id,
+                        cx,
+                    ))
                     .child(
                         div()
                             .flex()
@@ -489,6 +495,9 @@ impl Render for AccountView {
                                 "account/secret",
                                 msg::account_secret(cx),
                                 shown_secret,
+                                // The secret itself, masked or not: the mask
+                                // is for the screen, not the clipboard.
+                                secret,
                                 cx,
                             )))
                             .child(

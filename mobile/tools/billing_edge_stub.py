@@ -9,6 +9,16 @@ requests that need Stripe itself:
   which the app hands to the system browser; and it remembers the purchase;
 - GET /v1/account/subscription: no subscription ("none").
 
+With `--refuse-terms N` it also refuses the first N acceptance submissions
+(POST /v1/account/terms) with 503, as a gateway that failed mid-creation
+would, and then refuses a checkout for an account whose acceptance it refused
+with 428 (the terms gate) until a later submission for it goes through: how
+the UI tests reach an account created with its agreement unrecorded.
+
+GET /_stub/secret-sha256 answers the SHA-256 of the account secret the last
+authenticated request carried: what a UI test compares the clipboard with
+after copying that secret while it is masked on screen.
+
 A balance read for an account that "bought" here (by its Basic credentials)
 then carries the plan's credits as a pool of their own, so the app's re-read
 on coming back from the browser shows the purchase. Development and the UI
@@ -20,6 +30,8 @@ Standard library only.
 """
 
 import argparse
+import base64
+import hashlib
 import http.client
 import json
 import threading
@@ -36,6 +48,9 @@ PLANS = [
 ]
 CREDITS = {p["id"]: p["credits"] for p in PLANS}
 BOUGHT = {}
+NEEDS_TERMS = set()
+REFUSE = {"terms": 0}
+LAST_SECRET = {"sha256": ""}
 LOCK = threading.Lock()
 
 
@@ -70,9 +85,28 @@ class Edge(BaseHTTPRequestHandler):
         body = self.body()
         path = urllib.parse.urlsplit(self.path).path
         who = self.headers.get("Authorization")
+        if who and who.startswith("Basic "):
+            _, _, secret = base64.b64decode(who[6:]).decode().partition(":")
+            with LOCK:
+                LAST_SECRET["sha256"] = hashlib.sha256(secret.encode()).hexdigest()
+        if self.command == "GET" and path == "/_stub/secret-sha256":
+            with LOCK:
+                return self.reply(200, {"sha256": LAST_SECRET["sha256"]})
         if self.command == "GET" and path == "/v1/prices":
             return self.reply(200, {"data": PLANS})
+        if self.command == "POST" and path == "/v1/account/terms":
+            with LOCK:
+                refuse = REFUSE["terms"] > 0
+                if refuse:
+                    REFUSE["terms"] -= 1
+                    NEEDS_TERMS.add(who)
+            if refuse:
+                return self.reply(503, {"error": {"message": "the stand-in refused this submission"}})
         if self.command == "POST" and path == "/v1/account/checkout":
+            with LOCK:
+                gated = who in NEEDS_TERMS
+            if gated:
+                return self.reply(428, {"error": {"message": "terms acceptance required"}})
             price = json.loads(body or b"{}").get("price_id", "")
             if price not in CREDITS:
                 return self.reply(400, {"error": {"message": "unknown price"}})
@@ -82,6 +116,9 @@ class Edge(BaseHTTPRequestHandler):
         if self.command == "GET" and path == "/v1/account/subscription":
             return self.reply(200, {"state": "none"})
         resp, data = self.forward(body)
+        if self.command == "POST" and path == "/v1/account/terms" and resp.status < 300:
+            with LOCK:
+                NEEDS_TERMS.discard(who)
         if self.command == "GET" and path == "/v1/account/balances" and resp.status == 200:
             with LOCK:
                 bought = list(BOUGHT.get(who, []))
@@ -107,8 +144,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=18081)
     ap.add_argument("--upstream", default="http://127.0.0.1:18080")
+    ap.add_argument("--refuse-terms", type=int, default=0)
     args = ap.parse_args()
     Edge.upstream = args.upstream
+    REFUSE["terms"] = args.refuse_terms
     ThreadingHTTPServer(("127.0.0.1", args.port), Edge).serve_forever()
 
 

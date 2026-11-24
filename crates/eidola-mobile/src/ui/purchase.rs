@@ -27,7 +27,7 @@ use super::GUTTER;
 use super::account_view::format_credits;
 use super::i18n::msg;
 use super::loadable::Loadable;
-use super::nav::NavEvent;
+use super::nav::{Dest, NavEvent};
 use super::probe::Probe as _;
 use super::stores::Stores;
 use super::widgets::{Pill, error_note, header, keep_keyboard, note, pill, section, value_row};
@@ -297,7 +297,33 @@ impl Render for PurchaseView {
                     }
                 }
             }
-            if let Some(failure) = &self.failure {
+            // A checkout refused for want of the terms: the way to agree is
+            // offered here, for this account.
+            let terms_required = matches!(
+                &self.failure,
+                Some(CheckoutFailure::Refused(
+                    AppError::TermsAcceptanceRequired { .. }
+                ))
+            );
+            if terms_required {
+                body = body
+                    .child(error_note(
+                        "purchase/terms-required",
+                        msg::purchase_terms_required(cx),
+                        cx,
+                    ))
+                    .child(div().px(GUTTER).child(pill(
+                        "purchase/review-terms",
+                        msg::purchase_review_terms(cx),
+                        Pill::Primary,
+                        true,
+                        Box::new(cx.listener(|this, _, _, cx| {
+                            this.failure = None;
+                            cx.emit(NavEvent::To(Dest::AcceptTerms))
+                        })),
+                        cx,
+                    )));
+            } else if let Some(failure) = &self.failure {
                 let text = match failure {
                     CheckoutFailure::StaleMint => msg::account_stale_mint(cx),
                     CheckoutFailure::Refused(e) => msg::account_door_failed(cx, e.to_string()),

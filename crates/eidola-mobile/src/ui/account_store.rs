@@ -24,8 +24,8 @@ use std::rc::Rc;
 
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AccountCreateResult, AppCore, BalancesResult, CheckoutMint, ConfigState,
-    CredentialLifecycleInfo, PortalMint, PriceInfo, SubscriptionInfo, TermsDocument,
+    AppCore, BalancesResult, CheckoutMint, ConfigState, CredentialLifecycleInfo, PortalMint,
+    PriceInfo, SubscriptionInfo, TermsAcceptance, TermsDocument,
 };
 use gpui::{Context, Task};
 
@@ -55,6 +55,24 @@ pub struct AccountStore {
     /// A checkout link went to the browser and the balance has not been
     /// read since the app came back.
     checkout_out: bool,
+    create_task: Option<Task<()>>,
+    create_outcome: Option<Result<CreatedAccount, AppError>>,
+    link_task: Option<Task<()>>,
+    link_outcome: Option<Result<i64, AppError>>,
+    accept_task: Option<Task<()>>,
+    accept_outcome: Option<Result<TermsAcceptance, AppError>>,
+}
+
+/// An account this profile created, as the first run shows it.
+#[derive(Debug, Clone)]
+pub struct CreatedAccount {
+    pub id: String,
+    pub secret: String,
+    /// Where its acceptance of the terms stands, as the server reported it
+    /// after the creation.
+    pub terms: TermsAcceptance,
+    /// The snapshot the reader agreed to.
+    pub agreed: Vec<TermsDocument>,
 }
 
 impl AccountStore {
@@ -75,6 +93,12 @@ impl AccountStore {
             backends_task: None,
             op_error: None,
             checkout_out: false,
+            create_task: None,
+            create_outcome: None,
+            link_task: None,
+            link_outcome: None,
+            accept_task: None,
+            accept_outcome: None,
         };
         store.refresh_backends(cx);
         store
@@ -271,36 +295,172 @@ impl AccountStore {
         }
     }
 
-    /// Create an account, recording acceptance of `accepted_terms`: the
-    /// snapshot this store's [`terms`](Self::terms) held when the reader
-    /// agreed. The caller awaits it in its own slot.
-    pub fn request_create(
-        &self,
-        accepted_terms: Vec<TermsDocument>,
-    ) -> impl std::future::Future<Output = Result<AccountCreateResult, AppError>> + 'static {
+    /// Create an account, recording acceptance of `accepted`: the snapshot
+    /// this store's [`terms`](Self::terms) held when the reader agreed.
+    ///
+    /// **The operation is the store's, not a screen's**: the reader may leave
+    /// the screen that asked while it runs, and what follows the creation
+    /// (the Eidola backend turned back on, the new account's standing read)
+    /// still happens. Its outcome waits here for whichever screen looks
+    /// ([`Self::create_outcome`]). Refused while one is running.
+    pub fn create(&mut self, accepted: Vec<TermsDocument>, cx: &mut Context<Self>) -> bool {
+        if self.identity_busy() {
+            return false;
+        }
+        self.create_outcome = None;
         let core = self.core.clone();
-        async move { core.account_create(accepted_terms).await }
+        let agreed = accepted.clone();
+        self.create_task = Some(cx.spawn(async move |this, cx| {
+            let result = core.account_create(accepted).await;
+            if result.is_ok()
+                && let Err(e) = core.set_backend_enabled(EIDOLA_BACKEND.into(), true).await
+            {
+                log::error!("could not turn the Eidola backend on: {e}");
+            }
+            this.update(cx, |this, cx| {
+                this.create_task = None;
+                this.create_outcome = Some(result.map(|created| CreatedAccount {
+                    id: created.id,
+                    secret: created.secret,
+                    terms: created.terms,
+                    agreed,
+                }));
+                if matches!(this.create_outcome, Some(Ok(_))) {
+                    this.identity_changed(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+        true
     }
 
-    /// Link an existing account: set its credentials, then read its balance.
-    /// A refused check rolls the credentials back, so a bad attempt leaves
-    /// the profile as it was.
-    pub fn request_verify(
-        &self,
-        id: String,
-        secret: String,
-    ) -> impl std::future::Future<Output = Result<BalancesResult, AppError>> + 'static {
+    pub fn creating(&self) -> bool {
+        self.create_task.is_some()
+    }
+
+    pub fn create_outcome(&self) -> Option<&Result<CreatedAccount, AppError>> {
+        self.create_outcome.as_ref()
+    }
+
+    /// Link an existing account: set its credentials, then read its balance;
+    /// a refused check rolls the credentials back, so a bad attempt leaves the
+    /// profile as it was.
+    ///
+    /// **The check and its rollback are one operation, owned here**: the
+    /// credentials are written before the balance is read, so a reader who
+    /// leaves the screen while the read is out must not take the rollback
+    /// with them (an unchecked pair would stay configured, and the first run
+    /// would never open again). Refused while one is running.
+    pub fn link(&mut self, id: String, secret: String, cx: &mut Context<Self>) -> bool {
+        if self.identity_busy() {
+            return false;
+        }
+        self.link_outcome = None;
         let core = self.core.clone();
-        async move {
-            core.set_account_credentials(id, secret)?;
-            match core.account_balances().await {
-                Ok(balances) => Ok(balances),
-                Err(e) => {
-                    let _ = core.reset_account();
-                    Err(e)
+        self.link_task = Some(cx.spawn(async move |this, cx| {
+            let result = async {
+                core.set_account_credentials(id, secret)?;
+                match core.account_balances().await {
+                    Ok(balances) => Ok(balances),
+                    Err(e) => {
+                        if let Err(reset) = core.reset_account() {
+                            log::error!("could not roll back a refused link: {reset}");
+                        }
+                        Err(e)
+                    }
                 }
             }
+            .await;
+            if result.is_ok()
+                && let Err(e) = core.set_backend_enabled(EIDOLA_BACKEND.into(), true).await
+            {
+                log::error!("could not turn the Eidola backend on: {e}");
+            }
+            this.update(cx, |this, cx| {
+                this.link_task = None;
+                match result {
+                    Ok(balances) => {
+                        this.link_outcome = Some(Ok(balances.available));
+                        this.identity_changed(cx);
+                        this.set_balances(balances, cx);
+                    }
+                    Err(e) => this.link_outcome = Some(Err(e)),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+        true
+    }
+
+    pub fn linking(&self) -> bool {
+        self.link_task.is_some()
+    }
+
+    /// A creation or a link is running: each writes the profile's account,
+    /// so neither starts while the other runs.
+    pub fn identity_busy(&self) -> bool {
+        self.create_task.is_some() || self.link_task.is_some()
+    }
+
+    /// The last link's outcome: the balance it read, or the refusal.
+    pub fn link_outcome(&self) -> Option<&Result<i64, AppError>> {
+        self.link_outcome.as_ref()
+    }
+
+    /// Record the configured account's acceptance of `presented`: the
+    /// snapshot the reader agreed to on screen. The standing the server then
+    /// reports waits in [`Self::accept_outcome`]. Refused while one is
+    /// running.
+    pub fn accept_terms(&mut self, presented: Vec<TermsDocument>, cx: &mut Context<Self>) -> bool {
+        if self.accept_task.is_some() {
+            return false;
         }
+        self.accept_outcome = None;
+        let core = self.core.clone();
+        self.accept_task = Some(cx.spawn(async move |this, cx| {
+            let result = core.accept_terms(presented).await;
+            this.update(cx, |this, cx| {
+                this.accept_task = None;
+                this.accept_outcome = Some(result);
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+        true
+    }
+
+    pub fn accepting(&self) -> bool {
+        self.accept_task.is_some()
+    }
+
+    pub fn accept_outcome(&self) -> Option<&Result<TermsAcceptance, AppError>> {
+        self.accept_outcome.as_ref()
+    }
+
+    /// A new agreement page opens: the last one's outcome is not its own.
+    pub fn forget_accept_outcome(&mut self) {
+        if self.accept_task.is_none() {
+            self.accept_outcome = None;
+        }
+    }
+
+    /// A first run opens: settled outcomes of earlier visits are not news.
+    /// Operations still running stay, and so does an account created but not
+    /// saved here, whose secret exists nowhere else.
+    pub fn forget_settled_outcomes(&mut self) {
+        if !matches!(
+            self.create_outcome,
+            Some(Err(AppError::AccountNotSaved { .. }))
+        ) {
+            self.create_outcome = None;
+        }
+        self.link_outcome = None;
+        self.accept_outcome = None;
     }
 
     /// Mint a checkout link for `price_id`, under the account configured

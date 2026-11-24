@@ -305,6 +305,9 @@ impl AppView {
             Dest::SetUpAccount => Screen::Onboarding(
                 cx.new(|cx| OnboardingView::new(s, OnboardingStart::Choose, window, cx)),
             ),
+            Dest::AcceptTerms => Screen::Onboarding(
+                cx.new(|cx| OnboardingView::new(s, OnboardingStart::AcceptTerms, window, cx)),
+            ),
         }
     }
 

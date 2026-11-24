@@ -46,3 +46,7 @@ plans-credits-recurring =
        *[other] { $credits } credits, expire at the end of each billing period
     }
 plans-credits-described = { $line } — { $description }
+
+# A checkout the server refused because the account has not agreed to the current terms.
+purchase-terms-required = Checkout was refused: this account hasn’t agreed to the current terms. Review and agree to them, then try again.
+purchase-review-terms = Review the terms…

@@ -26,6 +26,9 @@ pub enum Dest {
     Licences,
     /// The first run's account steps, from Settings: create, link, or not.
     SetUpAccount,
+    /// The agreement to the current terms, for the configured account (a
+    /// checkout refused for want of it).
+    AcceptTerms,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

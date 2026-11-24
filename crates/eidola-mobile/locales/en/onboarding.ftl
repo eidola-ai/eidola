@@ -192,3 +192,18 @@ onboarding-cta-plans = Choose a plan…
 # $reason is the error's own text (English).
 onboarding-create-failed = Couldn’t create the account: { $reason }
 onboarding-verify-failed = Couldn’t check that account: { $reason }
+
+# Agreeing to the terms again, for an account whose agreement the server does not
+# show as recorded (after a creation, or a checkout refused for it).
+onboarding-accept-terms-body =
+    ## Agree to the terms
+
+    Purchases on this account need its agreement to the current { -fixed-terms-of-service } and { -fixed-privacy-policy }. Please read them.
+onboarding-cta-review-terms = Review and agree to the terms…
+onboarding-cta-record-agreement = Record my agreement.
+onboarding-cta-record-agreement-pending = Recording your agreement…
+onboarding-terms-recorded = Your agreement is recorded.
+onboarding-cta-continue = Continue.
+onboarding-accept-failed = Couldn’t record the agreement: { $reason }
+onboarding-terms-outstanding = The account’s agreement to { $documents } isn’t recorded, so purchases on it will be refused until it is.
+onboarding-terms-unknown = Whether the account’s agreement to the terms was recorded couldn’t be confirmed ({ $reason }), so a purchase may be refused.

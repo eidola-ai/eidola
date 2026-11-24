@@ -117,3 +117,16 @@ onboarding-cta-skip-account = 不使用帳戶繼續。
 onboarding-cta-plans = 選擇方案…
 onboarding-create-failed = 無法建立帳戶：{ $reason }
 onboarding-verify-failed = 無法核驗該帳戶：{ $reason }
+
+onboarding-accept-terms-body =
+    ## 同意條款
+
+    在此帳戶上購買，需要它同意現行的 { -fixed-terms-of-service } 和 { -fixed-privacy-policy }。請先閱讀。
+onboarding-cta-review-terms = 查看並同意條款…
+onboarding-cta-record-agreement = 記錄我的同意。
+onboarding-cta-record-agreement-pending = 正在記錄你的同意…
+onboarding-terms-recorded = 你的同意已記錄。
+onboarding-cta-continue = 繼續。
+onboarding-accept-failed = 無法記錄同意：{ $reason }
+onboarding-terms-outstanding = 此帳戶對 { $documents } 的同意尚未記錄，因此在記錄之前，它的購買會被拒絕。
+onboarding-terms-unknown = 無法確認此帳戶對條款的同意是否已記錄（{ $reason }），因此購買可能會被拒絕。
