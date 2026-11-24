@@ -9,6 +9,11 @@
 //! [`UpdateStore::approve`] can reach it, and `approve` is called only by the
 //! approve button. Approval consumes it: a second tap finds nothing.
 //!
+//! **A check and an install exclude each other**: an approval is refused
+//! while a check is out (its answer could replace what was approved), a check
+//! is refused while an install runs, and an install is never replaced: once
+//! one starts, nothing else touches the offer until it settles.
+//!
 //! **State holds the value, render chooses the words**: every outcome here is
 //! typed (the release, the claims, the error), and the screen words it.
 
@@ -146,6 +151,11 @@ impl UpdateStore {
         self.install_task.is_some()
     }
 
+    /// Whether the approve button may act now.
+    pub fn can_approve(&self) -> bool {
+        self.install_task.is_none() && self.check_task.is_none()
+    }
+
     pub fn report(&self) -> Option<&Result<BundleReport, String>> {
         self.report.as_ref()
     }
@@ -231,6 +241,11 @@ impl UpdateStore {
     }
 
     fn land_check(&mut self, result: Result<BundleUpdate, ReleaseCheckError>) {
+        // Never over an install (none can start while a check is out; this
+        // holds the line should that ever change).
+        if self.install_task.is_some() {
+            return;
+        }
         self.pending = None;
         self.display = match result {
             Ok(BundleUpdate::UpToDate { latest_version }) => {
@@ -254,6 +269,11 @@ impl UpdateStore {
     /// and activate it; then restart into it. A release whose claims changed
     /// is approved only after the reader accepted the change.
     pub fn approve(&mut self, cx: &mut Context<Self>) {
+        // An install runs, or a check is out whose answer would replace the
+        // offer being approved: nothing to do until it settles.
+        if self.install_task.is_some() || self.check_task.is_some() {
+            return;
+        }
         let UpdateDisplay::Available(offer) = &self.display else {
             return;
         };

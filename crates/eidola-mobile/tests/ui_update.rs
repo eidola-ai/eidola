@@ -1,8 +1,10 @@
 //! The Updates screen's store (`ui::update_store::UpdateStore`) under gpui's
 //! test app, over a host that counts what reaches the shell: **nothing is
 //! installed until the approval**, a release whose claims changed waits for
-//! the reader's acceptance too, an approval is spent once, and a release that
-//! failed a check is a warning that offers nothing.
+//! the reader's acceptance too, an approval is spent once, a release that
+//! failed a check is a warning that offers nothing, and a check and an install
+//! exclude each other (an approval waits for an outstanding check; nothing
+//! replaces an install in flight).
 //!
 //! The release is verified evidence by fiat (`PendingBundleUpdate::from_evidence`,
 //! as `tests/update.rs` takes it); the staging itself is `tests/update.rs`'s.
@@ -23,6 +25,7 @@ use eidola_mobile::ui::update_store::{UpdateDisplay, UpdateStore};
 use futures_util::future::LocalBoxFuture;
 use gpui::{AppContext as _, Entity, TestAppContext};
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 
 fn hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -86,13 +89,33 @@ fn state(active: &str) -> BundleState {
     }
 }
 
-/// A host that offers what `check` says and counts every install, revert
-/// and reload.
+/// A host that offers what `check` says and counts every check, install,
+/// revert and reload. With a gate up, checks or installs hold their answer
+/// until [`CountingHost::release`].
 struct CountingHost {
     hello: Hello,
     check: RefCell<Option<Result<(), ReleaseCheckError>>>,
+    checks: Cell<u32>,
     installs: Rc<Cell<u32>>,
     reloads: Rc<Cell<u32>>,
+    gate_checks: Cell<bool>,
+    gate_installs: Cell<bool>,
+    held: RefCell<Vec<oneshot::Sender<()>>>,
+}
+
+impl CountingHost {
+    fn gate(&self) -> Option<oneshot::Receiver<()>> {
+        let (tx, rx) = oneshot::channel();
+        self.held.borrow_mut().push(tx);
+        Some(rx)
+    }
+
+    /// Let every held answer through.
+    fn release(&self) {
+        for tx in self.held.borrow_mut().drain(..) {
+            tx.send(()).ok();
+        }
+    }
 }
 
 impl Host for CountingHost {
@@ -109,8 +132,19 @@ impl Host for CountingHost {
         &self,
         _: Rc<AppCore>,
     ) -> LocalBoxFuture<'static, Result<BundleUpdate, ReleaseCheckError>> {
+        self.checks.set(self.checks.get() + 1);
         let outcome = self.check.borrow().clone().unwrap_or(Ok(()));
-        Box::pin(async move { outcome.map(|()| BundleUpdate::Available(Box::new(pending()))) })
+        let gate = if self.gate_checks.get() {
+            self.gate()
+        } else {
+            None
+        };
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.await.ok();
+            }
+            outcome.map(|()| BundleUpdate::Available(Box::new(pending())))
+        })
     }
     fn install(
         &self,
@@ -120,7 +154,15 @@ impl Host for CountingHost {
         self.installs.set(self.installs.get() + 1);
         let version = pending.version_name().to_owned();
         let digest = pending.bundle_digest().to_owned();
+        let gate = if self.gate_installs.get() {
+            self.gate()
+        } else {
+            None
+        };
         Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.await.ok();
+            }
             Ok(ActivatedBundle {
                 state: state(&version),
                 version,
@@ -141,6 +183,7 @@ impl Host for CountingHost {
 
 struct Fixture {
     store: Entity<UpdateStore>,
+    host: Rc<CountingHost>,
     installs: Rc<Cell<u32>>,
     reloads: Rc<Cell<u32>>,
     _dir: tempfile::TempDir,
@@ -152,7 +195,7 @@ fn fixture(cx: &mut TestAppContext, check: Result<(), ReleaseCheckError>) -> Fix
     let core = Rc::new(AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).unwrap());
     let installs = Rc::new(Cell::new(0));
     let reloads = Rc::new(Cell::new(0));
-    let host: Rc<dyn Host> = Rc::new(CountingHost {
+    let host = Rc::new(CountingHost {
         hello: Hello {
             contract: 2,
             platform: "ios".into(),
@@ -160,12 +203,18 @@ fn fixture(cx: &mut TestAppContext, check: Result<(), ReleaseCheckError>) -> Fix
             methods: vec![],
         },
         check: RefCell::new(Some(check)),
+        checks: Cell::new(0),
         installs: installs.clone(),
         reloads: reloads.clone(),
+        gate_checks: Cell::new(false),
+        gate_installs: Cell::new(false),
+        held: RefCell::new(Vec::new()),
     });
-    let store = cx.update(|cx| cx.new(|cx| UpdateStore::new(core, host, cx)));
+    let shell: Rc<dyn Host> = host.clone();
+    let store = cx.update(|cx| cx.new(|cx| UpdateStore::new(core, shell, cx)));
     Fixture {
         store,
+        host,
         installs,
         reloads,
         _dir: dir,
@@ -235,4 +284,71 @@ fn an_unreachable_feed_is_quiet(cx: &mut TestAppContext) {
     f.store.update(cx, |s, cx| s.check_now(cx));
     cx.run_until_parked();
     assert!(matches!(display(&f, cx), UpdateDisplay::CheckFailed { .. }));
+}
+
+/// An offer on screen, its claims accepted: one tap from an install.
+fn offered(f: &Fixture, cx: &mut TestAppContext) {
+    f.store.update(cx, |s, cx| s.check_now(cx));
+    cx.run_until_parked();
+    assert!(matches!(display(f, cx), UpdateDisplay::Available(_)));
+    f.store.update(cx, |s, cx| s.accept_claims(cx));
+}
+
+#[gpui::test]
+fn an_approval_waits_for_an_outstanding_check(cx: &mut TestAppContext) {
+    let f = fixture(cx, Ok(()));
+    offered(&f, cx);
+
+    // A re-check goes out; its answer would replace the offer on screen, so
+    // the approval is refused until it lands.
+    f.host.gate_checks.set(true);
+    f.store.update(cx, |s, cx| s.check_now(cx));
+    cx.run_until_parked();
+    assert!(f.store.read_with(cx, |s, _| !s.can_approve()));
+    f.store.update(cx, |s, cx| s.approve(cx));
+    cx.run_until_parked();
+    assert_eq!(f.installs.get(), 0, "approved while a check was out");
+
+    f.host.release();
+    cx.run_until_parked();
+    assert!(matches!(display(&f, cx), UpdateDisplay::Available(_)));
+    f.store.update(cx, |s, cx| {
+        s.accept_claims(cx);
+        s.approve(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(f.installs.get(), 1);
+}
+
+#[gpui::test]
+fn nothing_replaces_an_install_in_flight(cx: &mut TestAppContext) {
+    let f = fixture(cx, Ok(()));
+    offered(&f, cx);
+    let checks = f.host.checks.get();
+
+    f.host.gate_installs.set(true);
+    f.store.update(cx, |s, cx| s.approve(cx));
+    cx.run_until_parked();
+    assert_eq!(f.installs.get(), 1);
+    assert!(matches!(display(&f, cx), UpdateDisplay::Installing(_)));
+
+    // Neither a check nor a second approval reaches the shell mid-install,
+    // and the screen stays on the install.
+    f.store.update(cx, |s, cx| {
+        s.check_now(cx);
+        s.approve(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        f.host.checks.get(),
+        checks,
+        "a check went out over an install"
+    );
+    assert_eq!(f.installs.get(), 1, "a second install started");
+    assert!(matches!(display(&f, cx), UpdateDisplay::Installing(_)));
+
+    f.host.release();
+    cx.run_until_parked();
+    assert!(matches!(display(&f, cx), UpdateDisplay::Activated { .. }));
+    assert_eq!(f.reloads.get(), 1);
 }

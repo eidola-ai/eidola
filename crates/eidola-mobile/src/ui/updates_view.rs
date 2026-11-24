@@ -206,7 +206,9 @@ impl UpdatesView {
                     msg::updates_install(cx)
                 },
                 Pill::Primary,
-                !installing,
+                // Off while installing, and while a re-check is out whose
+                // answer could replace this offer.
+                !installing && self.stores.updates.read(cx).can_approve(),
                 // The approval: the one call that stages anything.
                 Box::new(cx.listener(|this, _, _, cx| {
                     this.stores.updates.update(cx, |u, cx| u.approve(cx))
