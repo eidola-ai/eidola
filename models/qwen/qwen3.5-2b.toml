@@ -1,0 +1,50 @@
+sha256 = "b6e06fb21d798d6fd4c165e268c23bea65ad52776342c1b004c0caab062ead27"
+architecture = "Qwen35Dense2B"
+tags = ["qwen3.5-2b"]
+name = "Qwen3.5-2B"
+description = "Qwen's Qwen3.5-2B (BF16): a 2B-parameter dense hybrid of Gated DeltaNet and gated attention, text only, answering without reasoning and calling tools, served on the CPU executor"
+
+[source]
+repo = "Qwen/Qwen3.5-2B"
+revision = "15852e8c16360a2fea060d615a32b45270f8a8fc"
+
+[[files]]
+path = "chat_template.jinja"
+size = 7755
+sha256 = "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+
+[[files]]
+path = "config.json"
+size = 2908
+sha256 = "ed1c1723241f23f7f4e23430759cbd7dcfb4103cbdfe052bfe7626b57c2615b4"
+
+[[files]]
+path = "model.safetensors-00001-of-00001.safetensors"
+size = 4548221488
+sha256 = "aa33250c4fc64891ddfaba3a314fd9542ea371843c387178b425fbcc5ed680b1"
+
+[[files]]
+path = "model.safetensors.index.json"
+size = 64460
+sha256 = "aca8afed9da75b0f050b408d270766fd77627f1af401e240f61c3b47d0db02f9"
+
+[[files]]
+path = "tokenizer.json"
+size = 12807982
+sha256 = "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+
+[capabilities]
+context_length = 16384
+tool_calling = true
+reasoning = false
+input_modalities = ["text"]
+output_modalities = ["text"]
+max_output_tokens = 4096
+output_budget_class = "standard"
+
+[price]
+input_per_m = 0.10
+output_per_m = 1.00
+
+[lifecycle]
+status = "current"

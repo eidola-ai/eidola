@@ -1,0 +1,88 @@
+# Tinfoil Container configuration for one Eidola inference node serving
+# Qwen3.5-2B (weights b6e06fb2…, models/qwen/qwen3.5-2b.toml) on the CPU
+# executor, with no GPU, AMD SEV-SNP.
+#
+# The SHA-256 of this file is the deployment's HOST_DATA: the gateway pins
+# that hash beside the launch digest of the release image `cvm-version` names
+# and its guest policy (releases/trust/engine-enclaves.json, from
+# `measure-engine-enclaves`). Any change here is a different engine identity,
+# and needs a re-measure and a gateway release.
+#
+# Secrets are organisation-scoped and reach a container by their own names,
+# so the node's carry a prefix: `EIDOLA_ENV_PREFIX` names it, and the node
+# reads every variable under it. Its secrets are ENGINE_GATEWAY_TOKEN, the
+# token the gateway's GATEWAY_ENGINE_TOKEN carries, and the OTLP endpoint and
+# headers its telemetry goes to (empty, it exports none); none is measured,
+# so setting or rotating one changes no identity.
+#
+# The weights pack is the modelwrap schema 1 pack of the repo below; its
+# reference is reproducible from the repo at that revision (`modelwrap
+# --schema 1 <repo>@<revision>`, the packer image of modelwrap v0.3.0).
+#
+# The release is the plain CPU image of the platform release the gateway runs
+# on (releases/trust/server-enclave.json): the cpu executor attaches no GPU.
+# The CPU executor is the engine's numerics reference, slow: a proof of
+# concept. Sizing: four seats of the 16,384-position window
+# (4,097 blocks of 16 positions, 12 KiB of KV a position over the six
+# attention layers), the recurrent state pool of nine buffers of about 20 MB,
+# eight request slots, no drafting (the drafter saves nothing on a CPU), and
+# the prefix cache off, so the catalog row declares no engine prefix cache and
+# no client declares a cached prefix. About 15 GB of the VM's 32 GiB: the
+# request slots' pools and headroom (`engine_deployment::host_memory_bytes`),
+# the KV and state pool, and the 4.5 GB of mapped weights.
+#
+# Platform release 0.15.4-rc.2 was rebuilt from source on 2026-11-20 and every
+# published file was byte-identical (docs/contributing/
+# rebuilding-platform-images.md). Rebuild again, and update this note, when
+# the version below changes.
+cvm-version: 0.15.4-rc.2@sha256:689c945f62d8f8507d5051dfdc97abc019e7ea5c9cc153557fe8b6850db45dc2
+cpus: 16
+memory: 32768
+
+models:
+  - name: "weights"
+    repo: "Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc"
+    mpk: "eee99436c0728ab949c899b7104e8bc1a81aa2c14fcf6d80f170a6c31b60f5d7_4571279360_b697a1c0-7107-5382-89e4-75583db025a6"
+    schema: 1
+
+networks:
+  egress:
+    egress: open
+
+containers:
+  - name: "eidola-server-engine"
+    image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:886c5e6a764b65e7a7c9c1760307d7efc0ba015e796c8d4abd0ca25665094234"
+    models: ["weights"]
+    networks:
+      - egress
+    secrets:
+      - ENGINE_GATEWAY_TOKEN
+      - ENGINE_OTEL_EXPORTER_OTLP_ENDPOINT
+      - ENGINE_OTEL_EXPORTER_OTLP_HEADERS
+    env:
+      - EIDOLA_ENV_PREFIX: "ENGINE_"
+      - ENGINE_MODEL_ID: "b6e06fb21d798d6fd4c165e268c23bea65ad52776342c1b004c0caab062ead27"
+      - ENGINE_WEIGHTS_DIR: "/tinfoil/models/weights"
+      - ENGINE_WEIGHTS_SHA256: "b6e06fb21d798d6fd4c165e268c23bea65ad52776342c1b004c0caab062ead27"
+      - ENGINE_WEIGHTS_STORAGE: "verified-readonly"
+      - ENGINE_EXECUTOR: "cpu"
+      - ENGINE_BIND_ADDR: "0.0.0.0:8080"
+      - ENGINE_KV_BLOCK_SIZE: "16"
+      - ENGINE_KV_BLOCKS: "4097"
+      - ENGINE_MAX_MODEL_LEN: "16384"
+      - ENGINE_MAX_SEQS: "4"
+      - ENGINE_MAX_BATCHED_TOKENS: "512"
+      - ENGINE_MAX_PREFILL_CHUNK: "512"
+      - ENGINE_DRAFT_TOKENS: "0"
+      - ENGINE_MAX_REQUESTS: "8"
+      - ENGINE_PREFIX_CACHE: "false"
+      - ENGINE_CACHE_IDLE_TTL_SECS: "900"
+      - ENGINE_CACHE_MAX_AGE_SECS: "7200"
+      - ENGINE_KV_HOST_BYTES: "0"
+
+shim:
+  upstream-port: 8080
+  paths:
+    - /v1/chat/completions
+    - /v1/engine/info
+    - /healthz
