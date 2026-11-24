@@ -13,7 +13,7 @@ What to prepare before a shell build goes onto a physical device, and the exact 
 ## Before the session (on the Mac)
 
 - [ ] `just mobile-ios-test` and `just mobile-android-test` pass on this commit.
-- [ ] Xcode is signed in to an Apple ID on team `7N2X49G865` (Xcode → Settings → Accounts); the build uses automatic signing with the bundle id `ai.eidola.mobile.dev`.
+- [ ] Xcode is signed in to an Apple ID on team `JPK236247S` (Xcode → Settings → Accounts); the build uses automatic signing with the bundle id `ai.eidola.mobile.dev` (`IOS_TEAM` names another team).
 - [ ] Builds made ahead, one per bundle, each with the digest `build.sh` prints noted:
   - the contract test page: `mobile/ios/build.sh --device --bundle mobile/contract-test`
   - the app bundle: `mobile/ios/build.sh --device` (it builds `mobile/build/bundle` first)
