@@ -35,10 +35,25 @@ final class PhoneUITests: XCTestCase {
             .matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).allElementsBoundByIndex
     }
 
+    /// A device asks for local network access at a new install's first connect to this Mac (the
+    /// Simulator never does): allow it whenever it is up.
+    private func allowLocalNetwork() {
+        #if !targetEnvironment(simulator)
+            let allow = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.buttons["Allow"]
+            if allow.exists { allow.tap() }
+        #endif
+    }
+
     @discardableResult
     private func waitFor(_ name: String, timeout: TimeInterval = 30) -> XCUIElement {
         let element = probe(name)
-        if !element.waitForExistence(timeout: timeout) {
+        let deadline = Date().addingTimeInterval(timeout)
+        var found = element.waitForExistence(timeout: min(timeout, 2))
+        while !found && Date() < deadline {
+            allowLocalNetwork()
+            found = element.waitForExistence(timeout: 2)
+        }
+        if !found {
             shot("failure-\(name.replacingOccurrences(of: "/", with: "-"))")
             XCTFail("no \(name)")
         }

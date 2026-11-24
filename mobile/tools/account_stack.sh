@@ -9,7 +9,9 @@
 #                               measurement) and DIR/pids; logs to DIR
 #   account_stack.sh down DIR   stops what `up` started (and the database container)
 # The shim's certificate also names 10.0.2.2, the address the Android emulator reaches this machine
-# at. Needs docker (the database) and the database image `just services` builds.
+# at. With ACCOUNT_STACK_HOST set to this machine's LAN address, the shim listens on the LAN and its
+# certificate names that address too, for a physical device. Needs docker (the database) and the
+# database image `just services` builds.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -73,8 +75,9 @@ python3 "$HERE/billing_edge_stub.py" --port "$EDGE_PORT" --upstream "http://127.
 echo $! >>"$DIR/pids"
 wait_port "$EDGE_PORT"
 mkdir -p "$DIR/certs"
-CERT_DIR="$DIR/certs" LISTEN_ADDR="127.0.0.1:$SHIM_PORT" UPSTREAM_URL="http://127.0.0.1:$EDGE_PORT" \
-  DEV_MEASUREMENT="$MEASUREMENT" EXTRA_TLS_NAMES=10.0.2.2 "$BIN/tinfoil-shim-mock" >"$DIR/shim.log" 2>&1 &
+LAN="${ACCOUNT_STACK_HOST:-}"
+CERT_DIR="$DIR/certs" LISTEN_ADDR="${LAN:+0.0.0.0}${LAN:-127.0.0.1}:$SHIM_PORT" UPSTREAM_URL="http://127.0.0.1:$EDGE_PORT" \
+  DEV_MEASUREMENT="$MEASUREMENT" EXTRA_TLS_NAMES="10.0.2.2${LAN:+,$LAN}" "$BIN/tinfoil-shim-mock" >"$DIR/shim.log" 2>&1 &
 echo $! >>"$DIR/pids"
 wait_port "$SHIM_PORT"
 
