@@ -132,7 +132,10 @@ RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do
       if grep -q '^\[\[bin\]\]' "$manifest"; then echo 'fn main(){}' > "$dir/main.rs"; fi; \
     done
 
-# Both targets' graphs: build scripts and proc macros run on the x86-64 host.
+# Both targets' graphs: build scripts and proc macros run on the x86-64 host,
+# cargo reads every package the host activates even for the wasm build, and the
+# licences step (below) reads the whole workspace's graph; this fetch is what
+# mobile/build-bundle.sh fetches too.
 RUN cargo fetch --locked --target ${TARGET} --target x86_64-unknown-linux-musl
 
 # The flags mobile/build-bundle.sh passes, for this image's paths: an 8 MiB

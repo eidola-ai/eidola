@@ -19,6 +19,13 @@
 //!
 //! The output is a function of the lockfile and the package sources it
 //! names: sorted, every distinct text once, no paths, no times.
+//!
+//! It reads only what is already downloaded (`--offline`), and `cargo
+//! metadata` reads the whole workspace's graph for the wasm target and the
+//! host (cargo includes every package the host activates, whatever the
+//! target), so the packages must be fetched for both:
+//! `cargo fetch --locked --target wasm32-unknown-unknown --target <host>`, as
+//! `mobile/build-bundle.sh` and the release image do.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

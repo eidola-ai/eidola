@@ -79,6 +79,12 @@ FLAGS="['-Clink-arg=-zstack-size=8388608', '--remap-path-prefix=$ROOT=/eidola', 
 FEATURES=()
 $SELF_TEST && FEATURES=(--features self-test)
 [[ -n "$DEV_BACKEND" ]] && FEATURES=(--features dev)
+# The packages, fetched as the release image fetches them (oci/eidola-mobile-bundle): every locked
+# package the wasm target or this host activates. Cargo reads the host's too even for a wasm build,
+# and the licence step below reads the whole workspace's graph offline, so a fetch for the wasm
+# target alone, or only what the build downloads, is not enough.
+HOST="$(rustc "+$TOOLCHAIN" -vV | sed -n 's/^host: //p')"
+(cd "$ROOT" && cargo "+$TOOLCHAIN" fetch --locked --target wasm32-unknown-unknown --target "$HOST")
 (cd "$ROOT" && cargo "+$TOOLCHAIN" build --locked -p eidola-mobile --target wasm32-unknown-unknown \
   --profile mobile "${FEATURES[@]}" --config "target.wasm32-unknown-unknown.rustflags=$FLAGS")
 WASM="$TARGET_DIR/wasm32-unknown-unknown/mobile/eidola_mobile.wasm"
