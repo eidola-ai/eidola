@@ -157,6 +157,19 @@ impl GenerationDefaults {
         top_k: 0,
     };
 
+    /// Qwen3.5's defaults when its checkpoint ships no `generation_config.json` (the
+    /// released 2B and 0.8B do not): the model card's recommendation for text without
+    /// thinking, temperature 1.0, `top_p` 1.0, `top_k` 20 and `min_p` 0. Its
+    /// `presence_penalty` 2.0 and `repetition_penalty` 1.0 have no counterpart in the
+    /// engine's sampler and are not applied. Nothing is written into the weights
+    /// directory, whose files the weights hash covers: the defaults are the node's, for
+    /// the architecture.
+    pub const QWEN3_5_MODEL_CARD: GenerationDefaults = GenerationDefaults {
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: 20,
+    };
+
     fn parse(bytes: &[u8]) -> Result<Self, ModelError> {
         let bad = |m: &str| ModelError(format!("{GENERATION_CONFIG_FILE}: {m}"));
         let v: serde_json::Value =
@@ -389,9 +402,11 @@ impl LoadedModel {
                         .map_err(|_| ModelError(format!("{CHAT_TEMPLATE_FILE} is not UTF-8")))?;
                 let template = qwen::ChatTemplate::for_format(format, template_source)
                     .map_err(|e| ModelError(e.to_string()))?;
+                // Qwen3.8 requires its generation config; a Qwen3.5 directory without
+                // one gets the model card's defaults.
                 let defaults = match chat.get(GENERATION_CONFIG_FILE) {
                     Some(bytes) => GenerationDefaults::parse(bytes)?,
-                    None => GenerationDefaults::NONE,
+                    None => GenerationDefaults::QWEN3_5_MODEL_CARD,
                 };
                 if tokenizer.vocab_size() > config.vocab_size {
                     return Err(ModelError(format!(

@@ -185,8 +185,8 @@ fn cached(v: &Value) -> u64 {
 
 /// A BF16 `qwen3_5` configuration is Qwen3.5 (the 2B's architecture, the dev model not
 /// being the 0.8B's size), served through the Qwen3.5 template and tokenizer: its
-/// end-of-sequence ids `<|im_end|>` and `config.json`'s `<|endoftext|>`, and no sampling
-/// defaults (the checkpoints ship no generation config).
+/// end-of-sequence ids `<|im_end|>` and `config.json`'s `<|endoftext|>`, and the model
+/// card's sampling defaults (the checkpoints ship no generation config).
 #[test]
 fn the_dev_model_is_qwen35() {
     let model = qwen35_loaded();
@@ -201,11 +201,41 @@ fn the_dev_model_is_qwen35() {
     assert_eq!(model.tokenizer().vocab_size(), 248_070);
     assert_eq!(model.sampleable_vocab_size(), 248_070);
     assert_eq!(model.tokenizer().eos_token_ids(), [248_046, 248_044]);
-    assert_eq!(model.defaults(), GenerationDefaults::NONE);
+    assert_eq!(model.defaults(), GenerationDefaults::QWEN3_5_MODEL_CARD);
+    let d = model.defaults();
+    assert_eq!((d.temperature, d.top_p, d.top_k), (1.0, 1.0, 20));
     assert!(
         !qwen35_model_dir().join("generation_config.json").exists(),
         "the dev model ships no generation config, as the checkpoints do not"
     );
+}
+
+/// A request that names no temperature or `top_p` samples at the model card's defaults,
+/// `top_k` 20 among them; one that names them keeps `top_k` 20, which the strict subset
+/// leaves to the node.
+#[test]
+fn a_request_samples_at_the_model_cards_defaults() {
+    let model = qwen35_loaded();
+    let sampling = |extra: &str| {
+        let body = format!(
+            r#"{{"model": "m", "messages": [{{"role": "user", "content": "hi"}}], {extra}"max_completion_tokens": 1, "stream": true, "stream_options": {{"include_usage": true}}}}"#
+        );
+        let valid = eidola_server_engine::api::parse_request(body.as_bytes(), "m").unwrap();
+        eidola_server_engine::pipeline::prepare(
+            &model,
+            &eidola_engine::secret::SaltDeriver::new(),
+            1024,
+            1,
+            valid,
+        )
+        .unwrap()
+        .request
+        .sampling
+    };
+    let s = sampling("");
+    assert_eq!((s.temperature(), s.top_p(), s.top_k()), (1.0, 1.0, 20));
+    let s = sampling(r#""temperature": 0.7, "top_p": 0.8, "#);
+    assert_eq!((s.temperature(), s.top_p(), s.top_k()), (0.7, 0.8, 20));
 }
 
 /// A plain chat: the answer is the engine core's greedy generation over the same prompt
