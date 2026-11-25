@@ -21,14 +21,12 @@ on:
     branches:
       - next
       - main
-      - mobile
     tags:
       - "v*"
   pull_request:
     branches:
       - main
       - next
-      - mobile
 
 # Cancel superseded PR runs; let pushes to main and tag releases finish.
 concurrency:
@@ -287,13 +285,9 @@ jobs:
         # Save from pushes to the trunks: `next` (the active integration
         # branch — this is what warms feature PRs, which restore from their
         # base) and `main` (the default branch — the universal restore fallback
-        # and the promotion PR's base). PRs into `next` and `main` never save
-        # (github.ref is a PR ref), so there's no per-PR thrash. The `mobile`
-        # integration branch saves from its own pushes (its merges), which
-        # warm every PR into it, and its PRs save too: they take many pushes,
-        # and a cache saved under a PR ref is restored only by that same PR's
-        # later runs. This job only runs tests; no artifact from here is
-        # published.
+        # and the promotion PR's base). PRs never save (github.ref is a PR ref),
+        # so there's no per-PR thrash. This job only runs tests; no artifact
+        # from here is published.
         #
         # A failed job saves too. The key's environment half is the Rust
         # version, and a restore never crosses it, so the first trunk push
@@ -304,7 +298,7 @@ jobs:
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true' || steps.scope.outputs.markdown == 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/mobile' || github.base_ref == 'mobile' }}
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
           cache-on-failure: true
           # The pinned dev tools are their own workspace with their own
           # target directory; rust-cache keeps only the dependencies of the
