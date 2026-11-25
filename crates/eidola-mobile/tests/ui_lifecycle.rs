@@ -1,7 +1,8 @@
 //! The interface's domain lifecycle under gpui's test app, over a real core
 //! answering from an OpenAI-compatible mock: navigation never cancels a
-//! conversation's work, a reader who comes back joins the running entity, and
-//! a conversation reopened while its disposal is being decided is read once
+//! conversation's work, a reader who comes back joins the running entity and
+//! finds a failed turn's Retry or a refused post's words waiting, and a
+//! conversation reopened while its disposal is being decided is read once
 //! the disposal keeps it; and linking an account is the account store's
 //! operation, whose refused check rolls the credentials back with no screen
 //! holding it.
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 use eidola_app_core::AppCore;
 use eidola_mobile::dev::{DevConfig, seed};
-use eidola_mobile::ui::conversation::Conversation;
+use eidola_mobile::ui::conversation::{Conversation, Rejected};
 use eidola_mobile::ui::stores::Stores;
 use gpui::{Entity, TestAppContext};
 use wiremock::matchers::{body_partial_json, method, path};
@@ -324,6 +325,71 @@ fn a_turn_that_fails_after_the_reader_left_keeps_its_retry(cx: &mut TestAppConte
 
     // Dismissed, the recovery ends and nothing holds it any more.
     again.update(cx, |c, cx| c.dismiss_error(cx));
+    stores.spaces.update(cx, |s, cx| s.left(&again, cx));
+    wait_until(cx, "the hold is released", |cx| {
+        stores.spaces.read_with(cx, |s, _| !s.is_held(&id))
+    });
+}
+
+/// Back while a post saves, and the save is then refused: its words and the
+/// notice wait for the reader, and the conversation is let go only once a
+/// view has taken the words back into its composer.
+#[gpui::test]
+fn a_post_refused_after_the_reader_left_keeps_its_words(cx: &mut TestAppContext) {
+    let model = Model::start(Duration::ZERO);
+    let (stores, _dir) = stores(cx, &model);
+    let conversation = created(&stores, cx);
+    let id = conversation.read_with(cx, |c, _| c.id().to_string());
+    let entity = conversation.entity_id();
+
+    // A reply to a post that does not exist: the save is refused. Sent, and
+    // left in the same breath, so the refusal lands with no view to show it.
+    let reply_to = Some("no-such-post".to_string());
+    stores.spaces.update(cx, |spaces, cx| {
+        conversation.update(cx, |c, cx| {
+            assert!(c.submit("My words".into(), reply_to.clone(), cx))
+        });
+        assert!(conversation.read(cx).is_saving());
+        spaces.left(&conversation, cx);
+    });
+    drop(conversation);
+
+    let watched = stores
+        .spaces
+        .update(cx, |s, cx| s.open(&id, cx))
+        .downgrade();
+    wait_until(
+        cx,
+        "the save is refused or the conversation is gone",
+        |cx| {
+            watched
+                .upgrade()
+                .is_none_or(|c| c.read_with(cx, |c, _| !c.is_saving()))
+        },
+    );
+    cx.run_until_parked();
+    assert!(
+        watched.upgrade().is_some() && stores.spaces.read_with(cx, |s, _| s.is_held(&id)),
+        "a refused post's conversation was let go before the reader saw it"
+    );
+
+    let again = stores.spaces.update(cx, |s, cx| s.open(&id, cx));
+    assert_eq!(again.entity_id(), entity, "a second entity for one space");
+    assert!(
+        again.read_with(cx, |c, _| c.error().is_some()),
+        "the refusal's notice was lost"
+    );
+    assert_eq!(
+        again.read_with(cx, |c, _| c.rejected().cloned()),
+        Some(Rejected {
+            text: "My words".into(),
+            reply_to,
+        }),
+        "the refused post's words were lost"
+    );
+
+    // A view takes the words back; nothing holds the conversation any more.
+    again.update(cx, |c, cx| assert!(c.take_rejected(cx).is_some()));
     stores.spaces.update(cx, |s, cx| s.left(&again, cx));
     wait_until(cx, "the hold is released", |cx| {
         stores.spaces.read_with(cx, |s, _| !s.is_held(&id))

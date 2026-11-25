@@ -16,8 +16,8 @@
 //! happens to the task awaiting it, so a dropped task loses an answer's
 //! delivery, never a write.
 //!
-//! **Honest states**: a refused save gives the reader's words back to the
-//! composer ([`ConversationEvent::SubmitFailed`]) and says why; a failed turn
+//! **Honest states**: a refused save keeps the reader's words ([`Rejected`])
+//! until a view gives them back to its composer, and says why; a failed turn
 //! keeps a Retry until it is retried or dismissed, unless nothing could lift
 //! it; a failed read keeps what was shown and says so; a space whose creation
 //! was refused says that instead of offering a composer over nothing.
@@ -107,6 +107,15 @@ pub struct Pending {
     pub created_at: i64,
 }
 
+/// A post whose save was refused: its words, waiting for a view of this
+/// conversation to give them back to its composer (`take_rejected`) — the
+/// one showing it when the refusal lands, or the next one to open it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rejected {
+    pub text: String,
+    pub reply_to: Option<String>,
+}
+
 /// One answer streaming in.
 #[derive(Clone, Debug)]
 pub struct Turn {
@@ -151,11 +160,8 @@ pub enum ConversationEvent {
         action_id: String,
         reply_to: Option<String>,
     },
-    /// The save was refused: the words go back to the composer.
-    SubmitFailed {
-        text: String,
-        reply_to: Option<String>,
-    },
+    /// The save was refused: its words wait in `rejected` for the composer.
+    SubmitFailed,
     /// A streaming answer grew.
     Delta { seq: u64 },
     /// A streamed answer's post has been read back: the turn's overlay gave
@@ -179,6 +185,8 @@ pub struct Conversation {
     pending: Vec<Pending>,
     next_pending: u64,
     post_runner: Option<Task<()>>,
+    /// The refused post no view has taken back yet.
+    rejected: Option<Rejected>,
     turns: Vec<Turn>,
     turn_runners: HashMap<u64, Task<()>>,
     plan_tasks: HashMap<u64, Task<()>>,
@@ -219,6 +227,7 @@ impl Conversation {
             pending: Vec::new(),
             next_pending: 0,
             post_runner: None,
+            rejected: None,
             turns: Vec::new(),
             turn_runners: HashMap::new(),
             plan_tasks: HashMap::new(),
@@ -263,6 +272,20 @@ impl Conversation {
         self.failed_turn.is_some()
     }
 
+    /// The refused post whose words wait for a composer.
+    pub fn rejected(&self) -> Option<&Rejected> {
+        self.rejected.as_ref()
+    }
+
+    /// A view takes the refused post's words back into its composer.
+    pub fn take_rejected(&mut self, cx: &mut Context<Self>) -> Option<Rejected> {
+        let rejected = self.rejected.take();
+        if rejected.is_some() {
+            cx.notify();
+        }
+        rejected
+    }
+
     pub fn cascade_paused(&self) -> Option<i64> {
         self.cascade_paused
     }
@@ -293,11 +316,11 @@ impl Conversation {
     }
 
     /// Whether the entity must outlive every view of it: work in flight
-    /// (`is_busy`), or a failed turn whose notice and Retry wait for the
-    /// reader until retried or dismissed. `SpacesStore::left` holds it
-    /// while this is true.
+    /// (`is_busy`), a failed turn whose notice and Retry wait for the reader
+    /// until retried or dismissed, or a refused post whose words no view has
+    /// taken back. `SpacesStore::left` holds it while this is true.
     pub fn needs_keeping(&self) -> bool {
-        self.is_busy() || self.can_retry()
+        self.is_busy() || self.can_retry() || self.rejected.is_some()
     }
 
     /// A save is in flight: the composer holds its next one.
@@ -448,7 +471,8 @@ impl Conversation {
                     Err(e) => {
                         this.pending.retain(|p| p.seq != seq);
                         this.error = Some(e);
-                        cx.emit(ConversationEvent::SubmitFailed { text, reply_to });
+                        this.rejected = Some(Rejected { text, reply_to });
+                        cx.emit(ConversationEvent::SubmitFailed);
                         // A refused save may still have written something;
                         // the read says what is true.
                         this.load(cx);

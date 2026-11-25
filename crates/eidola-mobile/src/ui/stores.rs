@@ -68,9 +68,9 @@ pub struct SpacesStore {
     disposals: HashMap<String, Task<()>>,
     /// One entity per open space, shared by every view of it.
     registry: HashMap<String, WeakEntity<Conversation>>,
-    /// Conversations no view shows that still have work in flight or a failed
-    /// turn to offer again, kept alive until that ends (the observation
-    /// releases them).
+    /// Conversations no view shows that still have work in flight, a failed
+    /// turn to offer again or a refused post's words to give back, kept alive
+    /// until that ends (the observation releases them).
     held: HashMap<String, (Entity<Conversation>, Subscription)>,
 }
 
@@ -189,7 +189,8 @@ impl SpacesStore {
     /// its running stream (`open`). Dropping it would cancel exactly the
     /// continuations that do those things. A turn that failed is held on
     /// until it is retried or dismissed, so its notice and Retry are there
-    /// when the reader comes back (`Conversation::needs_keeping`).
+    /// when the reader comes back, and a refused post until a view takes its
+    /// words back into the composer (`Conversation::needs_keeping`).
     ///
     /// A space nobody wrote in goes with its screen — otherwise every "new
     /// conversation" tapped and abandoned stays in the Library — but a write
@@ -253,7 +254,7 @@ impl SpacesStore {
     }
 
     /// Whether a conversation no view shows is being kept alive for its work
-    /// in flight or its failed turn.
+    /// in flight, its failed turn or its refused post.
     pub fn is_held(&self, id: &str) -> bool {
         self.held.contains_key(id)
     }
