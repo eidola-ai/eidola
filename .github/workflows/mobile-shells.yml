@@ -64,6 +64,9 @@ jobs:
       - name: The tools cache refuses bytes it did not check in this run
         run: mobile/android/test-tools-cache.sh
 
+      - name: tcp.connect dials every resolved address within its deadline
+        run: mobile/android/test-connect.sh
+
       - name: Build twice, strip a signed build, compare with the committed hash
         run: |
           java -version
