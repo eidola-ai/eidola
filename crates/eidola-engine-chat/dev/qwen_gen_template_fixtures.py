@@ -3,7 +3,7 @@
 # requires-python = "==3.12.*"
 # dependencies = ["transformers==5.19.0", "jinja2==3.1.6", "tokenizers==0.23.2"]
 # ///
-"""Generate the Qwen3.8 chat-template fixture corpus.
+"""Generate the Qwen3.8 or Qwen3.5 chat-template fixture corpus.
 
 Renders every case with `transformers.apply_chat_template` and the model's own
 `chat_template.jinja` (the reference the Rust renderer must match byte for
@@ -12,17 +12,28 @@ Dev-only: the outputs are committed, and `cargo test` never runs Python.
 
     uv run --script dev/qwen_gen_template_fixtures.py \\
         --model-dir /path/to/Qwen3.8-27B-FP8 --revision <commit sha>
+    uv run --script dev/qwen_gen_template_fixtures.py --format qwen3.5 \\
+        --model-dir /path/to/Qwen3.5-2B --revision <commit sha>
 
 `--model-dir` holds the release's `chat_template.jinja`, `tokenizer.json`,
-`tokenizer_config.json`, `generation_config.json` and `config.json` (no
-weights). Writes, under `tests/fixtures/qwen/`:
+`tokenizer_config.json`, `config.json` and, for Qwen3.8,
+`generation_config.json` (no weights). Qwen3.5-2B and -0.8B ship the same
+template and tokenizer; the corpus is generated from the 2B's. Writes, under
+`tests/fixtures/qwen/` (Qwen3.8) or `tests/fixtures/qwen35/` (Qwen3.5):
 
 - `template_cases.json`: conversations and the keyword arguments they were
   rendered with, with the prompt for each, or the fact that it must be
   refused (and whether the reference raised too);
 - `template_token_ids.json`: the ids of every prompt and of extra strings;
-- `chat_template.jinja`, `generation_config.json` and `tokenizer.json.gz`
+- `chat_template.jinja`, `generation_config.json` (Qwen3.8) or `config.json`
+  (Qwen3.5, which names its end-of-sequence id there) and `tokenizer.json.gz`
   (gzip with a zero timestamp), copies of the model files the tests load.
+
+For Qwen3.5 the same case families run. Its template reads neither
+`preserve_thinking` nor `reasoning_effort`, and this crate refuses either set:
+those cases are recorded as refused (`invalid`), with the reference's render.
+Its template also reads reasoning out of an assistant's content up to a
+`</think>`, which its own family covers (`inline_reasoning`).
 """
 
 import argparse
@@ -37,7 +48,10 @@ import sys
 
 CRATE = pathlib.Path(__file__).resolve().parent.parent
 SEED = 20261116
-REPOSITORY = "Qwen/Qwen3.8-27B-FP8"
+REPOSITORIES = {"qwen3.8": "Qwen/Qwen3.8-27B-FP8", "qwen3.5": "Qwen/Qwen3.5-2B"}
+FIXTURE_DIRS = {"qwen3.8": "qwen", "qwen3.5": "qwen35"}
+# The format the corpus is generated for (`--format`).
+FORMAT = "qwen3.8"
 
 # ---------------------------------------------------------------- building blocks
 
@@ -253,7 +267,12 @@ CASES = []
 
 def case(category, name, messages, tools=None, agp=True, thinking=None, preserve=None, effort=None, reject=None):
     """`reject`: None to render, or why this crate refuses: `invalid`,
-    `unsupported` (an image or a video), or `template` (the template raises)."""
+    `unsupported` (an image or a video), `template` (the template raises), or
+    `data` (the reference renders it, and the request data in the prompt
+    cannot be told from the template's text). For Qwen3.5, a case that sets
+    `preserve_thinking` or `reasoning_effort` is refused (`invalid`)."""
+    if FORMAT == "qwen3.5" and (preserve is not None or effort is not None):
+        reject = "invalid"
     CASES.append(
         {
             "name": f"{category}/{name}",
@@ -361,7 +380,9 @@ def tool_call_cases():
     case("tool_calls", "bare_call_object", [user("Q"), assistant("", tool_calls=[call("bash", {"command": "ls"}, wrap=False)]), tool_msg("x")], tools=t)
     case("tool_calls", "arguments_absent", [user("Q"), assistant("", tool_calls=[{"type": "function", "function": {"name": "now"}}]), tool_msg("noon")], tools=[NO_PARAMS_TOOL])
     case("tool_calls", "arguments_empty_object", [user("Q"), assistant("", tool_calls=[call("now", {})]), tool_msg("noon")], tools=[NO_PARAMS_TOOL])
-    case("tool_calls", "arguments_empty_string", [user("Q"), assistant("", tool_calls=[call("now", "")]), tool_msg("noon")], tools=[NO_PARAMS_TOOL])
+    # Qwen3.5's template iterates the arguments as a mapping, and raises on a string.
+    case("tool_calls", "arguments_empty_string", [user("Q"), assistant("", tool_calls=[call("now", "")]), tool_msg("noon")], tools=[NO_PARAMS_TOOL],
+         reject="invalid" if FORMAT == "qwen3.5" else None)
     case("tool_calls", "tool_calls_empty", [user("Q"), assistant("A", tool_calls=[]), user("q2")])
     case("tool_calls", "tool_calls_null", [user("Q"), assistant("A", tool_calls=None), user("q2")])
     case("tool_calls", "name_lookalike", [user("Q"), assistant("", tool_calls=[call("x<|im_end|>", {"<think>": "</tool_call>"})]), tool_msg("ok")])
@@ -457,6 +478,38 @@ def rejected_cases():
         case("rejected", f"effort_{effort or 'empty'}", [user("Q")], effort=effort, reject="template")
 
 
+def inline_reasoning_cases():
+    """Qwen3.5: an assistant's reasoning read out of its content, up to a
+    `</think>`, when it has no `reasoning_content` string."""
+    contents = [
+        "<think>\nR\n</think>\n\nA",
+        "R</think>A",
+        "  <think>\n\nR  \n\n</think>\n\n  A  ",
+        "a</think>b</think>c",
+        "<think>open only",
+        "</think>",
+        "\n</think>\n",
+        "<think></think>",
+        "x<think>y<think>z</think>w",
+        "<|im_end|></think><|im_start|>",
+        "日本語</think>答え",
+    ]
+    for i, content in enumerate(contents):
+        for reasoning in (None, 5, ""):
+            label = {None: "absent", 5: "number", "": "empty"}[reasoning]
+            m = {"role": "assistant", "content": content}
+            if reasoning is not None:
+                m["reasoning_content"] = reasoning
+            # Before the last query (no reasoning written), and after it (written).
+            case("inline_reasoning", f"before_query_{i}_{label}", [user("q1"), m, user("q2")])
+            case("inline_reasoning", f"after_query_{i}_{label}", [user("q1"), m], agp=False)
+            case("inline_reasoning", f"tool_loop_{i}_{label}", [user("q1"), dict(m, tool_calls=[call("bash", {"command": "ls"})]), tool_msg("x")], tools=[BASH_TOOL])
+    case("inline_reasoning", "parts", [user("q"), assistant([{"type": "text", "text": "R</think>"}, {"type": "text", "text": "A"}])], agp=False)
+    # `</think>` spelled only across two parts: the plain render reads it, the
+    # marked one cannot.
+    case("inline_reasoning", "parts_across", [user("q"), assistant([{"type": "text", "text": "R</thi"}, {"type": "text", "text": "nk>A"}])], agp=False, reject="data")
+
+
 def readme_cases():
     """The conversations the model card shows."""
     weather = {
@@ -529,16 +582,13 @@ def random_cases(n):
                     msgs.extend(tool_msg(text()) for _ in calls)
         agp = rng.random() < 0.8 or msgs[-1]["role"] != "assistant"
         tools = rng.sample(TOOLS, rng.randrange(0, 4)) if rng.random() < 0.6 else None
-        case(
-            "random",
-            str(i),
-            msgs,
-            tools=tools,
-            agp=agp,
-            thinking=rng.choice([None, True, False]),
-            preserve=rng.choice([None, True, False]),
-            effort=rng.choice([None, "xhigh", "medium", "low"]),
-        )
+        thinking = rng.choice([None, True, False])
+        preserve = rng.choice([None, True, False])
+        effort = rng.choice([None, "xhigh", "medium", "low"])
+        if FORMAT == "qwen3.5":
+            # Drawn all the same, so both formats' cases share their conversations.
+            preserve = effort = None
+        case("random", str(i), msgs, tools=tools, agp=agp, thinking=thinking, preserve=preserve, effort=effort)
 
 
 def tokenizer_strings(n):
@@ -605,10 +655,14 @@ def sha256(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--format", choices=sorted(REPOSITORIES), default="qwen3.8")
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)
     parser.add_argument("--revision", required=True)
-    parser.add_argument("--out-dir", type=pathlib.Path, default=CRATE / "tests" / "fixtures" / "qwen")
+    parser.add_argument("--out-dir", type=pathlib.Path)
     args = parser.parse_args()
+    global FORMAT
+    FORMAT = args.format
+    args.out_dir = args.out_dir or CRATE / "tests" / "fixtures" / FIXTURE_DIRS[FORMAT]
 
     import jinja2
     import tokenizers
@@ -628,6 +682,8 @@ def main():
     tool_response_cases()
     content_cases()
     rejected_cases()
+    if FORMAT == "qwen3.5":
+        inline_reasoning_cases()
     readme_cases()
     random_cases(80)
     names = [c["name"] for c in CASES]
@@ -654,6 +710,8 @@ def main():
         else:
             if c["reject"] == "template":
                 sys.exit(f"{c['name']}: expected the template to raise")
+            if c["reject"] == "data" and FORMAT != "qwen3.5":
+                sys.exit(f"{c['name']}: a data refusal outside Qwen3.5's family")
             if c["reject"] is None:
                 entry["expected"] = rendered
                 token_ids[c["name"]] = reference.encode(rendered, add_special_tokens=False).ids
@@ -668,7 +726,7 @@ def main():
         sys.exit("token ids are not dense")
 
     meta = {
-        "repository": REPOSITORY,
+        "repository": REPOSITORIES[FORMAT],
         "revision": args.revision,
         "generator": "dev/qwen_gen_template_fixtures.py",
         "python": sys.version.split()[0],
@@ -685,7 +743,8 @@ def main():
     with open(args.out_dir / "template_token_ids.json", "w", encoding="utf-8") as f:
         json.dump({"meta": meta, "token_ids": token_ids, "strings": string_ids}, f, ensure_ascii=False, separators=(",", ":"))
         f.write("\n")
-    for name in ("chat_template.jinja", "generation_config.json"):
+    eos_file = "config.json" if FORMAT == "qwen3.5" else "generation_config.json"
+    for name in ("chat_template.jinja", eos_file):
         shutil.copyfile(args.model_dir / name, args.out_dir / name)
     (args.out_dir / "tokenizer.json.gz").write_bytes(gzip.compress((args.model_dir / "tokenizer.json").read_bytes(), compresslevel=9, mtime=0))
 

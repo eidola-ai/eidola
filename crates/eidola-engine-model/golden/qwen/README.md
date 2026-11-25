@@ -1,6 +1,6 @@
-# Qwen3.8 golden generation (dev-only)
+# Qwen3.8 and Qwen3.5 golden generation (dev-only)
 
-Python tooling that produces the reference outputs the Qwen3.8 forward (`src/qwen/`) is checked against, and checks the released checkpoint's health. It is never a build input: `cargo test` reads only the committed fixtures under `tests/fixtures/qwen_tiny/` and `tests/fixtures/qwen_tiny256/` and needs neither Python nor the network.
+Python tooling that produces the reference outputs the Qwen forward (`src/qwen/`) is checked against, and checks the released checkpoints' health: Qwen3.8-27B-FP8, and Qwen3.5-2B and -0.8B (below, Qwen3.5). It is never a build input: `cargo test` reads only the committed fixtures under `tests/fixtures/qwen_tiny/`, `qwen_tiny256/`, `qwen_tiny_bf16/` and `qwen_tiny_bf16_tied/` and needs neither Python nor the network.
 
 ## What the goldens are
 
@@ -117,3 +117,35 @@ DRY_RUN=1 CKPT=<dir> ./full_session.sh all       # print every command, run none
 On a GPU machine only `setup`, `fetch`, `tokens`, `released`, `released-torch` and `health` need the GPU: run those there, copy `<CKPT>/golden/` back, and run `rust` (and, if not done yet, `pinned` and `native`) on a CPU machine with the checkpoint.
 
 Every step is resumable: a finished step leaves `$OUT/done/<step>` and is skipped on a rerun. A step that fails exits non-zero, leaves no marker and stops the session; its output is in `$OUT/logs/<step>.log`. The released runs' goldens land beside the pinned one in `<CKPT>/golden/`, which is what the `rust` step compares.
+
+## Qwen3.5
+
+The same tooling runs Qwen3.5-2B and -0.8B (`Qwen/Qwen3.5-2B` at `15852e8c16360a2fea060d615a32b45270f8a8fc`, `Qwen/Qwen3.5-0.8B` at `2fc06364715b967f1860aea9cf38778875588b17`). Their reference is the same pinned Transformers code. Three things differ in how it is built (`qwen_golden/reference.py`):
+
+- **BF16 projections.** A checkpoint without a `quantization_config` keeps the model code's own `nn.Linear`s, whose `F.linear` is pinned (`pinned_ops.linear`); nothing of the FP8 emulation runs.
+- **The head tied to the embedding**, the model's `lm_head` the embedding's tensor (asserted), and the checkpoint carries no `lm_head.weight`.
+- **Every F32 parameter loaded into BF16.** The checkpoints store `A_log` and the gated norm's weight in F32. `from_pretrained` builds the model in the config's dtype and copies every parameter into it, and vLLM's loader does the same, so the reference rounds them to BF16 (ties to even) where Qwen3.8's tooling assigns the stored tensors as they are (all of its small tensors are BF16 already).
+
+### Synthetic fixtures (committed)
+
+```sh
+uv run python make_synthetic.py --qwen35            # tests/fixtures/qwen_tiny_bf16/
+uv run python make_synthetic.py --qwen35 --tied     # tests/fixtures/qwen_tiny_bf16_tied/
+```
+
+`synthetic.qwen35`: the checkpoint's config keys (no `quantization_config`, `language_model_only`, `output_gate_type`, top-level `partial_rotary_factor`, `bos_token_id` or `pad_token_id`; `mlp_only_layers: []`), BF16 projections, `A_log` and the gated-norm weight in F32, the released groupings (six value heads over six key heads, eight query heads over two KV heads) at the fixture's other sizes, and with `--tied` no `lm_head.weight` and the embedding drawn at the head's scale. The random draws are the same as `qwen_tiny`'s, so these change only where the format does. Regenerating every fixture with the extended tooling leaves `qwen_tiny` and `qwen_tiny256` byte for byte as they were.
+
+### Real weights (local, not CI)
+
+```sh
+uv run python fetch_checkpoint.py --model qwen3.5-2b --dir <dir>      # 4.5 GB; 0.8b: 1.7 GB
+uv run python real_golden.py --model qwen3.5-2b --dir <dir>           # the whole model, pinned
+uv run python real_golden.py --model qwen3.5-2b --dir <dir> --mode native
+uv run python health_check.py --model qwen3.5-2b --dir <dir>
+cd ../../../.. && EIDOLA_QWEN_DIR=<dir> EIDOLA_QWEN_LAYERS=24 \
+    cargo test --release -p eidola-engine-model --test qwen_real -- --ignored --nocapture
+EIDOLA_QWEN_DIR=<dir> cargo test --release -p eidola-engine-model --test qwen_health -- --ignored --nocapture
+EIDOLA_QWEN_DIR=<dir> cargo test --release -p eidola-engine-cpu --test qwen_real -- --ignored --nocapture
+```
+
+Each checkpoint is one shard, fetched whole (`--truncation full`, the only one), and `--layers` defaults to the whole model. Its files are recorded in `upstream-qwen3.5-2b-sha256.json` and `upstream-qwen3.5-0.8b-sha256.json` as Qwen3.8's are (`--model` selects the list; `qwen_golden/upstream.py`), and the Rust tests pick the list whose `config.json` the directory holds. On an M4 Max: `real_golden.py` pinned 246 s for the 2B and 90 s for the 0.8B, `native` about 5 and 3 minutes (most of it the one-token calls), `health_check.py` about 6 and 3 minutes; the measurements are in `eidola-engine-model/AGENTS.md` → Qwen3.5.

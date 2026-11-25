@@ -279,6 +279,7 @@ impl<D: QwenDevice> QwenCudaExecutor<D> {
     /// An executor over `model` on `dev`. Refuses a configuration the kernels cannot run.
     pub fn new(dev: D, model: &QwenModel, cfg: QwenCudaExecutorConfig) -> Result<Self> {
         let c = model.config();
+        super::check_supported(c)?;
         let a = &c.attention;
         let d = &c.deltanet;
         if d.k_head_dim != KEY_DIM as usize || d.v_head_dim > 128 || d.conv_kernel != 4 {

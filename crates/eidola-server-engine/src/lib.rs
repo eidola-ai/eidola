@@ -13,6 +13,8 @@
 //!   sequences, reasoning and tool calls out.
 //! * [`worker`] — the engine's step loop on its own thread, and the bridge to it.
 //! * [`http`] — the routes.
+//! * [`zeroing`] — the binary's global allocator, which zeroes every heap block before it
+//!   is freed.
 //!
 //! Doctrine lives in this crate's `AGENTS.md`.
 
@@ -30,6 +32,7 @@ pub mod storage;
 pub mod swap;
 pub mod telemetry;
 pub mod worker;
+pub mod zeroing;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -361,7 +364,7 @@ pub fn deepseek_cpu_config(
     })
 }
 
-/// The Qwen3.8 CPU executor's configuration: one captured shape, as for the others; both
+/// The Qwen CPU executor's configuration (Qwen3.8 and Qwen3.5): one captured shape, as for the others; both
 /// KV groups `kv_blocks` blocks; a state pool of
 /// `eidola_common::engine_deployment::recurrent_state_buffers` buffers (the CUDA
 /// executor's rule: per seat its base, a fresh buffer and, with the prefix cache, its
@@ -384,7 +387,7 @@ pub fn qwen_cpu_config(
     }
     if kv_host_bytes > 0 {
         return Err(BootError(format!(
-            "{} must be 0: the Qwen3.8 cpu executor takes no host tier",
+            "{} must be 0: the Qwen cpu executor takes no host tier",
             config::env::KV_HOST_BYTES
         )));
     }
@@ -538,7 +541,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         QwenCpuExecutor::new(reference, exec_config)
                     }))
-                    .map_err(|_| "the Qwen3.8 executor refused this model".to_string())
+                    .map_err(|_| "the Qwen executor refused this model".to_string())
                 },
                 scheduler,
                 SWEEP_INTERVAL,
@@ -546,7 +549,8 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
             );
             (engine, None)
         }
-        // Qwen3.8 on one GPU. Never a fallback: a refusal here ends the boot.
+        // Qwen3.8 on one GPU (Qwen3.5 is refused before the device). Never a fallback: a
+        // refusal here ends the boot.
         #[cfg(feature = "cuda")]
         (
             ExecutorConfig::Cuda {

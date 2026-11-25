@@ -10,27 +10,28 @@ These docs describe how Eidola works, what it commits to, and what it does not y
 
 ## Design pieces
 
-4. **[The client](client.md)** — Embedded trust root, per-handshake attestation, and refusal when verification fails.
-5. **[The mobile app](mobile.md)** — The bundle and the native shell: what each platform lets you verify, and what the shell is trusted with.
-6. **[The gateway](gateway.md)** — Linked and unlinked surfaces, anonymous credentials, telemetry, and what runs in confidential compute.
-7. **[Inference engine](engine.md)** — Where models run, and how that layer is pinned and verified.
-8. **[Model identity](model-identity.md)** — The weights hash that names a model, and how to recompute it.
-9. **[Anonymous credits](anonymous-credits.md)** — How payment stays unlinkable from use, one decision at a time.
+4. **[Architecture](architecture.md)** — Every part and every connection between them, with what each connection reveals and what protects it.
+5. **[The client](client.md)** — Embedded trust root, per-handshake attestation, and refusal when verification fails.
+6. **[The mobile app](mobile.md)** — The bundle and the native shell: what each platform lets you verify, and what the shell is trusted with.
+7. **[The gateway](gateway.md)** — Linked and unlinked surfaces, anonymous credentials, telemetry, and what runs in confidential compute.
+8. **[The engine](engine.md)** — Where models run, and how that layer is pinned and verified.
+9. **[Model identity](model-identity.md)** — The weights hash that names a model, and how to recompute it.
+10. **[Anonymous credits](anonymous-credits.md)** — How payment stays unlinkable from use, one decision at a time.
 
 ## Release flow
 
-10. **[Releases](releases.md)** — How a release becomes trustable: a CI signature plus human attestation, both on the same transparency log.
-11. **[Verification](verification.md)** — Payload, archive, envelope, installable: the hashes a user checks, and what the CI-signed manifest records.
-12. **[Trust root](trust-root.md)** — What is pinned at compile time, how schema versions work, and how the verifier walks the chain.
-13. **[Apple distribution](apple-distribution.md)** — The macOS envelope: Developer ID, notarization, and why those bytes never enter the manifest.
+11. **[Releases](releases.md)** — How a release becomes trustable: a CI signature plus human attestation, both on the same transparency log.
+12. **[Verification](verification.md)** — Payload, archive, envelope, installable: the hashes a user checks, and what the CI-signed manifest records.
+13. **[Trust root](trust-root.md)** — What is pinned at compile time, how schema versions work, and how the verifier walks the chain.
+14. **[Apple distribution](apple-distribution.md)** — The macOS envelope: Developer ID, notarization, and why those bytes never enter the manifest.
 
 ## What's missing
 
-14. **[Known gaps](gaps.md)** — Every piece of the trust chain that is deferred, with what it would catch and what constrains it today.
+15. **[Known gaps](gaps.md)** — Every piece of the trust chain that is deferred, with what it would catch and what constrains it today.
 
 ## Operations
 
-15. **[Infrastructure and vendors](vendors.md)** — The third parties that process data for Eidola, and what each can see. Referenced by the [privacy policy](https://www.eidola.ai/privacy/).
+16. **[Infrastructure and vendors](vendors.md)** — The third parties that process data for Eidola, and what each can see. Referenced by the [privacy policy](https://www.eidola.ai/privacy/).
 
 ## For contributors
 

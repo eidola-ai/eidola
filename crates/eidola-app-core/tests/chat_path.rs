@@ -2299,6 +2299,23 @@ fn regenerate_replaces_answer_with_a_new_generation() {
         assert_eq!(regen.space_id, result.space_id);
         assert!(regen.credits_charged > 0);
 
+        // Exercise the schema's chain-derived numbering through the same
+        // render query the GUI uses, after a real paid regeneration.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(result.space_id.clone()))
+            .unwrap();
+        let answer = tree
+            .iter()
+            .find(|post| post.action_type == "inference")
+            .unwrap();
+        assert_eq!((answer.generation, answer.generation_count), (1, 2));
+        let question = tree
+            .iter()
+            .find(|post| post.action_type == "user_input")
+            .unwrap();
+        assert_eq!((question.generation, question.generation_count), (0, 1));
+
         // The default view shows the regenerated answer in place — still two
         // messages (user + current answer), not three: Revise replaces in the
         // default view, where Reply would have appended a sibling.

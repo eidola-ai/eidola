@@ -51,45 +51,10 @@ CREATE INDEX idx_account_stripe_customer ON account (stripe_customer_id)
     WHERE stripe_customer_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- Account Acceptance
--- ---------------------------------------------------------------------------
-
-CREATE TABLE account_acceptance (
-    account_id  UUID NOT NULL REFERENCES account(id),
-    document    TEXT NOT NULL
-        CHECK (document IN ('terms_of_service', 'privacy_policy')),
-    version     BIGINT NOT NULL CHECK (version >= 1),
-    sha256      TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    PRIMARY KEY (account_id, document, sha256)
-);
-
-COMMENT ON TABLE account_acceptance IS
-    'Append-only record of terms-of-service / privacy-policy acceptance. '
-    'Each row binds an account to the SHA-256 of the exact document text it '
-    'accepted (the same accept-by-hash mechanism the repository''s CLA uses), '
-    'so a dispute can be resolved against the precise version in git history. '
-    'Rows are never updated or deleted; re-accepting an already-accepted '
-    'version is a no-op that preserves the original timestamp. The currently '
-    'REQUIRED versions live in required_document (advanced by the terms-feed '
-    'poller and/or seeded from server configuration).';
-
-COMMENT ON COLUMN account_acceptance.version IS
-    'The document''s front-matter version number at acceptance time, '
-    'stamped from the requiring server''s view. The acceptance gate is '
-    'MAX(version) >= required version, so accepting a newer version '
-    'satisfies an instance whose required view briefly lags.';
-
-COMMENT ON COLUMN account_acceptance.sha256 IS
-    'Hex-encoded SHA-256 of the exact published document text the account '
-    'accepted.';
-
--- ---------------------------------------------------------------------------
 -- Required Document
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE required_document (
+CREATE TABLE required_document_version (
     document    TEXT NOT NULL
         CHECK (document IN ('terms_of_service', 'privacy_policy')),
     version     BIGINT NOT NULL CHECK (version >= 1),
@@ -97,10 +62,11 @@ CREATE TABLE required_document (
     url         TEXT NOT NULL,
     first_required_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    PRIMARY KEY (document, version)
+    PRIMARY KEY (document, version),
+    UNIQUE (document, version, sha256)
 );
 
-COMMENT ON TABLE required_document IS
+COMMENT ON TABLE required_document_version IS
     'Append-only record of every legal-document version this cluster has '
     'ever required. One row per (document, version); rows are never '
     'updated or deleted. The CURRENT requirement is the highest version '
@@ -117,10 +83,47 @@ COMMENT ON TABLE required_document IS
     'a different hash is a contract violation the poller detects and '
     'refuses to record.';
 
-COMMENT ON COLUMN required_document.first_required_at IS
+COMMENT ON COLUMN required_document_version.first_required_at IS
     'When this version was first observed and became enforced '
     'cluster-wide. Never overwritten — later observations of the same '
     'version are no-ops.';
+
+-- ---------------------------------------------------------------------------
+-- Account Acceptance
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE account_acceptance (
+    account_id  UUID NOT NULL REFERENCES account(id),
+    document    TEXT NOT NULL
+        CHECK (document IN ('terms_of_service', 'privacy_policy')),
+    version     BIGINT NOT NULL CHECK (version >= 1),
+    sha256      TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (account_id, document, sha256),
+    FOREIGN KEY (document, version, sha256)
+        REFERENCES required_document_version(document, version, sha256)
+);
+
+COMMENT ON TABLE account_acceptance IS
+    'Append-only record of terms-of-service / privacy-policy acceptance. '
+    'Each row binds an account to the SHA-256 of the exact document text it '
+    'accepted (the same accept-by-hash mechanism the repository''s CLA uses), '
+    'so a dispute can be resolved against the precise version in git history. '
+    'Rows are never updated or deleted; re-accepting an already-accepted '
+    'version is a no-op that preserves the original timestamp. The currently '
+    'REQUIRED versions live in required_document_version (advanced by the terms-feed '
+    'poller and/or seeded from server configuration).';
+
+COMMENT ON COLUMN account_acceptance.version IS
+    'The document''s front-matter version number at acceptance time, '
+    'stamped from the requiring server''s view. The acceptance gate is '
+    'MAX(version) >= required version, so accepting a newer version '
+    'satisfies an instance whose required view briefly lags.';
+
+COMMENT ON COLUMN account_acceptance.sha256 IS
+    'Hex-encoded SHA-256 of the exact published document text the account '
+    'accepted.';
 
 -- ---------------------------------------------------------------------------
 -- Issuer Key
@@ -297,9 +300,10 @@ COMMENT ON COLUMN credit_ledger.credential_key_id IS
     'per key" without joining to issuer_key.';
 
 COMMENT ON COLUMN credit_ledger.credential_credits IS
-    'Only set for credential_issuance entries. The credit amount loaded into the '
-    'issued credential. Always equals -delta by constraint. Stored explicitly for '
-    'query convenience ("show me the distribution of credential sizes").';
+    'Only set for credential_issuance entries. This ledger row''s allocation '
+    'toward an issuance, always equal to -delta. One issuance can consume '
+    'several purchase lots; its whole credential size is credential_issuance.credits, '
+    'and credential_issuance_allocation links every debit that funded it.';
 
 -- Primary query path: "what is this account's available balance?"
 CREATE INDEX idx_ledger_account_balance ON credit_ledger (account_id, expires_at)
@@ -319,9 +323,9 @@ CREATE INDEX idx_ledger_payment_intent ON credit_ledger (stripe_payment_intent)
 -- One row per idempotent issuance: the signed response, kept so a client whose
 -- response was lost can ask again under the same idempotency key and receive
 -- the same response instead of being debited a second time. Account-surface
--- data only, beside the ledger row it was debited by (which already records
+-- data only, beside the ledger rows it was debited by (which already record
 -- the account, amount, key and time). No timestamp of its own: the ledger
--- row has one, and nothing here needs a second.
+-- rows have them, and nothing here needs another.
 
 CREATE TABLE credential_issuance (
     account_id        UUID   NOT NULL REFERENCES account(id),
@@ -330,12 +334,34 @@ CREATE TABLE credential_issuance (
     issuer_key_id     TEXT   NOT NULL REFERENCES issuer_key(id),
     credits           BIGINT NOT NULL CHECK (credits > 0),
     issuance_response BYTEA  NOT NULL,
-    ledger_entry_id   UUID   NOT NULL UNIQUE REFERENCES credit_ledger(id),
+    issuance_id       UUID   NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    UNIQUE (issuance_id, account_id, issuer_key_id),
     PRIMARY KEY (account_id, idempotency_key)
 );
 
 -- Pruning walks a key's rows at once.
 CREATE INDEX idx_credential_issuance_key ON credential_issuance (issuer_key_id);
+
+-- Every allocation belongs to the issuance's account and issuer key. A
+-- non-issuance ledger row has no credential_key_id and cannot satisfy this FK.
+CREATE UNIQUE INDEX idx_ledger_issuance_allocation
+    ON credit_ledger (id, account_id, credential_key_id);
+CREATE TABLE credential_issuance_allocation (
+    issuance_id     UUID NOT NULL,
+    account_id      UUID NOT NULL,
+    issuer_key_id   TEXT NOT NULL,
+    ledger_entry_id UUID PRIMARY KEY,
+    FOREIGN KEY (issuance_id, account_id, issuer_key_id)
+        REFERENCES credential_issuance(issuance_id, account_id, issuer_key_id) ON DELETE CASCADE,
+    FOREIGN KEY (ledger_entry_id, account_id, issuer_key_id)
+        REFERENCES credit_ledger(id, account_id, credential_key_id)
+);
+CREATE INDEX idx_issuance_allocation_issuance ON credential_issuance_allocation (issuance_id);
+
+COMMENT ON TABLE credential_issuance_allocation IS
+    'All ledger debits funding one identified issuance, written atomically '
+    'with its response. Each debit funds only one issuance. Pruned with that '
+    'response; the append-only credit ledger remains. Contains no spend data.';
 
 COMMENT ON TABLE credential_issuance IS
     'Stored responses of idempotent credential issuances, keyed by the account '
@@ -541,19 +567,20 @@ RETURNS TABLE (
     issuer_key_id     TEXT,
     credits           BIGINT,
     issuance_response BYTEA,
-    ledger_entry_id   UUID
+    issuance_id       UUID
 )
 LANGUAGE plpgsql
 AS $$
 #variable_conflict use_column
 DECLARE
     v_ids UUID[];
+    v_issuance_id UUID;
 BEGIN
     PERFORM 1 FROM account WHERE id = p_account_id FOR UPDATE;
 
     RETURN QUERY
         SELECT 'stored'::TEXT, ci.request_digest, ci.issuer_key_id, ci.credits,
-               ci.issuance_response, ci.ledger_entry_id
+               ci.issuance_response, ci.issuance_id
         FROM credential_issuance ci
         WHERE ci.account_id = p_account_id
           AND ci.idempotency_key = p_idempotency_key;
@@ -585,13 +612,17 @@ BEGIN
     END IF;
 
     INSERT INTO credential_issuance (account_id, idempotency_key, request_digest,
-                                     issuer_key_id, credits, issuance_response,
-                                     ledger_entry_id)
+                                     issuer_key_id, credits, issuance_response)
     VALUES (p_account_id, p_idempotency_key, p_request_digest, p_issuer_key_id,
-            p_credits, p_response, v_ids[1]);
+            p_credits, p_response)
+    RETURNING credential_issuance.issuance_id INTO v_issuance_id;
+
+    INSERT INTO credential_issuance_allocation (issuance_id, account_id, issuer_key_id, ledger_entry_id)
+    SELECT v_issuance_id, p_account_id, p_issuer_key_id, entry
+    FROM unnest(v_ids) AS entries(entry);
 
     RETURN QUERY SELECT 'issued'::TEXT, p_request_digest, p_issuer_key_id,
-                        p_credits, p_response, v_ids[1];
+                        p_credits, p_response, v_issuance_id;
 END;
 $$;
 
@@ -629,7 +660,7 @@ RETURNS TABLE (
     issuer_key_id     TEXT,
     credits           BIGINT,
     issuance_response BYTEA,
-    ledger_entry_id   UUID
+    issuance_id       UUID
 )
 LANGUAGE plpgsql
 AS $$
@@ -639,7 +670,7 @@ BEGIN
 
     RETURN QUERY
         SELECT 'stored'::TEXT, ci.request_digest, ci.issuer_key_id, ci.credits,
-               ci.issuance_response, ci.ledger_entry_id
+               ci.issuance_response, ci.issuance_id
         FROM credential_issuance ci
         WHERE ci.account_id = p_account_id
           AND ci.idempotency_key = p_idempotency_key;
@@ -711,7 +742,13 @@ INSERT INTO billing_protocol(singleton,ingress_version,execution_version) VALUES
 
 ALTER TABLE account ADD COLUMN billing_state TEXT NOT NULL DEFAULT 'open'
     CHECK (billing_state IN ('open', 'closing', 'closed'));
-ALTER TABLE account ADD COLUMN billing_closed_at TIMESTAMPTZ;
+ALTER TABLE account ADD COLUMN billing_close_requested_at TIMESTAMPTZ;
+ALTER TABLE account ADD CONSTRAINT billing_closure_timestamp CHECK (
+    (billing_state = 'open') = (billing_close_requested_at IS NULL)
+);
+COMMENT ON COLUMN account.billing_close_requested_at IS
+    'When closure began and refund eligibility was frozen, not when closure '
+    'finished. Set on entering closing and retained in closed.';
 
 CREATE TABLE billing_operation (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -726,7 +763,7 @@ CREATE TABLE billing_operation (
 CREATE TABLE billing_purchase (
     id TEXT PRIMARY KEY,
     account_id UUID NOT NULL REFERENCES account(id),
-    operation_id UUID NOT NULL UNIQUE REFERENCES billing_operation(id),
+    operation_id UUID NOT NULL UNIQUE,
     charge_id TEXT UNIQUE,
     payment_intent TEXT UNIQUE,
     invoice_id TEXT UNIQUE,
@@ -738,6 +775,7 @@ CREATE TABLE billing_purchase (
     kind TEXT NOT NULL CHECK (kind IN ('purchase', 'subscription_renewal')),
     CHECK (paid_minor = 0 OR charge_id IS NOT NULL),
     CHECK (kind = 'subscription_renewal' OR expires_at > purchased_at),
+    FOREIGN KEY (operation_id, account_id) REFERENCES billing_operation(id, account_id),
     UNIQUE(id,account_id),
     UNIQUE(id,expires_at)
 );
@@ -972,8 +1010,8 @@ BEGIN
         SELECT p.*, COALESCE(SUM(cl.delta), 0)::BIGINT AS remaining
         FROM billing_purchase p JOIN credit_ledger cl ON cl.purchase_id = p.id
         WHERE p.account_id = d.account_id AND p.currency = d.currency AND p.paid_minor > 0
-          AND (p.expires_at > COALESCE((SELECT billing_closed_at FROM account WHERE id = d.account_id), clock_timestamp())
-               OR p.purchased_at >= (SELECT billing_closed_at FROM account WHERE id = d.account_id))
+          AND (p.expires_at > COALESCE((SELECT billing_close_requested_at FROM account WHERE id = d.account_id), clock_timestamp())
+               OR p.purchased_at >= (SELECT billing_close_requested_at FROM account WHERE id = d.account_id))
         GROUP BY p.id HAVING SUM(cl.delta) > 0
         ORDER BY (p.id = d.purchase_id) DESC, p.expires_at, p.id
     LOOP

@@ -156,6 +156,10 @@
 //! still never emitted by a turn. A turn with an empty tool registry can only
 //! ever take one iteration, so every pre-existing row above is untouched.
 //!
+//! Revision numbering is derived from the supersedes chain, including after
+//! clock rollback; it adds no write or emission. `regenerate_replaces_answer_with_a_new_generation`
+//! in `chat_path.rs` checks the rendered generation and count after a paid turn.
+//!
 //! **Regeneration has two transports and one contract.** `AppCore::regenerate`
 //! and `AppCore::regenerate_stream` share `Inner::begin_regeneration` — the same
 //! target/tip resolution, the same two gates (the human's verb, on an agent's

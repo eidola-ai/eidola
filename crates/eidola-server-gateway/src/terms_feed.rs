@@ -8,11 +8,11 @@
 //! document's exact source bytes (`/terms/source.md`, `/privacy/source.md`
 //! — published by the site builder alongside the rendered page), computes
 //! the SHA-256 of those bytes itself, parses the front-matter `version`,
-//! and advances the shared `required_document` table.
+//! and advances the shared `required_document_version` table.
 //!
 //! Ordering and failure semantics:
-//! - Advancement is **monotonic** (`db::upsert_required_document` only
-//!   accepts a strictly greater version), so a stale CDN edge, a lagging
+//! - Advancement is **monotonic** (requirements select the highest version
+//!   recorded by `db::record_required_document`), so a stale CDN edge, a lagging
 //!   poll, or a website outage can never *regress* the requirement — it
 //!   can only pause its advancement. CI enforces that a document's bytes
 //!   never change without a version increment, which is what makes the

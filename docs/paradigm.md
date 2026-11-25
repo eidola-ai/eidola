@@ -23,7 +23,7 @@ Your data (chat history, drafts, accounts) lives on your device. A request that 
 Privacy guarantees in Eidola are properties of the *running code*, not of an operator's stated policy. The user can verify which code is running because:
 
 - **The source is public and the builds are reproducible.** Anyone can rebuild the released binaries from the committed source and get the same bytes. The expected hashes are committed beside the source and re-derived in CI.
-- **Servers run in confidential compute.** The gateway runs in an AMD SEV-SNP enclave, and the inference engines in Intel TDX confidential VMs with NVIDIA confidential-computing GPUs. The client verifies the gateway's hardware attestation on every TLS handshake, and the gateway verifies each engine's the same way. Each checks against measurements compiled into its own build. See [gateway.md](gateway.md) and [engine.md](engine.md).
+- **Servers run in confidential compute.** The gateway and the inference engines run in confidential VMs, each on AMD SEV-SNP or Intel TDX as its deployment names (today the gateway on SEV-SNP, and the engines on TDX with NVIDIA confidential-computing GPUs). The client verifies the gateway's hardware attestation on every TLS handshake, and the gateway verifies each engine's the same way. Each checks against measurements compiled into its own build. See [gateway.md](gateway.md) and [engine.md](engine.md).
 - **Releases are attested by named people.** Every release [carries a signed attestation](releases.md), in wording the previous version of the app fixes and verifies, that the release meets the versioned properties in [Privacy guarantees](privacy-guarantees.md). Each attestant's key fingerprint is pinned in the prior client, so the chain of authorized attestants is unbroken across releases.
 
 Together these make the guarantees auditable: whether chat history is logged is a question about the running code, which can be read, and a named person has signed that the code matches the claims.
@@ -44,9 +44,10 @@ These docs may be incomplete, and may drift from the code. The code is the sourc
 
 - [Privacy guarantees](privacy-guarantees.md) — the specific commitments in each release.
 - [Threat model](threat-model.md) — who you're trusting and who you're not.
+- [Architecture](architecture.md) — every part and connection, and what each connection reveals.
 - [The client](client.md) — the trust root and what the client refuses.
 - [The gateway](gateway.md) — what runs in confidential compute, and what is deliberately kept apart from it.
-- [Inference engine](engine.md) — where models run, and how that layer is pinned.
+- [The engine](engine.md) — where models run, and how that layer is pinned.
 - [Releases](releases.md) — how a new binary becomes trustable.
 - [Verification](verification.md) — payload, archive, envelope, installable, and the hashes a user checks.
 - [Known gaps](gaps.md) — what we don't yet defend against.

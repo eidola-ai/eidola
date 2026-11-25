@@ -22,8 +22,9 @@
 //!
 //! Each input file is rerun-watched; the generator validates that everything
 //! parses as JSON before emitting. The server URL is derived as
-//! `template.replace("{hash}", sha256(snp_measurement_bytes ||
-//! host_data_bytes)[..hash_length_hex_chars])`.
+//! `template.replace("{hash}", sha256(launch_measurement_bytes ||
+//! config_hash_bytes)[..hash_length_hex_chars])`: on SEV-SNP the launch
+//! digest and HOST_DATA, on TDX MRTD and the config hash MRCONFIGID carries.
 
 use std::env;
 use std::fs;
@@ -82,11 +83,18 @@ fn main() {
             "server-enclave.json schema_version `{enclave_schema_version}` is not supported by this build.rs (expected `2`)"
         );
     }
-    exact_keys(
-        &server_enclave,
-        &["cvm_version", "igvm_sha256", "schema_version", "sev_snp"],
-        "server-enclave.json",
-    );
+    // The gateway's launch identity on the TEE it runs in: exactly one of
+    // `sev_snp` and `tdx`, each in the attesting client's pin shape
+    // (`tinfoil_verifier::SevSnpPin`, `TdxPin`), whose pin compiler checks it
+    // when the client builds its pins (and `trust_root`'s tests check it).
+    let platform = match (server_enclave.get("sev_snp"), server_enclave.get("tdx")) {
+        (Some(_), None) => "sev_snp",
+        (None, Some(_)) => "tdx",
+        _ => panic!("server-enclave.json must have exactly one of `sev_snp` and `tdx`"),
+    };
+    let mut members = ["cvm_version", "igvm_sha256", platform, "schema_version"];
+    members.sort_unstable();
+    exact_keys(&server_enclave, &members, "server-enclave.json");
     let cvm_version = get_str(&server_enclave, "cvm_version");
     if cvm_version
         .split_once("@sha256:")
@@ -100,22 +108,65 @@ fn main() {
         );
     }
     let igvm_sha256 = get_hex_str(&server_enclave, "igvm_sha256", 64);
-    let sev_snp = server_enclave
-        .get("sev_snp")
-        .expect("server-enclave.json missing `sev_snp`");
-    exact_keys(
-        sev_snp,
-        &["guest_policy", "host_data", "measurement"],
-        "server-enclave.json sev_snp",
-    );
-    let snp = get_hex_str(sev_snp, "measurement", 96);
-    let host_data = get_hex_str(sev_snp, "host_data", 64);
-    // Its spelling and safety bits are checked by the verifier's pin
-    // compiler when the client builds its pins; here, only that it is one.
-    let guest_policy = get_str(sev_snp, "guest_policy");
-    if !guest_policy.starts_with("0x") {
-        panic!("server-enclave.json sev_snp.guest_policy must be 0x-prefixed hex");
-    }
+    let identity = &server_enclave[platform];
+    // The launch measurement (which image) and the config hash (which
+    // deployment of it), on either TEE.
+    let (launch_measurement, config_hash) = match platform {
+        "sev_snp" => {
+            exact_keys(
+                identity,
+                &["guest_policy", "host_data", "measurement"],
+                "server-enclave.json sev_snp",
+            );
+            // Its spelling and safety bits are checked by the verifier's pin
+            // compiler when the client builds its pins; here, only that it is
+            // one.
+            if !get_str(identity, "guest_policy").starts_with("0x") {
+                panic!("server-enclave.json sev_snp.guest_policy must be 0x-prefixed hex");
+            }
+            (
+                get_hex_str(identity, "measurement", 96),
+                get_hex_str(identity, "host_data", 64),
+            )
+        }
+        _ => {
+            exact_keys(
+                identity,
+                &["mrconfigid", "mrtd", "policy"],
+                "server-enclave.json tdx",
+            );
+            // The machine policy's widths and safety bits are the verifier's
+            // pin compiler's to check; here, that it names every member.
+            exact_keys(
+                &identity["policy"],
+                &[
+                    "cached_keys",
+                    "dynamic_platform",
+                    "minimum_tcb_evaluation_data_number",
+                    "minimum_tee_tcb_svn",
+                    "mr_seam",
+                    "ppids",
+                    "qe_vendor_id",
+                    "smt_enabled",
+                    "td_attributes",
+                    "xfam",
+                ],
+                "server-enclave.json tdx.policy",
+            );
+            let mrconfigid = get_hex_str(identity, "mrconfigid", 96);
+            // MRCONFIGID is the config's SHA-256 and sixteen zero bytes.
+            let (hash, rest) = mrconfigid.split_at(64);
+            if rest != "0".repeat(32) {
+                panic!(
+                    "server-enclave.json tdx.mrconfigid must be a config hash and 16 zero bytes"
+                );
+            }
+            (get_hex_str(identity, "mrtd", 96), hash.to_string())
+        }
+    };
+    let mut pin = serde_json::Map::new();
+    pin.insert(platform.to_string(), identity.clone());
+    let pin_json = serde_json::Value::Object(pin).to_string();
 
     let url_template = get_str(&trust_constants, "server_url_template");
     let url_hash_length = trust_constants
@@ -126,7 +177,7 @@ fn main() {
     if !url_template.contains("{hash}") {
         panic!("server_url_template must contain `{{hash}}` placeholder");
     }
-    let server_url_hash = derive_url_hash(&snp, &host_data, url_hash_length);
+    let server_url_hash = derive_url_hash(&launch_measurement, &config_hash, url_hash_length);
     let server_url = url_template.replace("{hash}", &server_url_hash);
 
     let expected_ci_identity_pattern = get_str(&trust_constants, "expected_ci_identity_pattern");
@@ -161,9 +212,10 @@ fn main() {
     push_str_const(&mut out, "SERVER_URL_HASH", &server_url_hash);
     push_str_const(&mut out, "SERVER_CVM_VERSION", cvm_version);
     push_str_const(&mut out, "SERVER_IGVM_SHA256", &igvm_sha256);
-    push_str_const(&mut out, "SERVER_SNP_MEASUREMENT", &snp);
-    push_str_const(&mut out, "SERVER_SNP_HOST_DATA", &host_data);
-    push_str_const(&mut out, "SERVER_SNP_GUEST_POLICY", guest_policy);
+    push_str_const(&mut out, "SERVER_PLATFORM", platform);
+    push_str_const(&mut out, "SERVER_LAUNCH_MEASUREMENT", &launch_measurement);
+    push_str_const(&mut out, "SERVER_CONFIG_HASH", &config_hash);
+    push_str_const(&mut out, "SERVER_PIN_JSON", &pin_json);
     push_str_const(
         &mut out,
         "EXPECTED_CI_IDENTITY_PATTERN",
@@ -310,13 +362,13 @@ fn release_trust_sha256(paths: &[&Path]) -> String {
     hex
 }
 
-/// The URL hash: the launch digest says which image, HOST_DATA which
-/// deployment of it (the digest alone is the same for every deployment of a
-/// release).
-fn derive_url_hash(snp: &str, host_data: &str, hash_len: usize) -> String {
+/// The URL hash: the launch measurement says which image, the config hash
+/// which deployment of it (the measurement alone is the same for every
+/// deployment of a release).
+fn derive_url_hash(launch_measurement: &str, config_hash: &str, hash_len: usize) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(decode_hex(snp));
-    hasher.update(decode_hex(host_data));
+    hasher.update(decode_hex(launch_measurement));
+    hasher.update(decode_hex(config_hash));
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for b in digest {

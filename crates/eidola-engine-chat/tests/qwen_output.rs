@@ -1,7 +1,9 @@
 //! Qwen3.8 output parsing: the rule on the cases it decides, and property
 //! tests over arbitrary text, splits and token ids (no panic, streaming equals
 //! whole-output parsing, strict-JSON arguments), and over turns the real
-//! template renders (parsing inverts the template).
+//! template renders (parsing inverts the template). Qwen3.5's output is
+//! parsed by the same parsers; its template's renders invert too, and its
+//! output starts in the answer unless thinking was asked for.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -37,11 +39,17 @@ fn tokenizer() -> Tokenizer {
 }
 
 fn parser(thinking: Option<bool>, tools: bool) -> OutputParser {
+    parser_for(ChatFormat::Qwen3_8, thinking, tools)
+}
+
+fn parser_for(format: ChatFormat, thinking: Option<bool>, tools: bool) -> OutputParser {
     let tools = tools.then(|| ToolSchemas::from_tools(&json::parse(TOOLS).unwrap()));
-    OutputParser::new(
-        OutputConfig::qwen3_8(thinking, tools),
-        PrefixedCallIds("call_".into()),
-    )
+    let config = match format {
+        ChatFormat::Qwen3_8 => OutputConfig::qwen3_8(thinking, tools),
+        ChatFormat::Qwen3_5 => OutputConfig::qwen3_5(thinking, tools),
+        other => panic!("{other:?} is not a Qwen format"),
+    };
+    OutputParser::new(config, PrefixedCallIds("call_".into()))
 }
 
 fn append(all: &mut ChatDelta, delta: ChatDelta) {
@@ -56,7 +64,17 @@ fn run(
     chunks: &[&str],
     cause: StopCause,
 ) -> (ChatDelta, FinishReason) {
-    let mut p = parser(thinking, tools);
+    run_for(ChatFormat::Qwen3_8, thinking, tools, chunks, cause)
+}
+
+fn run_for(
+    format: ChatFormat,
+    thinking: Option<bool>,
+    tools: bool,
+    chunks: &[&str],
+    cause: StopCause,
+) -> (ChatDelta, FinishReason) {
+    let mut p = parser_for(format, thinking, tools);
     let mut all = ChatDelta::default();
     for c in chunks {
         append(&mut all, p.push_text(c));
@@ -183,6 +201,39 @@ fn value_framing() {
         StopCause::EndOfSequence,
     );
     assert_eq!(d.tool_calls[0].arguments, r#"{"s": "7", "i": 7}"#);
+}
+
+/// Qwen3.5 thinks only when asked: its output is the answer unless
+/// `enable_thinking` was `true`, and then it starts in the reasoning.
+#[test]
+fn qwen35_thinks_only_when_asked() {
+    let output = ["R\n</think>\n\nThe answer"];
+    for thinking in [None, Some(false)] {
+        let (d, _) = run_for(
+            ChatFormat::Qwen3_5,
+            thinking,
+            false,
+            &output,
+            StopCause::EndOfSequence,
+        );
+        assert_eq!(d.reasoning_content, "", "{thinking:?}");
+        assert_eq!(d.content, output[0]);
+    }
+    let (d, _) = run_for(
+        ChatFormat::Qwen3_5,
+        Some(true),
+        false,
+        &output,
+        StopCause::EndOfSequence,
+    );
+    assert_eq!(
+        (d.reasoning_content.as_str(), d.content.as_str()),
+        ("R\n", "\n\nThe answer")
+    );
+    let mut p = parser_for(ChatFormat::Qwen3_5, None, false);
+    p.push_text("The answer");
+    p.finish(StopCause::MaxTokens);
+    assert!(!p.resumes_exactly());
 }
 
 /// A Qwen3.8 response is never continued from what it gave out.
@@ -447,27 +498,72 @@ proptest! {
         arguments in proptest::collection::vec(typed_arguments(), 0..3),
         thinking: bool,
     ) {
-        let template = ChatTemplate::from_model_dir(&fixtures()).unwrap();
+        inverts(ChatFormat::Qwen3_8, &reasoning, &content, &arguments, thinking)?;
+    }
+
+    /// The same for Qwen3.5's template, which thinks only when asked and
+    /// writes a boolean or a number argument with Python's `str()`.
+    #[test]
+    fn parsing_inverts_the_qwen35_template(
+        reasoning in prose(),
+        content in prose(),
+        arguments in proptest::collection::vec(typed_arguments(), 0..3),
+        thinking: bool,
+    ) {
+        inverts(ChatFormat::Qwen3_5, &reasoning, &content, &arguments, thinking)?;
+    }
+}
+
+/// [`parsing_inverts_the_template`]'s property for the template of `format`.
+fn inverts(
+    format: ChatFormat,
+    reasoning: &str,
+    content: &str,
+    arguments: &[Json],
+    thinking: bool,
+) -> Result<(), TestCaseError> {
+    {
+        let dir = match format {
+            ChatFormat::Qwen3_8 => "qwen",
+            _ => "qwen35",
+        };
+        let template = ChatTemplate::from_model_dir(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(dir),
+        )
+        .unwrap();
+        // The switch that turns thinking `on` or off in this format's template.
+        let switch = match format {
+            ChatFormat::Qwen3_8 => (!thinking).then_some(false),
+            _ => thinking.then_some(true),
+        };
         let calls: Vec<serde_json::Value> = arguments
             .iter()
             .map(|a| serde_json::json!({"type": "function", "function": {"name": "typed", "arguments": json::dumps_default(a)}}))
             .collect();
         let mut assistant = serde_json::json!({"role": "assistant", "content": content});
         if thinking {
-            assistant["reasoning_content"] = reasoning.clone().into();
+            assistant["reasoning_content"] = reasoning.into();
         }
         if !calls.is_empty() {
             assistant["tool_calls"] = calls.into();
         }
         let question = serde_json::json!([{"role": "user", "content": "q"}]);
         let options = RenderOptions {
-            enable_thinking: (!thinking).then_some(false),
+            enable_thinking: switch,
             ..RenderOptions::default()
         };
         let render = |messages: &serde_json::Value, add_generation_prompt| {
             let input = ChatInput::from_json(&messages.to_string(), Some(TOOLS)).unwrap();
             template
-                .render(&input, &RenderOptions { add_generation_prompt, ..options.clone() })
+                .render(
+                    &input,
+                    &RenderOptions {
+                        add_generation_prompt,
+                        ..options.clone()
+                    },
+                )
                 .unwrap()
         };
         let prompt = render(&question, true);
@@ -477,15 +573,16 @@ proptest! {
         prop_assert!(full.starts_with(&prompt));
         let output = full[prompt.len()..].strip_suffix("<|im_end|>\n").unwrap();
 
-        let (d, _) = run((!thinking).then_some(false), true, &[output], StopCause::EndOfSequence);
+        let (d, _) = run_for(format, switch, true, &[output], StopCause::EndOfSequence);
         if thinking {
-            prop_assert_eq!(py_strip(&d.reasoning_content), py_strip(&reasoning));
+            prop_assert_eq!(py_strip(&d.reasoning_content), py_strip(reasoning));
         } else {
             prop_assert_eq!(d.reasoning_content.as_str(), "");
         }
-        prop_assert_eq!(py_strip(&d.content), py_strip(&content));
+        prop_assert_eq!(py_strip(&d.content), py_strip(content));
         let parsed: Vec<String> = d.tool_calls.iter().map(|c| c.arguments.clone()).collect();
         let sent: Vec<String> = arguments.iter().map(json::dumps_default).collect();
         prop_assert_eq!(parsed, sent);
     }
+    Ok(())
 }

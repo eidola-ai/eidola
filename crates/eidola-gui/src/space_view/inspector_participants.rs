@@ -253,7 +253,7 @@ impl SpaceView {
             .read(cx)
             .settings(&space_id)
             .value()
-            .and_then(|s| s.notebook_participant_id.as_deref())
+            .and_then(|s| s.notebook_owner_participant_id.as_deref())
             == Some(participant_id)
     }
 
@@ -286,7 +286,7 @@ impl SpaceView {
                 .read(cx)
                 .settings(&space_id)
                 .value()?
-                .notebook_participant_id
+                .notebook_owner_participant_id
                 .is_some(),
         )
     }

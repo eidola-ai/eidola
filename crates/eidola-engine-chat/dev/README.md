@@ -43,3 +43,12 @@ Two generators, run with `uv` like the DeepSeek one, each with its dependencies 
   ```
 
 Both execute code they are pointed at (the template, vLLM's parser): run them only on files you trust. Refresh a lock with `uv lock --script <script>` after changing its dependencies.
+
+## Qwen3.5
+
+`qwen_gen_template_fixtures.py --format qwen3.5` generates the Qwen3.5 corpus, `tests/fixtures/qwen35/`, from a directory holding the non-weight files of [`Qwen/Qwen3.5-2B`](https://huggingface.co/Qwen/Qwen3.5-2B) (Apache-2.0) at the revision to pin: `chat_template.jinja`, `tokenizer.json`, `tokenizer_config.json` and `config.json`. Qwen3.5-0.8B ships the same template and tokenizer. The case families are Qwen3.8's, a case setting `preserve_thinking` or `reasoning_effort` recorded as refused, plus the template's reading of reasoning out of content (`inline_reasoning`); it copies `config.json` (the end-of-sequence id's file) where Qwen3.8's copies `generation_config.json`. Regenerating Qwen3.8's corpus with the default `--format qwen3.8` reproduces its committed files byte for byte.
+
+```sh
+uv run --script dev/qwen_gen_template_fixtures.py --format qwen3.5 \
+    --model-dir <dir> --revision <commit sha>
+```

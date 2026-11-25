@@ -25,6 +25,14 @@
 //! reference executor refuses to embed one (vision is not served), and a sampled one
 //! would end the engine. Every other tensor is the fixture's, byte for byte.
 //!
+//! The Qwen3.5 dev model is derived the same way from the model crate's BF16 fixture with
+//! a tied head (`tests/fixtures/qwen_tiny_bf16_tied`): its embedding, which is also its
+//! head, widened to 248,320 rows, `config.json` as for Qwen3.8's, and the chat crate's
+//! pinned Qwen3.5 `tokenizer.json` and `chat_template.jinja` (Qwen3.5's checkpoints ship
+//! no `generation_config.json`, and neither does this). The embedding's rows of the vision
+//! placeholders are zero, which as the head's rows keeps them out of the ranking as in
+//! Qwen3.8's.
+//!
 //! The output is gibberish (random weights); tests assert structure and token-level
 //! equality, never semantics.
 
@@ -88,6 +96,18 @@ fn qwen_input_files() -> Vec<PathBuf> {
         chat.join("tokenizer.json.gz"),
         chat.join("chat_template.jinja"),
         chat.join("generation_config.json"),
+    ]
+}
+
+/// Every input file of the Qwen3.5 derivation.
+fn qwen35_input_files() -> Vec<PathBuf> {
+    let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/qwen_tiny_bf16_tied");
+    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures/qwen35");
+    vec![
+        tiny.join("config.json"),
+        tiny.join("model.safetensors"),
+        chat.join("tokenizer.json.gz"),
+        chat.join("chat_template.jinja"),
     ]
 }
 
@@ -167,6 +187,15 @@ pub fn ensure_qwen_dev_model(out: &Path) -> std::io::Result<()> {
         &qwen_input_files(),
     )?;
     ensure_built(out, &fingerprint, write_qwen_dev_model)
+}
+
+/// [`ensure_dev_model`] for the Qwen3.5 dev model.
+pub fn ensure_qwen35_dev_model(out: &Path) -> std::io::Result<()> {
+    let fingerprint = fingerprint_of(
+        "eidola-server-engine qwen3.5 dev model v1",
+        &qwen35_input_files(),
+    )?;
+    ensure_built(out, &fingerprint, write_qwen35_dev_model)
 }
 
 fn ensure_built(
@@ -298,6 +327,49 @@ pub fn write_qwen_dev_model(out: &Path) -> std::io::Result<()> {
     for name in ["chat_template.jinja", "generation_config.json"] {
         std::fs::copy(chat.join(name), out.join(name))?;
     }
+    Ok(())
+}
+
+/// Writes the Qwen3.5 dev model into `out` (module docs).
+pub fn write_qwen35_dev_model(out: &Path) -> std::io::Result<()> {
+    let tiny = crates_dir().join("eidola-engine-model/tests/fixtures/qwen_tiny_bf16_tied");
+    let chat = crates_dir().join("eidola-engine-chat/tests/fixtures/qwen35");
+    std::fs::create_dir_all(out)?;
+
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(tiny.join("config.json"))?)?;
+    config["text_config"]["vocab_size"] = QWEN_VOCAB.into();
+    config["text_config"]["eos_token_id"] = QWEN_ENDOFTEXT.into();
+    config["image_token_id"] = QWEN_IMAGE_TOKEN.into();
+    config["video_token_id"] = QWEN_VIDEO_TOKEN.into();
+    config["vision_start_token_id"] = QWEN_VISION_START.into();
+    config["vision_end_token_id"] = QWEN_VISION_END.into();
+    std::fs::write(out.join("config.json"), canonical_json(&config, true))?;
+
+    let vision = [
+        QWEN_VISION_START,
+        QWEN_VISION_END,
+        QWEN_IMAGE_TOKEN,
+        QWEN_VIDEO_TOKEN,
+    ]
+    .map(|t| t as usize);
+    let embed = "model.language_model.embed_tokens.weight";
+    let file = widened_safetensors(
+        &tiny.join("model.safetensors"),
+        &[embed],
+        QWEN_VOCAB,
+        &[(embed, &vision)],
+    )?;
+    std::fs::write(out.join("model.safetensors"), file)?;
+
+    let mut tokenizer = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(chat.join("tokenizer.json.gz"))?)
+        .read_to_end(&mut tokenizer)?;
+    std::fs::write(out.join("tokenizer.json"), tokenizer)?;
+    std::fs::copy(
+        chat.join("chat_template.jinja"),
+        out.join("chat_template.jinja"),
+    )?;
     Ok(())
 }
 

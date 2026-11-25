@@ -16,6 +16,9 @@
 //! before the devices, and the node's executor configuration run over host devices
 //! answering token for token as the CPU executor does.
 //!
+//! Qwen3.5 (its dev model): refused before the device, the executor having no kernels for
+//! its BF16 weights or tied head.
+//!
 //! Qwen3.8 (its dev model), without a device: graphs refused, one KV budget, the state
 //! pool and one sequence in it, the host tier and the weights hash before the device; and
 //! the node's executor configuration run over the kernels' bodies compiled for the host
@@ -643,6 +646,25 @@ fn qwen_cuda_env() -> HashMap<&'static str, String> {
     map.insert(env::MODEL_ID, QWEN_MODEL_ID.into());
     map.insert(env::KV_DEVICE_BYTES, (64u64 << 20).to_string());
     map
+}
+
+/// Qwen3.5 (BF16 weights, a head tied to the embedding) has no CUDA kernels: a cuda node
+/// on its dev model is refused before the device, naming why, drafting or not, and is
+/// never served on the CPU instead.
+#[test]
+fn qwen35_is_refused_before_the_device() {
+    for k in ["0", "2"] {
+        let mut map = cuda_env(qwen35_model_dir(), qwen35_weights_hash());
+        map.insert(env::MODEL_ID, QWEN35_MODEL_ID.into());
+        map.insert(env::KV_DEVICE_BYTES, (64u64 << 20).to_string());
+        map.insert(env::DRAFT_TOKENS, k.into());
+        let err = boot_err(&map);
+        assert!(
+            err.contains("BF16") && err.contains("cpu executor"),
+            "{k}: {err}"
+        );
+        assert!(!err.contains(NO_DEVICE), "{k}: {err}");
+    }
 }
 
 /// A Qwen3.8 configuration the node accepts on the host goes on to the device and,

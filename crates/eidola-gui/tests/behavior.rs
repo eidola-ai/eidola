@@ -1331,6 +1331,7 @@ fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
 
     let mut trust = eidola_trust();
     trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
+        platform: eidola_app_core::MeasurementPlatform::SevSnp,
         measurement: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f89d2bb3ef58af1e7c0c12f3b4a5d6e7f8".into(),
         host_data: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         guest_policy: "0x30133".into(),
@@ -2793,6 +2794,7 @@ fn eidola_trust() -> eidola_app_core::EidolaTrust {
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
         pinned_measurement: eidola_app_core::MeasurementInfo {
+            platform: eidola_app_core::MeasurementPlatform::SevSnp,
             measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
             host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
             guest_policy: "0x30133".into(),
@@ -17247,7 +17249,7 @@ fn inspector_a_notebook_offers_no_grant_door(cx: &mut TestAppContext) {
         stores.space_settings.read_with(cx, |s, _| {
             s.settings(&notebook)
                 .value()
-                .is_some_and(|s| s.notebook_participant_id.is_some())
+                .is_some_and(|s| s.notebook_owner_participant_id.is_some())
         })
     });
     assert!(
@@ -17432,7 +17434,7 @@ fn inspector_withholds_the_grant_door_until_the_settings_say_what_this_space_is(
         stores.space_settings.read_with(cx, |s, _| {
             s.settings(&notebook)
                 .value()
-                .is_some_and(|s| s.notebook_participant_id.is_some())
+                .is_some_and(|s| s.notebook_owner_participant_id.is_some())
         })
     });
     draw_window(cx, window);
@@ -18098,7 +18100,7 @@ fn a_watching_reader_may_quote_elsewhere_but_not_here(cx: &mut TestAppContext) {
         s.space_settings = Some((
             "s".to_string(),
             eidola_app_core::SpaceSettings {
-                notebook_participant_id: None,
+                notebook_owner_participant_id: None,
                 ..Default::default()
             },
         ));

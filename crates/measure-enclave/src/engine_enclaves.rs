@@ -8,31 +8,32 @@
 //! - `tinfoil-config.yml` — the deployment's Tinfoil Container config, deployed
 //!   and measured exactly as the gateway's own: the `eidola-server-engine`
 //!   image by digest, the weights hash and storage mode, the prompt-cache
-//!   retention, the gateway token's Argon2id hash. Its `cvm-version` pins the
-//!   platform release manifest inline (`X+gpu@sha256:<hex>`: the release's GPU
-//!   image, which the `cuda` executor needs).
+//!   retention. Its `cvm-version` pins the platform release manifest inline
+//!   (`X+gpu@sha256:<hex>`, the release's GPU image, for the `cuda` executor;
+//!   `X@sha256:<hex>`, its CPU image, for `cpu`).
 //! - `deployment.json` — what a pin needs that the config does not determine:
-//!   the weights' architecture and provenance (`repo`, `revision`), the GPU count the
-//!   deployment presents evidence for, and the machines its hosts are: one
-//!   policy of a vendored platform endorsements release (tag and file hash),
-//!   plus the PCK platform flags the endorsements do not carry.
+//!   the weights' architecture and provenance (`repo`, `revision`), the GPU
+//!   count the deployment presents evidence for, and the TEE it is pinned on:
+//!   `sev_snp`, or `tdx` with the machines its hosts are (one policy of a
+//!   vendored platform endorsements release, tag and file hash, plus the PCK
+//!   platform flags the endorsements do not carry).
 //!
-//! [`deployment_entry`] turns one such directory, plus the TDX IGVM image
-//! its `cvm-version` names and that release's manifest, vendored under
-//! `releases/trust/cvm-releases/`, into the file's entry: the
-//! TDX launch identity (MRTD recomputed from the image, MRCONFIGID from the
-//! config, via [`crate::tdx_igvm::release_pin`]) with the machine policy
-//! derived from the verified endorsements
-//! ([`crate::platform_endorsements::tdx_policy`]), and the weights and cache
-//! policy the config sets. The gateway's build re-derives everything here
-//! from the same committed files, MRTD as the vendored manifest states it
-//! (the image itself is not committed), so a hand edit that disagrees with
-//! them fails that build.
+//! [`deployment_entry`] turns one such directory, plus that TEE's IGVM image
+//! of the release its `cvm-version` names and the release's manifest,
+//! vendored under `releases/trust/cvm-releases/`, into the file's entry:
 //!
-//! Only TDX deployments are measured here: the platform provider deploys
-//! engines on its IGVM launch model, which has no SEV-SNP image. The file's
-//! schema stays platform-tagged, so a SEV-SNP deployment remains expressible
-//! when one exists.
+//! - on SEV-SNP, the launch digest recomputed from the image, HOST_DATA from
+//!   the config and the guest policy the image states
+//!   ([`crate::snp_igvm::release_pin`]), the identity the gateway's own pin
+//!   for clients is;
+//! - on TDX, MRTD recomputed from the image and MRCONFIGID from the config
+//!   ([`crate::tdx_igvm::release_pin`]), with the machine policy derived from
+//!   the verified endorsements ([`crate::platform_endorsements::tdx_policy`]);
+//!
+//! and the weights and cache policy the config sets. The gateway's build
+//! re-derives everything here from the same committed files, the launch
+//! measurement as the vendored manifest states it (the image itself is not
+//! committed), so a hand edit that disagrees with them fails that build.
 
 use std::collections::BTreeMap;
 
@@ -41,14 +42,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use eidola_common::engine_deployment::deployment::{
-    ModelIdentity, check_deployment, check_model_agreement, check_release_manifest,
-    release_manifest_file,
+    DeploymentPlatform, ModelIdentity, check_deployment, check_model_agreement,
+    check_release_manifest, release_manifest_file,
 };
 
-use tinfoil_verifier::{AllowedMeasurement, PlatformMeasurement, TdxPin};
+use tinfoil_verifier::{AllowedMeasurement, PlatformMeasurement, SevSnpPin, TdxPin};
 
 use crate::platform_endorsements::{self, ReadFile};
-use crate::tdx_igvm;
+use crate::{snp_igvm, tdx_igvm};
 
 /// The schema version emitted.
 pub const SCHEMA_VERSION: u64 = 1;
@@ -60,7 +61,8 @@ pub struct DeploymentInputs<'a> {
     pub config_path: &'a str,
     pub config: &'a [u8],
     pub sidecar: &'a [u8],
-    /// The release's `tinfoil-tdx-<version>.igvm`.
+    /// The release's IGVM image for the deployment's TEE
+    /// (`tinfoil-<snp|tdx>-v<version>.igvm`, [`release_files`]).
     pub igvm: &'a [u8],
     /// Reads other committed files (the vendored release manifest and
     /// platform endorsements, the Sigstore trusted root) by path relative to
@@ -86,15 +88,26 @@ pub struct ReleaseFiles {
     pub tag: String,
     /// The vendored release manifest, relative to the workspace root.
     pub manifest: String,
-    /// The TDX IGVM image's published file name (`tinfoil-tdx-v<version>.igvm`).
+    /// The IGVM image's published file name, for the deployment's TEE
+    /// (`tinfoil-snp-v<version>.igvm` or `tinfoil-tdx-v<version>.igvm`).
     pub image: String,
     /// The image's SHA-256, as the vendored manifest records it.
     pub image_sha256: String,
 }
 
-/// The release files `config` names, its vendored manifest read through
-/// `read` by the gateway build's rule.
-pub fn release_files(config: &[u8], read: &ReadFile<'_>) -> Result<ReleaseFiles> {
+/// The release files the deployment at `config_path` (`config`, with its
+/// sidecar `sidecar`) launches on: its vendored manifest, read through `read`
+/// by the gateway build's rule, and the image of the TEE the sidecar names.
+pub fn release_files(
+    config_path: &str,
+    config: &[u8],
+    sidecar: &[u8],
+    read: &ReadFile<'_>,
+) -> Result<ReleaseFiles> {
+    let tee = check_deployment(config_path, config, "deployment.json", sidecar)
+        .map_err(anyhow::Error::msg)?
+        .platform
+        .tee();
     let (version, manifest_sha256) = required_release(config)?;
     let cvm_version = format!("{version}@sha256:{manifest_sha256}");
     let manifest = release_manifest_file(&cvm_version).map_err(anyhow::Error::msg)?;
@@ -103,8 +116,8 @@ pub fn release_files(config: &[u8], read: &ReadFile<'_>) -> Result<ReleaseFiles>
     let tag = version.split_once('+').map_or(version.as_str(), |(t, _)| t);
     Ok(ReleaseFiles {
         tag: format!("v{tag}"),
-        image: format!("tinfoil-tdx-v{version}.igvm"),
-        image_sha256: launch.igvm_sha256,
+        image: format!("tinfoil-{}-v{version}.igvm", tee.image_name()),
+        image_sha256: launch.image(tee).igvm_sha256.clone(),
         manifest,
     })
 }
@@ -132,38 +145,46 @@ pub fn deployment_entry(inputs: &DeploymentInputs<'_>) -> Result<Entry> {
     )
     .map_err(anyhow::Error::msg)?;
     let identity = checked.model_identity();
-    let machines = checked
-        .tdx
-        .as_ref()
-        .context("deployment.json states no tdx machines; only TDX deployments are measured")?;
 
-    // The vendored manifest, from where the gateway's build reads it;
+    // The vendored manifest, from where the gateway's build reads it; each
     // `release_pin` reads it by the build's rule and measures the image
     // against it.
     let manifest_path = release_manifest_file(&checked.cvm_version).map_err(anyhow::Error::msg)?;
     let release_manifest = (inputs.read)(&manifest_path)?;
-    let (_, manifest_sha256) = required_release(inputs.config)?;
-    let launch = tdx_igvm::release_pin(
-        &release_manifest,
-        &manifest_sha256,
-        inputs.igvm,
-        inputs.config,
-    )?;
-
-    // The machine policy, from the signed endorsements the sidecar names,
-    // verified offline. The pin is then built in the attesting client's own
-    // type and compiled by its own pin compiler (the one the gateway's build
-    // runs over the file): a policy the client would refuse — DEBUG
-    // attributes, a wrong width, no machine — fails here, before the file is
-    // rendered.
-    let policy = platform_endorsements::tdx_policy(machines, inputs.read)
-        .map_err(|e| anyhow::anyhow!("{sidecar_path}: tdx.platform_endorsements: {e:#}"))?;
+    let platform = match &checked.platform {
+        DeploymentPlatform::SevSnp => {
+            let launch = snp_igvm::release_pin(&release_manifest, inputs.igvm, inputs.config)?;
+            PlatformMeasurement::SevSnp(SevSnpPin {
+                measurement: launch.sev_snp.measurement,
+                host_data: launch.sev_snp.host_data,
+                guest_policy: launch.sev_snp.guest_policy,
+            })
+        }
+        DeploymentPlatform::Tdx(machines) => {
+            let (_, manifest_sha256) = required_release(inputs.config)?;
+            let launch = tdx_igvm::release_pin(
+                &release_manifest,
+                &manifest_sha256,
+                inputs.igvm,
+                inputs.config,
+            )?;
+            // The machine policy, from the signed endorsements the sidecar
+            // names, verified offline.
+            let policy = platform_endorsements::tdx_policy(machines, inputs.read)
+                .map_err(|e| anyhow::anyhow!("{sidecar_path}: tdx.platform_endorsements: {e:#}"))?;
+            PlatformMeasurement::Tdx(TdxPin {
+                mrtd: launch.mrtd,
+                mrconfigid: launch.mrconfigid,
+                policy,
+            })
+        }
+    };
+    // The pin is built in the attesting client's own type and compiled by
+    // its own pin compiler (the one the gateway's build runs over the file):
+    // a pin the client would refuse — a DEBUG guest policy or attributes, a
+    // wrong width, no machine — fails here, before the file is rendered.
     let pin = AllowedMeasurement {
-        platform: PlatformMeasurement::Tdx(TdxPin {
-            mrtd: launch.mrtd,
-            mrconfigid: launch.mrconfigid,
-            policy,
-        }),
+        platform,
         expected_gpus: checked
             .expected_gpus
             .map(u32::try_from)
@@ -351,7 +372,6 @@ containers:
         "architecture": "MimoV26Flash",
         "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
         "expected_gpus": 8,
-        "gpu": "NVIDIA B300 SXM6 AC",
         "tdx": {
             "platform_endorsements": {
                 "release": "platform-v0.1.11",
@@ -454,14 +474,108 @@ containers:
         assert_eq!(parsed["models"][&"3".repeat(64)][0]["config"], PATH);
     }
 
+    /// [`SIDECAR`] on SEV-SNP: `sev_snp` in place of the TDX machines.
+    fn snp_sidecar() -> String {
+        let tdx_at = SIDECAR.find("\"tdx\"").unwrap();
+        format!("{}\"sev_snp\": {{}}\n    }}", &SIDECAR[..tdx_at])
+    }
+
+    /// An SEV-SNP deployment's entry is the identity the gateway's own pin
+    /// is: the launch digest recomputed from the release's SEV-SNP image,
+    /// HOST_DATA the config's hash, the guest policy the image states. Here a
+    /// `cpu` deployment, on the release's CPU image with no GPU.
+    #[test]
+    fn an_sev_snp_entry_is_the_launch_digest_host_data_and_policy() {
+        use crate::snp_igvm::tests as snp;
+        let snp_image = snp::image(vec![snp::page(0x2000, 1), snp::vmsa()]);
+        let digest = hex::encode(
+            snp_igvm::launch_digest_from_igvm(&snp_image)
+                .unwrap()
+                .measurement,
+        );
+        let tdx_image = image(vec![page(0x2000, 1, IgvmPageDataFlags::new())]);
+        let mut release: Value = serde_json::from_slice(&manifest(
+            &tdx_image,
+            &hex::encode(tdx_igvm::mrtd_from_igvm(&tdx_image).unwrap()),
+            &"00".repeat(48),
+        ))
+        .unwrap();
+        release["version"] = "v0.0.0-test".into();
+        release["igvm"]["snp"] = hex::encode(Sha256::digest(&snp_image)).into();
+        release["igvm"]["snp_launch"]["measurement"] = digest.clone().into();
+        let release = serde_json::to_vec(&release).unwrap();
+        let release_sha = hex::encode(Sha256::digest(&release));
+        let cpu = config(&release_sha)
+            .replace("0.0.0-test+gpu@", "0.0.0-test@")
+            .replace("gpus: 8\n", "")
+            .replace("    runtime: nvidia\n", "")
+            .replace("    gpus: all\n", "")
+            .replace("ENGINE_EXECUTOR: \"cuda\"", "ENGINE_EXECUTOR: \"cpu\"")
+            .replace(
+                "      - ENGINE_KV_DEVICE_BYTES: \"68719476736\"\n",
+                "      - ENGINE_KV_BLOCKS: \"4096\"\n",
+            )
+            .replace("      - ENGINE_KERNELS_DIR: \"/opt/eidola/kernels\"\n", "")
+            .replace("      - ENGINE_CUDA_GRAPHS: \"on\"\n", "")
+            .replace("      - ENGINE_GPU_CC: \"required\"\n", "");
+        let sidecar = snp_sidecar().replace("\"expected_gpus\": 8,", "");
+        const CPU_MANIFEST: &str =
+            "releases/trust/cvm-releases/v0.0.0-test/tinfoil-inference-v0.0.0-test-manifest.json";
+        let read = |path: &str| {
+            if path == CPU_MANIFEST {
+                Ok(release.clone())
+            } else {
+                workspace_file(path)
+            }
+        };
+        assert_eq!(
+            release_files(PATH, cpu.as_bytes(), sidecar.as_bytes(), &read).unwrap(),
+            ReleaseFiles {
+                tag: "v0.0.0-test".into(),
+                manifest: CPU_MANIFEST.into(),
+                image: "tinfoil-snp-v0.0.0-test.igvm".into(),
+                image_sha256: hex::encode(Sha256::digest(&snp_image)),
+            }
+        );
+        let entry = |igvm: &[u8]| {
+            deployment_entry(&DeploymentInputs {
+                config_path: PATH,
+                config: cpu.as_bytes(),
+                sidecar: sidecar.as_bytes(),
+                igvm,
+                read: &read,
+            })
+        };
+        let pin = entry(&snp_image).unwrap().json["pin"].clone();
+        assert_eq!(
+            pin,
+            json!({"platform": {"sev_snp": {
+                "measurement": digest,
+                "host_data": hex::encode(Sha256::digest(cpu.as_bytes())),
+                "guest_policy": "0x30133",
+            }}})
+        );
+        // The TDX image is not the SEV-SNP one the release records.
+        let err = entry(&tdx_image).unwrap_err().to_string();
+        assert!(err.contains("records"), "{err}");
+    }
+
     #[test]
     fn the_release_files_are_named_by_the_vendored_manifest() {
         let igvm = image(vec![page(0x2000, 1, IgvmPageDataFlags::new())]);
         let mrtd = hex::encode(tdx_igvm::mrtd_from_igvm(&igvm).unwrap());
         let release = manifest(&igvm, &mrtd, &"00".repeat(48));
         let good = config(&hex::encode(Sha256::digest(&release)));
+        let files = |config: &str, sidecar: &str| {
+            release_files(
+                PATH,
+                config.as_bytes(),
+                sidecar.as_bytes(),
+                &vendoring(&release),
+            )
+        };
         assert_eq!(
-            release_files(good.as_bytes(), &vendoring(&release)).unwrap(),
+            files(&good, SIDECAR).unwrap(),
             ReleaseFiles {
                 tag: "v0.0.0-test".into(),
                 manifest: MANIFEST.into(),
@@ -470,8 +584,18 @@ containers:
             }
         );
         let other = config(&"ab".repeat(32));
-        let err = release_files(other.as_bytes(), &vendoring(&release)).unwrap_err();
+        let err = files(&other, SIDECAR).unwrap_err();
         assert!(format!("{err:#}").contains("not the pinned"), "{err:#}");
+        // An SEV-SNP deployment launches the release's SEV-SNP image.
+        assert_eq!(
+            files(&good, &snp_sidecar()).unwrap(),
+            ReleaseFiles {
+                tag: "v0.0.0-test".into(),
+                manifest: MANIFEST.into(),
+                image: "tinfoil-snp-v0.0.0-test+gpu.igvm".into(),
+                image_sha256: "11".repeat(32),
+            }
+        );
     }
 
     /// Every deployment of one weights hash shares its provenance and
@@ -582,13 +706,12 @@ containers:
         assert!(entry(&good, &pro).contains("not implemented"));
         let unknown = SIDECAR.replace("MimoV26Flash", "Llama");
         assert!(entry(&good, &unknown).contains("not one the engine knows"));
-        let no_machines = r#"{
+        let no_tee = r#"{
             "architecture": "MimoV26Flash",
             "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
-            "expected_gpus": 8,
-            "gpu": "NVIDIA B300 SXM6 AC"
+            "expected_gpus": 8
         }"#;
-        assert!(entry(&good, no_machines).contains("only TDX deployments"));
+        assert!(entry(&good, no_tee).contains("exactly one TEE"));
         let unpinned = good.replace(&format!("@sha256:{release_sha}"), "");
         assert!(entry(&unpinned, SIDECAR).contains("pin its release manifest"));
         let other_release = good.replace(&release_sha, &"ab".repeat(32));
@@ -706,15 +829,15 @@ containers:
         assert!(entry(&partial, SIDECAR).contains("shim.paths must expose"));
         let ungranted = good.replace("    models: [\"weights\"]\n", "");
         assert!(entry(&ungranted, SIDECAR).contains("granted exactly the weights pack"));
-        // A variable the node does not read, and a VM shape the platform does
-        // not launch.
+        // A variable the node does not read, and a VM shape the platform
+        // refuses.
         let ambient = good.replace(
             "      - ENGINE_MODEL_ID",
             "      - TOKIO_WORKER_THREADS: \"0\"\n      - ENGINE_MODEL_ID",
         );
         assert!(entry(&ambient, SIDECAR).contains("may not set \"TOKIO_WORKER_THREADS\""));
-        let tiny = good.replace("memory: 65536", "memory: 1");
-        assert!(entry(&tiny, SIDECAR).contains("memory must be a whole number of GiB"));
+        let none = good.replace("memory: 65536", "memory: 0");
+        assert!(entry(&none, SIDECAR).contains("cpus and memory must be positive"));
         let tagged = good.replace(&format!("@sha256:{}", "2".repeat(64)), ":v1");
         assert!(entry(&tagged, SIDECAR).contains("exactly one container"));
 

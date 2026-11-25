@@ -23,9 +23,10 @@
 //!   check `measure-enclave` runs before it emits a pin. Every rule about
 //!   what the config may say lives there.
 //! - The pin agrees with that deployment: release, weights (hash, repo,
-//!   revision), prompt-cache retention, GPU evidence count, and a TDX
-//!   MRCONFIGID equal to the config's hash; and the attesting client's own
-//!   pin compiler accepts it.
+//!   revision), prompt-cache retention, GPU evidence count, the TEE its
+//!   sidecar names, and the config's hash as the TEE carries it (HOST_DATA on
+//!   SEV-SNP, MRCONFIGID on TDX); and the attesting client's own pin compiler
+//!   accepts it.
 //! - **A TDX pin's machine policy is re-derived from the signed platform
 //!   endorsements the sidecar names**: the vendored release file and its
 //!   Sigstore bundle (`releases/trust/platform-endorsements/<tag>/`) are
@@ -49,21 +50,26 @@
 //!   newest vendored platform endorsements release, and no vendored release
 //!   or release manifest is one nothing names.
 //!
-//! - **A TDX pin's MRTD is the platform release's statement of it**: the
-//!   release manifest `cvm-version` pins, vendored under
+//! - **A pin's launch measurement is the platform release's statement of
+//!   it**: the release manifest `cvm-version` pins, vendored under
 //!   `releases/trust/cvm-releases/` (`deployment::release_manifest_file`), must
 //!   hash to that pin, describe that release, state a launch in the measured
-//!   model, and state the pin's MRTD (`deployment::check_release_manifest`,
-//!   the rule `measure-enclave` reads the manifest by).
+//!   model, and state the pin's measurement for its TEE's image (MRTD, or the
+//!   SEV-SNP launch digest) (`deployment::check_release_manifest`, the rule
+//!   `measure-enclave` reads the manifest by).
 //!
-//! What is **not** recomputed here: MRTD from the image, and a SEV-SNP launch
-//! digest. Both need the platform provider's release images, so they are
-//! release-time work (`measure-enclave`'s `measure-engine-enclaves`), and the
-//! artifacts chain reruns the first.
+//! What is **not** recomputed here: the measurement from the image, and an
+//! SEV-SNP pin's guest policy, which the image's IGVM header states. Both
+//! need the platform provider's release images, so they are release-time
+//! work (`measure-enclave`'s `measure-engine-enclaves`), and the artifacts
+//! chain reruns it; the policy's safety bits (DEBUG and MIGRATE_MA clear) are
+//! the pin compiler's, below.
 
 use std::collections::BTreeMap;
 
-use eidola_common::engine_deployment::{Architecture, CacheConfig, deployment, is_safe_component};
+use eidola_common::engine_deployment::{
+    Architecture, CacheConfig, Tee, deployment, is_safe_component,
+};
 use sha2::{Digest, Sha256};
 
 /// The schema version this gateway reads.
@@ -305,7 +311,7 @@ pub fn require_vendored_releases_named(
             deployment::release_manifest_file(&checked.cvm_version)
                 .map_err(|e| format!("{config_path}: {e}"))?,
         );
-        let Some(machines) = &checked.tdx else {
+        let Some(machines) = checked.platform.tdx() else {
             continue;
         };
         let (file, bundle) = deployment::platform_endorsement_files(&machines.release);
@@ -508,7 +514,8 @@ fn check_deployment(
                 &format!("{at}: pin.platform.tdx"),
             )?;
             let mrtd = hex_string(&tdx["mrtd"], 48, &format!("{at}: pin.platform.tdx.mrtd"))?;
-            check_mrtd(
+            check_launch_measurement(
+                Tee::Tdx,
                 mrtd,
                 &checked.cvm_version,
                 &format!("{at} ({config_path})"),
@@ -527,9 +534,10 @@ fn check_deployment(
                 ));
             }
             object(&tdx["policy"], &format!("{at}: pin.platform.tdx.policy"))?;
-            let machines = checked.tdx.as_ref().ok_or_else(|| {
-                format!("{at}: a TDX pin, but {sidecar_path} states no tdx machines")
-            })?;
+            let machines = checked
+                .platform
+                .tdx()
+                .ok_or_else(|| format!("{at}: a TDX pin, but {sidecar_path} names sev_snp"))?;
             let derived = derive_tdx_policy(machines, read)
                 .map_err(|e| format!("{at}: {sidecar_path}: tdx.platform_endorsements: {e}"))?;
             let derived = serde_json::to_value(&derived)
@@ -550,10 +558,17 @@ fn check_deployment(
                 &[],
                 &format!("{at}: pin.platform.sev_snp"),
             )?;
-            hex_string(
+            let measurement = hex_string(
                 &snp["measurement"],
                 48,
                 &format!("{at}: pin.platform.sev_snp.measurement"),
+            )?;
+            check_launch_measurement(
+                Tee::SevSnp,
+                measurement,
+                &checked.cvm_version,
+                &format!("{at} ({config_path})"),
+                read,
             )?;
             let host_data = hex_string(
                 &snp["host_data"],
@@ -566,9 +581,9 @@ fn check_deployment(
                      (expected {config_sha256})"
                 ));
             }
-            if checked.tdx.is_some() {
+            if checked.platform.tee() != Tee::SevSnp {
                 return Err(format!(
-                    "{at}: a SEV-SNP pin, but {sidecar_path} states tdx machines"
+                    "{at}: an SEV-SNP pin, but {sidecar_path} names tdx"
                 ));
             }
         }
@@ -597,13 +612,16 @@ fn check_deployment(
     ))
 }
 
-/// A TDX pin's MRTD is the one the platform release states for the image
-/// the config launches: the release's manifest, vendored under
-/// `releases/trust/cvm-releases/`, must be the one `cvm-version` pins, and
-/// its `igvm.tdx_launch.mrtd` must be the pin's. `measure-enclave` reads the
-/// same manifest by the same rule, and checks the image reproduces it.
-fn check_mrtd(
-    mrtd: &str,
+/// A pin's launch measurement (`measurement`: the MRTD of a TDX pin, the
+/// launch digest of an SEV-SNP one) is the one the platform release states
+/// for the image of `tee` the config launches: the release's manifest,
+/// vendored under `releases/trust/cvm-releases/`, must be the one
+/// `cvm-version` pins, and state exactly that measurement for that image.
+/// `measure-enclave` reads the same manifest by the same rule, and checks the
+/// image reproduces it.
+fn check_launch_measurement(
+    tee: Tee,
+    measurement: &str,
     cvm_version: &str,
     at: &str,
     read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
@@ -617,11 +635,17 @@ fn check_mrtd(
     })?;
     let release = deployment::check_release_manifest(cvm_version, &manifest)
         .map_err(|e| format!("{at}: {path}: {e}"))?;
-    if mrtd != release.mrtd {
+    let (member, stated) = match tee {
+        Tee::Tdx => ("pin.platform.tdx.mrtd", &release.tdx.measurement),
+        Tee::SevSnp => (
+            "pin.platform.sev_snp.measurement",
+            &release.sev_snp.measurement,
+        ),
+    };
+    if measurement != stated {
         return Err(format!(
-            "{at}: pin.platform.tdx.mrtd is {mrtd}, but {path} states {} for the image \
-             {cvm_version:?} launches (re-measure with measure-enclave's measure-engine-enclaves)",
-            release.mrtd
+            "{at}: {member} is {measurement}, but {path} states {stated} for the image \
+             {cvm_version:?} launches (re-measure with measure-enclave's measure-engine-enclaves)"
         ));
     }
     Ok(())

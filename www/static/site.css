@@ -155,6 +155,9 @@ body {
 
 .layout > main {
   grid-column: 2;
+  /* A grid item otherwise grows to its widest content; a wide diagram
+   * scrolls inside the column instead. */
+  min-width: 0;
 }
 
 /* --- The reading column ------------------------------------------------ */
@@ -329,6 +332,107 @@ main.prose {
 
 .prose img {
   max-width: 100%;
+}
+
+/* --- Diagrams ------------------------------------------------------------ */
+/* Inline SVG drawn at build time from a doc's mermaid block
+ * (crates/eidola-www/src/diagram.rs). The SVG carries geometry, line kind
+ * and stroke widths; every colour is a theme slot set here, so a diagram
+ * follows day and night with the page. A diagram is drawn at its natural
+ * size, the size its text was measured for, or shrunk to the figure's
+ * 648px when that keeps its text at 10px or more; where the column is
+ * narrower the figure (which takes the column's padding as well) scrolls
+ * sideways rather than shrinking its labels further. */
+
+.prose figure.diagram {
+  margin: 2rem -24px;
+  overflow-x: auto;
+}
+
+.diagram svg {
+  display: block;
+  margin: 0 auto;
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+}
+
+.diagram text {
+  fill: var(--foreground);
+  text-anchor: middle;
+  dominant-baseline: central;
+}
+
+.diagram .boundaries rect {
+  fill: var(--secondary);
+  stroke: var(--border);
+}
+
+/* A title is drawn over the lines crossing it, with a halo of the
+ * boundary's own fill so a crossing line stops short of the text. */
+.diagram .boundary-titles text {
+  fill: var(--muted-foreground);
+  font-size: 13px;
+  text-anchor: start;
+  paint-order: stroke;
+  stroke: var(--secondary);
+  stroke-width: 6px;
+  stroke-linejoin: round;
+}
+
+.diagram .node {
+  fill: var(--background);
+  stroke: var(--foreground);
+}
+
+.diagram .line {
+  fill: none;
+  stroke: var(--foreground);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.diagram .arrowhead {
+  fill: var(--foreground);
+}
+
+/* A wide transparent twin of each line, so a thin line is easy to hit. */
+.diagram .hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14px;
+  pointer-events: stroke;
+}
+
+.diagram .labels rect {
+  fill: var(--background);
+}
+
+.diagram a {
+  text-decoration: none;
+}
+
+.diagram a:hover .line,
+.diagram a:focus-visible .line {
+  stroke: var(--link-hover);
+}
+
+.diagram a:hover text,
+.diagram a:focus-visible text {
+  fill: var(--link-hover);
+}
+
+.diagram a:hover .node,
+.diagram a:focus-visible .node {
+  stroke: var(--link-hover);
+}
+
+.diagram a:focus-visible {
+  outline: none;
+}
+
+/* The section a line links to marks itself when it is the target. */
+.prose h3:target {
+  color: var(--accent-foreground);
 }
 
 /* --- Docs sidebar -------------------------------------------------------- */

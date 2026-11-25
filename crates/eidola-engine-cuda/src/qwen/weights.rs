@@ -20,7 +20,7 @@ use std::any::Any;
 use eidola_engine_model::Matrix;
 use eidola_engine_model::qwen::QwenModel;
 use eidola_engine_model::qwen::attention::rope_cos_sin;
-use eidola_engine_model::qwen::linear::{Bf16Matrix, Fp8Linear};
+use eidola_engine_model::qwen::linear::{Bf16Matrix, Fp8Linear, Linear};
 use eidola_engine_model::qwen::numeric::exp32;
 use eidola_engine_model::qwen::weights::{LayerWeights, MixerWeights, ZcNorm};
 
@@ -168,20 +168,28 @@ impl<D: QwenDevice> Loader<'_, D> {
         self.f32s(&n.0)
     }
 
-    fn fp8(&mut self, w: &Fp8Linear) -> Result<Fp8W> {
+    fn fp8(&mut self, w: &Linear) -> Result<Fp8W> {
         self.stack(&[w])
     }
 
     /// `parts` stacked by rows into one weight: the codes one after another, and the
-    /// scales transposed to `[k / 128][n / 128]` over the stack's blocks.
-    fn stack(&mut self, parts: &[&Fp8Linear]) -> Result<Fp8W> {
+    /// scales transposed to `[k / 128][n / 128]` over the stack's blocks. Every part is
+    /// FP8 (`super::check_supported`).
+    fn stack(&mut self, parts: &[&Linear]) -> Result<Fp8W> {
+        let parts = parts
+            .iter()
+            .map(|w| {
+                w.as_fp8()
+                    .ok_or_else(|| CudaError::new("a projection is not FP8 block-scaled"))
+            })
+            .collect::<Result<Vec<&Fp8Linear>>>()?;
         let k = parts[0].cols;
         if parts.iter().any(|w| w.cols != k) {
             return Err(CudaError::new("stacked FP8 weights differ in K"));
         }
         let rows: usize = parts.iter().map(|w| w.rows).sum();
         let mut codes = Vec::with_capacity(rows * k);
-        for w in parts {
+        for w in &parts {
             let c = w.codes.bytes();
             if let Some(i) = c.iter().position(|&c| c & 0x7f == 0x7f) {
                 return Err(CudaError::new(format!(
@@ -193,7 +201,7 @@ impl<D: QwenDevice> Loader<'_, D> {
         let (nb, kb) = (rows / 128, k / 128);
         let mut t = vec![0.0f32; nb * kb];
         let mut first = 0;
-        for w in parts {
+        for w in &parts {
             for i in 0..w.rows / 128 {
                 for j in 0..kb {
                     t[j * nb + first + i] = w.scales[i * kb + j];

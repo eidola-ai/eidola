@@ -1,0 +1,39 @@
+{
+  "repository": "Qwen/Qwen3.5-2B",
+  "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+  "files": {
+    "LICENSE": {
+      "size": 11544,
+      "git_sha1": "f938136e3adacfd92be087f6e113b5d6d97f678f",
+      "sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+    },
+    "chat_template.jinja": {
+      "size": 7755,
+      "git_sha1": "0ef09f214eaa6d9bca297988afc1454b5827b2c7",
+      "sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+    },
+    "config.json": {
+      "size": 2908,
+      "git_sha1": "d30a15be1bbfd610f58ad80f1fbeb6778f58a80f",
+      "sha256": "ed1c1723241f23f7f4e23430759cbd7dcfb4103cbdfe052bfe7626b57c2615b4"
+    },
+    "model.safetensors-00001-of-00001.safetensors": {
+      "size": 4548221488,
+      "sha256": "aa33250c4fc64891ddfaba3a314fd9542ea371843c387178b425fbcc5ed680b1"
+    },
+    "model.safetensors.index.json": {
+      "size": 64460,
+      "git_sha1": "69a41758e1138259916d08b99b56fada441fd502",
+      "sha256": "aca8afed9da75b0f050b408d270766fd77627f1af401e240f61c3b47d0db02f9"
+    },
+    "tokenizer.json": {
+      "size": 12807982,
+      "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+    },
+    "tokenizer_config.json": {
+      "size": 16709,
+      "git_sha1": "fae3ce993e07c092ad024dde45e592379fde91bb",
+      "sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+    }
+  }
+}

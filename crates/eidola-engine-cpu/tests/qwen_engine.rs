@@ -1,8 +1,8 @@
-//! The Qwen3.8 CPU executor through the real engine on the committed fixture: every row's
+//! The Qwen CPU executor through the real engine on the committed fixture: every row's
 //! target logits, drafter rows, chain rows and draft draws, every produced token and
 //! every stored recurrent state equal to the dense oracle, bit for bit, across chunk
 //! sizes, step budgets, interleavings, prefix hits at state snapshots, preemption and
-//! drafting.
+//! drafting. Every test runs on each committed fixture (`qwen_common::FIXTURES`).
 
 mod qwen_common;
 
@@ -10,7 +10,6 @@ use eidola_engine::engine::{CacheScope, FinishReason};
 use eidola_engine::sampling::SamplingParams;
 use qwen_common::*;
 
-#[test]
 fn requests_match_the_oracle_at_every_chunking() {
     for speculative in [false, true] {
         for chunk in [1, 3, 4, 5, 7, 256] {
@@ -39,7 +38,6 @@ fn requests_match_the_oracle_at_every_chunking() {
     }
 }
 
-#[test]
 fn interleaved_rows_under_any_budget_match_the_oracle() {
     for budget in [8, 13, 64] {
         let mut s = chunked(5, true);
@@ -62,7 +60,6 @@ fn interleaved_rows_under_any_budget_match_the_oracle() {
 }
 
 /// A request's every logit is the same bits alone and beside others, in another slot.
-#[test]
 fn a_request_alone_and_beside_others_computes_the_same_bits() {
     let prompt = TestRng(7).tokens(17, VOCAB);
     let g = SamplingParams::greedy();
@@ -105,7 +102,6 @@ fn a_request_alone_and_beside_others_computes_the_same_bits() {
     crowd.check_all(true);
 }
 
-#[test]
 fn hits_at_every_snapshot_match_the_oracle() {
     let g = SamplingParams::greedy();
     for speculative in [false, true] {
@@ -144,7 +140,6 @@ fn hits_at_every_snapshot_match_the_oracle() {
     }
 }
 
-#[test]
 fn preemption_and_resumes_match_the_oracle() {
     for (blocks, buffers) in [(24, 128), (512, 6), (28, 5)] {
         for speculative in [false, true] {
@@ -183,7 +178,6 @@ fn narrow(sampleable: u32, buffers: u32) -> Harness {
     Harness::new(fixture(), cfg, sched(true))
 }
 
-#[test]
 fn drafts_accepted_and_rejected_in_every_pattern_match_the_oracle() {
     let mut counts = [0usize; 5];
     for sampleable in [2, 3] {
@@ -207,7 +201,6 @@ fn drafts_accepted_and_rejected_in_every_pattern_match_the_oracle() {
 }
 
 /// Greedy output is the same drafted and undrafted, at every acceptance.
-#[test]
 fn greedy_drafting_equals_plain_decoding() {
     for sampleable in [2, 3, SAMPLEABLE] {
         let mut outs = Vec::new();
@@ -238,7 +231,6 @@ fn greedy_drafting_equals_plain_decoding() {
 /// A stop token or a length limit inside the drafts a step accepted leaves the device past
 /// the end of the turn; the continuation point still holds the turn's own state, saved
 /// from the slot, and the next turn resumes there exactly.
-#[test]
 fn an_ending_inside_accepted_drafts_saves_the_turns_own_state() {
     let g = SamplingParams::greedy();
     let mut saved = 0;
@@ -287,7 +279,6 @@ fn an_ending_inside_accepted_drafts_saves_the_turns_own_state() {
     );
 }
 
-#[test]
 fn shedding_under_pressure_ends_as_the_engine_says() {
     // One sequence alone in a pool too small for its prompt ends without growing.
     let mut h = Harness::fixture(6, 8, 3, chunked(4, true));
@@ -309,7 +300,6 @@ fn shedding_under_pressure_ends_as_the_engine_says() {
 
 /// A request requiring a cached prefix up to a snapshot is admitted and exact; one
 /// requiring a token past the hit is refused before anything runs.
-#[test]
 fn a_required_prefix_resumes_at_a_snapshot_or_is_refused() {
     let g = SamplingParams::greedy();
     let mut h = Harness::fixture(256, 32, 3, sched(true));
@@ -325,3 +315,16 @@ fn a_required_prefix_resumes_at_a_snapshot_or_is_refused() {
     assert_eq!(h.finished[&3], FinishReason::CachedPrefixMissing);
     h.check_all(true);
 }
+
+on_each_fixture!(
+    requests_match_the_oracle_at_every_chunking,
+    interleaved_rows_under_any_budget_match_the_oracle,
+    a_request_alone_and_beside_others_computes_the_same_bits,
+    hits_at_every_snapshot_match_the_oracle,
+    preemption_and_resumes_match_the_oracle,
+    drafts_accepted_and_rejected_in_every_pattern_match_the_oracle,
+    greedy_drafting_equals_plain_decoding,
+    an_ending_inside_accepted_drafts_saves_the_turns_own_state,
+    shedding_under_pressure_ends_as_the_engine_says,
+    a_required_prefix_resumes_at_a_snapshot_or_is_refused,
+);

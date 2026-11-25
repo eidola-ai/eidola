@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 22;
+const LATEST_VERSION: i64 = 23;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -2610,7 +2610,7 @@ pub async fn pristine_space_ids(conn: &Connection) -> Result<Vec<String>, AppErr
 const PRISTINE_SPACE_IDS_SQL: &str = "\
 SELECT s.id FROM space s \
 WHERE s.touched_at IS NULL \
-  AND s.notebook_participant_id IS NULL \
+  AND s.notebook_owner_participant_id IS NULL \
   AND NOT EXISTS (SELECT 1 FROM action a WHERE a.space_id = s.id) \
   AND NOT EXISTS (SELECT 1 FROM memory_block m WHERE m.space_id = s.id) \
   AND NOT EXISTS (SELECT 1 FROM space c WHERE c.parent_space_id = s.id) \
@@ -2689,7 +2689,7 @@ pub async fn space_footprint_counts(
 /// space-owned `participant` are `action`, `memory_block` (both checked) and
 /// `prefix_cache_key` (empty, as above; `space_participant` /
 /// `space_template_participant` are CHECK-pinned to globals and
-/// `space.notebook_participant_id` names only a global). FK
+/// `space.notebook_owner_participant_id` names only a global). FK
 /// enforcement is on for every connection, so anything this reasoning missed
 /// aborts the transaction and the space is kept — which is the direction the
 /// whole feature errs in.
@@ -3147,7 +3147,7 @@ pub async fn has_reference_from(
         "SELECT 1 FROM action_antecedent aa \
          JOIN action a ON a.id = aa.action_id \
          JOIN item_current ic ON ic.current_action_id = a.id \
-         JOIN action origin ON origin.item_id = a.item_id \
+         JOIN action origin ON origin.item_id = a.item_id AND origin.space_id = a.space_id \
            AND origin.supersedes_action_id IS NULL \
          WHERE aa.relation = 'reference' AND aa.antecedent_action_id = ?1 \
            AND a.space_id = ?2 AND origin.participant_id = ?3 \
@@ -3245,10 +3245,10 @@ pub async fn last_reply_by_participant(
          JOIN action ante ON ante.id = aa.antecedent_action_id \
          JOIN action anchored ON anchored.id = ?3 \
          JOIN item_current ic ON ic.current_action_id = a.id \
-         JOIN action origin ON origin.item_id = a.item_id \
+         JOIN action origin ON origin.item_id = a.item_id AND origin.space_id = a.space_id \
            AND origin.supersedes_action_id IS NULL \
          WHERE a.space_id = ?1 AND origin.participant_id = ?2 \
-           AND ante.item_id = anchored.item_id \
+           AND ante.item_id = anchored.item_id AND ante.space_id = anchored.space_id \
            AND a.rowid > ?4 \
            AND a.status IN ('complete', 'cancelled') \
            AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
@@ -3314,7 +3314,7 @@ pub async fn last_post_by_participant(
     let sql = format!(
         "SELECT a.id FROM action a \
          JOIN item_current ic ON ic.current_action_id = a.id \
-         JOIN action origin ON origin.item_id = a.item_id \
+         JOIN action origin ON origin.item_id = a.item_id AND origin.space_id = a.space_id \
            AND origin.supersedes_action_id IS NULL \
          WHERE a.space_id = ?1 AND origin.participant_id = ?2 \
            AND a.status IN ('complete', 'cancelled') \
@@ -4350,7 +4350,7 @@ pub struct Promotion<'a> {
 ///    NULL overrides. Ownership no longer implies membership, and NULL
 ///    overrides mean the effective config (`COALESCE(override, config)`) is
 ///    byte-identical to what it was: the space's persona is preserved exactly.
-/// 4. The agent's private **notebook space** (`space.notebook_participant_id`),
+/// 4. The agent's private **notebook space** (`space.notebook_owner_participant_id`),
 ///    referenced into by the agent itself, hidden from the Library listing.
 ///
 /// The caller has already validated *what* may be promoted (kind, scope, the
@@ -4454,7 +4454,7 @@ async fn promote_participant_tx_body(
 }
 
 /// Create an agent's private notebook space. A real space in every respect —
-/// only `notebook_participant_id` distinguishes it, which is what the Library
+/// only `notebook_owner_participant_id` distinguishes it, which is what the Library
 /// listing filters on and what the agent-management surface will look it up by.
 pub async fn insert_notebook_space(
     conn: &Connection,
@@ -4469,7 +4469,7 @@ pub async fn insert_notebook_space(
     // mistake that would cost an agent the residence of its core memory.
     conn.execute(
         "INSERT INTO space (id, parent_space_id, title, linkability, \
-                            notebook_participant_id, created_at, touched_at) \
+                            notebook_owner_participant_id, created_at, touched_at) \
          VALUES (?1, NULL, ?2, 'unlinked', ?3, ?4, ?4)",
         (
             Value::Text(id.to_string()),
@@ -4491,7 +4491,7 @@ pub async fn notebook_space_for(
     participant_id: &str,
 ) -> Result<Option<String>, AppError> {
     let mut stmt = conn
-        .prepare("SELECT id FROM space WHERE notebook_participant_id = ?1")
+        .prepare("SELECT id FROM space WHERE notebook_owner_participant_id = ?1")
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -4535,7 +4535,7 @@ pub async fn list_global_agents(conn: &Connection) -> Result<Vec<GlobalAgentRow>
         .prepare(
             "SELECT p.id, p.label, p.model_ref, p.system_prompt, p.notify_policy, s.id \
              FROM participant p \
-             LEFT JOIN space s ON s.notebook_participant_id = p.id \
+             LEFT JOIN space s ON s.notebook_owner_participant_id = p.id \
              WHERE p.scope = 'global' AND p.kind = 'agent' AND p.removed_at IS NULL \
              ORDER BY p.label, p.id",
         )
@@ -4978,7 +4978,7 @@ async fn retire_participant_tx_body(
     // rows-affected figure cannot say *which*. The predicate is the same in the
     // select and the update, so the two describe one set — nothing can land in
     // between, the whole body being one `BEGIN IMMEDIATE` transaction.
-    const LIVE_NOTEBOOK_OF: &str = "notebook_participant_id = ?1 AND archived_at IS NULL";
+    const LIVE_NOTEBOOK_OF: &str = "notebook_owner_participant_id = ?1 AND archived_at IS NULL";
     // Owner-scoped, so depth is irrelevant and nobody else's room is reached.
     // The membership predicate is [`SUBSPACE_OWNER_SQL`]'s, minus its
     // tie-break: that fragment names *the* owner where this asks *is an owner*,
@@ -5163,7 +5163,7 @@ pub async fn may_read_space(
                  WHERE id = ?2 AND kind = 'human' AND removed_at IS NULL \
              ) AND EXISTS ( \
                  SELECT 1 FROM space \
-                 WHERE id = ?1 AND notebook_participant_id IS NULL \
+                 WHERE id = ?1 AND notebook_owner_participant_id IS NULL \
              )",
             (
                 Value::Text(space_id.to_string()),
@@ -5801,7 +5801,7 @@ async fn remove_space_participant_tx_body(
              WHERE space_id = ?1 AND participant_id = ?2 AND left_at IS NULL \
                AND NOT EXISTS ( \
                    SELECT 1 FROM space s \
-                   WHERE s.id = ?1 AND s.notebook_participant_id = ?2 \
+                   WHERE s.id = ?1 AND s.notebook_owner_participant_id = ?2 \
                ) \
                AND NOT ( \
                    role = 'owner' AND EXISTS ( \
@@ -5827,7 +5827,7 @@ async fn remove_space_participant_tx_body(
         outcome,
         archived_spaces: Vec::new(),
     };
-    if notebook_participant_of(conn, space_id).await?.as_deref() == Some(participant_id) {
+    if notebook_owner_of(conn, space_id).await?.as_deref() == Some(participant_id) {
         return Ok(refused(SpaceRemoval::RefusedNotebookOwner));
     }
     if subspace_owner_of(conn, space_id).await?.as_deref() == Some(participant_id) {
@@ -5906,12 +5906,12 @@ async fn close_delegations_run_for(
 /// [`notebook_space_for`]. Read by the removal guard above, and surfaced to the
 /// GUI (via `SpaceSettings`) so the roster can withhold a Remove that could only
 /// be refused.
-pub async fn notebook_participant_of(
+pub async fn notebook_owner_of(
     conn: &Connection,
     space_id: &str,
 ) -> Result<Option<String>, AppError> {
     let mut stmt = conn
-        .prepare("SELECT notebook_participant_id FROM space WHERE id = ?1")
+        .prepare("SELECT notebook_owner_participant_id FROM space WHERE id = ?1")
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -7947,7 +7947,9 @@ pub async fn memory_revisions(
             "SELECT a.id, a.participant_id, a.created_at, cb.text_content \
              FROM action a \
              LEFT JOIN content_block cb ON cb.action_id = a.id AND cb.ordinal = 0 \
-             WHERE a.item_id = ?1 ORDER BY a.created_at ASC, a.id ASC",
+             JOIN memory_block m ON m.item_id = a.item_id AND m.space_id = a.space_id \
+             JOIN action_resolved ar ON ar.action_id = a.id \
+             WHERE m.item_id = ?1 ORDER BY ar.generation ASC",
         )
         .await
         .map_err(AppError::db)?;
@@ -8616,9 +8618,9 @@ pub async fn list_spaces(
     // `include_archived` is about archival, an orthogonal axis — so it does
     // not surface notebooks either.
     let filter = if include_archived {
-        "WHERE s.notebook_participant_id IS NULL "
+        "WHERE s.notebook_owner_participant_id IS NULL "
     } else {
-        "WHERE s.notebook_participant_id IS NULL AND s.archived_at IS NULL "
+        "WHERE s.notebook_owner_participant_id IS NULL AND s.archived_at IS NULL "
     };
     // The parent join is a self-join on the navigational `parent_space_id`, and
     // it answers in the **same read** as the listing rather than in a per-row
@@ -8795,15 +8797,13 @@ pub async fn get_space_actions_for_context(
              JOIN participant p ON p.id = a.participant_id \
              LEFT JOIN space_participant sp \
                ON sp.space_id = a.space_id AND sp.participant_id = a.participant_id \
-             JOIN (SELECT space_id, item_id, \
-                          MIN(created_at) AS born_at, MIN(id) AS first_action_id \
-                   FROM action GROUP BY space_id, item_id) origin \
-               ON origin.space_id = a.space_id AND origin.item_id = a.item_id \
+             JOIN action origin ON origin.supersedes_action_id IS NULL \
+               AND origin.space_id = a.space_id AND origin.item_id = a.item_id \
              LEFT JOIN content_block cb \
                ON cb.action_id = a.id AND cb.block_type = 'text' \
              WHERE a.space_id = ?1 \
                AND a.status IN ('complete', 'cancelled') \
-             ORDER BY origin.born_at ASC, origin.first_action_id ASC, cb.ordinal ASC",
+             ORDER BY origin.created_at ASC, origin.id ASC, cb.ordinal ASC",
         )
         .await
         .map_err(AppError::db)?;
@@ -9135,15 +9135,13 @@ pub async fn get_space_tree_data(
          JOIN participant p ON p.id = ar.participant_id \
          LEFT JOIN space_participant sp \
            ON sp.space_id = ar.space_id AND sp.participant_id = ar.participant_id \
-         JOIN (SELECT space_id, item_id, \
-                      MIN(created_at) AS born_at, MIN(id) AS first_action_id \
-               FROM action GROUP BY space_id, item_id) origin \
-           ON origin.space_id = ar.space_id AND origin.item_id = ar.item_id \
+         JOIN action origin ON origin.supersedes_action_id IS NULL \
+           AND origin.space_id = ar.space_id AND origin.item_id = ar.item_id \
          WHERE ar.space_id = ?1 \
            AND ar.is_current = 1 \
            AND ar.status IN ('complete', 'cancelled') \
            AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
-         ORDER BY origin.born_at ASC, origin.first_action_id ASC"
+         ORDER BY origin.created_at ASC, origin.id ASC"
     );
     let mut stmt = conn.prepare(&action_sql).await.map_err(AppError::db)?;
     let mut rows = stmt
@@ -12312,6 +12310,239 @@ mod tests {
             Some("i1"),
             "an un-superseded target resolves to itself"
         );
+    }
+
+    #[tokio::test]
+    async fn revision_chains_are_space_scoped_and_ignore_wall_clock_order() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        for space in ["one", "two"] {
+            insert_space(&conn, space, None, "unlinked", 0)
+                .await
+                .unwrap();
+        }
+        // The clock moves backwards; tied timestamps also sort opposite to the
+        // chain. A different space deliberately reuses the logical item id.
+        for (id, space, item, prior, time) in [
+            ("root", "one", "shared-item", None, 2_000),
+            ("middle", "one", "shared-item", Some("root"), 1_000),
+            ("current", "one", "shared-item", Some("middle"), 1_000),
+            ("other-space", "two", "shared-item", None, 500),
+            ("earlier-post", "one", "other-item", None, 1_500),
+        ] {
+            conn.execute(
+                "INSERT INTO action (id, space_id, participant_id, participant_scope, \
+                 item_id, supersedes_action_id, supersedes_item_id, action_type, created_at) \
+                 VALUES (?1, ?2, ?3, 'global', ?4, ?5, ?6, 'user_input', ?7)",
+                (
+                    id,
+                    space,
+                    HUMAN_PARTICIPANT_ID,
+                    item,
+                    prior,
+                    prior.map(|_| item),
+                    time,
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let tree = get_space_tree_data(&conn, "one").await.unwrap();
+        assert_eq!(
+            tree.actions
+                .iter()
+                .map(|a| (a.action_id.as_str(), a.generation))
+                .collect::<Vec<_>>(),
+            [("earlier-post", 0), ("current", 2)],
+            "revision numbers follow edges; post order follows each actual root"
+        );
+        let context = get_space_actions_for_context(&conn, "one").await.unwrap();
+        assert_eq!(
+            context
+                .iter()
+                .map(|a| a.action_id.as_str())
+                .collect::<Vec<_>>(),
+            ["earlier-post", "current"]
+        );
+        let mut rows = conn.query(
+            "SELECT action_id, generation FROM action_resolved WHERE item_id = 'shared-item' ORDER BY action_id", ()
+        ).await.unwrap();
+        let mut generations = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            generations.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        }
+        assert_eq!(
+            generations,
+            [
+                ("current".into(), 2),
+                ("middle".into(), 1),
+                ("other-space".into(), 0),
+                ("root".into(), 0)
+            ]
+        );
+        assert!(conn.execute(
+            "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
+             supersedes_action_id, supersedes_item_id, action_type, created_at) \
+             VALUES ('cross-space', 'two', ?1, 'global', 'shared-item', 'current', 'shared-item', 'user_input', 3000)",
+            [HUMAN_PARTICIPANT_ID],
+        ).await.is_err());
+        assert_eq!(
+            current_tip_of_item(&conn, "one", "shared-item")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("current")
+        );
+        assert_eq!(
+            current_tip_of_item(&conn, "two", "shared-item")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("other-space")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_history_follows_its_chain_in_its_resident_space() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        conn.execute_batch(
+            "INSERT INTO space(id,linkability,created_at) VALUES ('one','unlinked',0),('two','unlinked',0);
+             INSERT INTO participant(id,scope,kind,label,created_at) VALUES ('agent','global','agent','Agent',0);
+             INSERT INTO action(id,space_id,participant_id,participant_scope,item_id,action_type,created_at)
+               VALUES ('root','one','agent','global','memory-item','memory',2000),
+                      ('unrelated','two','agent','global','memory-item','memory',0);
+             INSERT INTO action(id,space_id,participant_id,participant_scope,item_id,
+                                supersedes_action_id,supersedes_item_id,action_type,created_at)
+               VALUES ('revision','one','agent','global','memory-item','root','memory-item','memory',1000);"
+        ).await.unwrap();
+        let mut block = NewMemoryBlock {
+            item_id: "memory-item".into(),
+            root_action_id: "root".into(),
+            owner_participant_id: "agent".into(),
+            name: "notes".into(),
+            scope: "core".into(),
+            space_id: "two".into(),
+            created_at: 2000,
+            updated_at: 1000,
+        };
+        assert!(
+            insert_memory_block(&conn, &block).await.is_err(),
+            "a memory root must live in its residence"
+        );
+        block.space_id = "one".into();
+        insert_memory_block(&conn, &block).await.unwrap();
+        let history = memory_revisions(&conn, "memory-item").await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|r| r.action_id.as_str())
+                .collect::<Vec<_>>(),
+            ["root", "revision"]
+        );
+    }
+
+    #[tokio::test]
+    async fn notebooks_require_global_agent_owners_on_insert_and_update() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        conn.execute_batch(
+            "INSERT INTO space(id,linkability,created_at) VALUES ('home','unlinked',0);
+             INSERT INTO space_template(id,title,created_at) VALUES ('template','Template',0);
+             INSERT INTO participant(id,scope,kind,label,created_at) VALUES ('agent','global','agent','Agent',0);
+             INSERT INTO participant(id,scope,owner_space_id,kind,label,created_at)
+               VALUES ('owned','space','home','agent','Owned',0);
+             INSERT INTO participant(id,scope,owner_template_id,kind,label,created_at)
+               VALUES ('templated','template','template','agent','Templated',0);"
+        ).await.unwrap();
+        for owner in [
+            HUMAN_PARTICIPANT_ID,
+            SYSTEM_PARTICIPANT_ID,
+            "owned",
+            "templated",
+            "missing",
+        ] {
+            assert!(
+                insert_notebook_space(&conn, "invalid", owner, "Notebook", 0)
+                    .await
+                    .is_err(),
+                "{owner}"
+            );
+        }
+        insert_notebook_space(&conn, "notebook", "agent", "Notebook", 0)
+            .await
+            .unwrap();
+        assert!(
+            insert_notebook_space(&conn, "duplicate", "agent", "Notebook", 0)
+                .await
+                .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE space SET notebook_owner_participant_id = ?1 WHERE id = 'notebook'",
+                [HUMAN_PARTICIPANT_ID]
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE participant SET kind = 'human' WHERE id = 'agent'",
+                ()
+            )
+            .await
+            .is_err()
+        );
+        assert!(conn.execute("UPDATE participant SET scope = 'space', owner_space_id = 'home' WHERE id = 'agent'", ()).await.is_err());
+        assert_eq!(
+            notebook_space_for(&conn, "agent").await.unwrap().as_deref(),
+            Some("notebook")
+        );
+    }
+
+    #[tokio::test]
+    async fn issuance_checkpoint_requires_a_non_null_32_byte_idempotency_key() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        upsert_issuer_key(
+            &conn,
+            "key",
+            "params",
+            b"public",
+            b"params",
+            IssuerKeyDeadlines {
+                spend_until: 100,
+                accept_until: 200,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+        for key in [
+            Value::Null,
+            Value::Blob(vec![0; 31]),
+            Value::Blob(vec![0; 33]),
+        ] {
+            assert!(conn.execute(
+                "INSERT INTO pre_credential(id,type,issuer_key_id,data,credits,idempotency_key,issuance_request,account_id,created_at) \
+                 VALUES ('invalid','issuance','key',x'01',100,?1,x'02','account',0)", [key]
+            ).await.is_err());
+        }
+        insert_pre_credential_issuance(
+            &conn,
+            &PreIssuanceRecord {
+                id: "valid",
+                issuer_key_id: "key",
+                data: b"pre",
+                credits: 100,
+                idempotency_key: &[0; 32],
+                issuance_request: b"request",
+                account_id: "account",
+                created_at: 0,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     /// The one-root-per-item invariant is enforced by the database, not

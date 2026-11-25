@@ -5,7 +5,6 @@
     "revision": "c3a462cc3d38cf351f3b26cbd763469eeb74ef81"
   },
   "expected_gpus": 1,
-  "gpu": "NVIDIA B200",
   "tdx": {
     "platform_endorsements": {
       "release": "platform-v0.1.11",
