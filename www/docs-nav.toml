@@ -22,6 +22,7 @@ title = "Design pieces"
 pages = [
     ["architecture.md", "Architecture"],
     ["client.md", "The client"],
+    ["mobile.md", "The mobile app"],
     ["gateway.md", "The gateway"],
     ["engine.md", "The engine"],
     ["model-identity.md", "Model identity"],

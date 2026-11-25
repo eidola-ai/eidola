@@ -85,6 +85,7 @@ pub enum AppError {
     /// written — typed ([`crate::proxy::ProxyRefusal`]) so a surface can choose
     /// its own words for which one. Prints as the configuration error it
     /// always was.
+    #[cfg(feature = "desktop")]
     #[error("config error: {refusal}")]
     ProxyRefused { refusal: crate::proxy::ProxyRefusal },
 
@@ -95,6 +96,13 @@ pub enum AppError {
     /// Enclave attestation verification failed.
     #[error("attestation failed: {message}")]
     Attestation { message: String },
+
+    /// This wasm32 core was built without a host's dialer
+    /// (`AppCore::with_host_network`), the only transport that target has, so
+    /// no client could be built and nothing was sent.
+    #[cfg(target_family = "wasm")]
+    #[error("no HTTP transport on this target")]
+    NoTransport,
 
     /// The server returned a non-success HTTP status.
     #[error("server error ({status}): {message}")]
@@ -405,8 +413,8 @@ impl std::fmt::Display for IssuerKeyRefusal {
 // ---------------------------------------------------------------------------
 
 impl AppError {
-    /// Classify a `reqwest::Error`, surfacing attestation failures explicitly.
-    pub(crate) fn from_request(e: reqwest::Error) -> Self {
+    /// Classify a transport error, surfacing attestation failures explicitly.
+    pub(crate) fn from_request(e: crate::transport::Error) -> Self {
         let chain = request_error_text(e);
         if chain.contains("measurement") && chain.contains("allowed") {
             return AppError::Attestation {
@@ -438,10 +446,10 @@ impl AppError {
     }
 }
 
-/// One `reqwest::Error` rendered as text a person can be shown — **with the
+/// One transport error rendered as text a person can be shown — **with the
 /// request URL removed**.
 ///
-/// reqwest attaches the request URL to every request-phase error and prints it
+/// The native transport, reqwest, attaches the request URL to every request-phase error and prints it
 /// in `Display` (`error sending request for url (https://host/x?token=…)`),
 /// and `Response::bytes`/`text`/`json` attach it to a body they collected. A
 /// model link's query is its *authorization* — a signed S3/CDN URL carries
@@ -454,18 +462,11 @@ impl AppError {
 /// The source chain is appended, which is where the useful part lives (DNS,
 /// TLS, connect); it never repeats the URL — established by running each of
 /// those failures rather than by reading the docs. **Every path in this crate
-/// that turns a `reqwest::Error` into a message goes through here**, so no
-/// individual call site has to remember.
-pub(crate) fn request_error_text(e: reqwest::Error) -> String {
-    let e = e.without_url();
-    let mut chain = format!("{e}");
-    let mut source = std::error::Error::source(&e);
-    while let Some(err) = source {
-        use std::fmt::Write;
-        let _ = write!(chain, ": {err}");
-        source = err.source();
-    }
-    chain
+/// that turns a transport error into a message goes through here**, so no
+/// individual call site has to remember. The host-socket transport never
+/// writes the URL into an error.
+pub(crate) fn request_error_text(e: crate::transport::Error) -> String {
+    e.text_without_url()
 }
 
 /// An account the server created that the profile could not keep — what

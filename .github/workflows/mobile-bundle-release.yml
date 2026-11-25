@@ -1,0 +1,159 @@
+name: Mobile release bundle
+
+# The release app bundle is built in the pinned StageX toolchain
+# (oci/eidola-mobile-bundle/Containerfile), every build stage on linux/amd64,
+# so its bytes must not depend on the machine that builds it. This builds it
+# twice from the same checkout, from scratch and with no layer cache, in two
+# deliberately different environments, and fails unless the two bundles are
+# identical, file for file. Both bundles are kept as artifacts, so a mismatch
+# can be compared. No digest is committed: the release manifest records the
+# canonical one, at release time (scripts/artifact-manifest.sh build-mobile).
+#
+# What this shows, and what it does not: both builds run on native x86-64
+# runners, so this is a same-architecture, cross-environment check. The two
+# differ in runner image (Ubuntu 24.04 against 22.04: kernel, Docker engine,
+# container runtime, filesystem), in BuildKit (the pinned one the release
+# chain uses against the engine's own) and in the build's temporary
+# directory. A build that depended on the host's CPU or architecture would
+# pass here. The cross-architecture check, a build emulated on arm64 against
+# a native one, runs weekly instead (mobile-bundle-cross-arch.yml), because
+# under emulation it takes about two and a half hours.
+#
+# Like the desktop's reproducibility checks, it runs for main only: on the
+# promotion PR from next and on pushes to main. Path-filtered to the bundle's
+# inputs, which are wide: any crate can be in the app's graph, and app-core
+# compiles in the trust root and the model catalog.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "models/**"
+      - "releases/trust/server-enclave.json"
+      - "releases/trust/trust-constants.json"
+      - "releases/trust/sigstore-trusted-root.json"
+      - "releases/schema/attestation-templates.json"
+      - "oci/eidola-mobile-bundle/**"
+      - "oci/pallet-rust"
+      - "docker-bake.hcl"
+      - ".dockerignore"
+      - "mobile/build-bundle-release.sh"
+      - "mobile/tools/bundle_digest.py"
+      - ".github/workflows/mobile-bundle-release.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "models/**"
+      - "releases/trust/server-enclave.json"
+      - "releases/trust/trust-constants.json"
+      - "releases/trust/sigstore-trusted-root.json"
+      - "releases/schema/attestation-templates.json"
+      - "oci/eidola-mobile-bundle/**"
+      - "oci/pallet-rust"
+      - "docker-bake.hcl"
+      - ".dockerignore"
+      - "mobile/build-bundle-release.sh"
+      - "mobile/tools/bundle_digest.py"
+      - ".github/workflows/mobile-bundle-release.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  build:
+    name: Release bundle on ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: Ubuntu 24.04, pinned BuildKit
+            runner: ubuntu-24.04
+            builder: ""
+            artifact: mobile-bundle-release-a
+          - host: Ubuntu 22.04, the engine's BuildKit
+            runner: ubuntu-22.04
+            builder: default
+            artifact: mobile-bundle-release-b
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        # The pinned buildx and BuildKit the artifact chain builds with, for
+        # the first environment; the second builds with the Docker engine's
+        # own (the `default` builder). No layer cache of any kind: the point
+        # is a build from scratch.
+        if: matrix.builder == ''
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.31.1
+          platforms: linux/amd64
+          cache-binary: false
+          driver-opts: |
+            image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
+
+      - name: Build the release bundle
+        env:
+          BUILDER: ${{ matrix.builder }}
+        run: |
+          # The second environment also builds from another temporary directory.
+          if [ -n "$BUILDER" ]; then
+            export TMPDIR="$RUNNER_TEMP/elsewhere"
+            mkdir -p "$TMPDIR"
+          fi
+          echo "$(uname -srm), $(nproc) CPUs, $(docker version --format '{{.Server.Version}}'), TMPDIR=${TMPDIR:-unset}"
+          started=$(date +%s)
+          mobile/build-bundle-release.sh --out "$RUNNER_TEMP/bundle" ${BUILDER:+--builder "$BUILDER"}
+          echo "built in $(( ($(date +%s) - started) / 60 )) min"
+
+      - name: Keep the bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/bundle
+          if-no-files-found: error
+          overwrite: true
+
+  compare:
+    name: Release bundle identical in both environments
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download both bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mobile-bundle-release-*
+          path: ${{ runner.temp }}/bundles
+
+      - name: Compare them file by file
+        env:
+          BUNDLES: ${{ runner.temp }}/bundles
+        run: |
+          for b in a b; do
+            echo "$b: $(python3 -I mobile/tools/bundle_digest.py "$BUNDLES/mobile-bundle-release-$b")"
+            (cd "$BUNDLES/mobile-bundle-release-$b" && find . -type f | LC_ALL=C sort | xargs sha256sum)
+          done
+          diff -r "$BUNDLES/mobile-bundle-release-a" "$BUNDLES/mobile-bundle-release-b"
+          echo "identical in both environments"

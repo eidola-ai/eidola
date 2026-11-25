@@ -33,29 +33,12 @@ rsa = "0.9"
 # CSPRNG for the per-handshake attestation nonce.
 getrandom = "0.4"
 
-# HTTP client returned to callers and used by the standalone attestation-document helper.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
-
 # TLS verification. Trust roots are supplied by the caller via
 # `AttestingClientConfig::tls_roots` — the verifier intentionally does not
 # bundle `webpki-roots` or `rustls-native-certs` so each consumer (gateway in
 # enclave, CLI on developer machine, etc.) can pick the source that fits its
 # environment without dragging the wrong dep into the others.
 rustls = { version = "0.23", default-features = false, features = ["std"] }
-
-# Connector layer plumbing for the per-handshake attesting client.
-# `tower` gives us Layer/Service traits; `hyper` and `hyper-util` give us the
-# Read/Write/Connection traits and the TokioIo adapter that lets us drive an
-# inline HTTP/1.1 request on a freshly handshaked connection; `httparse`
-# parses the response head.
-tower = { version = "0.5", default-features = false }
-hyper = { version = "1", default-features = false }
-hyper-util = { version = "0.1", default-features = false }
-httparse = "1"
-http = "1"
-
-# Async runtime
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
 
 # Hashing. Pinned to 0.10 because the rsa crate's `VerifyingKey<D>`
 # bounds require `D: rsa::sha2::Digest`, which only resolves when our
@@ -96,11 +79,50 @@ eidola-common = { path = "../eidola-common", optional = true }
 # Logging
 tracing = "0.1"
 
+# The attestation check's inline request runs over any tokio byte stream
+# (`attest`), and the byte-pipe transport (`pipe`) runs TLS over one a host
+# dialed. Neither needs a runtime: `io-util` alone, on every target.
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+# Parses the attestation response's head.
+httparse = "1"
+# Classifies a TDX document's captured Intel PCS responses by URL: the parser
+# `reqwest::Url` re-exports, depended on directly so wasm32 links no reqwest.
+url = "2"
+
+# The reqwest connector is native-only (`attesting_client`): it drives TCP
+# and TLS through tokio and reqwest's native connector. The check and the
+# byte-pipe transport compile for wasm32 without it.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# HTTP client returned to callers.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# Connector layer plumbing for the per-handshake attesting client.
+# `tower` gives us Layer/Service traits; `hyper` and `hyper-util` give us the
+# Read/Write/Connection traits and the TokioIo adapter that turns a
+# freshly handshaked connection into the stream the check drives.
+tower = { version = "0.5", default-features = false }
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+http = "1"
+
+# Async runtime; `net` for the native `pipe::TcpDialer`.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "time"] }
+
+# wasm32-unknown-unknown has no OS randomness or clock: the nonce (getrandom
+# 0.4) and the RSA crates (getrandom 0.2) draw from the browser's, and rustls
+# reads the browser's clock (`rustls-pki-types/web`).
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+rustls-pki-types = { version = "1", features = ["web"] }
+
 [features]
 platform-endorsements = ["dep:eidola-common", "dep:const-oid", "dep:spki", "dep:p256", "dep:p384", "dep:signature"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+# The byte-pipe tests run against in-process shims (`tests/pipe.rs`).
+tinfoil-shim-mock = { path = "../tinfoil-shim-mock" }
 # The live and mock-shim tests install the RustCrypto provider, as production
 # callers do.
 rustls-rustcrypto = "0.1.0-pre.0"

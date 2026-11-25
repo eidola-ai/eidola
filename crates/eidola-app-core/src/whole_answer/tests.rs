@@ -143,7 +143,7 @@ async fn serving_once(
     content_type: &'static str,
     body: Vec<u8>,
     cut: bool,
-) -> reqwest::Response {
+) -> crate::transport::Response {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -177,6 +177,7 @@ async fn serving_once(
         .send()
         .await
         .unwrap()
+        .into()
 }
 
 async fn assembled(events: &[String]) -> Result<Answer, Box<AnswerFailure>> {

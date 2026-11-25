@@ -4,30 +4,36 @@ pub mod config;
 pub mod db;
 pub mod decline;
 pub mod discovery;
+mod durability;
 pub mod error;
+#[cfg(feature = "desktop")]
 pub mod ipc;
 pub mod local_models;
 pub mod memory;
 pub mod model_catalog;
 mod peer_read;
 mod prefix_cache;
+#[cfg(feature = "desktop")]
 pub mod proxy;
 mod recorded;
 pub mod router;
+mod rt;
 pub mod search;
+pub mod storage;
 pub mod subspace_driver;
 pub mod subspaces;
 pub mod summaries;
 pub mod tools;
+pub mod transport;
 pub mod trust_root;
 pub mod updater;
 pub mod updates;
 pub mod utility;
 mod whole_answer;
 
+use rt::{SystemTime, UNIX_EPOCH};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anonymous_credit_tokens::{
     CreditToken, IssuanceResponse, Params, PreIssuance, PreRefund, PublicKey, Refund, SpendProof,
@@ -2319,6 +2325,9 @@ struct Inner {
     /// [`Inner::update_config`]).
     config_write: Mutex<()>,
     data_dir: PathBuf,
+    /// Where the config, the update state and the database are read and
+    /// written: the filesystem, or a host's files ([`storage`]).
+    files: storage::ProfileFiles,
     db: tokio::sync::OnceCell<turso::Database>,
     /// Cached update-check state and the ordering that governs writes to it
     /// (see [`UpdateStateCell`]), lazily loaded from
@@ -2570,7 +2579,10 @@ struct Inner {
     /// crate's dev-dependency self-reference for `cargo test`), so release
     /// builds contain no bypass path at all.
     #[cfg(feature = "test-support")]
-    http_override: Option<reqwest::Client>,
+    http_override: Option<crate::transport::Client>,
+    /// How this core's requests reach the network: natively, or through the
+    /// embedding app's dialer ([`AppCore::with_host_network`]).
+    transport: transport::Transport,
     /// **Test-only seam.** Makes the eidola backend's declarations count as
     /// authoritative even though the harness reaches it through a base-URL
     /// override.
@@ -2601,8 +2613,10 @@ struct Inner {
     /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
     /// silently contending for turso's single-writer file. Held purely by
     /// existing; released when this `Inner` drops (the descriptor closes), so
-    /// a crash cannot wedge it either. See [`db::DbLock`].
-    _db_lock: db::DbLock,
+    /// a crash cannot wedge it either. See [`db::DbLock`]. `None` for a
+    /// profile on a host: its stream holds the lock until its last write has
+    /// reached the host ([`storage`]).
+    _db_lock: Option<db::DbLock>,
 }
 
 // --- Config helpers (sync) ---------------------------------------------------
@@ -2661,14 +2675,14 @@ impl MechanicalOutcome {
 
 impl Inner {
     fn load_config(&self) -> Config {
-        Config::load_from(&self.config_path)
+        self.files.load_config(&self.config_path)
     }
 
     /// The config a setter is about to rewrite whole: see
     /// [`Config::load_for_update`] (an unreadable file refuses the write
     /// rather than reading as defaults the save would then persist).
     fn load_config_for_update(&self) -> Result<Config, AppError> {
-        Config::load_for_update(&self.config_path)
+        self.files.load_config_for_update(&self.config_path)
     }
 
     /// Rewrite the config: load it strictly, apply `change`, save it whole —
@@ -2691,10 +2705,10 @@ impl Inner {
         change: impl FnOnce(&mut Config) -> Result<(), AppError>,
     ) -> Result<(), AppError> {
         let _serialized = self.config_write.lock().unwrap_or_else(|e| e.into_inner());
-        config::sweep_stale_temporaries(&self.config_path);
-        let mut cfg = Config::load_for_update(&self.config_path)?;
+        self.files.sweep_config_temporaries(&self.config_path);
+        let mut cfg = self.files.load_config_for_update(&self.config_path)?;
         change(&mut cfg)?;
-        cfg.save_to(&self.config_path)
+        self.files.save_config(&cfg, &self.config_path)
     }
 
     fn require_credentials<'a>(&self, cfg: &'a Config) -> Result<(&'a str, &'a str), AppError> {
@@ -2769,7 +2783,7 @@ impl Inner {
         let mut guard = self.update_state.lock().expect("update_state lock");
         guard
             .state
-            .get_or_insert_with(|| updates::load_state(&self.data_dir))
+            .get_or_insert_with(|| self.files.load_update_state(&self.data_dir))
             .clone()
     }
 
@@ -2798,9 +2812,9 @@ impl Inner {
             let cell = &mut *guard;
             let state = cell
                 .state
-                .get_or_insert_with(|| updates::load_state(&self.data_dir));
+                .get_or_insert_with(|| self.files.load_update_state(&self.data_dir));
             let answer = f(state, &mut cell.applied_check);
-            if let Err(e) = updates::save_state(&self.data_dir, state) {
+            if let Err(e) = self.files.save_update_state(&self.data_dir, state) {
                 eprintln!("warning: failed to persist update-check state: {e}");
             }
             answer
@@ -2842,16 +2856,23 @@ impl Inner {
             + 1;
         let releases_url = self.load_config().update_releases_url();
         // Hashing the install's main executable reads tens of megabytes the
-        // first time, so it runs where blocking is allowed.
-        let data_dir = self.data_dir.clone();
-        let installed_git_commit = tokio::task::spawn_blocking(move || {
-            updater::installed::running_install_commit(&data_dir)
-        })
-        .await
-        .ok()
-        .flatten();
+        // first time, so it runs where blocking is allowed. A build without
+        // the desktop install kinds has no installed executable to hash, so
+        // it reads as a fresh install: no commit known, continuity skipped.
+        #[cfg(feature = "desktop")]
+        let installed_git_commit = {
+            let data_dir = self.data_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                updater::installed::running_install_commit(&data_dir)
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        #[cfg(not(feature = "desktop"))]
+        let installed_git_commit = None;
 
-        let outcome = match updater::build_http_client() {
+        let outcome = match updater::build_http_client(&self.transport) {
             Ok(client) => {
                 let mut ctx = updates::CheckContext::new(releases_url, env!("CARGO_PKG_VERSION"));
                 ctx.installed_git_commit = installed_git_commit;
@@ -2940,7 +2961,7 @@ impl Inner {
         let database = self
             .db
             .get_or_try_init(|| async {
-                let database = db::open(&self.data_dir).await?;
+                let database = self.files.open_database(&self.data_dir).await?;
                 self.forget_other_domains_cache_keys(&database).await;
                 self.sweep_pristine_spaces(&database).await;
                 Ok::<_, AppError>(database)
@@ -3156,7 +3177,7 @@ impl Inner {
         &self,
         eidola: &EidolaResolved,
         attestation_observer: Option<tinfoil_verifier::AttestationObserver>,
-    ) -> Result<reqwest::Client, AppError> {
+    ) -> Result<crate::transport::Client, AppError> {
         // Test seam: a plain-HTTP client injected via
         // `AppCore::with_test_http_client` short-circuits attestation so
         // integration tests can drive the HTTP paths against a mock upstream.
@@ -3184,32 +3205,27 @@ impl Inner {
             .iter()
             .map(config::TrustedMeasurement::allowed)
             .collect();
-        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &allowed,
-            inference_base_url: &eidola.base_url,
-            trusted_ark_der: hardware_root_der.as_deref(),
-            trusted_ask_der: hardware_intermediate_der.as_deref(),
-            snp_min_tcb: None,
-            snp_observer: None,
+        transport::attesting_client(
+            &self.transport,
+            &allowed,
+            &eidola.base_url,
+            hardware_root_der.as_deref(),
+            hardware_intermediate_der.as_deref(),
             attestation_observer,
-            tls_roots: load_native_root_store(),
-        })
+        )
         .await
-        .map_err(|e| AppError::Attestation {
-            message: format!("attestation client build failed: {e}"),
-        })
     }
 
     /// The plain-HTTP client used for local-engine and generic
     /// OpenAI-compatible backends (no enclave, so nothing to attest). Under
     /// the `test-support` feature an injected test client takes its place so
     /// the chat harness can intercept these paths too.
-    fn plain_client(&self) -> Result<reqwest::Client, AppError> {
+    fn plain_client(&self) -> Result<crate::transport::Client, AppError> {
         #[cfg(feature = "test-support")]
         if let Some(client) = &self.http_override {
             return Ok(client.clone());
         }
-        local_models::plain_http_client()
+        local_models::plain_http_client(&self.transport)
     }
 
     /// The client a chat turn's or a chore's completion goes out on, to an
@@ -3219,12 +3235,12 @@ impl Inner {
     /// [`local_models::completion_http_client`]. Under the `test-support`
     /// feature an injected test client takes its place, so a test of the
     /// policy itself runs on an ordinary core.
-    fn completion_client(&self) -> Result<reqwest::Client, AppError> {
+    fn completion_client(&self) -> Result<crate::transport::Client, AppError> {
         #[cfg(feature = "test-support")]
         if let Some(client) = &self.http_override {
             return Ok(client.clone());
         }
-        local_models::completion_http_client()
+        local_models::completion_http_client(&self.transport)
     }
 
     /// The client a **proxied** completion goes out on: [`Inner::plain_client`]
@@ -3232,12 +3248,13 @@ impl Inner {
     /// header set is an allowlist the Record repeats back to the reader and a
     /// header the builder adds would travel outside it. See
     /// [`local_models::proxy_http_client`].
-    fn proxy_client(&self) -> Result<reqwest::Client, AppError> {
+    #[cfg(feature = "desktop")]
+    fn proxy_client(&self) -> Result<crate::transport::Client, AppError> {
         #[cfg(feature = "test-support")]
         if let Some(client) = &self.http_override {
             return Ok(client.clone());
         }
-        local_models::proxy_http_client()
+        local_models::proxy_http_client(&self.transport)
     }
 
     /// Is what this eidola connection says about its models a fact this
@@ -3423,6 +3440,16 @@ impl Inner {
         if saved.is_ok() {
             self.bus.emit(Change::Config);
         }
+        // Kept means durable. On a profile its host owns, the save above only
+        // queued the config for the host; a host that then fails the write has
+        // kept nothing, and the next launch would have no account. So the
+        // creation waits for the host (within the durability barrier's bound)
+        // and a failure is an unsaved account, like a config that could not
+        // be written at all. On the filesystem the save is already durable.
+        let saved = match saved {
+            Ok(()) => self.files.durable().await,
+            Err(e) => Err(e),
+        };
         // Not kept: write the credential to a file of its own beside the
         // profile, now, before any more network. The returned error carries it
         // too, but a caller can drop that (a window closed mid-create, a
@@ -3439,7 +3466,11 @@ impl Inner {
                 account_secret: Some(created.secret.clone()),
                 ..Config::default()
             };
-            recovery.save_to(&path).ok().map(|()| path)
+            // Named only once it is durable, as the profile would have been.
+            match self.files.save_config(&recovery, &path) {
+                Ok(()) if self.files.durable().await.is_ok() => Some(path),
+                _ => None,
+            }
         } else {
             None
         };
@@ -3892,9 +3923,9 @@ impl Inner {
     /// rather than left waiting — a turn waits here holding `spend_gate`.
     async fn lock_issuance_gate(
         &self,
-        deadline: tokio::time::Instant,
+        deadline: rt::Instant,
     ) -> Result<tokio::sync::MutexGuard<'_, ()>, AppError> {
-        tokio::time::timeout_at(deadline, self.issuance_gate.lock())
+        rt::timeout_at(deadline, self.issuance_gate.lock())
             .await
             .map_err(|_| AppError::ProvisioningTimeout {
                 message: "timed out waiting for another credential issuance to finish".into(),
@@ -3903,7 +3934,7 @@ impl Inner {
 
     /// The account balance, read under the issuance deadline.
     async fn account_balances_bounded(&self) -> Result<BalancesResult, AppError> {
-        tokio::time::timeout(self.issuance_request_timeout(), self.account_balances())
+        rt::timeout(self.issuance_request_timeout(), self.account_balances())
             .await
             .map_err(|_| AppError::Network {
                 message: "timed out reading the account balance".into(),
@@ -3942,7 +3973,7 @@ impl Inner {
     /// answer was lost would otherwise debit once per attempt.
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
         let _issuing = self
-            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .lock_issuance_gate(rt::Instant::now() + self.provision_wait())
             .await?;
         let recovered = Box::pin(self.resolve_pending_issuances_locked()).await?;
         if !recovered.is_empty() {
@@ -3993,7 +4024,7 @@ impl Inner {
                 message: "the core is shutting down".into(),
             });
         };
-        tokio::spawn(async move { inner.allocate_locked(credits).await })
+        rt::spawn(async move { inner.allocate_locked(credits).await })
             .await
             .map_err(join_err)?
     }
@@ -4013,7 +4044,7 @@ impl Inner {
     async fn allocate_with_key(
         &self,
         cfg: &Config,
-        client: &reqwest::Client,
+        client: &crate::transport::Client,
         base_url: &str,
         key: &CurrentIssuerKey,
         credits: i64,
@@ -4212,7 +4243,7 @@ impl Inner {
     /// the wallet; nothing about a request that is about to be made enters it.
     async fn provision_once(&self) -> Result<ProvisionOutcome, AppError> {
         let _issuing = self
-            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .lock_issuance_gate(rt::Instant::now() + self.provision_wait())
             .await?;
         // A disabled backend is asked for nothing, not even a recovery: the
         // reader has turned the service off, and nothing unattended converts
@@ -4576,7 +4607,7 @@ impl Inner {
             // The spend exactly as it was presented.
             let presented =
                 PresentedSpend::new(&issuer_key_hash, &spend_proof_cbor, &row.pre_refund_data);
-            let answer = tokio::time::timeout(
+            let answer = rt::timeout(
                 SPEND_RECOVERY_REQUEST_TIMEOUT,
                 recover_refund(&client, base_url, &presented, Some(row.spend_until)),
             )
@@ -4621,7 +4652,7 @@ impl Inner {
     /// or its recovery except on the reader's own instruction.
     async fn recover_pending_issuances(&self) -> Result<IssuanceRecovery, AppError> {
         let _issuing = self
-            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .lock_issuance_gate(rt::Instant::now() + self.provision_wait())
             .await?;
         let recovered = Box::pin(self.recover_pending_issuances_locked()).await?;
         let (waiting, unresolved) = self.pending_issuance_counts().await?;
@@ -7227,7 +7258,7 @@ impl Inner {
         funding: Funding,
     ) -> Result<Vec<(db::SpendableCredential, i64)>, AppError> {
         let wait = self.provision_wait();
-        let deadline = tokio::time::Instant::now() + wait;
+        let deadline = rt::Instant::now() + wait;
         // A hold no turn in this process is flying with settles only when
         // somebody asks for it: once before anything is converted for this
         // request, and once more while it waits, with the last quarter of
@@ -7288,9 +7319,9 @@ impl Inner {
                     .map(|c| c.credits)
                     .collect();
                 if settlement_could_cover(&in_flight, &held, charge_credits)
-                    && tokio::time::Instant::now() < deadline
+                    && rt::Instant::now() < deadline
                 {
-                    tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
+                    rt::sleep(PROVISION_POLL_INTERVAL).await;
                     continue;
                 }
                 return match chosen_inputs(db_conn, charge_credits).await? {
@@ -7367,14 +7398,14 @@ impl Inner {
                 ))
                 .collect();
             let recoverable = settlement_could_cover(&in_flight, &held, charge_credits);
-            if recoverable && tokio::time::Instant::now() < deadline {
-                if stranded_asks == 1 && tokio::time::Instant::now() >= last_ask_at {
+            if recoverable && rt::Instant::now() < deadline {
+                if stranded_asks == 1 && rt::Instant::now() >= last_ask_at {
                     stranded_asks = 0;
                     if self.recover_stranded_spends_by(deadline).await {
                         continue;
                     }
                 }
-                tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
+                rt::sleep(PROVISION_POLL_INTERVAL).await;
                 continue;
             }
 
@@ -7445,13 +7476,13 @@ impl Inner {
     ///
     /// On a task of its own: a turn's future is deep already, and settling a
     /// refund checks its proof on the stack.
-    async fn recover_stranded_spends_by(&self, deadline: tokio::time::Instant) -> bool {
+    async fn recover_stranded_spends_by(&self, deadline: rt::Instant) -> bool {
         let Some(inner) = self.self_ref.upgrade() else {
             return false;
         };
-        let recovery = tokio::spawn(async move { inner.recover_stranded_spends().await });
+        let recovery = rt::spawn(async move { inner.recover_stranded_spends().await });
         matches!(
-            tokio::time::timeout_at(deadline, recovery).await,
+            rt::timeout_at(deadline, recovery).await,
             Ok(Ok(Ok(recovered))) if !recovered.is_empty()
         )
     }
@@ -11120,8 +11151,8 @@ pub(crate) fn is_padding_event(event: &[u8]) -> bool {
 /// half of the rule each streaming transport states at its shape check: the
 /// shapes it exists for (a JSON completion, an HTML error page) both name a
 /// content type, while a compliant SSE server always sets one.
-pub(crate) fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
-    let Some(value) = headers.get(reqwest::header::CONTENT_TYPE) else {
+pub(crate) fn is_event_stream(headers: &http::header::HeaderMap) -> bool {
+    let Some(value) = headers.get(http::header::CONTENT_TYPE) else {
         return true;
     };
     value
@@ -11143,7 +11174,7 @@ pub(crate) fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
 // ============================================================================
 
 pub struct AppCore {
-    runtime: tokio::runtime::Runtime,
+    runtime: rt::Runtime,
     inner: Arc<Inner>,
     /// The invalidation bus, shared with `Inner` so callers can subscribe
     /// while `Inner` emits on the tokio runtime.
@@ -11151,6 +11182,7 @@ pub struct AppCore {
 }
 
 impl AppCore {
+    #[cfg(not(target_family = "wasm"))]
     pub fn runtime(&self) -> &tokio::runtime::Runtime {
         &self.runtime
     }
@@ -11588,7 +11620,7 @@ impl AppCore {
 }
 
 /// Convert a `tokio::task::JoinError` (panic / cancellation) into `AppError`.
-fn join_err(e: tokio::task::JoinError) -> AppError {
+fn join_err(e: rt::JoinError) -> AppError {
     AppError::Internal {
         message: format!("async task failed: {e}"),
     }
@@ -11606,6 +11638,7 @@ impl AppCore {
     /// it — turso is single-writer, so two openers would otherwise contend
     /// silently. The lock is released when the returned `AppCore` (and any
     /// task holding its inner `Arc`) drops.
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(config_dir: PathBuf, data_dir: PathBuf) -> Result<Self, AppError> {
         Self::open_as(config_dir, data_dir, db::LockHolder::App)
     }
@@ -11615,24 +11648,126 @@ impl AppCore {
     /// holder ([`db::LockHolder::Command`]): a contender refused while this
     /// core lives learns that the profile will be let go when the command
     /// ends, which is what lets another command wait for it rather than fail.
+    #[cfg(not(target_family = "wasm"))]
     pub fn new_for_command(config_dir: PathBuf, data_dir: PathBuf) -> Result<Self, AppError> {
         Self::open_as(config_dir, data_dir, db::LockHolder::Command)
     }
 
+    /// [`AppCore::new`] for an app that supplies its own socket: every
+    /// request this core makes — account, credentials, chat, models, updates —
+    /// is a stream `host`'s dialer opens, with TLS (and, to the Eidola
+    /// backend, enclave attestation) run in this process over it. The host
+    /// moves ciphertext and makes no trust decision. The mobile app, whose
+    /// files its host owns too, passes its network to [`AppCore::on_host`].
+    #[cfg(not(target_family = "wasm"))]
+    pub fn with_host_network(
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        host: transport::HostNetwork,
+    ) -> Result<Self, AppError> {
+        let db_lock = db::DbLock::acquire(&data_dir, db::LockHolder::App)?;
+        Self::build(
+            config_dir,
+            data_dir,
+            storage::ProfileFiles::Disk,
+            Some(db_lock),
+            transport::Transport::new(Some(host)),
+            #[cfg(feature = "test-support")]
+            None,
+        )
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     fn open_as(
         config_dir: PathBuf,
         data_dir: PathBuf,
         holder: db::LockHolder,
     ) -> Result<Self, AppError> {
-        #[cfg(feature = "test-support")]
-        let core = Self::build(config_dir, data_dir, holder, None);
-        #[cfg(not(feature = "test-support"))]
-        let core = Self::build(config_dir, data_dir, holder);
-        core
+        // Loud DB contention: claim the single-writer database before
+        // building anything else, so a second opener is refused with a typed
+        // error instead of silently racing the first.
+        let db_lock = db::DbLock::acquire(&data_dir, holder)?;
+        Self::build(
+            config_dir,
+            data_dir,
+            storage::ProfileFiles::Disk,
+            Some(db_lock),
+            transport::Transport::default(),
+            #[cfg(feature = "test-support")]
+            None,
+        )
+    }
+
+    /// Open a profile whose files the embedding app owns, loaded by
+    /// [`storage::HostProfile::load`] (which took the profile's lock). The
+    /// config lives beside the database, so [`Self::config_dir`] and
+    /// [`Self::data_dir`] are both the profile's `data_dir`.
+    ///
+    /// Writes stream to the host behind the work that made them, on this
+    /// core's runtime; [`Self::flush_storage`] waits for them, and so does
+    /// every request before it leaves (see [`storage`] for what is durable
+    /// when). `network`, when given, is the socket every request goes over
+    /// (as [`Self::with_host_network`]); wasm32 has no other.
+    pub fn on_host(
+        profile: storage::HostProfile,
+        network: Option<transport::HostNetwork>,
+    ) -> Result<Self, AppError> {
+        Self::on_host_inner(
+            profile,
+            transport::Transport::new(network),
+            #[cfg(feature = "test-support")]
+            None,
+        )
+    }
+
+    /// [`Self::on_host`] with [`Self::with_test_http_client`]'s client.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn on_host_with_test_http_client(
+        profile: storage::HostProfile,
+        client: impl Into<crate::transport::Client>,
+    ) -> Result<Self, AppError> {
+        Self::on_host_inner(
+            profile,
+            transport::Transport::default(),
+            Some(client.into()),
+        )
+    }
+
+    fn on_host_inner(
+        mut profile: storage::HostProfile,
+        transport: transport::Transport,
+        #[cfg(feature = "test-support")] http_override: Option<crate::transport::Client>,
+    ) -> Result<Self, AppError> {
+        let stream = profile.stream.take();
+        let core = Self::build(
+            profile.data_dir.clone(),
+            profile.data_dir.clone(),
+            storage::ProfileFiles::Host(profile.image.clone()),
+            None,
+            transport,
+            #[cfg(feature = "test-support")]
+            http_override,
+        )?;
+        if let Some(stream) = stream {
+            drop(core.runtime.spawn(stream));
+        }
+        Ok(core)
+    }
+
+    /// Wait until every write this core made before the call is durable on
+    /// its host ([`storage::ProfileImage::flush`]). Returns at once for a
+    /// profile on the filesystem, whose writes are durable when made.
+    pub async fn flush_storage(&self) -> Result<(), AppError> {
+        match &self.inner.files {
+            #[cfg(not(target_family = "wasm"))]
+            storage::ProfileFiles::Disk => Ok(()),
+            storage::ProfileFiles::Host(image) => image.flush().await,
+        }
     }
 
     /// Construct an `AppCore` whose HTTP client is the supplied plain
-    /// `reqwest::Client` instead of the attesting client.
+    /// `crate::transport::Client` instead of the attesting client.
     ///
     /// **Test-only seam.** This bypasses per-handshake enclave attestation so
     /// integration tests can exercise `chat` / `chat_stream` (and the account /
@@ -11645,13 +11780,21 @@ impl AppCore {
     /// [`AppCore::set_base_url`]); the injected client only governs *how*
     /// requests are made, not *where*.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
     pub fn with_test_http_client(
         config_dir: PathBuf,
         data_dir: PathBuf,
-        client: reqwest::Client,
+        client: impl Into<crate::transport::Client>,
     ) -> Result<Self, AppError> {
-        Self::build(config_dir, data_dir, db::LockHolder::App, Some(client))
+        let db_lock = db::DbLock::acquire(&data_dir, db::LockHolder::App)?;
+        Self::build(
+            config_dir,
+            data_dir,
+            storage::ProfileFiles::Disk,
+            Some(db_lock),
+            transport::Transport::default(),
+            Some(client.into()),
+        )
     }
 
     /// **Test-only seam.** Treat the eidola backend as though it were reached
@@ -11754,21 +11897,26 @@ impl AppCore {
     fn build(
         config_dir: PathBuf,
         data_dir: PathBuf,
-        holder: db::LockHolder,
-        #[cfg(feature = "test-support")] http_override: Option<reqwest::Client>,
+        files: storage::ProfileFiles,
+        db_lock: Option<db::DbLock>,
+        transport: transport::Transport,
+        #[cfg(feature = "test-support")] http_override: Option<crate::transport::Client>,
     ) -> Result<Self, AppError> {
-        // Loud DB contention: claim the single-writer database before
-        // building anything else, so a second opener is refused with a typed
-        // error instead of silently racing the first.
-        let db_lock = db::DbLock::acquire(&data_dir, holder)?;
+        // Every request this core sends waits on its own profile's barrier.
+        let durability = match &files {
+            storage::ProfileFiles::Host(image) => durability::Durability::host(image.clone()),
+            #[cfg(not(target_family = "wasm"))]
+            storage::ProfileFiles::Disk => durability::Durability::default(),
+        };
+        let transport = transport.with_durability(durability.clone());
+        #[cfg(feature = "test-support")]
+        let http_override = http_override.map(|client| client.with_durability(durability));
+        #[cfg(not(feature = "test-support"))]
+        let _ = durability;
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(8 * 1024 * 1024) // 8 MB — matches default main-thread size
-            .build()
-            .map_err(|e| AppError::Internal {
-                message: format!("failed to create tokio runtime: {e}"),
-            })?;
+        let runtime = rt::new_runtime().map_err(|e| AppError::Internal {
+            message: format!("failed to create tokio runtime: {e}"),
+        })?;
         let bus = BroadcastSource::new();
         Ok(Self {
             runtime,
@@ -11778,6 +11926,7 @@ impl AppCore {
                 config_path: config_dir.join("config.toml"),
                 config_write: Mutex::new(()),
                 data_dir,
+                files,
                 db: tokio::sync::OnceCell::new(),
                 update_state: Mutex::new(UpdateStateCell::default()),
                 update_checks_started: std::sync::atomic::AtomicU64::new(0),
@@ -11849,6 +11998,7 @@ impl AppCore {
                 tool_incapable_models: std::sync::RwLock::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 http_override,
+                transport,
                 #[cfg(feature = "test-support")]
                 trust_declared_capabilities: std::sync::atomic::AtomicBool::new(false),
                 cache_clock: CacheClock::default(),
@@ -12322,6 +12472,65 @@ impl AppCore {
         self.inner.accept_changed_claims(version, manifest_sha256)
     }
 
+    /// The mobile app's update check: find the release to offer next,
+    /// verify it exactly as [`Self::update_check`] does, and read the app
+    /// bundle it records ([`updater::mobile::prepare`]). Downloads the
+    /// signed documents only; nothing is staged. Refused anywhere but in the
+    /// mobile app ([`updater::install_kind::InstallKind::MobileBundle`]),
+    /// the one install a bundle replaces.
+    ///
+    /// The error keeps [`updater::ReleaseCheckError`]'s two kinds apart, as
+    /// the desktop's check does (`CheckFailed` against `Unverifiable`): a
+    /// release that arrived and failed a check is evidence the interface must
+    /// show as such, and a feed it could not reach is not. A refusal that
+    /// involves no release at all — this install takes no bundle, or the
+    /// fetcher could not be built — is the quiet kind.
+    pub async fn prepare_bundle_update(
+        &self,
+    ) -> Result<updater::mobile::BundleUpdate, updater::ReleaseCheckError> {
+        let kind = updater::install_kind::detect(updater::install_kind::running_program());
+        if kind != updater::install_kind::InstallKind::MobileBundle {
+            return Err(updater::ReleaseCheckError::Unreachable(format!(
+                "this install ({kind:?}) is not updated by an app bundle"
+            )));
+        }
+        let releases_url = self.inner.load_config().update_releases_url();
+        let fetcher = self
+            .update_fetcher()
+            .map_err(|e| updater::ReleaseCheckError::Unreachable(e.to_string()))?;
+        // No installed commit: as for every install the updater has not yet
+        // recorded, continuity is not checked and the next release along the
+        // latest's history is offered (`updater::discover_next_release`).
+        updater::mobile::prepare(
+            &fetcher,
+            &releases_url,
+            env!("CARGO_PKG_VERSION"),
+            None,
+            &updater::ReleasePins::embedded(),
+        )
+        .await
+    }
+
+    /// The user approved `pending`: download its bundle, check every byte,
+    /// stage it in the shell's store and activate it
+    /// ([`updater::mobile::PendingBundleUpdate::approve`]). The caller then
+    /// reloads, and the new bundle's boot confirms it.
+    pub async fn install_bundle_update(
+        &self,
+        pending: updater::mobile::PendingBundleUpdate,
+        store: &dyn updater::mobile::BundleStore,
+    ) -> Result<updater::mobile::ActivatedBundle, AppError> {
+        Ok(pending.approve(&self.update_fetcher()?, store).await?)
+    }
+
+    /// The updater's byte source over this core's transport: plain WebPKI
+    /// TLS, natively through reqwest and on a host through its socket.
+    pub fn update_fetcher(&self) -> Result<updater::Fetcher, AppError> {
+        Ok(updater::Fetcher::Network(updater::build_http_client(
+            &self.inner.transport,
+        )?))
+    }
+
     /// Start the background poll loop: one check immediately, then one
     /// after each [`updates::next_poll_delay`] (about an hour) while the
     /// process runs.
@@ -12338,7 +12547,7 @@ impl AppCore {
         self.runtime.spawn(async move {
             loop {
                 let _ = inner.run_update_check().await;
-                tokio::time::sleep(updates::next_poll_delay(&mut OsRng)).await;
+                rt::sleep(updates::next_poll_delay(&mut OsRng)).await;
             }
         });
     }
@@ -12426,8 +12635,8 @@ impl AppCore {
                 // provisioner's pass an account-authenticated one, so they
                 // are kept at least a quarter of the interval apart.
                 let before_sweep = provision_delay(interval / 4, interval * 3 / 4);
-                tokio::time::sleep(before_sweep).await;
-                let _ = tokio::time::timeout(
+                rt::sleep(before_sweep).await;
+                let _ = rt::timeout(
                     PROVISION_PASS_DEADLINE,
                     changes::with_origin(
                         changes::ChangeOrigin::Unattended,
@@ -12435,11 +12644,11 @@ impl AppCore {
                     ),
                 )
                 .await;
-                tokio::time::sleep(interval.saturating_sub(before_sweep)).await;
+                rt::sleep(interval.saturating_sub(before_sweep)).await;
                 // Offline, signed out, a server error: each is simply another
                 // look later. Nothing here is the reader's to see.
                 // Nobody is waiting on these writes.
-                let _ = tokio::time::timeout(
+                let _ = rt::timeout(
                     PROVISION_PASS_DEADLINE,
                     changes::with_origin(
                         changes::ChangeOrigin::Unattended,
@@ -12828,6 +13037,7 @@ impl AppCore {
     /// Snapshot of the local-inference domain: resolved engine binary and
     /// every model with its lifecycle state. Refresh on
     /// [`Change::LocalModels`].
+    #[cfg(feature = "desktop")]
     pub async fn local_models_state(&self) -> Result<LocalModelsState, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12839,6 +13049,7 @@ impl AppCore {
     /// Start a background model download from a direct `.gguf` URL (or a
     /// Hugging Face file-page URL). Returns the future `<slug>@local` id
     /// immediately; progress arrives via [`Change::LocalModels`].
+    #[cfg(feature = "desktop")]
     pub async fn download_local_model(&self, url: String) -> Result<String, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12848,6 +13059,7 @@ impl AppCore {
     }
 
     /// Cancel an in-flight model download; the partial file is removed.
+    #[cfg(feature = "desktop")]
     pub async fn cancel_local_model_download(&self, id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12858,6 +13070,7 @@ impl AppCore {
 
     /// Delete a downloaded model from disk. Fails while the model is
     /// loaded (unload first) or downloading (cancel instead).
+    #[cfg(feature = "desktop")]
     pub async fn delete_local_model(&self, id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12874,6 +13087,7 @@ impl AppCore {
     /// the row [`Self::local_models_state`] synthesizes, so this is what makes
     /// such a row go away once the reader has read it. Idempotent; emits
     /// [`Change::LocalModels`] only when something was actually forgotten.
+    #[cfg(feature = "desktop")]
     pub async fn dismiss_local_model_failure(&self, id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12886,6 +13100,7 @@ impl AppCore {
     /// is ready to serve. Resolves when the model is chat-selectable (or
     /// the load failed); intermediate states arrive via
     /// [`Change::LocalModels`].
+    #[cfg(feature = "desktop")]
     pub async fn load_local_model(&self, id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12895,6 +13110,7 @@ impl AppCore {
     }
 
     /// Unload a local model, terminating its engine subprocess.
+    #[cfg(feature = "desktop")]
     pub async fn unload_local_model(&self, id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12919,6 +13135,7 @@ impl AppCore {
     /// Signalling is not reaping: the supervisor task owns the child, so a
     /// caller that is about to `exit()` must leave the runtime a moment to
     /// run them.
+    #[cfg(feature = "desktop")]
     pub fn shutdown_engines(&self) -> usize {
         self.inner.shutdown_all_engines()
     }
@@ -12939,6 +13156,7 @@ impl AppCore {
     ///
     /// Synchronous, infallible, no filesystem and no database: one mutex
     /// acquisition over an in-memory map, safe to call from a UI callback.
+    #[cfg(feature = "desktop")]
     pub fn running_engines(&self) -> Vec<RunningEngine> {
         self.inner.running_engines()
     }
@@ -12946,6 +13164,7 @@ impl AppCore {
     /// Pin or unpin a loaded model's engine. Pinned engines are protected
     /// from automatic (LRU) unloading when another model needs the memory;
     /// manual unload still applies.
+    #[cfg(feature = "desktop")]
     pub async fn set_local_model_pinned(&self, id: String, pinned: bool) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -12968,7 +13187,7 @@ impl AppCore {
     /// `backend_id`'s current incarnation — a load in flight, as another
     /// caller would find it.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     pub fn test_register_warming_local_model(&self, backend_id: &str, slug: &str, port: u16) {
         self.inner
             .local
@@ -12978,7 +13197,7 @@ impl AppCore {
     /// Test-only seam: register a fake ready engine with explicit
     /// footprint / pin / LRU timestamp — the eviction tests' fixture.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     #[allow(clippy::too_many_arguments)]
     pub fn test_register_engine(
         &self,
@@ -13527,7 +13746,7 @@ impl AppCore {
     /// Test-only seam: pin the engine-pool memory budget so eviction tests
     /// are deterministic on any machine.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     pub fn test_set_memory_budget(&self, budget: u64) {
         self.inner.local.set_memory_budget_for_test(budget);
     }
@@ -13549,7 +13768,7 @@ impl AppCore {
     /// started — the witness for "nothing was executed", which a child killed
     /// microseconds after `fork` cannot provide from outside.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     pub fn test_engine_spawn_count(&self) -> u64 {
         self.inner.local.engine_spawn_count()
     }
@@ -13558,7 +13777,7 @@ impl AppCore {
     /// — before it reserves, and before its supervisor starts the child — so a
     /// test can drive the races a retirement has with an in-flight load.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     pub fn test_pause_at_load_checkpoints(&self, pause: std::time::Duration) {
         self.inner.local.set_load_pause_for_test(pause);
     }
@@ -13566,7 +13785,7 @@ impl AppCore {
     /// Test-only seam: shorten the engine readiness budget (five minutes in
     /// production) so a test can watch the load deadline fire.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(all(feature = "test-support", feature = "desktop"))]
     pub fn test_set_engine_ready_timeout(&self, timeout: std::time::Duration) {
         self.inner.local.set_ready_timeout_for_test(timeout);
     }
@@ -14948,7 +15167,7 @@ const CACHE_KEY_PLACEHOLDER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 /// the body carries a fresh random key that is stored nowhere and used once —
 /// exactly as unlinkable as no key, and the same length. Only if the OS cannot
 /// supply randomness at all does the body fail, and the request with it.
-fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usize) {
+fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (crate::transport::Body, usize) {
     let mut bytes = serde_json::to_vec(body).expect("a JSON value serializes");
     // Object members serialize sorted, and `cache_key` sorts first among the
     // body's members, so the first unescaped occurrence is the member itself
@@ -14999,10 +15218,7 @@ fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usiz
         bytes[at..at + CACHE_KEY_PLACEHOLDER.len()].copy_from_slice(key.as_str().as_bytes());
         Ok::<_, std::io::Error>(bytes::Bytes::from(bytes))
     };
-    (
-        reqwest::Body::wrap_stream(futures_util::stream::once(chunk)),
-        len,
-    )
+    (transport::deferred_body(chunk), len)
 }
 
 /// A key stored nowhere and sent once: what a keyed body carries when its
@@ -15098,7 +15314,7 @@ struct TurnPrep {
     #[allow(dead_code)]
     engine_lease: Option<local_models::EngineLease>,
     attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>>,
-    client: reqwest::Client,
+    client: crate::transport::Client,
     /// The `connection` row the request rows record: adopted from the most
     /// recent attestation flush on an attested route, or written once before
     /// the first send on a plain one ([`Self::attach_plain_connection`]).
@@ -15398,7 +15614,7 @@ impl SpendPrep {
     /// surfaced as a warning, never corrected locally.
     async fn settle(
         &mut self,
-        client: &reqwest::Client,
+        client: &crate::transport::Client,
         base_url: &str,
         db_conn: &turso::Connection,
         bus: &BroadcastSource,
@@ -15791,7 +16007,7 @@ impl TurnPrep {
     /// declared nothing, and for every other answer.
     fn declared_prefix_refusal(
         &self,
-        status: reqwest::StatusCode,
+        status: http::StatusCode,
         body: &serde_json::Value,
         text: &str,
     ) -> Option<AppError> {
@@ -15916,17 +16132,17 @@ impl TurnPrep {
     /// what the Record keeps, and it never holds a credential.
     fn with_body(
         &self,
-        request: reqwest::RequestBuilder,
+        request: crate::transport::RequestBuilder,
         body: &serde_json::Value,
-    ) -> reqwest::RequestBuilder {
+    ) -> crate::transport::RequestBuilder {
         let body = body_with_spend(body, self.spend.as_ref());
         if self.cache_scope.is_none() {
             return request.json(&*body);
         }
         let (stream, len) = keyed_body(self, &body);
         request
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::CONTENT_LENGTH, len)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::CONTENT_LENGTH, len)
             .body(stream)
     }
 
@@ -16011,8 +16227,8 @@ impl TurnPrep {
     /// was attempted ([`Self::attach_plain_connection`]).
     async fn send(
         &mut self,
-        request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, reqwest::Error> {
+        request: crate::transport::RequestBuilder,
+    ) -> Result<crate::transport::Response, crate::transport::Error> {
         let request = request.build()?;
         self.attach_plain_connection().await;
         self.cache_clock.at_send();
@@ -16967,7 +17183,7 @@ async fn process_refund(
 /// spent key's `spend_until` has passed (`spend_until`, when known), when the
 /// successor must be taken while it is worth anything.
 async fn recover_refund(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     base_url: &str,
     spend: &PresentedSpend,
     spend_until: Option<i64>,
@@ -20409,7 +20625,7 @@ struct CurrentIssuerKey {
 /// alike: the client cannot tell an emergency rotation from a server singling
 /// it out, and the honest design has no rotation within an epoch.
 async fn current_issuer_key(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     base_url: &str,
     expected_ds: &str,
     timeout: std::time::Duration,
@@ -20587,7 +20803,7 @@ enum IssuanceAttempt {
 /// answered with the stored response or the final `409`, and the stored
 /// response outlives the key's spend window, after which the issuance is no
 /// longer asked for (`db::list_pending_issuances`).
-fn retry_refusal_is_final(status: reqwest::StatusCode) -> bool {
+fn retry_refusal_is_final(status: http::StatusCode) -> bool {
     matches!(status.as_u16(), 400 | 409 | 422)
 }
 
@@ -20597,13 +20813,13 @@ fn retry_refusal_is_final(status: reqwest::StatusCode) -> bool {
 /// the named issuer key) and `428` (the terms). Any other status did not come
 /// from that path's own verdict on this request, so it proves nothing about
 /// whether the request reached the debit, and the issuance stays pending.
-fn first_refusal_is_final(status: reqwest::StatusCode) -> bool {
+fn first_refusal_is_final(status: http::StatusCode) -> bool {
     matches!(status.as_u16(), 400 | 401 | 402 | 409 | 422 | 428)
 }
 
 /// Send one issuance request.
 async fn send_issuance(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     base_url: &str,
     account_id: &str,
     secret: &str,
@@ -20959,17 +21175,17 @@ fn refund_recovery_key(pre_refund_cbor: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
 /// so the builder refuses it exactly as it did before (the refusal carries no
 /// value).
 pub(crate) fn with_authorization(
-    request: reqwest::RequestBuilder,
+    request: crate::transport::RequestBuilder,
     authorization: Option<&str>,
-) -> reqwest::RequestBuilder {
+) -> crate::transport::RequestBuilder {
     match authorization {
         None => request,
-        Some(auth) => match reqwest::header::HeaderValue::from_str(auth) {
+        Some(auth) => match http::header::HeaderValue::from_str(auth) {
             Ok(mut value) => {
                 value.set_sensitive(true);
-                request.header(reqwest::header::AUTHORIZATION, value)
+                request.header(http::header::AUTHORIZATION, value)
             }
-            Err(_) => request.header(reqwest::header::AUTHORIZATION, auth),
+            Err(_) => request.header(http::header::AUTHORIZATION, auth),
         },
     }
 }
@@ -21039,15 +21255,6 @@ pub fn iso_to_ms(s: &str) -> Result<i64, AppError> {
     Ok(secs * 1000)
 }
 
-pub(crate) fn load_native_root_store() -> rustls::RootCertStore {
-    let mut store = rustls::RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        let _ = store.add(cert);
-    }
-    store
-}
-
 fn params_from_domain_separator(ds: &str) -> Result<Params, AppError> {
     let parts: Vec<&str> = ds.split(':').collect();
     if parts.len() != 5 {
@@ -21062,18 +21269,20 @@ fn params_from_domain_separator(ds: &str) -> Result<Params, AppError> {
 /// rule). This is the shared reader for every call this app makes to the Eidola
 /// server, so the ceiling lands on all of them at once; attested or not, the
 /// bytes are still chosen by the other end.
-async fn read_response(resp: reqwest::Response) -> Result<(reqwest::StatusCode, String), AppError> {
+async fn read_response(
+    resp: crate::transport::Response,
+) -> Result<(http::StatusCode, String), AppError> {
     crate::peer_read::read_api_answer(resp, "the server's answer").await
 }
 
-fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError> {
+fn check_status(status: http::StatusCode, body: &str) -> Result<(), AppError> {
     if status.is_success() {
         return Ok(());
     }
     // 428 Precondition Required is the server's terms-acceptance gate —
     // typed so UIs route to a review-and-accept step instead of showing a
     // generic server error.
-    if status == reqwest::StatusCode::PRECONDITION_REQUIRED {
+    if status == http::StatusCode::PRECONDITION_REQUIRED {
         return Err(AppError::TermsAcceptanceRequired {
             message: parse_server_error_message(body),
         });
@@ -21119,7 +21328,7 @@ pub(crate) fn parse_server_error_message(body: &str) -> String {
 }
 
 async fn fetch_models(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     base_url: &str,
 ) -> Result<ModelsResponseInfo, AppError> {
     let resp = client
@@ -21303,11 +21512,11 @@ mod tests {
         assert!(!format!("{spend:?}").contains(&key_text));
 
         // An external backend's bearer key is a sensitive header.
-        let client = reqwest::Client::builder().build().unwrap();
+        let client = crate::transport::Client::from(reqwest::Client::builder().build().unwrap());
         let bearer = with_authorization(client.get("http://127.0.0.1:9/"), Some("Bearer sk-x"))
             .build()
             .unwrap();
-        assert!(bearer.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+        assert!(bearer.headers()[http::header::AUTHORIZATION].is_sensitive());
         assert!(!format!("{bearer:?}").contains("sk-x"));
     }
 
@@ -22350,7 +22559,7 @@ mod tests {
 
     #[test]
     fn only_a_retry_refusal_no_attempt_in_flight_can_overturn_is_final() {
-        let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        let status = |code: u16| http::StatusCode::from_u16(code).unwrap();
         for code in [400, 409, 422] {
             assert!(
                 retry_refusal_is_final(status(code)),
@@ -22367,7 +22576,7 @@ mod tests {
 
     #[test]
     fn only_the_issuance_paths_own_refusals_end_a_first_attempt() {
-        let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        let status = |code: u16| http::StatusCode::from_u16(code).unwrap();
         for code in [400, 401, 402, 409, 422, 428] {
             assert!(
                 first_refusal_is_final(status(code)),
@@ -22385,7 +22594,7 @@ mod tests {
     #[test]
     fn check_status_maps_428_to_terms_acceptance_required() {
         let body = r#"{"error":{"message":"acceptance of the current terms_of_service is required","type":"terms_acceptance_required"}}"#;
-        let err = check_status(reqwest::StatusCode::PRECONDITION_REQUIRED, body).unwrap_err();
+        let err = check_status(http::StatusCode::PRECONDITION_REQUIRED, body).unwrap_err();
         match err {
             AppError::TermsAcceptanceRequired { message } => {
                 assert!(message.contains("terms_of_service"));

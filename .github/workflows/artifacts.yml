@@ -1176,6 +1176,107 @@ jobs:
   # invalid head (Guard failed, the builds skipped) at the cost of a few
   # seconds of an ubuntu runner, red after any failed, skipped or cancelled
   # job, and cancelled (never green) if it is itself cancelled.
+  # ── The mobile app (cheap ubuntu runner) ───────────────────────────────────
+  # The release app bundle, built in the pinned StageX toolchain
+  # (oci/eidola-mobile-bundle/Containerfile) against the trust root the `oci`
+  # job stamped, as the client images are; then the Android shell's unsigned
+  # APK and App Bundle over that bundle, from the pinned, hash-checked
+  # Android tools. Built on every run, so the path is exercised before the
+  # manifest schema that records the bundle and the APK is emitted; below
+  # that schema its partial is empty, and a file no row covers is never
+  # published. Nothing here signs: the signed APK and the App Bundle Play
+  # takes are signed at release time, by a person, from the unsigned files
+  # this job keeps (releases/README.md, Signing the Android shell).
+  mobile:
+    name: Mobile bundle + Android shell
+    needs: oci
+    runs-on: ubuntu-24.04
+    # One cold wasm32 release build (its standard library and the
+    # wasm-bindgen CLI first; 6 to 9 minutes cold on an emulating x86-64
+    # builder, which a native runner beats), then the APK, about a minute.
+    timeout-minutes: 60
+    outputs:
+      artifact_manifest: ${{ steps.partial.outputs.actual }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stamped deploy/gateway/tinfoil-config.yml + recomputed server-enclave.json
+        env:
+          STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
+          SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
+        run: |
+          # The bundle compiles in the same trust root the client images
+          # were built against (see the `apple` job).
+          printf '%s\n' "$STAMPED_CONFIG" > deploy/gateway/tinfoil-config.yml
+          printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
+
+      - name: Set up Docker Buildx
+        # Same pinned buildx and BuildKit as the `oci` job, for the same
+        # reasons (see there). No registry layer cache: the build is short,
+        # and a v* tag would skip it anyway.
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.31.1
+          platforms: linux/amd64
+          cache-binary: false
+          driver-opts: |
+            image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
+
+      - name: Cache the pinned Android build tools' archives # zizmor: ignore[cache-poisoning]
+        # Archives only, never an unpacked tool: every run hashes each archive
+        # against its pin and unpacks it afresh before anything in it runs
+        # (mobile/android/tools/fetch.sh; mobile/android/test-tools-cache.sh
+        # holds that). Skipped entirely on v* release tags, like the cargo
+        # cache, so the attested release fetches its tools from their sources.
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/eidola/android-tools/archives
+          key: android-tools-${{ hashFiles('mobile/android/tools.sh', 'mobile/android/tools/fetch.sh') }}
+
+      - name: Build the release bundle and the Android shell over it
+        id: partial
+        run: |
+          ./scripts/artifact-manifest.sh build-mobile \
+            --output /tmp/mobile-artifact-manifest.json \
+            --artifact-dir /tmp/eidola-release-assets \
+            --unsigned-dir /tmp/eidola-mobile-unsigned
+          sha256sum /tmp/eidola-release-assets/* /tmp/eidola-mobile-unsigned/*
+
+          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/mobile-artifact-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the bundle container
+        # The asset `release.json` indexes for the bundle and the mobile
+        # updater downloads; the tagged release workflow attaches it only
+        # once the signed manifest records it and its hash matches.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets-mobile
+          path: /tmp/eidola-release-assets
+          if-no-files-found: error
+          # A job re-run reaches the original failure instead of dying on the
+          # artifact this attempt already uploaded.
+          overwrite: true
+
+      - name: Upload the unsigned APK and App Bundle
+        # The inputs of the release-time signing step, as the unsigned macOS
+        # zip is for its own: never a release asset as they are (the APK's
+        # row is recorded and deliberately not published).
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: eidola-mobile-android-unsigned
+          path: /tmp/eidola-mobile-unsigned
+          if-no-files-found: error
+          overwrite: true
+
   artifact-manifest:
     name: Verify artifact manifest
     if: ${{ always() }}
@@ -1189,6 +1290,7 @@ jobs:
       - apple
       - linux-gui
       - linux-deb-arm64
+      - mobile
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -1242,6 +1344,7 @@ jobs:
           APPLE_MANIFEST: ${{ needs.apple.outputs.artifact_manifest }}
           LINUX_GUI_MANIFEST: ${{ needs.linux-gui.outputs.artifact_manifest }}
           LINUX_DEB_MANIFEST: ${{ needs.linux-deb-arm64.outputs.artifact_manifest }}
+          MOBILE_MANIFEST: ${{ needs.mobile.outputs.artifact_manifest }}
         run: |
           # The committed deploy/gateway/tinfoil-config.yml and server-enclave.json must be
           # exactly what the oci job recomputed: the stamped config (the
@@ -1283,6 +1386,7 @@ jobs:
           printf '%s' "$APPLE_MANIFEST" > /tmp/apple-artifact-manifest.json
           printf '%s' "$LINUX_GUI_MANIFEST" > /tmp/linux-gui-artifact-manifest.json
           printf '%s' "$LINUX_DEB_MANIFEST" > /tmp/linux-deb-artifact-manifest.json
+          printf '%s' "$MOBILE_MANIFEST" > /tmp/mobile-artifact-manifest.json
 
       - name: Verify full artifact manifest
         id: verify
@@ -1298,6 +1402,7 @@ jobs:
             --partial /tmp/apple-artifact-manifest.json \
             --partial /tmp/linux-gui-artifact-manifest.json \
             --partial /tmp/linux-deb-artifact-manifest.json \
+            --partial /tmp/mobile-artifact-manifest.json \
             --manifest artifact-manifest.json \
             --config deploy/gateway/tinfoil-config.yml \
             --server-enclave releases/trust/server-enclave.json \

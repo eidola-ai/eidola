@@ -65,7 +65,7 @@ const OLD_INSTALLED: &str = "0.0.6";
 /// Where a fixture release's index is served, under the releases location.
 const LATEST: &str = "/latest/download/release.json";
 
-fn http_client() -> reqwest::Client {
+fn http_client() -> eidola_app_core::transport::Client {
     // reqwest's `rustls-no-provider` build refuses to construct a client
     // until a crypto provider is installed, even for plain-HTTP fixture
     // servers. Idempotent — mirrors what `AppCore::new` does.
@@ -73,6 +73,7 @@ fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .build()
         .expect("plain http client")
+        .into()
 }
 
 /// The bytes a fixture release serves. `None` leaves the file unserved,

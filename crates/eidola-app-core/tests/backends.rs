@@ -555,6 +555,7 @@ fn openai_backend_chat_sends_bearer_no_spend_and_records_backend() {
 }
 
 #[test]
+#[cfg(feature = "desktop")]
 fn llamacpp_backend_routes_to_its_own_engine() {
     run(|| {
         let (mock, core, _dir) = chat_harness::core_for(MockConfig::default());
@@ -612,6 +613,7 @@ fn llamacpp_backend_routes_to_its_own_engine() {
 }
 
 #[test]
+#[cfg(feature = "desktop")]
 fn llamacpp_auto_start_disabled_refuses_request_without_spawning() {
     run(|| {
         let (_mock, core, _dir) = chat_harness::core_for(MockConfig::default());
@@ -717,6 +719,7 @@ fn openai_backend_models_come_from_listing_when_not_pinned() {
 /// immediately, and every turn runs against the previous file while Settings
 /// describes the new directory.
 #[test]
+#[cfg(feature = "desktop")]
 fn removing_a_backend_retires_its_engines_so_a_revival_cannot_inherit_them() {
     run(|| {
         let (core, dir) = bare_core();
@@ -781,6 +784,7 @@ fn removing_a_backend_retires_its_engines_so_a_revival_cannot_inherit_them() {
 /// repointing it at another models directory, and disabling it (a backend
 /// that may not serve a turn has no business holding gigabytes).
 #[test]
+#[cfg(feature = "desktop")]
 fn repointing_or_disabling_a_backend_retires_its_engines() {
     run(|| {
         let (core, dir) = bare_core();
@@ -846,6 +850,7 @@ fn repointing_or_disabling_a_backend_retires_its_engines() {
 /// disable stopped one, leaving a disabled backend holding gigabytes.
 /// Managing files is a different thing and stays open.
 #[test]
+#[cfg(feature = "desktop")]
 fn a_disabled_backend_starts_no_engine_even_when_asked_explicitly() {
     run(|| {
         let (core, dir) = bare_core();
@@ -892,6 +897,7 @@ fn a_disabled_backend_starts_no_engine_even_when_asked_explicitly() {
 /// with it — a different directory, a different `llama-server`. Retiring a
 /// backend's engines therefore retires what those engines had to say.
 #[test]
+#[cfg(feature = "desktop")]
 fn a_re_added_backend_does_not_inherit_its_predecessors_error() {
     run(|| {
         let (core, dir) = bare_core();
@@ -954,6 +960,7 @@ fn a_re_added_backend_does_not_inherit_its_predecessors_error() {
 /// reports. A subscriber that refreshes the snapshot on its documented
 /// invalidation would otherwise go on rendering an error that is gone.
 #[test]
+#[cfg(feature = "desktop")]
 fn retiring_a_backend_that_only_has_a_failure_still_invalidates() {
     run(|| {
         let (core, dir) = bare_core();
@@ -1032,6 +1039,7 @@ fn retiring_a_backend_with_nothing_to_retire_emits_nothing() {
 /// it. The load has already reported success, and the backend is enabled, so
 /// nothing about the end state explains the engine that vanished.
 #[test]
+#[cfg(feature = "desktop")]
 fn an_older_disables_cleanup_cannot_retire_an_enabled_backends_engine() {
     run(|| {
         let (core, _dir) = bare_core();

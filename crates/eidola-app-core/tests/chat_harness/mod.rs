@@ -4863,6 +4863,25 @@ pub fn redirecting_upstream() -> (String, Arc<std::sync::atomic::AtomicBool>) {
     (format!("http://127.0.0.1:{backend_port}"), reached)
 }
 
+/// The client a harness core sends everything through: reqwest, or — with
+/// `EIDOLA_TEST_TRANSPORT=pipe` — the host-socket transport over a
+/// `TcpDialer`, so every case runs on the transport the mobile app uses (its
+/// HTTP framing, streaming, ceilings and deferred bodies; attestation is
+/// `tests/pipe_transport.rs`'s). Both follow redirects, as reqwest's default
+/// client does.
+pub fn test_client() -> eidola_app_core::transport::Client {
+    if std::env::var("EIDOLA_TEST_TRANSPORT").as_deref() == Ok("pipe") {
+        eidola_app_core::transport::Client::test_plain_over(std::sync::Arc::new(
+            eidola_app_core::transport::TcpDialer,
+        ))
+    } else {
+        reqwest::Client::builder()
+            .build()
+            .expect("plain http client")
+            .into()
+    }
+}
+
 pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) {
     // The injected plain client is built before `AppCore` (which installs the
     // rustls provider), so install it here first. Idempotent across tests.
@@ -4870,10 +4889,8 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
     let dir = tempfile::tempdir().expect("tempdir");
     let config_dir = dir.path().to_path_buf();
     let data_dir = dir.path().join("data");
-    let client = reqwest::Client::builder()
-        .build()
-        .expect("plain http client");
-    let core = AppCore::with_test_http_client(config_dir, data_dir, client).expect("open core");
+    let core =
+        AppCore::with_test_http_client(config_dir, data_dir, test_client()).expect("open core");
     if let Some(calendar) = config.issuer_calendar {
         core.test_set_issuer_calendar(calendar);
     }
@@ -4883,6 +4900,28 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
         .expect("set base url");
     seat_default_agent_on_mock(&core);
     (mock, core, dir)
+}
+
+/// [`core_for`] on a profile its host owns ([`eidola_app_core::storage`]):
+/// the same mock and seating, with every write streamed to `profile`'s host.
+pub fn core_on_host(
+    config: MockConfig,
+    profile: eidola_app_core::storage::HostProfile,
+) -> (MockServer, AppCore) {
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("plain http client");
+    let core = AppCore::on_host_with_test_http_client(profile, client).expect("open core");
+    if let Some(calendar) = config.issuer_calendar {
+        core.test_set_issuer_calendar(calendar);
+    }
+    let mock = core.runtime().block_on(async { start(config).await });
+    core.runtime()
+        .block_on(core.set_base_url(mock.base_url.clone()))
+        .expect("set base url");
+    seat_default_agent_on_mock(&core);
+    (mock, core)
 }
 
 /// Re-seat the Default template's one agent on the mock's [`MODEL`], labelled
@@ -4922,10 +4961,8 @@ const SEEDED_AGENT_SYSTEM_PROMPT: &str =
 pub fn reopen_core(dir: &tempfile::TempDir, base_url: &str) -> AppCore {
     let config_dir = dir.path().to_path_buf();
     let data_dir = dir.path().join("data");
-    let client = reqwest::Client::builder()
-        .build()
-        .expect("plain http client");
-    let core = AppCore::with_test_http_client(config_dir, data_dir, client).expect("reopen core");
+    let core =
+        AppCore::with_test_http_client(config_dir, data_dir, test_client()).expect("reopen core");
     core.runtime()
         .block_on(core.set_base_url(base_url.to_string()))
         .expect("set base url");

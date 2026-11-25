@@ -696,7 +696,7 @@ impl Inner {
                 .lock()
                 .expect("backend config pause");
             if let Some(pause) = pause {
-                tokio::time::sleep(pause).await;
+                crate::rt::sleep(pause).await;
             }
         }
         if self.retire_backend_engines(backend_id).changed() {

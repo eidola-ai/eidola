@@ -1,0 +1,117 @@
+name: Mobile shells
+
+# The Android shell builds on Linux with pinned, hash-checked tools (no SDK, no
+# Gradle): two clean builds must be identical, a signed APK must strip back to
+# them, and the result must equal mobile/android/reproducible.sha256, the same
+# bytes a macOS build gives. The iOS shell needs macOS and stays a local gate
+# (mobile/AGENTS.md). The app bundle (crates/eidola-mobile, built by
+# mobile/build-bundle.sh) must build twice, from scratch, to the same bytes.
+# The reproducibility jobs run for main only (the promotion PR from next and
+# pushes to main), like the desktop's; the Android shell's tests run on every
+# change. Path-filtered: the shells, the app crate, and what pins the bundle's
+# build.
+# Whether app-core still compiles for wasm32 is rust-checks' gate, on every
+# change.
+on:
+  push:
+    branches: [next, main]
+    paths:
+      - "mobile/**"
+      - "crates/eidola-mobile/**"
+      - "crates/eidola-theme/**"
+      - "crates/eidola-i18n/**"
+      - "crates/gpui-markdown-editor/**"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - ".github/workflows/mobile-shells.yml"
+  pull_request:
+    branches: [next, main]
+    paths:
+      - "mobile/**"
+      - "crates/eidola-mobile/**"
+      - "crates/eidola-theme/**"
+      - "crates/eidola-i18n/**"
+      - "crates/gpui-markdown-editor/**"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - ".github/workflows/mobile-shells.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  android-tests:
+    name: Android shell tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Archives only, never an unpacked tool: every run hashes each archive
+      # against its pin and unpacks it afresh (mobile/android/tools/fetch.sh).
+      - name: Cache the pinned build tools' archives
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/eidola/android-tools/archives
+          key: android-tools-${{ hashFiles('mobile/android/tools.sh', 'mobile/android/tools/fetch.sh') }}
+
+      - name: The tools cache refuses bytes it did not check in this run
+        run: mobile/android/test-tools-cache.sh
+
+      - name: tcp.connect dials every resolved address within its deadline
+        run: mobile/android/test-connect.sh
+
+  android:
+    name: Android shell reproducible
+    if: github.base_ref == 'main' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Archives only, never an unpacked tool: every run hashes each archive
+      # against its pin and unpacks it afresh (mobile/android/tools/fetch.sh).
+      - name: Cache the pinned build tools' archives
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/eidola/android-tools/archives
+          key: android-tools-${{ hashFiles('mobile/android/tools.sh', 'mobile/android/tools/fetch.sh') }}
+
+      - name: Build twice, strip a signed build, compare with the committed hash
+        run: |
+          java -version
+          mobile/android/repro.sh
+
+  bundle:
+    name: App bundle reproducible
+    if: github.base_ref == 'main' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No cache: a restored wasm-bindgen CLI would run without its bytes
+      # being checked, and cargo does not re-hash a crate archive it finds
+      # already downloaded. Everything comes from its source, checked by
+      # Cargo.lock, in every run.
+      - name: Build the bundle twice from scratch and compare
+        run: |
+          rustup show
+          mobile/bundle-repro.sh

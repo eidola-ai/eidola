@@ -170,6 +170,12 @@ jobs:
         # Bash + python3, no toolchain.
         run: ./scripts/test-release-assets.sh
 
+      - name: Test the next manifest schema's emit side
+        # Deliberately ungated, like the two above: what flipping
+        # MANIFEST_SCHEMA_VERSION turns on otherwise runs first on the
+        # release that flips it. Bash, jq and python3; builds nothing.
+        run: ./scripts/test-manifest-schema-flip.sh
+
       - name: Test the release signing-identity guard
         # Deliberately ungated: the guard runs only on a real `v*` tag,
         # where a mistake in it either signs a release the previous
@@ -312,6 +318,29 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           echo "::remove-matcher owner=rust::"
 
+      - name: Clippy for wasm32 without desktop
+        # The mobile app (eidola-mobile) builds eidola-app-core and
+        # tinfoil-verifier for wasm32-unknown-unknown without app-core's
+        # `desktop` feature, and no other gate compiles that build, so it
+        # would rot unnoticed. Clippy compiles everything `cargo check` does,
+        # so this is the check too; the self-test and dev features are linted
+        # with it.
+        # The target is added here rather than in rust-toolchain.toml, whose
+        # hash the Nix toolchain pins. Its rustflags come from
+        # .cargo/config.toml, which a RUSTFLAGS variable would replace, so
+        # this job sets none.
+        if: steps.scope.outputs.rust == 'true'
+        run: |
+          rustup target add wasm32-unknown-unknown
+          echo "::add-matcher::.github/rust-problem-matcher.json"
+          cargo clippy -p eidola-app-core -p tinfoil-verifier -p eidola-mobile \
+            --target wasm32-unknown-unknown --no-default-features -- -D warnings
+          cargo clippy -p eidola-mobile --target wasm32-unknown-unknown \
+            --features self-test -- -D warnings
+          cargo clippy -p eidola-mobile --target wasm32-unknown-unknown \
+            --features dev -- -D warnings
+          echo "::remove-matcher owner=rust::"
+
       - name: Markdown lint
         if: steps.scope.outputs.markdown == 'true'
         # rumdl is pinned by the crates/devtools workspace and, locally, is
@@ -328,6 +357,16 @@ jobs:
       - name: Run tests
         if: steps.scope.outputs.rust == 'true'
         run: cargo test
+
+      - name: Run the chat path over the host-socket transport
+        # The chat harness's cases again, with every request on the
+        # transport the mobile app uses (a host-dialed stream, HTTP/1.1 run
+        # in process) instead of reqwest. Same arguments as "Run tests" but
+        # the target, so it reruns an executable that step built.
+        if: steps.scope.outputs.rust == 'true'
+        env:
+          EIDOLA_TEST_TRANSPORT: pipe
+        run: cargo test --test chat_path
 
       - name: Test billing transactions and recovery with PostgreSQL
         if: steps.scope.outputs.rust == 'true'
@@ -410,6 +449,17 @@ jobs:
             (cd "$dir" && "$executable" --ignored --test-threads=1 < /dev/null)
             echo "::endgroup::"
           done < "$tests"
+
+      - name: Run app-core tests without desktop
+        # app-core's shared paths (the chat path, the wallet, sub-spaces, the
+        # real runtime and database lock) as the mobile build compiles them:
+        # `desktop` off, its suites skipped by `required-features`. Placed
+        # after the billing step, whose listing of the workspace test build
+        # must compile nothing. A `-p` build resolves features over this
+        # package alone, so it compiles its own variant of the shared
+        # dependencies, which the cache keeps.
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo test -p eidola-app-core --no-default-features
 
       - name: Check OCI stub-source resolution
         # The image builds resolve the workspace from manifests plus stub

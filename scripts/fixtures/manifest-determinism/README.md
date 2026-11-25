@@ -1,6 +1,6 @@
 # manifest-determinism fixtures
 
-Documents `scripts/check-manifest-determinism.sh` must **reject**. Every default run of the check re-runs them and fails if one is accepted, or if either class is missing — a check that has stopped catching anything is a worse outcome than a check that fails.
+Documents `scripts/check-manifest-determinism.sh` must **reject** (`bad-*`), and a few it must **accept** (`good-*`): shapes the client already accepts that no committed manifest carries yet, so the release that first emits one does not meet a gate that refuses it. Every default run of the check re-runs them and fails if one is accepted, or if either class is missing — a check that has stopped catching anything is a worse outcome than a check that fails.
 
 None of these is a real manifest or a real workflow. The `.yml` files deliberately live here rather than in `.github/workflows/`.
 
@@ -35,3 +35,11 @@ None of these is a real manifest or a real workflow. The `.yml` files deliberate
 | `bad-reusable-workflow-ancestor.yml` | A job-level `uses:` in the manifest job's ancestry. The callee's environments and outputs are in a file this scanner does not read, so the call is refused rather than assumed harmless. |
 | `bad-merge-key-job.yml` | A merge key splicing an `environment:` into the job, in the form that needs no anchor at all. GitHub rejects `<<:` today, but actions that expand it before GitHub parses exist. |
 | `bad-mapping-environment.yml` | `environment:` in mapping form (`name: apple-signing`) on the job that computes a manifest partial — valid GitHub Actions that a scalar-only parser reads as "no environment". |
+| `bad-bundle-file-field.json` | A field added to one file of the mobile bundle's listing (`mtime`). The listing is nested, and held to an exact key set like every other level. |
+| `bad-bundle-digest.json` | A mobile bundle row whose `digest` is not the digest of its own listing (`mobile/shell-contract.md` → Bundle digest). Every client refuses such a row, so the gate does first. |
+
+`good-schema-6-emitted.json` is accepted rather than refused: the manifest `scripts/artifact-manifest.sh` composes once it emits schema 6, written by its own producers over the inputs in `../manifest-flip/` with the constant flipped in a copy (`scripts/test-manifest-schema-flip.sh`, which requires it byte for byte and rewrites it with `--update`). App-core's claims check and `release-tool` read it in their tests too.
+
+| Accepted fixture | The shape it keeps open |
+| --- | --- |
+| `good-schema-6.json` | Manifest schema 6's mobile rows: the unsigned Android APK (`file`) and the app bundle (`bundle`, with its container hash, digest and file listing). The client's reader parses this same file (`updater::mobile::row` tests), so the gate and the client agree on the shape and the digest. |

@@ -46,7 +46,7 @@ pub(crate) struct UtilityTarget {
 /// An opened route: everything one HTTP call needs, plus the engine lease that
 /// must outlive it.
 struct UtilityRoute {
-    client: reqwest::Client,
+    client: crate::transport::Client,
     base_url: String,
     wire_model: String,
     /// `(prompt_rate, completion_rate, scale_factor)` — `Some` only for a

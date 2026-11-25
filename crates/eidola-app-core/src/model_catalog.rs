@@ -423,4 +423,19 @@ pub(crate) mod tests {
             assert!(resolve(CATALOG, &format!("sha256:{}", row.sha256)).is_some());
         }
     }
+
+    /// The default of a build without local models is a bare tag of a
+    /// current row: it routes to the Eidola backend and follows the tag. A
+    /// catalog change that moves the tag off every current row, or retires
+    /// it, fails here rather than on a phone's first turn.
+    #[test]
+    fn the_hosted_default_is_a_current_catalog_tag() {
+        let model = crate::config::HOSTED_DEFAULT_MODEL;
+        let routed = crate::backends::parse_model_ref(model);
+        assert_eq!(routed.backend_id, crate::backends::EIDOLA_BACKEND_ID);
+        assert_eq!(routed.model, model, "a pin or a qualified spelling");
+        let (row, _) = resolve(CATALOG, model).expect("the hosted default is in the catalog");
+        assert!(row.tags.contains(&model), "{model} is not a tag");
+        assert_eq!(row.lifecycle, Lifecycle::Current);
+    }
 }

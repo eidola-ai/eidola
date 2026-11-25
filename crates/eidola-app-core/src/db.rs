@@ -112,6 +112,7 @@ pub struct DbLock {
     /// descriptor and releases. The lockfile itself is left on disk (an
     /// unlocked file is meaningless, and unlinking it would race a contender
     /// that already opened it).
+    #[cfg(not(target_family = "wasm"))]
     _file: std::fs::File,
     path: PathBuf,
 }
@@ -131,6 +132,7 @@ pub enum LockHolder {
 }
 
 impl LockHolder {
+    #[cfg(not(target_family = "wasm"))]
     fn as_str(self) -> &'static str {
         match self {
             LockHolder::App => "app",
@@ -152,6 +154,7 @@ impl DbLock {
     /// lockfile if needed, and record `holder` in it. Fails with
     /// [`AppError::DatabaseInUse`] if another process (or another `AppCore`
     /// in this one) already holds it.
+    #[cfg(not(target_family = "wasm"))]
     pub fn acquire(data_dir: &Path, holder: LockHolder) -> Result<Self, AppError> {
         use fs4::{FileExt, TryLockError};
 
@@ -211,9 +214,42 @@ impl DbLock {
         Ok(Self { _file: file, path })
     }
 
+    /// wasm32 has no `flock`, and a browser page is one process: the lock is
+    /// held in this process alone, so a second `AppCore` on one data dir is
+    /// refused here exactly as natively. Nothing is written to disk.
+    #[cfg(target_family = "wasm")]
+    pub fn acquire(data_dir: &Path, _holder: LockHolder) -> Result<Self, AppError> {
+        let path = data_dir.join(LOCK_FILE_NAME);
+        let mut held = HELD_LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+        if held.contains(&path) {
+            return Err(AppError::DatabaseInUse {
+                pid: None,
+                message: format!(
+                    "this database is already open ({}).",
+                    data_dir.join("eidola.db").display()
+                ),
+            });
+        }
+        held.push(path.clone());
+        Ok(Self { path })
+    }
+
     /// Path of the lockfile this guard holds (diagnostics/tests).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// The lockfiles this process holds, on wasm32 (see the wasm32
+/// [`DbLock::acquire`]).
+#[cfg(target_family = "wasm")]
+static HELD_LOCKS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_family = "wasm")]
+impl Drop for DbLock {
+    fn drop(&mut self) {
+        let mut held = HELD_LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+        held.retain(|path| *path != self.path);
     }
 }
 
@@ -225,6 +261,7 @@ impl std::fmt::Debug for DbLock {
 
 /// Stamp our pid and holder kind into the (already locked) lockfile, as one
 /// line: `<pid> <app|command>`.
+#[cfg(not(target_family = "wasm"))]
 fn write_lock_record(file: &std::fs::File, holder: LockHolder) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
     let mut file = file;
@@ -276,10 +313,31 @@ pub async fn open(data_dir: &Path) -> Result<Database, AppError> {
         })?;
 
     let conn = connect(&db).await?;
-    initialize(&conn).await?;
+    initialize(&conn, false).await?;
 
     Ok(db)
 }
+
+/// [`open`] for a profile held in memory and streamed to its host
+/// ([`crate::storage`]): the same database, schema check and seeds, with
+/// every read and write served from `image`.
+pub async fn open_on_image(image: &crate::storage::ProfileImage) -> Result<Database, AppError> {
+    let db = Builder::new_local(IMAGE_DB_NAME)
+        .with_io_impl(image.turso_io())
+        .build()
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to open database: {e}"),
+        })?;
+
+    let conn = connect(&db).await?;
+    initialize(&conn, true).await?;
+
+    Ok(db)
+}
+
+/// The database's name inside a profile image; its log is `<name>-wal`.
+pub const IMAGE_DB_NAME: &str = "eidola.db";
 
 /// Open a **write** transaction — `BEGIN IMMEDIATE`, reserving the writer
 /// before the first read.
@@ -348,16 +406,40 @@ pub async fn connect(db: &Database) -> Result<Connection, AppError> {
 /// idempotent defaults; any *other* non-zero version is from an incompatible
 /// pre-release build and is refused with an honest "delete your dev database"
 /// error rather than limping against a schema it doesn't match.
-async fn initialize(conn: &Connection) -> Result<(), AppError> {
+///
+/// With `atomic_schema`, the schema and its version stamp commit as one
+/// transaction, so a process killed during a first open leaves an empty
+/// database rather than a half-made schema the next open refuses. A profile
+/// on a host asks for it: a phone may end the app during its first launch.
+async fn initialize(conn: &Connection, atomic_schema: bool) -> Result<(), AppError> {
     let version = get_user_version(conn).await?;
 
     if version == 0 {
-        conn.execute_batch(SCHEMA)
-            .await
-            .map_err(|e| AppError::Database {
-                message: format!("schema init failed: {e}"),
-            })?;
-        set_user_version(conn, LATEST_VERSION).await?;
+        if atomic_schema {
+            begin_write(conn).await?;
+        }
+        let made = async {
+            conn.execute_batch(SCHEMA)
+                .await
+                .map_err(|e| AppError::Database {
+                    message: format!("schema init failed: {e}"),
+                })?;
+            set_user_version(conn, LATEST_VERSION).await
+        }
+        .await;
+        if atomic_schema {
+            match made {
+                Ok(()) => {
+                    conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            }
+        } else {
+            made?;
+        }
     } else if version != LATEST_VERSION {
         return Err(AppError::Database {
             message: format!(
@@ -10502,7 +10584,7 @@ mod tests {
         // Mirror production: initialize (and seed) under FK enforcement, so a
         // seed-order bug would surface here too.
         let conn = connect(&db).await.unwrap();
-        initialize(&conn).await.unwrap();
+        initialize(&conn, false).await.unwrap();
         db
     }
 
@@ -10559,7 +10641,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let database = open(dir.path()).await.expect("open");
         let conn = fk_conn(&database).await;
-        initialize(&conn).await.unwrap();
+        initialize(&conn, false).await.unwrap();
         instantiate_template(
             &conn,
             crate::config::DEFAULT_TEMPLATE_ID,
@@ -11212,7 +11294,7 @@ mod tests {
     async fn initialize_is_idempotent() {
         let db = open_memory_fresh().await;
         let conn = db.connect().unwrap();
-        initialize(&conn).await.unwrap();
+        initialize(&conn, false).await.unwrap();
         assert_eq!(get_user_version(&conn).await.unwrap(), LATEST_VERSION);
     }
 
@@ -14062,7 +14144,9 @@ mod tests {
         let conn = db.connect().unwrap();
         // Simulate a database from an older, incompatible schema version.
         set_user_version(&conn, 1).await.unwrap();
-        let err = initialize(&conn).await.expect_err("stale version refused");
+        let err = initialize(&conn, false)
+            .await
+            .expect_err("stale version refused");
         let msg = format!("{err}");
         assert!(
             msg.contains("incompatible") && msg.contains("delete"),

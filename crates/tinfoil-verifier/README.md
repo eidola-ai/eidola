@@ -1,6 +1,6 @@
 # tinfoil-verifier
 
-Builds a `reqwest::Client` that verifies Tinfoil's self-contained v3 enclave attestation before using each new TLS connection.
+Builds a `reqwest::Client` that verifies Tinfoil's self-contained v3 enclave attestation before using each new TLS connection. The same verification runs over a byte stream an embedding host dials (`pipe`), with TLS inside this crate, so a host that only moves bytes takes no part in it.
 
 For every handshake the connector sends a fresh nonce to `/.well-known/tinfoil-attestation` over the same connection, strictly parses the returned envelope, verifies the endorsed-section hashes and TLS SPKI binding, enforces report field hygiene (version ≥ 3, DEBUG/MIGRATE_MA guest-policy bits off, VCEK-signed, no ID-block and no ID-block fields, VMPL 0 — fields the launch measurement does not cover), requires the document-carried AMD ASK/ARK chain to match the pinned chain, verifies the SEV-SNP VCEK and report, verifies the complete carried AMD CRL's ARK identity/signature, signed half-open validity interval, and ASK/VCEK revocation state, enforces TCB and measurement policy, and compares the report's signed `REPORT_DATA` with the envelope's domain-separated recomputation.
 
@@ -25,4 +25,4 @@ let client = tinfoil_verifier::attesting_client(
 .await?;
 ```
 
-Run unit and offline contract tests with `cargo test -p tinfoil-verifier`; they include a real document captured from a deployment of the gateway (`tests/fixtures/tinfoil-gateway/`). The live tests run only with their environment set: `LIVE_ORIGIN` names any SEV-SNP enclave whose platform release serves the v3 collateral profile, and `LIVE_GATEWAY_ORIGIN` a deployed gateway, verified against `releases/trust/server-enclave.json`. `mock_attesting_client_e2e` runs the full connector against `tinfoil-shim-mock` when `MOCK_URL` and `MOCK_CERT_DIR` are set.
+Run unit and offline contract tests with `cargo test -p tinfoil-verifier`; they include a real document captured from a deployment of the gateway (`tests/fixtures/tinfoil-gateway/`). The live tests run only with their environment set: `LIVE_ORIGIN` names any SEV-SNP enclave whose platform release serves the v3 collateral profile, and `LIVE_GATEWAY_ORIGIN` a deployed gateway, verified against `releases/trust/server-enclave.json`. `mock_attesting_client_e2e` runs the full connector against `tinfoil-shim-mock` when `MOCK_URL` and `MOCK_CERT_DIR` are set. `tests/pipe.rs` needs no setup: it starts shims in process and runs the byte-pipe transport (`pipe`) and the native connector against each, a genuine one and one breaking each binding.

@@ -1,0 +1,193 @@
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
+# check=skip=FromPlatformFlagConstDisallowed
+
+# The toolchain is x86-64 only and the build stages say so with a constant
+# `--platform`: they run there whatever the host, so the bundle's bytes do not
+# depend on where it is built.
+
+# The mobile app bundle (`eidola-mobile` for `wasm32-unknown-unknown`, bound by
+# the wasm-bindgen CLI, with the page that loads it): the bundle a release
+# records and publishes, and the one the release APK embeds.
+#
+# StageX's Rust ships a standard library for `x86_64-unknown-linux-musl`
+# alone. Its LLVM targets WebAssembly and its lld includes `wasm-ld`, so the
+# same rustc builds the wasm32 standard library here from the `rust-src` it
+# ships, as the arm64 client's image does for AArch64, and installs it into
+# its sysroot; the app then builds on stable with a plain `--target`. The
+# wasm-bindgen CLI is built from its published crate, pinned by hash, with
+# the lockfile that crate carries.
+#
+# The output is the bundle's files and nothing else (an empty image holding
+# them, exported as a directory: `just mobile-bundle-release`, or
+# scripts/artifact-manifest.sh build-mobile). No manifest row records this
+# image; the bundle row records the files (crates/eidola-mobile/AGENTS.md →
+# The release bundle).
+
+# ── pinned inputs (StageX sx2026.09.0) ─────────────────────────────────────────
+FROM --platform=linux/amd64 stagex/pallet-rust:sx2026.09.0@sha256:6033fb215dd7c87c885dd7b1c12de42464606dcc0323fc57339318d61f010a30 AS pallet-rust
+
+# ── toolchain ──────────────────────────────────────────────────────────────────
+FROM pallet-rust AS toolchain
+
+# oci/pallet-rust records the Rust this image ships, which
+# rust-toolchain.toml must name (scripts/check-rust-toolchain.sh); the record
+# is held to the image here.
+COPY oci/pallet-rust /pallet-rust
+RUN --network=none <<-'EOF'
+	set -eu
+	recorded="$(sed -n 's/^rust //p' /pallet-rust)"
+	actual="$(rustc --version | cut -d' ' -f2)"
+	if [ "$recorded" != "$actual" ]; then
+		echo "error: oci/pallet-rust records Rust $recorded, but the pinned pallet-rust is $actual" >&2
+		exit 1
+	fi
+	rm /pallet-rust
+EOF
+
+ENV TARGET=wasm32-unknown-unknown
+ENV SOURCE_DATE_EPOCH=0
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_HOME=/cargo
+# The standard library's sources are named as a Rust distribution names them,
+# `/rustc/<commit>`, with the commit of the 1.97.1 release whose source this
+# rustc is built from (its own `-vV` reports none). Only a label: it keeps
+# the path the image happens to install `rust-src` at out of the bundle.
+ENV RUST_SRC_REMAP="--remap-path-prefix=/usr/lib/rustlib/src/rust=/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+# wasm-ld is lld's WebAssembly driver, the linker a Rust distribution ships
+# for this target as `rust-lld`.
+ENV CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_LINKER=wasm-ld
+
+# ── std ────────────────────────────────────────────────────────────────────────
+# The standard library for wasm32-unknown-unknown, from the rust-src this
+# rustc ships, installed into rustc's sysroot beside the x86-64 one. Every
+# rlib carries bitcode as well as object code (`embed-bitcode`), as a
+# distributed standard library does, so the app's fat LTO reaches into std.
+FROM toolchain AS std
+
+WORKDIR /build/std
+RUN <<-'EOF'
+	set -eux
+	mkdir src
+	printf '%s\n' '[package]' 'name = "std-wasm32"' 'version = "0.0.0"' 'edition = "2024"' \
+		'[lib]' 'path = "src/lib.rs"' \
+		'[profile.release]' 'opt-level = 3' 'codegen-units = 1' 'debug = false' 'strip = false' > Cargo.toml
+	echo '#![no_std]' > src/lib.rs
+	RUSTC_BOOTSTRAP=1 cargo fetch -Zbuild-std=std,panic_abort --target $TARGET
+EOF
+
+# The one step that uses unstable cargo (`-Zbuild-std`); nothing after it does.
+RUN --network=none <<-'EOF'
+	set -eux
+	RUSTC_BOOTSTRAP=1 \
+	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C embed-bitcode=yes $RUST_SRC_REMAP" \
+		cargo build --frozen --release --target $TARGET -Zbuild-std=std,panic_abort
+	lib=/usr/lib/rustlib/$TARGET/lib
+	mkdir -p $lib
+	cp target/$TARGET/release/deps/*.rlib $lib/
+	rm $lib/libstd_wasm32-*.rlib
+	ls $lib
+	rm -rf /build/std
+EOF
+
+# ── wasm-bindgen ───────────────────────────────────────────────────────────────
+# The CLI at exactly the version of the `wasm-bindgen` crate in Cargo.lock
+# (checked below, in the build stage), from its published crate, with the
+# lockfile that crate carries. Without default features: they add TLS to
+# `wasm-bindgen-test-runner`'s downloads, and the binding tool uses none of it.
+FROM toolchain AS wasm-bindgen
+
+ADD --checksum=sha256:2e29140c04e81832902b70e5d37b9ce1bfa811c8fe4563bea08f76df8388cf20 \
+    https://static.crates.io/crates/wasm-bindgen-cli/wasm-bindgen-cli-0.2.128.crate /build/wasm-bindgen-cli.tar.gz
+
+WORKDIR /build
+RUN <<-'EOF'
+	set -eux
+	tar -xzf wasm-bindgen-cli.tar.gz
+	cd wasm-bindgen-cli-0.2.128
+	cargo fetch --locked --target x86_64-unknown-linux-musl
+EOF
+RUN --network=none <<-'EOF'
+	set -eux
+	cd wasm-bindgen-cli-0.2.128
+	cargo build --frozen --release --no-default-features --bin wasm-bindgen
+	install -D -m 0755 target/release/wasm-bindgen /out/wasm-bindgen
+	/out/wasm-bindgen --version
+EOF
+
+# ── fetch ──────────────────────────────────────────────────────────────────────
+# Manifests and stub sources, so the dependency graph is fetched and compiled
+# in a layer that only dependency changes invalidate (as in
+# oci/eidola-cli/Containerfile).
+FROM std AS fetch
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# The wasm target's `getrandom_backend` cfg lives here.
+COPY .cargo/config.toml ./.cargo/config.toml
+COPY --parents crates/*/Cargo.toml ./
+
+RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do \
+      dir="$(dirname "$manifest")/src"; mkdir -p "$dir"; \
+      touch "$dir/lib.rs"; \
+      if grep -q '^\[\[bin\]\]' "$manifest"; then echo 'fn main(){}' > "$dir/main.rs"; fi; \
+    done
+
+# Both targets' graphs: build scripts and proc macros run on the x86-64 host,
+# cargo reads every package the host activates even for the wasm build, and the
+# licences step (below) reads the whole workspace's graph; this fetch is what
+# mobile/build-bundle.sh fetches too.
+RUN cargo fetch --locked --target ${TARGET} --target x86_64-unknown-linux-musl
+
+# The flags mobile/build-bundle.sh passes, for this image's paths: an 8 MiB
+# stack (turso's query engine overflows wasm-ld's default 1 MiB), and the
+# checkout and the standard library's sources remapped as the host build
+# remaps them (CARGO_HOME is already `/cargo`, the name the host build maps its
+# own to). They go through `--config`, which cargo joins to
+# .cargo/config.toml's; a RUSTFLAGS variable would replace those.
+ENV BUNDLE_RUSTFLAGS="['-Clink-arg=-zstack-size=8388608', '--remap-path-prefix=/src=/eidola', '--remap-path-prefix=/usr/lib/rustlib/src/rust=/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452']"
+
+RUN --network=none \
+    cargo build --frozen --profile mobile --target ${TARGET} -p eidola-mobile \
+      --config "target.${TARGET}.rustflags=${BUNDLE_RUSTFLAGS}"
+
+# ── build ──────────────────────────────────────────────────────────────────────
+# Real sources over the stubs, with the trust-root and model-catalog inputs
+# `eidola-app-core/build.rs` compiles in (the same files the client images
+# copy, for the same reasons).
+FROM fetch AS build
+
+COPY crates/ ./crates/
+COPY --parents releases/trust/server-enclave.json releases/trust/trust-constants.json releases/trust/sigstore-trusted-root.json releases/schema/attestation-templates.json ./
+COPY --parents models* ./
+# What the bundle's licences file (crates/mobile-licences) reads beyond the
+# packages: this repository's SPDX texts, and the Kotlin release the Android
+# shell carries.
+COPY --parents LICENSES mobile/android/tools.sh ./
+COPY --from=wasm-bindgen /out/wasm-bindgen /usr/local/bin/wasm-bindgen
+
+RUN find crates/ -name '*.rs' -exec touch {} +
+
+RUN --network=none <<-'EOF'
+	set -eux
+	want="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
+	got="$(wasm-bindgen --version)"
+	if [ "$got" != "wasm-bindgen $want" ]; then
+		echo "error: the wasm-bindgen CLI is '$got', but Cargo.lock has wasm-bindgen $want" >&2
+		exit 1
+	fi
+	cargo build --frozen --profile mobile --target ${TARGET} -p eidola-mobile \
+		--config "target.${TARGET}.rustflags=${BUNDLE_RUSTFLAGS}"
+	mkdir -p /out
+	wasm-bindgen target/${TARGET}/mobile/eidola_mobile.wasm --out-dir /out --target web \
+		--no-typescript --remove-name-section --remove-producers-section
+	cp crates/eidola-mobile/web/index.html crates/eidola-mobile/web/app.css crates/eidola-mobile/web/boot.js /out/
+	# The licences screen's file, from the lockfile, by the generator build-bundle.sh runs.
+	cargo run --frozen -p mobile-licences -- /src > /out/licences.json
+	chmod -R u=rwX,go=rX /out
+	find /out -type f | sort
+EOF
+
+# ── package ────────────────────────────────────────────────────────────────────
+FROM scratch AS package
+
+COPY --from=build /out/ /

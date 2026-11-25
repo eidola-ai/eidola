@@ -271,6 +271,8 @@ async fn engine(identity: Identity) -> Engine {
         host_data: [0; 32],
         cert_dir,
         gpus: identity.gpus,
+        extra_tls_names: Vec::new(),
+        misbind: None,
     })
     .await
     .unwrap();

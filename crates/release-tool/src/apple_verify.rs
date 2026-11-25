@@ -693,6 +693,54 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_6_manifest_reads_like_any_other() {
+        // The tool reads a manifest by artifact key and is indifferent to
+        // the rows it does not ask about, so the mobile rows schema 6 adds
+        // (one of a type of its own, with a nested listing) change nothing
+        // it does. The same accepted fixture the determinism gate and the
+        // client both read.
+        let manifest =
+            include_bytes!("../../../scripts/fixtures/manifest-determinism/good-schema-6.json");
+        assert_eq!(
+            manifest_recorded_sha256(manifest, MACOS_UNSIGNED_ZIP_KEY).unwrap(),
+            None
+        );
+        assert_eq!(
+            manifest_recorded_sha256(manifest, "eidola-mobile-android-apk").unwrap(),
+            Some("8".repeat(64))
+        );
+        assert_eq!(
+            manifest_recorded_sha256(manifest, "eidola-mobile-bundle").unwrap(),
+            Some("7".repeat(64))
+        );
+    }
+
+    #[test]
+    fn the_emitter_s_schema_6_manifest_records_what_attest_reads() {
+        // What `scripts/artifact-manifest.sh` composes once it emits schema
+        // 6 (`scripts/test-manifest-schema-flip.sh` holds this file to the
+        // bytes its producers write): the unsigned macOS zip the Apple claim
+        // binds to is recorded, and so is the unsigned APK a signed one must
+        // reduce to.
+        let manifest = include_bytes!(
+            "../../../scripts/fixtures/manifest-determinism/good-schema-6-emitted.json"
+        );
+        assert_eq!(
+            manifest_recorded_sha256(manifest, MACOS_UNSIGNED_ZIP_KEY).unwrap(),
+            Some("5".repeat(64))
+        );
+        let apk = manifest_recorded_sha256(manifest, "eidola-mobile-android-apk")
+            .unwrap()
+            .expect("schema 6 records the unsigned APK");
+        assert_eq!(apk.len(), 64);
+        assert!(
+            manifest_recorded_sha256(manifest, "eidola-mobile-bundle")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn a_recorded_row_reads_back_as_bare_hex() {
         let manifest = br#"{
             "schema_version": 3,

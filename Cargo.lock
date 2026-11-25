@@ -2661,18 +2661,25 @@ dependencies = [
  "eidola-server-gateway",
  "fs4",
  "futures-util",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hex",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "js-sys",
  "libc",
  "p256 0.13.2",
  "p384 0.13.1",
+ "percent-encoding",
  "rand_core 0.6.4",
  "regex",
  "reqwest",
  "rustls",
  "rustls-native-certs",
+ "rustls-pki-types",
  "rustls-rustcrypto",
  "semver",
  "serde",
@@ -2682,11 +2689,17 @@ dependencies = [
  "spki 0.7.3",
  "tempfile",
  "thiserror 2.0.21",
+ "tinfoil-shim-mock",
  "tinfoil-verifier",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "turso",
+ "url",
  "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-time",
+ "webpki-roots",
  "wiremock",
  "x509-cert 0.2.5",
  "zeroize",
@@ -2875,8 +2888,9 @@ version = "0.1.0"
 dependencies = [
  "eidola-app-core",
  "eidola-common",
+ "eidola-i18n",
+ "eidola-theme",
  "fluent-bundle",
- "fluent-syntax",
  "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
@@ -2897,6 +2911,51 @@ dependencies = [
  "tempfile",
  "tokio",
  "unic-langid",
+]
+
+[[package]]
+name = "eidola-i18n"
+version = "0.1.0"
+dependencies = [
+ "fluent-bundle",
+ "fluent-syntax",
+ "unic-langid",
+]
+
+[[package]]
+name = "eidola-mobile"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "eidola-app-core",
+ "eidola-i18n",
+ "eidola-mobile",
+ "eidola-theme",
+ "fluent-bundle",
+ "futures-util",
+ "gpui-component",
+ "gpui-kit-assets",
+ "gpui-markdown-editor",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "gpui-pre-web",
+ "hex",
+ "js-sys",
+ "log",
+ "reqwest",
+ "rustls",
+ "rustls-rustcrypto",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tinfoil-shim-mock",
+ "tinfoil-verifier",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wiremock",
 ]
 
 [[package]]
@@ -3010,6 +3069,17 @@ dependencies = [
  "reqwest",
  "rustls",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "eidola-theme"
+version = "0.1.0"
+dependencies = [
+ "eidola-app-core",
+ "gpui-component",
+ "gpui-markdown-editor",
+ "gpui-pre",
+ "serde_json",
 ]
 
 [[package]]
@@ -6424,6 +6494,13 @@ dependencies = [
  "log",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mobile-licences"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -10635,6 +10712,7 @@ dependencies = [
  "dcap-qvl",
  "der 0.7.10",
  "eidola-common",
+ "getrandom 0.2.17",
  "getrandom 0.4.3",
  "hex",
  "http",
@@ -10647,6 +10725,7 @@ dependencies = [
  "reqwest",
  "rsa 0.9.10",
  "rustls",
+ "rustls-pki-types",
  "rustls-rustcrypto",
  "serde",
  "serde_json",
@@ -10655,9 +10734,12 @@ dependencies = [
  "signature 2.2.0",
  "spki 0.7.3",
  "thiserror 2.0.21",
+ "tinfoil-shim-mock",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tracing",
+ "url",
  "webpki-roots",
  "x509-cert 0.2.5",
 ]
@@ -11142,7 +11224,7 @@ dependencies = [
 [[package]]
 name = "turso"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "thiserror 2.0.21",
  "tracing",
@@ -11155,7 +11237,7 @@ dependencies = [
 [[package]]
 name = "turso_core"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "aegis",
  "aes 0.8.4",
@@ -11221,13 +11303,14 @@ dependencies = [
  "twox-hash",
  "uncased",
  "uuid",
+ "web-time",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "turso_ext"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -11237,7 +11320,7 @@ dependencies = [
 [[package]]
 name = "turso_macros"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -11247,7 +11330,7 @@ dependencies = [
 [[package]]
 name = "turso_parser"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "bitflags 2.13.2",
  "memchr",
@@ -11261,7 +11344,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -11277,7 +11360,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit_macros"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -11287,7 +11370,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_engine"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -11309,7 +11392,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_sdk_kit"
 version = "0.8.0-pre.4"
-source = "git+https://github.com/eidola-ai/turso?branch=fix-concurrent-view-expansion-guard#20d141cb5dd36d281d24f9d3a00156ff56b24c06"
+source = "git+https://github.com/eidola-ai/turso?branch=wasm-web-time-clock#eeda62d8d665a8e591635ea49091555af66662ae"
 dependencies = [
  "bindgen",
  "env_logger",

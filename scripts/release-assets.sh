@@ -27,6 +27,18 @@
 #   * `file` rows naming a static binary (`eidola-cli-linux-static-<arch>`)
 #     carry the executable's own `sha256`. Published as `<key>`, with no
 #     extension, because the download is the program.
+#   * `bundle` rows (the mobile app bundle, from manifest schema 6) carry
+#     the `sha256` of the container its files are published in, an
+#     uncompressed `ustar` archive. Published as `<key>.tar`: the one asset
+#     `release.json` indexes for the key, which the mobile updater
+#     downloads, checks against this hash, and then checks file by file
+#     against the row's own listing.
+#   * `eidola-mobile-android-apk` is deliberately **not** published, for
+#     the macOS zip's reason: it is the *unsigned* APK, recorded so a
+#     verifier can reproduce it; the APK a user installs is signed, and its
+#     hash and signing identity belong in the human attestation. A signed
+#     APK reduces to this file once its signature is stripped
+#     (`mobile/android/tools/strip_apk_signature.py`).
 #   * `eidola-gui-macos-universal-zip` is deliberately **not** published.
 #     It is the *unsigned* container, recorded so a verifier can reproduce
 #     the recipe; the macOS installable is the Developer ID-signed zip,
@@ -326,6 +338,10 @@ NOT_PUBLISHED = {
         "the unsigned macOS container; the installable is the Developer "
         "ID-signed zip, whose hash lives in the human attestation"
     ),
+    "eidola-mobile-android-apk": (
+        "the unsigned Android APK; the installable is the signed APK, whose "
+        "hash and signing identity live in the human attestation"
+    ),
 }
 
 
@@ -342,6 +358,8 @@ def expected(name, entry):
         return name + ".deb", entry.get("sha256")
     if kind == "file" and name.startswith("eidola-cli-linux-static-"):
         return name, entry.get("sha256")
+    if kind == "bundle":
+        return name + ".tar", entry.get("sha256")
     problems.append(
         "artifacts.{}: type {} is not in the publication table — a new "
         "artifact class needs a deliberate decision about whether a "

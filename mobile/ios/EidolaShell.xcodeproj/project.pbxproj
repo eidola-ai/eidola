@@ -1,0 +1,340 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		E1D0000000000000000000B1 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F1 /* App.swift */; };
+		E1D0000000000000000000B2 /* Bridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F2 /* Bridge.swift */; };
+		E1D0000000000000000000B3 /* Files.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F3 /* Files.swift */; };
+		E1D0000000000000000000B4 /* Pipe.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F4 /* Pipe.swift */; };
+		E1D0000000000000000000B5 /* BundleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F5 /* BundleStore.swift */; };
+		E1D0000000000000000000B6 /* bundle in Resources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F7 /* bundle */; };
+		E1D0000000000000000000B8 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F9 /* AppIcon.icon */; };
+		E1D0000000000000000000B7 /* ContractUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000F8 /* ContractUITests.swift */; };
+		E1D0000000000000000000B9 /* PhoneUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D0000000000000000000FA /* PhoneUITests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		E1D0000000000000000000C1 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E1D00000000000000000000A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E1D0000000000000000000T1;
+			remoteInfo = EidolaShell;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		E1D0000000000000000000F1 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
+		E1D0000000000000000000F2 /* Bridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Bridge.swift; sourceTree = "<group>"; };
+		E1D0000000000000000000F3 /* Files.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Files.swift; sourceTree = "<group>"; };
+		E1D0000000000000000000F4 /* Pipe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pipe.swift; sourceTree = "<group>"; };
+		E1D0000000000000000000F5 /* BundleStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BundleStore.swift; sourceTree = "<group>"; };
+		E1D0000000000000000000F6 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		E1D0000000000000000000F7 /* bundle */ = {isa = PBXFileReference; lastKnownFileType = folder; name = bundle; path = build/bundle; sourceTree = SOURCE_ROOT; };
+		E1D0000000000000000000F9 /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = AppIcon.icon; sourceTree = "<group>"; };
+		E1D0000000000000000000F8 /* ContractUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContractUITests.swift; sourceTree = "<group>"; };
+		E1D0000000000000000000FA /* PhoneUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneUITests.swift; sourceTree = "<group>"; };
+		E1D0000000000000000000P1 /* EidolaShell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EidolaShell.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		E1D0000000000000000000P2 /* EidolaShellUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EidolaShellUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		E1D000000000000000000FW1 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E1D000000000000000000FW2 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		E1D0000000000000000000G0 = {
+			isa = PBXGroup;
+			children = (
+				E1D0000000000000000000G1 /* Shell */,
+				E1D0000000000000000000G2 /* UITests */,
+				E1D0000000000000000000F6 /* Info.plist */,
+				E1D0000000000000000000F9 /* AppIcon.icon */,
+				E1D0000000000000000000F7 /* bundle */,
+				E1D0000000000000000000G3 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		E1D0000000000000000000G1 /* Shell */ = {
+			isa = PBXGroup;
+			children = (
+				E1D0000000000000000000F1 /* App.swift */,
+				E1D0000000000000000000F2 /* Bridge.swift */,
+				E1D0000000000000000000F5 /* BundleStore.swift */,
+				E1D0000000000000000000F3 /* Files.swift */,
+				E1D0000000000000000000F4 /* Pipe.swift */,
+			);
+			path = Shell;
+			sourceTree = "<group>";
+		};
+		E1D0000000000000000000G2 /* UITests */ = {
+			isa = PBXGroup;
+			children = (
+				E1D0000000000000000000F8 /* ContractUITests.swift */,
+				E1D0000000000000000000FA /* PhoneUITests.swift */,
+			);
+			path = UITests;
+			sourceTree = "<group>";
+		};
+		E1D0000000000000000000G3 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				E1D0000000000000000000P1 /* EidolaShell.app */,
+				E1D0000000000000000000P2 /* EidolaShellUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		E1D0000000000000000000T1 /* EidolaShell */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = E1D0000000000000000000L1 /* Build configuration list for PBXNativeTarget "EidolaShell" */;
+			buildPhases = (
+				E1D0000000000000000000S1 /* Sources */,
+				E1D000000000000000000FW1 /* Frameworks */,
+				E1D0000000000000000000R1 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = EidolaShell;
+			productName = EidolaShell;
+			productReference = E1D0000000000000000000P1 /* EidolaShell.app */;
+			productType = "com.apple.product-type.application";
+		};
+		E1D0000000000000000000T2 /* EidolaShellUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = E1D0000000000000000000L2 /* Build configuration list for PBXNativeTarget "EidolaShellUITests" */;
+			buildPhases = (
+				E1D0000000000000000000S2 /* Sources */,
+				E1D000000000000000000FW2 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				E1D0000000000000000000D1 /* PBXTargetDependency */,
+			);
+			name = EidolaShellUITests;
+			productName = EidolaShellUITests;
+			productReference = E1D0000000000000000000P2 /* EidolaShellUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		E1D00000000000000000000A /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2700;
+				LastUpgradeCheck = 2700;
+				TargetAttributes = {
+					E1D0000000000000000000T2 = {
+						TestTargetID = E1D0000000000000000000T1;
+					};
+				};
+			};
+			buildConfigurationList = E1D0000000000000000000L0 /* Build configuration list for PBXProject "EidolaShell" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = E1D0000000000000000000G0;
+			productRefGroup = E1D0000000000000000000G3 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				E1D0000000000000000000T1 /* EidolaShell */,
+				E1D0000000000000000000T2 /* EidolaShellUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		E1D0000000000000000000R1 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E1D0000000000000000000B8 /* AppIcon.icon in Resources */,
+				E1D0000000000000000000B6 /* bundle in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		E1D0000000000000000000S1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E1D0000000000000000000B1 /* App.swift in Sources */,
+				E1D0000000000000000000B2 /* Bridge.swift in Sources */,
+				E1D0000000000000000000B3 /* Files.swift in Sources */,
+				E1D0000000000000000000B4 /* Pipe.swift in Sources */,
+				E1D0000000000000000000B5 /* BundleStore.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E1D0000000000000000000S2 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+		E1D0000000000000000000B7 /* ContractUITests.swift in Sources */,
+		E1D0000000000000000000B9 /* PhoneUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		E1D0000000000000000000D1 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E1D0000000000000000000T1 /* EidolaShell */;
+			targetProxy = E1D0000000000000000000C1 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		E1D000000000000000000PD1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = JPK236247S;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		E1D000000000000000000PR1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = JPK236247S;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		E1D000000000000000000AD1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.eidola.app.ios.dev;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		E1D000000000000000000AR1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.eidola.app.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+		E1D000000000000000000TD1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.eidola.app.ios.dev.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_TARGET_NAME = EidolaShell;
+			};
+			name = Debug;
+		};
+		E1D000000000000000000TR1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.eidola.app.ios.dev.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_TARGET_NAME = EidolaShell;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		E1D0000000000000000000L0 /* Build configuration list for PBXProject "EidolaShell" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E1D000000000000000000PD1 /* Debug */,
+				E1D000000000000000000PR1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		E1D0000000000000000000L1 /* Build configuration list for PBXNativeTarget "EidolaShell" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E1D000000000000000000AD1 /* Debug */,
+				E1D000000000000000000AR1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		E1D0000000000000000000L2 /* Build configuration list for PBXNativeTarget "EidolaShellUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E1D000000000000000000TD1 /* Debug */,
+				E1D000000000000000000TR1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = E1D00000000000000000000A /* Project object */;
+}

@@ -248,7 +248,7 @@ impl Inner {
     /// branch tip — from summarizing the same branch twice.
     pub(crate) fn spawn_branch_summaries(&self, space_id: &str) {
         // No runtime (a synchronous unit test) ⇒ nothing to spawn onto.
-        if tokio::runtime::Handle::try_current().is_err() {
+        if !crate::rt::in_runtime() {
             return;
         }
         let Some(inner) = self.self_ref.upgrade() else {
@@ -261,7 +261,7 @@ impl Inner {
             .lock()
             .expect("summary trigger lock poisoned")
             .insert(space_id.clone(), stamp);
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             // A space with summaries off (no router model, the default) has
             // no pass to wait for, so it holds no task through the debounce.
             if !inner.summaries_enabled(&space_id).await {
@@ -274,7 +274,7 @@ impl Inner {
                 }
                 return;
             }
-            tokio::time::sleep(DEBOUNCE).await;
+            crate::rt::sleep(DEBOUNCE).await;
             {
                 let mut triggers = inner
                     .summary_triggers

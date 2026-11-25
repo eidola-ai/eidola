@@ -300,6 +300,7 @@ pub(crate) fn random_nonce() -> Result<[u8; NONCE_LEN], Error> {
 ///
 /// This checks the envelope's internal bindings and nonce. The result is not
 /// authenticated until its CPU evidence and `report_data` are verified.
+#[cfg(not(target_family = "wasm"))]
 pub async fn fetch_well_known(
     client: &reqwest::Client,
     attestation_url: &str,

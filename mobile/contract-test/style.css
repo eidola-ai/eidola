@@ -1,0 +1,16 @@
+body {
+  margin: 0;
+  padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+    max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+  font: 14px -apple-system, system-ui, sans-serif;
+  background: #fbf9f4;
+  color: #222;
+}
+h1 { font-size: 18px; margin: 0 0 8px; }
+#summary { font-weight: 600; }
+#digest { font: 11px ui-monospace, monospace; word-break: break-all; color: #555; }
+pre { font: 11px ui-monospace, monospace; white-space: pre-wrap; }
+@media (prefers-color-scheme: dark) {
+  body { background: #15181c; color: #ddd; }
+  #digest { color: #aaa; }
+}

@@ -69,9 +69,61 @@ fn a_fresh_database_is_seeded_with_a_usable_default_template() {
             Some(eidola_app_core::config::DEFAULT_MODEL)
         );
         assert_eq!(
+            t.participants[0].label,
+            eidola_app_core::db::default_agent_label(eidola_app_core::config::DEFAULT_MODEL),
+            "the seeded agent carries the model's display name"
+        );
+        #[cfg(feature = "desktop")]
+        assert_eq!(
             t.participants[0].label, "Gemma 4 E4B",
             "the seeded agent carries the curated model's display name"
         );
+    });
+}
+
+/// **A fresh profile's first conversation is answered by a model this build
+/// can run.** The desktop seeds the curated local model, which it can
+/// download and serve; a build without local models (the mobile app) has no
+/// engine to serve one, so it seeds a current model of the Eidola catalog,
+/// which a turn routes to the Eidola backend. Nothing but the seed runs here:
+/// no template is re-seated, as a phone's first launch re-seats none.
+#[test]
+fn a_fresh_profile_seeds_a_default_agent_this_build_can_run() {
+    run(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = open(dir.path(), &dir.path().join("data"));
+        let model = core
+            .runtime()
+            .block_on(core.default_model())
+            .expect("the default model");
+        let seeded = default_template(&core).participants[0].model_ref.clone();
+        assert_eq!(seeded.as_deref(), Some(model.as_str()));
+
+        #[cfg(feature = "desktop")]
+        assert!(
+            eidola_app_core::local_models::catalog_entry_for_model_ref(&model).is_some(),
+            "the desktop's default is not a curated local model: {model}"
+        );
+        #[cfg(not(feature = "desktop"))]
+        {
+            let routed = eidola_app_core::backends::parse_model_ref(&model);
+            assert_eq!(
+                routed.backend_id,
+                eidola_app_core::backends::EIDOLA_BACKEND_ID,
+                "a build without local models seeded a model only an engine it lacks could serve: \
+                 {model}"
+            );
+            let (row, _) = eidola_app_core::model_catalog::resolve(
+                eidola_app_core::model_catalog::CATALOG,
+                &routed.model,
+            )
+            .unwrap_or_else(|| panic!("{model} is not in the Eidola catalog"));
+            assert_eq!(
+                row.lifecycle,
+                eidola_app_core::model_catalog::Lifecycle::Current,
+                "{model} is not a current catalog model"
+            );
+        }
     });
 }
 

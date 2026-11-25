@@ -16,11 +16,26 @@ pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidola:inference:production:2
 /// Embedded fallback for the inference model. The `default_model` config key
 /// is gone (Participants v1); this is the model the seeded "Default" space
 /// template's agent participant carries, and the last-resort fallback when a
-/// space or template has no resolvable agent model. It is the curated Gemma 4
-/// E4B in the managed local store (`gemma-4-e4b` in
-/// `local_models::LOCAL_MODEL_CATALOG`), spelled as the `<file-stem>@local`
-/// reference that model is selected by once downloaded.
-pub const DEFAULT_MODEL: &str = "gemma-4-E4B_q4_0-it@local";
+/// space or template has no resolvable agent model.
+///
+/// It is a model this build can run. With the `desktop` feature it is
+/// [`LOCAL_DEFAULT_MODEL`]; a build without it (the mobile app) has no local
+/// engines, so it is [`HOSTED_DEFAULT_MODEL`].
+#[cfg(feature = "desktop")]
+pub const DEFAULT_MODEL: &str = LOCAL_DEFAULT_MODEL;
+#[cfg(not(feature = "desktop"))]
+pub const DEFAULT_MODEL: &str = HOSTED_DEFAULT_MODEL;
+
+/// The desktop's default model: the curated Gemma 4 E4B in the managed local
+/// store (`gemma-4-e4b` in `local_models::LOCAL_MODEL_CATALOG`), spelled as
+/// the `<file-stem>@local` reference that model is selected by once
+/// downloaded.
+pub const LOCAL_DEFAULT_MODEL: &str = "gemma-4-E4B_q4_0-it@local";
+
+/// The default model of a build without local models: a tag of the Eidola
+/// model catalog (`models/`), bare so it routes to the `eidola` backend and
+/// follows the tag as it moves. A test holds it to a current catalog row.
+pub const HOSTED_DEFAULT_MODEL: &str = "qwen3.5-2b";
 
 /// Well-known id of the seeded "Default" space template — the compiled-in
 /// value [`Config::default_template`] resolves to when the user has set no
@@ -355,7 +370,12 @@ impl Config {
         let Ok(contents) = fs::read_to_string(path) else {
             return Config::default();
         };
-        toml::from_str(&contents).unwrap_or_default()
+        Self::parse_lenient(&contents)
+    }
+
+    /// [`Config::load_from`]'s reading of a file's text.
+    pub(crate) fn parse_lenient(contents: &str) -> Config {
+        toml::from_str(contents).unwrap_or_default()
     }
 
     /// Load config from `path` **to write it back**: a missing file is the
@@ -374,13 +394,19 @@ impl Config {
                 });
             }
         };
+        Self::parse_for_update(&contents, path)
+    }
+
+    /// [`Config::load_for_update`]'s reading of a file's text; `path` names
+    /// the file in an error.
+    pub(crate) fn parse_for_update(contents: &str, path: &Path) -> Result<Config, AppError> {
         // Where, never what: the parser's `Display` quotes the failing source
         // line and its message can quote a value, and this file's lines
         // include the account secret (a partial sync write that leaves
         // `account_secret = "…` unterminated fails on exactly that line). The
         // text reaches a settings alert and `AccountNotSaved`'s reason, so it
         // names the position only.
-        toml::from_str(&contents).map_err(|e| {
+        toml::from_str(contents).map_err(|e| {
             let at = e
                 .span()
                 .map(|span| {
@@ -396,6 +422,13 @@ impl Config {
                     path.display()
                 ),
             }
+        })
+    }
+
+    /// The file's text.
+    pub(crate) fn to_toml(&self) -> Result<String, AppError> {
+        toml::to_string_pretty(self).map_err(|e| AppError::Config {
+            message: format!("failed to serialize config: {e}"),
         })
     }
 
@@ -427,9 +460,7 @@ impl Config {
                 message: format!("failed to create config directory: {e}"),
             })?;
         }
-        let contents = toml::to_string_pretty(self).map_err(|e| AppError::Config {
-            message: format!("failed to serialize config: {e}"),
-        })?;
+        let contents = self.to_toml()?;
         let write_err = |e: std::io::Error| AppError::Config {
             message: format!("failed to write config: {e}"),
         };
@@ -448,12 +479,14 @@ impl Config {
         options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&tmp).map_err(write_err)?;
-        let written = file
-            .write_all(contents.as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(write_err);
-        drop(file);
+        // The file is closed at the end of this block, before it is removed
+        // or renamed.
+        let written = {
+            let mut file = options.open(&tmp).map_err(write_err)?;
+            file.write_all(contents.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(write_err)
+        };
         if let Err(e) = written {
             let _ = fs::remove_file(&tmp);
             return Err(e);
@@ -508,6 +541,7 @@ impl Config {
 /// lock belongs to the one `AppCore` that may write this profile, since the
 /// database's exclusive lock refuses a second. Best effort: a temporary that
 /// cannot be removed is left for the next update.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn sweep_stale_temporaries(path: &Path) {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
         return;

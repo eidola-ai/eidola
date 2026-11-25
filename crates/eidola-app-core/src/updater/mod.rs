@@ -46,8 +46,8 @@
 //! otherwise an adversary who produced a single forged attestation could
 //! also forge a `release.json` that lowered the threshold to 1.
 
+use crate::rt::Instant;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use sha2::Digest;
 
@@ -60,10 +60,12 @@ pub use eidola_attestation::{
 
 pub mod ci_sigstore;
 pub mod human_attestation;
+#[cfg(feature = "desktop")]
 pub mod install;
 pub mod install_kind;
 pub mod installed;
 mod merkle;
+pub mod mobile;
 mod rekor_verify;
 pub mod sigstore_bundle;
 pub mod trust;
@@ -85,14 +87,16 @@ pub mod trust;
 /// Rekor, or inclusion-proof verification; the whole point is that the
 /// fixtures path exercises the same verifier code.
 pub enum Fetcher {
-    Network(reqwest::Client),
+    Network(crate::transport::Client),
     Fixtures(PathBuf),
 }
 
 impl Fetcher {
     /// Construct the default network fetcher (rustls + native roots).
     pub fn network() -> Result<Self, AppError> {
-        Ok(Fetcher::Network(build_http_client()?))
+        Ok(Fetcher::Network(build_http_client(
+            &crate::transport::Transport::default(),
+        )?))
     }
 
     /// Read release bytes from the given directory. URLs in `release.json`
@@ -157,7 +161,7 @@ impl Fetcher {
 
     /// Fetch a referenced asset with an explicit ceiling, for callers whose
     /// artifacts are larger than a signed document.
-    pub(crate) async fn fetch_url_bounded(
+    pub async fn fetch_url_bounded(
         &self,
         url: &str,
         label: &str,
@@ -446,6 +450,10 @@ pub struct VerifiedAttestation {
     /// the attestation's schema records it. `None` for a schema that
     /// predates those fields.
     pub apple: Option<AppleSignatureAttestation>,
+    /// What the attestant swore about the signed Android APK, when the
+    /// attestation's schema records it. `None` for a schema that predates
+    /// those fields.
+    pub android: Option<AndroidSignatureAttestation>,
     pub fingerprint_hex: String,
     pub rekor_log_index: u64,
     pub attested_at: String,
@@ -472,6 +480,25 @@ pub struct AppleSignatureAttestation {
     /// omitting the fact.
     pub team_id: Option<String>,
     pub signing_identifier: String,
+}
+
+/// The key-dependent facts about the Android APK a release publishes, as a
+/// named human recorded them.
+///
+/// The manifest records the *unsigned* APK, a function of source; the APK
+/// a user installs is that file signed, and a signature is a function of a
+/// key, so its hash and the certificate it is signed with belong here. A
+/// signed APK reduces to the unsigned one once its signing block is
+/// stripped (`mobile/android/tools/strip_apk_signature.py`), and the
+/// certificate's SHA-256 is what Android, and tools such as AppVerifier,
+/// show for an installed app — the identity a user compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndroidSignatureAttestation {
+    /// Lowercase hex sha256 of the signed APK the release publishes.
+    pub signed_apk_sha256: String,
+    /// Lowercase hex sha256 of the DER signing certificate (APK Signature
+    /// Scheme v2/v3), as `apksigner verify --print-certs` prints it.
+    pub signing_certificate_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1319,9 +1346,9 @@ pub(crate) const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 /// No error text here carries the URL. `reqwest` attaches it to the error
 /// it returns and prints it in `Display`, and a redirect can leave a
 /// credential in it, so errors go through `request_error_text` — the one
-/// path a `reqwest::Error` becomes text through in this crate.
+/// path a `crate::transport::Error` becomes text through in this crate.
 async fn fetch_url_network(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     url: &str,
     label: &str,
     max_bytes: u64,
@@ -1340,7 +1367,7 @@ async fn fetch_url_network(
 /// The body of [`fetch_url_network`], with the silence bound supplied —
 /// which is how a test drives it in milliseconds rather than minutes.
 async fn fetch_url_network_with(
-    client: &reqwest::Client,
+    client: &crate::transport::Client,
     url: &str,
     accept: &str,
     label: &str,
@@ -1356,7 +1383,7 @@ async fn fetch_url_network_with(
     // and not a whole-request timeout, which would cut off a large
     // container that is still arriving.
     let resp =
-        match tokio::time::timeout(stall, client.get(url).header("Accept", accept).send()).await {
+        match crate::rt::timeout(stall, client.get(url).header("Accept", accept).send()).await {
             Ok(sent) => sent.map_err(|e| {
                 let malformed = e.is_builder();
                 let message = format!("GET {label}: {}", crate::error::request_error_text(e));
@@ -1390,7 +1417,7 @@ async fn fetch_url_network_with(
         // finishes. The bound is per read rather than overall: a large
         // container on a slow link keeps arriving, and only silence is
         // grounds to give up.
-        let next = match tokio::time::timeout(stall, stream.next()).await {
+        let next = match crate::rt::timeout(stall, stream.next()).await {
             Ok(next) => next,
             Err(_) => {
                 return Err(FetchFailure::Unreachable(format!(
@@ -1419,7 +1446,7 @@ async fn fetch_url_network_with(
         // Anything else is the server failing to answer — an outage, a rate
         // limit, a wall in front of it — which says nothing about the file.
         return Err(
-            if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+            if status == http::StatusCode::NOT_FOUND || status == http::StatusCode::GONE {
                 FetchFailure::Missing(message)
             } else {
                 FetchFailure::Unreachable(message)
@@ -1429,28 +1456,10 @@ async fn fetch_url_network_with(
     Ok(bytes)
 }
 
-pub(crate) fn build_http_client() -> Result<reqwest::Client, AppError> {
-    // Idempotent — AppCore::new normally installs this; for standalone
-    // updater callers (tests, future binaries) this is the safety net.
-    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(crate::load_native_root_store())
-        .with_no_client_auth();
-
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(tls_config)
-        .user_agent(concat!("eidola-app-core/", env!("CARGO_PKG_VERSION")))
-        // Bounds the handshake only. A whole-request timeout would be
-        // wrong here: the same client fetches a small signed document and
-        // a container of tens of megabytes, and the second is allowed to
-        // take as long as it keeps making progress — which is what the
-        // per-read stall bound measures.
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| AppError::Update {
-            message: format!("constructing HTTPS client: {e}"),
-        })
+pub(crate) fn build_http_client(
+    transport: &crate::transport::Transport,
+) -> Result<crate::transport::Client, AppError> {
+    crate::transport::update_client(transport)
 }
 
 #[cfg(test)]
@@ -1543,7 +1552,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let client = build_http_client().unwrap();
+            let client = build_http_client(&crate::transport::Transport::default()).unwrap();
             let err = fetch_url_network(&client, &format!("{}/big", server.uri()), "a payload", 64)
                 .await
                 .expect_err("an oversized body must be refused");
@@ -1564,7 +1573,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let client = build_http_client().unwrap();
+            let client = build_http_client(&crate::transport::Transport::default()).unwrap();
             let err =
                 fetch_url_network(&client, &format!("{}/big", server.uri()), "a payload", 100)
                     .await
@@ -1745,8 +1754,8 @@ mod tests {
             );
         }
 
-        fn client_for_test() -> reqwest::Client {
-            build_http_client().unwrap()
+        fn client_for_test() -> crate::transport::Client {
+            build_http_client(&crate::transport::Transport::default()).unwrap()
         }
     }
 

@@ -69,7 +69,10 @@ use crate::trust_root;
 use super::rekor_verify;
 use super::sigstore_bundle::CosignBundle;
 use super::trust::TrustedRoot;
-use super::{AppleSignatureAttestation, ReleaseIndex, VerifiedAttestation, VerifiedClaim};
+use super::{
+    AndroidSignatureAttestation, AppleSignatureAttestation, ReleaseIndex, VerifiedAttestation,
+    VerifiedClaim,
+};
 
 // Re-export the attestant-key classifier so external callers (notably
 // `release-tool`) can validate a candidate signing key against the same
@@ -404,6 +407,20 @@ const APPLE_FIELDS: [&str; 4] = [
     "apple_team_id",
 ];
 
+/// The schema from which an attestation also records the signed Android
+/// APK: its hash and its signing certificate's. Schemas only add, so a
+/// schema-3 attestation carries the Apple block too. Like the Apple fields,
+/// these are forbidden below their schema ([`check_android_field_shape`]).
+const ANDROID_FIELDS_SINCE_SCHEMA: u32 = 3;
+
+/// The keys [`ANDROID_FIELDS_SINCE_SCHEMA`] governs. Neither may be `null`:
+/// a release that declares this schema published a signed APK, and both
+/// facts about it exist.
+const ANDROID_FIELDS: [&str; 2] = [
+    "android_signed_apk_sha256",
+    "android_signing_certificate_sha256",
+];
+
 /// Parse the attestation prose, cross-check its top-level fields
 /// against the release index, and verify every signed claim is the
 /// character-for-character rendering of its pinned template (with
@@ -443,6 +460,7 @@ fn verify_attestation_content(
     }
 
     check_apple_field_shape(&attestation, prose.schema_version)?;
+    check_android_field_shape(&attestation, prose.schema_version)?;
 
     // Attestant pubkey fingerprint must match what we observed in the
     // signature — defends against an attestation file that names a
@@ -649,6 +667,20 @@ fn verify_attestation_content(
     } else {
         None
     };
+    let android = if prose.schema_version >= ANDROID_FIELDS_SINCE_SCHEMA {
+        Some(AndroidSignatureAttestation {
+            signed_apk_sha256: required_android_hash(
+                prose.android_signed_apk_sha256,
+                "android_signed_apk_sha256",
+            )?,
+            signing_certificate_sha256: required_android_hash(
+                prose.android_signing_certificate_sha256,
+                "android_signing_certificate_sha256",
+            )?,
+        })
+    } else {
+        None
+    };
 
     Ok(VerifiedAttestation {
         attestant_id: prose.attestant.id,
@@ -656,6 +688,7 @@ fn verify_attestation_content(
         jurisdiction: prose.attestant.jurisdiction,
         artifact_manifest_sha256: prose.artifact_manifest_sha256,
         apple,
+        android,
         fingerprint_hex: fingerprint_hex.to_string(),
         rekor_log_index,
         attested_at: prose.attested_at,
@@ -673,6 +706,29 @@ fn required_apple_string(value: Option<String>, field: &str) -> Result<String, A
              release with no signature material to name does not declare this schema"
         ),
     })
+}
+
+/// An Android field: present, not `null`, and a lowercase hex SHA-256,
+/// the one spelling both facts have.
+fn required_android_hash(value: Option<String>, field: &str) -> Result<String, AppError> {
+    let value = value.ok_or_else(|| AppError::Update {
+        message: format!(
+            "attestation records `{field}` as null; a release that declares this schema \
+             published a signed APK, and both facts about it exist"
+        ),
+    })?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(AppError::Update {
+            message: format!(
+                "attestation records `{field}` as `{value}`, not a lowercase hex SHA-256"
+            ),
+        });
+    }
+    Ok(value)
 }
 
 /// The schema an attestation *declares* is the shape it is held to, in
@@ -729,6 +785,38 @@ fn check_apple_field_shape(
     Ok(())
 }
 
+/// [`check_apple_field_shape`]'s rule for the Android block: forbidden
+/// below [`ANDROID_FIELDS_SINCE_SCHEMA`], every key present from it on.
+fn check_android_field_shape(
+    attestation: &serde_json::Value,
+    schema_version: u32,
+) -> Result<(), AppError> {
+    let object = attestation.as_object().ok_or_else(|| AppError::Update {
+        message: "attestation JSON is not an object".into(),
+    })?;
+    let (present, missing): (Vec<&str>, Vec<&str>) = ANDROID_FIELDS
+        .into_iter()
+        .partition(|key| object.contains_key(*key));
+    if schema_version < ANDROID_FIELDS_SINCE_SCHEMA {
+        if !present.is_empty() {
+            return Err(AppError::Update {
+                message: format!(
+                    "attestation declares schema_version `{schema_version}` but carries {present:?}, \
+                     which attestations record only from schema {ANDROID_FIELDS_SINCE_SCHEMA} on"
+                ),
+            });
+        }
+    } else if !missing.is_empty() {
+        return Err(AppError::Update {
+            message: format!(
+                "attestation declares schema_version `{schema_version}` but omits {missing:?}, \
+                 which every attestation from schema {ANDROID_FIELDS_SINCE_SCHEMA} on records"
+            ),
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Attestation prose JSON shape — this struct is the source of truth.
 // ---------------------------------------------------------------------------
@@ -769,6 +857,15 @@ struct AttestationProse {
     apple_team_id: Option<String>,
     #[serde(default)]
     apple_signing_identifier: Option<String>,
+    /// The Android block, recorded from [`ANDROID_FIELDS_SINCE_SCHEMA`] and
+    /// forbidden before it, held to that by [`check_android_field_shape`]
+    /// for the reason the Apple block is: the signed APK's bytes and its
+    /// certificate are functions of a key, so the manifest records only the
+    /// unsigned APK.
+    #[serde(default)]
+    android_signed_apk_sha256: Option<String>,
+    #[serde(default)]
+    android_signing_certificate_sha256: Option<String>,
     attestant: AttestantBlock,
     attested_at: String,
     attestant_statement: String,
@@ -1194,6 +1291,124 @@ mod tests {
                         .unwrap_or_else(|| panic!("`{field}` must not be null"))
                 );
                 assert!(msg.contains(field), "got: {msg}");
+            }
+        }
+    }
+
+    // ── Attestation schema 3: the Android block ──────────────────────
+    //
+    // Schema 2's document plus the signed APK's two facts. No claim
+    // substitutes them yet (a claim binds one release after the templates
+    // that declare it), so the schema-2 fixture's claims render unchanged
+    // and the schema-3 document is that fixture with the block added.
+
+    const SIGNED_APK: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+    const SIGNING_CERT: &str = "6666666666666666666666666666666666666666666666666666666666666666";
+
+    fn schema_three_fixture() -> serde_json::Value {
+        let mut attestation = schema_two_fixture();
+        attestation["schema_version"] = serde_json::json!(3);
+        attestation["android_signed_apk_sha256"] = serde_json::json!(SIGNED_APK);
+        attestation["android_signing_certificate_sha256"] = serde_json::json!(SIGNING_CERT);
+        attestation
+    }
+
+    #[test]
+    fn schema_three_attestation_verifies_and_surfaces_both_blocks() {
+        let verified = verify_fixture(&schema_three_fixture(), &[1, 2, 3])
+            .expect("a schema-3 attestation verifies against the committed templates");
+        let android = verified
+            .android
+            .expect("schema 3 records the Android block");
+        assert_eq!(android.signed_apk_sha256, SIGNED_APK);
+        assert_eq!(android.signing_certificate_sha256, SIGNING_CERT);
+        assert!(
+            verified.apple.is_some(),
+            "schema 3 keeps schema 2's Apple block"
+        );
+        // Below schema 3 there is no Android block to surface.
+        let verified = verify_fixture(&schema_two_fixture(), &[1, 2, 3]).unwrap();
+        assert_eq!(verified.android, None);
+    }
+
+    #[test]
+    fn the_committed_trust_root_accepts_schema_three() {
+        assert!(
+            trust_root::SUPPORTED_ATTESTATION_SCHEMA_VERSIONS.contains(&3),
+            "the accept side ships a release before anything signs schema 3"
+        );
+        verify_fixture(
+            &schema_three_fixture(),
+            trust_root::SUPPORTED_ATTESTATION_SCHEMA_VERSIONS,
+        )
+        .expect("this build reads a schema-3 attestation");
+    }
+
+    #[test]
+    fn schema_three_attestation_is_refused_by_a_client_pinned_below_it() {
+        let err = verify_fixture(&schema_three_fixture(), &[1, 2])
+            .expect_err("a client pinned to [1, 2] must not read a schema-3 attestation");
+        assert!(
+            format!("{err}").contains("schema_version 3 not in supported set"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn schema_two_attestation_may_not_carry_android_fields() {
+        for field in ANDROID_FIELDS {
+            let mut attestation = schema_two_fixture();
+            attestation[field] = serde_json::json!(SIGNED_APK);
+            let err = verify_fixture(&attestation, &[1, 2, 3])
+                .expect_err("android fields at schema 2 are not a shape any release produced");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(field) && msg.contains("only from schema 3 on"),
+                "got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_three_attestation_must_carry_both_blocks() {
+        for field in ANDROID_FIELDS {
+            let mut attestation = schema_three_fixture();
+            attestation.as_object_mut().unwrap().remove(field);
+            let err = verify_fixture(&attestation, &[1, 2, 3])
+                .expect_err("a schema-3 attestation omitting an android field is refused");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(field) && msg.contains("from schema 3 on records"),
+                "got: {msg}"
+            );
+        }
+        let mut attestation = schema_three_fixture();
+        attestation
+            .as_object_mut()
+            .unwrap()
+            .remove("apple_signing_identifier");
+        let err = verify_fixture(&attestation, &[1, 2, 3])
+            .expect_err("schemas only add: schema 3 records the Apple block too");
+        assert!(
+            format!("{err}").contains("apple_signing_identifier"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn android_fields_are_lowercase_hex_hashes_and_never_null() {
+        for field in ANDROID_FIELDS {
+            for bad in [
+                serde_json::Value::Null,
+                serde_json::json!("AB".repeat(32)),
+                serde_json::json!(&SIGNED_APK[1..]),
+                serde_json::json!(format!("sha256:{}", &SIGNED_APK[7..])),
+            ] {
+                let mut attestation = schema_three_fixture();
+                attestation[field] = bad.clone();
+                let err = verify_fixture(&attestation, &[1, 2, 3])
+                    .expect_err("a malformed android field is refused");
+                assert!(format!("{err}").contains(field), "{bad}: {err}");
             }
         }
     }

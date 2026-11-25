@@ -184,7 +184,7 @@ impl From<ReadFailure> for AppError {
 /// it, so a ceiling checked afterwards is a ceiling on the value and not on the
 /// cost. A read that fails hands back the prefix it had ([`ReadFailure`]).
 pub(crate) async fn read_bounded(
-    response: reqwest::Response,
+    response: crate::transport::Response,
     ceiling: usize,
 ) -> Result<BoundedBody, ReadFailure> {
     use futures_util::StreamExt;
@@ -225,9 +225,9 @@ pub(crate) async fn read_bounded(
 /// syntax one — and it names the ceiling rather than the size, because the size
 /// is the peer's claim.
 pub(crate) async fn read_api_answer(
-    response: reqwest::Response,
+    response: crate::transport::Response,
     what: &str,
-) -> Result<(reqwest::StatusCode, String), AppError> {
+) -> Result<(http::StatusCode, String), AppError> {
     let status = response.status();
     let body = read_bounded(response, API_ANSWER_MAX_BYTES).await?;
     Ok((status, whole_text(body, what)?))
@@ -258,7 +258,7 @@ mod tests {
     use super::*;
 
     /// A one-shot loopback server answering with `body`. The bound lives on a
-    /// real `reqwest::Response`, so the only honest way to hold it is against
+    /// real `crate::transport::Response`, so the only honest way to hold it is against
     /// one.
     async fn serving_once(body: Vec<u8>) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -293,7 +293,7 @@ mod tests {
         addr
     }
 
-    async fn get(addr: std::net::SocketAddr) -> reqwest::Response {
+    async fn get(addr: std::net::SocketAddr) -> crate::transport::Response {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         reqwest::Client::builder()
             .build()
@@ -302,6 +302,7 @@ mod tests {
             .send()
             .await
             .expect("send")
+            .into()
     }
 
     /// **The bound is on the bytes, not on the value.** A ceiling checked after
@@ -339,7 +340,7 @@ mod tests {
         let (status, text) = read_api_answer(get(addr).await, "the model list")
             .await
             .expect("read");
-        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(status, http::StatusCode::OK);
         assert_eq!(text, r#"{"data":[]}"#);
     }
 }
