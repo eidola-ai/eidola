@@ -40,9 +40,15 @@ final class PhoneUITests: XCTestCase {
     /// is up, then retry what failed (the onboarding's terms read offers a retry).
     private func allowLocalNetwork() {
         #if !targetEnvironment(simulator)
-            let allow = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.buttons["Allow"]
+            let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+            let allow = springboard.alerts.buttons["Allow"]
             guard allow.exists else { return }
-            allow.tap()
+            // The alert can close between the check and the tap (answered on the device itself), and
+            // an element tap then fails the test: tap where the button was, only while it is still up.
+            let frame = allow.frame
+            guard allow.exists, !frame.isEmpty else { return }
+            springboard.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: frame.midX, dy: frame.midY)).tap()
             let retry = app.webViews.firstMatch.descendants(matching: .any)
                 .matching(NSPredicate(format: "label ENDSWITH '/retry'")).firstMatch
             if retry.waitForExistence(timeout: 5) {
@@ -451,7 +457,11 @@ final class PhoneUITests: XCTestCase {
         XCTAssertTrue(safari.wait(for: .runningForeground, timeout: 30), "the browser did not open")
         sleep(4)
         shot("28-checkout-in-the-browser")
-        XCTAssertEqual(app.state, .runningBackground)
+        // A phone sends the app to the background; an iPad may open the browser in a window over
+        // it, leaving it in the foreground, and the return is then only a regained focus.
+        if UIDevice.current.userInterfaceIdiom == .phone {
+            XCTAssertEqual(app.state, .runningBackground)
+        }
         app.activate()
         waitFor("purchase/opened", timeout: 30)
         // Back in the foreground, the balance is read again: the purchase is in it.

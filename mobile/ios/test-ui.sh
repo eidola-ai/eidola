@@ -22,7 +22,8 @@
 # at ADDRESS (default this Mac's en0 address). It keeps the app installed (and its local network
 # grant; the tests allow the prompt when a new install raises it) and starts the profile afresh by
 # blanking its files; the device's own language decides the keyboard, so the Pinyin test is
-# Simulator-only.
+# Simulator-only, and the runner cannot type at a usable pace on a device, so the conversation and
+# the night relaunch are too (the checklist has them by hand).
 # STUB_PORT, UPDATE_PORT  the model stub's and the update fixtures' ports on this machine
 #                         (default 8790, 8791), so two runs on one machine stay apart
 # Uses (and creates once per runtime) its own simulators, "eidola-phone" and "eidola-phone-zh" (its
@@ -149,6 +150,7 @@ run_test() { # run_test DESTINATION METHOD
   TEST_RUNNER_SHOTS="$OUT" xcodebuild -project "$HERE/EidolaShell.xcodeproj" -scheme EidolaShell \
     -configuration Debug -derivedDataPath "$HERE/build/DerivedData" -destination "id=$1" \
     -resultBundlePath "$HERE/build/ui-$2.xcresult" -only-testing:"EidolaShellUITests/PhoneUITests/$2" \
+    -collect-test-diagnostics never \
     "${SIGNING[@]}" test 2>&1 | grep -E "Test Case|error:|\*\* TEST|failed"
   return "${PIPESTATUS[0]}"
 }
@@ -168,15 +170,26 @@ if [[ $FIRST -eq 0 ]]; then
     FIRST=1
   fi
 fi
-run_test "$UDID" testConversation
-STATUS=$?
+if [[ -z "$DEVICE" ]]; then
+  run_test "$UDID" testConversation
+  STATUS=$?
+fi
 run_test "$UDID" testSettings
 SETTINGS=$?
-# The same profile after a cold launch, with the device switched to dark.
-appearance "$UDID" dark
-run_test "$UDID" testRelaunchAtNight
-NIGHT=$?
-appearance "$UDID" light
+if [[ -z "$DEVICE" ]]; then
+  # The same profile after a cold launch, with the device switched to dark.
+  appearance "$UDID" dark
+  run_test "$UDID" testRelaunchAtNight
+  NIGHT=$?
+  appearance "$UDID" light
+else
+  # On a device the test runner types about a key a minute and loses keys (it waits for the app to
+  # settle before each, and a focused composer never does), so the conversation, and the night
+  # relaunch that reopens it, are done by hand there (mobile/device-checklist.md).
+  STATUS=0
+  NIGHT=0
+  echo "conversation and night: not run on a device (by hand: mobile/device-checklist.md)"
+fi
 run_test "$UDID" testUpdate
 UPDATE=$?
 kill -INT "$VIDEO" 2>/dev/null && wait "$VIDEO" 2>/dev/null

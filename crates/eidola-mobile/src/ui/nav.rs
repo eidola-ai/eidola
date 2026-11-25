@@ -73,14 +73,14 @@ thread_local! {
     };
 }
 
-/// The page came back to the foreground (`visibilitychange` to visible:
-/// the reader returned from another app, the browser after a checkout among
-/// them), as the app's one listener receives it.
+/// The reader came back to the app (the page visible again, or its window
+/// focused again after losing focus: back from another app, the browser after
+/// a checkout among them), as the app's one listener receives it.
 pub fn foreground_events() -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
     FOREGROUND.with(|f| f.borrow_mut().1.take())
 }
 
-/// The page became visible again.
+/// The reader came back to the app.
 pub fn came_to_foreground() {
     FOREGROUND.with(|f| {
         let _ = f.borrow().0.send(());
