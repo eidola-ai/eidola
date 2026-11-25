@@ -76,7 +76,9 @@ echo $! >>"$DIR/pids"
 wait_port "$EDGE_PORT"
 mkdir -p "$DIR/certs"
 LAN="${ACCOUNT_STACK_HOST:-}"
-CERT_DIR="$DIR/certs" LISTEN_ADDR="${LAN:+0.0.0.0}${LAN:-127.0.0.1}:$SHIM_PORT" UPSTREAM_URL="http://127.0.0.1:$EDGE_PORT" \
+BIND=127.0.0.1
+[[ -n "$LAN" ]] && BIND=0.0.0.0
+CERT_DIR="$DIR/certs" LISTEN_ADDR="$BIND:$SHIM_PORT" UPSTREAM_URL="http://127.0.0.1:$EDGE_PORT" \
   DEV_MEASUREMENT="$MEASUREMENT" EXTRA_TLS_NAMES="10.0.2.2${LAN:+,$LAN}" "$BIN/tinfoil-shim-mock" >"$DIR/shim.log" 2>&1 &
 echo $! >>"$DIR/pids"
 wait_port "$SHIM_PORT"
