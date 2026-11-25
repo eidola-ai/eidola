@@ -2,7 +2,7 @@
 
 use crate::tokenizer::{
     CONFIG_FILE, GENERATION_CONFIG_FILE, PINNED_DEEPSEEK_V4_1_TOKENIZER_SHA256,
-    PINNED_QWEN3_8_TOKENIZER_SHA256, PINNED_TOKENIZER_SHA256,
+    PINNED_QWEN3_5_TOKENIZER_SHA256, PINNED_QWEN3_8_TOKENIZER_SHA256, PINNED_TOKENIZER_SHA256,
 };
 
 /// A model architecture's prompt and output format. The caller picks it from
@@ -20,6 +20,12 @@ pub enum ChatFormat {
     /// ([`crate::qwen::ChatTemplate`]) and `<tool_call>` markup with each tag
     /// on its own line.
     Qwen3_8,
+    /// Qwen3.5 (2B and 0.8B, text only): the model's own Jinja template
+    /// ([`crate::qwen::ChatTemplate`], Qwen3.5's), Qwen3.8's markup and
+    /// parsers, thinking off unless asked for. Its end-of-sequence ids are
+    /// `config.json`'s `text_config.eos_token_id` and the turn's end,
+    /// `<|im_end|>` (the checkpoints ship no `generation_config.json`).
+    Qwen3_5,
 }
 
 impl ChatFormat {
@@ -28,7 +34,7 @@ impl ChatFormat {
     pub fn eos_config_file(self) -> &'static str {
         match self {
             ChatFormat::MimoV2_6 | ChatFormat::Qwen3_8 => GENERATION_CONFIG_FILE,
-            ChatFormat::DeepSeekV4_1 => CONFIG_FILE,
+            ChatFormat::DeepSeekV4_1 | ChatFormat::Qwen3_5 => CONFIG_FILE,
         }
     }
 
@@ -38,6 +44,7 @@ impl ChatFormat {
             ChatFormat::MimoV2_6 => PINNED_TOKENIZER_SHA256,
             ChatFormat::DeepSeekV4_1 => PINNED_DEEPSEEK_V4_1_TOKENIZER_SHA256,
             ChatFormat::Qwen3_8 => PINNED_QWEN3_8_TOKENIZER_SHA256,
+            ChatFormat::Qwen3_5 => PINNED_QWEN3_5_TOKENIZER_SHA256,
         }
     }
 }

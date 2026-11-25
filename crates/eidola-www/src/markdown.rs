@@ -8,9 +8,12 @@
 //! doesn't host source files). Absolute URLs, fragments, and site-absolute
 //! paths pass through untouched.
 
-use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{
+    CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html,
+};
 
 use crate::content::{Heading, docs_route};
+use crate::diagram;
 
 const GITHUB_BLOB_BASE: &str = "https://github.com/eidola-ai/eidola/blob/main";
 
@@ -90,8 +93,9 @@ fn plain_text(events: &[Event]) -> String {
     out
 }
 
-/// Render a markdown body to HTML.
-pub fn render(body: &str, source_dir: &str) -> Rendered {
+/// Render a markdown body to HTML. Fails only on a `mermaid` block that
+/// cannot be drawn (see [`diagram`]).
+pub fn render(body: &str, source_dir: &str) -> Result<Rendered, String> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_FOOTNOTES);
@@ -176,14 +180,54 @@ pub fn render(body: &str, source_dir: &str) -> Rendered {
         }
     }
 
+    // Mermaid blocks become inline SVG, once every heading has its id so a
+    // labelled line can be checked against the section it links to.
+    let mut drawn = 0;
+    let mut i = 0;
+    while i < events.len() {
+        let is_mermaid = matches!(
+            &events[i],
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang))) if lang.as_ref() == "mermaid"
+        );
+        if !is_mermaid {
+            i += 1;
+            continue;
+        }
+        let end = events[i..]
+            .iter()
+            .position(|e| matches!(e, Event::End(TagEnd::CodeBlock)))
+            .map(|off| i + off)
+            .unwrap_or(events.len() - 1);
+        let source: String = events[i + 1..end]
+            .iter()
+            .filter_map(|e| match e {
+                Event::Text(t) => Some(t.as_ref()),
+                _ => None,
+            })
+            .collect();
+        let svg = diagram::render(
+            &source,
+            &diagram::Context {
+                index: drawn,
+                sections: &used_ids,
+                link: &|target| rewrite_link(target, source_dir),
+                slug: &slugify,
+            },
+        )
+        .map_err(|e| format!("diagram {}: {e}", drawn + 1))?;
+        events.splice(i..=end, [Event::Html(CowStr::from(svg))]);
+        drawn += 1;
+        i += 1;
+    }
+
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
-    Rendered {
+    Ok(Rendered {
         html: out,
         first_heading,
         first_paragraph,
         headings,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -235,7 +279,8 @@ mod tests {
         let r = render(
             "# The Title\n\nFirst para.\n\n## A section\n\n## A section\n",
             "",
-        );
+        )
+        .unwrap();
         assert_eq!(r.first_heading.as_deref(), Some("The Title"));
         assert_eq!(r.first_paragraph.as_deref(), Some("First para."));
         assert!(r.html.contains("<h1 id=\"the-title\">"));
@@ -247,7 +292,7 @@ mod tests {
     fn gfm_alerts_render_with_kind_classes() {
         // ENABLE_GFM: the `[!NOTE]` marker line is consumed and the kind
         // arrives as a class site.css styles (colored rule + label).
-        let r = render("> [!NOTE]\n> Markers become classes.\n", "");
+        let r = render("> [!NOTE]\n> Markers become classes.\n", "").unwrap();
         assert!(
             r.html
                 .contains("<blockquote class=\"markdown-alert-note\">")

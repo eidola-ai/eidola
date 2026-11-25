@@ -28,9 +28,10 @@
 //! rather than a choice between values.
 
 use anyhow::{Context, Result, bail, ensure};
+use eidola_common::engine_deployment::deployment::read_release_manifest;
 use igvm::{IgvmDirectiveHeader, IgvmFile, IgvmInitializationHeader, IgvmPlatformHeader};
 use igvm_defs::{IgvmPageDataType, IgvmPlatformType};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256, Sha384};
 use zerocopy::IntoBytes;
 
@@ -268,28 +269,6 @@ pub fn guest_policy_hex(policy: u64) -> String {
     format!("{policy:#x}")
 }
 
-/// The fields of a cvmimage release manifest this tool reads.
-#[derive(Deserialize)]
-struct ReleaseManifest {
-    version: String,
-    igvm: ReleaseIgvm,
-}
-
-#[derive(Deserialize)]
-struct ReleaseIgvm {
-    /// Layout version of this `igvm` block. Only version 1 is understood.
-    format_version: u32,
-    /// SHA-256 of the SEV-SNP IGVM image.
-    snp: String,
-    snp_launch: SnpLaunch,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SnpLaunch {
-    measurement: String,
-}
-
 /// The SEV-SNP launch identity of one deployment of one release: the
 /// `releases/trust/server-enclave.json` record, less its envelope.
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -334,13 +313,9 @@ pub fn release_pin(manifest: &[u8], igvm: &[u8], config: &[u8]) -> Result<SnpLau
         actual == pinned,
         "config pins release manifest {pinned}, but the manifest supplied is {actual}"
     );
-    let parsed: ReleaseManifest =
-        serde_json::from_slice(manifest).context("parsing release manifest")?;
-    ensure!(
-        parsed.igvm.format_version == 1,
-        "release manifest igvm.format_version {} is not supported",
-        parsed.igvm.format_version
-    );
+    // The manifest is read by the rule the gateway's build holds a vendored
+    // one to, so the two cannot disagree on what a release states.
+    let parsed = read_release_manifest(manifest).map_err(anyhow::Error::msg)?;
     ensure!(
         parsed.version == format!("v{}", selected.version),
         "config selects cvm-version {}, but the release manifest is {}",
@@ -350,19 +325,19 @@ pub fn release_pin(manifest: &[u8], igvm: &[u8], config: &[u8]) -> Result<SnpLau
 
     let igvm_sha256 = hex::encode(Sha256::digest(igvm));
     ensure!(
-        igvm_sha256 == parsed.igvm.snp.to_ascii_lowercase(),
+        igvm_sha256 == parsed.sev_snp.igvm_sha256,
         "IGVM image SHA-256 is {igvm_sha256}, but release {} records {}",
         parsed.version,
-        parsed.igvm.snp
+        parsed.sev_snp.igvm_sha256
     );
     let image = launch_digest_from_igvm(igvm)?;
     let measurement = hex::encode(image.measurement);
     ensure!(
-        measurement == parsed.igvm.snp_launch.measurement.to_ascii_lowercase(),
+        measurement == parsed.sev_snp.measurement,
         "recomputed SEV-SNP launch digest {measurement} disagrees with the digest release {} \
          states, {}",
         parsed.version,
-        parsed.igvm.snp_launch.measurement
+        parsed.sev_snp.measurement
     );
     Ok(SnpLaunchPin {
         cvm_version: format!("{}@sha256:{pinned}", selected.version),
@@ -376,7 +351,7 @@ pub fn release_pin(manifest: &[u8], igvm: &[u8], config: &[u8]) -> Result<SnpLau
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use igvm::IgvmRevision;
     use igvm::snp_defs::SevVmsa;
@@ -416,11 +391,11 @@ mod tests {
         out
     }
 
-    fn image(directives: Vec<IgvmDirectiveHeader>) -> Vec<u8> {
+    pub(crate) fn image(directives: Vec<IgvmDirectiveHeader>) -> Vec<u8> {
         image_with(Some(POLICY), directives)
     }
 
-    fn page(gpa: u64, fill: u8) -> IgvmDirectiveHeader {
+    pub(crate) fn page(gpa: u64, fill: u8) -> IgvmDirectiveHeader {
         IgvmDirectiveHeader::PageData {
             gpa,
             compatibility_mask: SNP_MASK,
@@ -451,7 +426,7 @@ mod tests {
         }
     }
 
-    fn vmsa() -> IgvmDirectiveHeader {
+    pub(crate) fn vmsa() -> IgvmDirectiveHeader {
         vmsa_with(VMSA_GPA, 0, 0x1000)
     }
 
@@ -707,9 +682,15 @@ mod tests {
             "igvm": {
                 "format_version": 1,
                 "snp": hex::encode(Sha256::digest(igvm)),
-                "tdx": "00",
+                "tdx": "22".repeat(32),
                 "snp_launch": {"measurement": measurement},
-                "tdx_launch": {},
+                "tdx_launch": {
+                    "mrtd": "33".repeat(48),
+                    "rtmr0": "00".repeat(48),
+                    "rtmr1": "00".repeat(48),
+                    "rtmr2": "00".repeat(48),
+                    "rtmr3": "00".repeat(48),
+                },
             },
         }))
         .unwrap()

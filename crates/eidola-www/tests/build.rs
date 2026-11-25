@@ -142,6 +142,16 @@ fn builds_the_real_site() {
     assert!(!read(&out, "privacy/index.html").contains("class=\"toc\""));
     assert!(read(&out, "assets/toc.js").contains("aria-current"));
 
+    // A mermaid block is drawn as an inline SVG: its lines link to the
+    // page's own sections and its nodes through the page's link rewriting,
+    // and the source block itself is gone.
+    let architecture = read(&out, "docs/architecture/index.html");
+    assert!(architecture.contains("<figure class=\"diagram\"><svg"));
+    assert!(architecture.contains("<a href=\"#chat\">"));
+    assert!(architecture.contains("<h3 id=\"chat\">"));
+    assert!(architecture.contains("<a href=\"/docs/gateway/\"><title>Gateway</title>"));
+    assert!(!architecture.contains("language-mermaid"));
+
     // Every docs page carries an edit link to its own source; nothing
     // else does.
     assert!(client.contains("https://github.com/eidola-ai/eidola/edit/main/docs/client.md"));

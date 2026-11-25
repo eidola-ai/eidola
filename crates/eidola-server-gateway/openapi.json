@@ -1717,13 +1717,17 @@
           "issuance_response",
           "issuer_key_id",
           "credits",
-          "ledger_entry_id"
+          "issuance_id"
         ],
         "properties": {
           "credits": {
             "type": "integer",
             "format": "int64",
             "description": "Number of credits issued."
+          },
+          "issuance_id": {
+            "type": "string",
+            "description": "Stable identity of this issuance and all ledger allocations funding it."
           },
           "issuance_response": {
             "type": "string",
@@ -1732,10 +1736,6 @@
           "issuer_key_id": {
             "type": "string",
             "description": "Issuer key identifier: hex-encoded SHA-256(pkI_serialized)."
-          },
-          "ledger_entry_id": {
-            "type": "string",
-            "description": "The ledger entry ID for this issuance."
           }
         }
       },
@@ -1794,7 +1794,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "This ledger row's contribution to an issuance, which may span multiple purchase lots."
           },
           "credential_key_id": {
             "type": [

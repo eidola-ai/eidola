@@ -25,7 +25,6 @@ use eidola_engine_cuda::qwen::{
 };
 use eidola_engine_cuda::{Gpu, KernelDir};
 use eidola_engine_model::deepseek::DsConfig;
-use eidola_engine_model::qwen::config::LayerKind;
 use eidola_engine_model::qwen::{QwenConfig, QwenModel};
 use eidola_engine_model::safetensors::WeightSet;
 
@@ -67,8 +66,8 @@ const RETENTION_POINTS: u64 = 3;
 /// bytes are the executor's own (`GroupGeometry::block_bytes`). The rule reads only
 /// measured values, never the device, so the same configuration derives the same counts
 /// on every node. Its least accepted budget is
-/// `eidola_common::engine_deployment::cuda_kv_min_bytes`, which the gateway's build
-/// holds every pinned deployment to; the two are kept equal by a test here.
+/// `eidola_common::engine_deployment::cuda_kv_min_bytes`, the sizing aid's; the two are
+/// kept equal by a test here.
 /// The executor's bytes per block of group `g` (`GroupGeometry::block_bytes`: BF16 K and
 /// V of every layer, and a drafter block's boundary tap of `hidden` f32 per depth).
 fn group_block_bytes(g: &KvGroupSpec, sizing: &Sizing, hidden: u32) -> Result<u64, BootError> {
@@ -99,12 +98,12 @@ fn group_block_bytes(g: &KvGroupSpec, sizing: &Sizing, hidden: u32) -> Result<u6
 /// pools' mix (`device`, as [`derive_kv_blocks`] gave it) scaled to the budget, so each
 /// group `g` with `n_g` device blocks of `b_g` bytes gets `floor(n_g × H / Σ n_h b_h)`
 /// host blocks (`H` = `kv_host_bytes`), the null block among them. The blocks' bytes then
-/// sum to at most `H`, which the gateway's build charges to the VM's memory
+/// sum to at most `H`, which the sizing aid charges to the VM's memory
 /// (`engine_deployment::check_resources`). The host tier takes what the device pools hold
 /// when they run short, in the same mix. 0 gives no host tier; a budget too small for two
 /// blocks in every group is refused. The least accepted budget is
-/// `eidola_common::engine_deployment::cuda_kv_host_min_bytes`, which the gateway's build
-/// holds every pinned deployment to; the two are kept equal by a test here.
+/// `eidola_common::engine_deployment::cuda_kv_host_min_bytes`, the sizing aid's; the two
+/// are kept equal by a test here.
 pub fn derive_host_blocks(
     spec: &ModelSpec,
     hidden: u32,
@@ -741,29 +740,7 @@ pub fn prepare_deepseek(
 /// bit, is the verification mode.
 pub const QWEN_PROFILE: QwenProfile = QwenProfile::Fast;
 
-/// The dimensions the shared rules count Qwen3.8's pools, seats and scratch from
-/// (`eidola_common::architecture::HybridDims`), of the model loaded: the released
-/// model's are `eidola_common::architecture::QWEN38_DIMS`.
-pub fn qwen_dims(c: &QwenConfig) -> HybridDims {
-    let deltanet = c.layers_of(LayerKind::DeltaNet).count() as u64;
-    let attention = c.layers_of(LayerKind::Attention).count() as u64;
-    let (a, d) = (&c.attention, &c.deltanet);
-    HybridDims {
-        hidden: c.hidden_size as u64,
-        intermediate: c.intermediate_size as u64,
-        vocab: c.vocab_size as u64,
-        attention_layers: attention,
-        deltanet_layers: deltanet,
-        q_heads: a.num_q_heads as u64,
-        kv_heads: a.num_kv_heads as u64,
-        head_dim: a.head_dim as u64,
-        rotary: a.rotary_dim as u64,
-        k_heads: d.num_k_heads as u64,
-        v_heads: d.num_v_heads as u64,
-        k_dim: d.k_head_dim as u64,
-        v_dim: d.v_head_dim as u64,
-    }
-}
+pub use crate::model::qwen_dims;
 
 /// The Qwen3.8 executor's device pools: every KV group (the target's attention layers
 /// and, drafting, the drafter's) `kv_blocks` blocks, and `state_buffers` state buffers,
@@ -887,7 +864,9 @@ pub fn derive_qwen_host_pools(
 /// ([`derive_qwen_host_pools`]); `DRAFT_TOKENS` drafts from the model's MTP layer; the
 /// live state strategy; `graphs` as configured: with `on`, construction captures a graph
 /// for every rung of the decode ladders of that one step shape (draft width 0, and
-/// `DRAFT_TOKENS` when drafting), and uniform decode steps replay them.
+/// `DRAFT_TOKENS` when drafting), and uniform decode steps replay them. A checkpoint the
+/// executor has no kernels for is refused first (`eidola_engine_cuda::qwen::check_supported`:
+/// Qwen3.5's BF16 weights and tied head).
 #[allow(clippy::too_many_arguments)]
 pub fn qwen_config(
     qwen: &QwenConfig,
@@ -898,6 +877,10 @@ pub fn qwen_config(
     graphs: CudaGraphs,
     sampleable_vocab_size: u32,
 ) -> Result<QwenCudaExecutorConfig, BootError> {
+    // Qwen3.5's BF16 weights and tied head have no kernels here: the cpu executor serves
+    // them.
+    eidola_engine_cuda::qwen::check_supported(qwen)
+        .map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
     if sizing.draft_tokens > 0 && qwen.mtp_layers == 0 {
         return Err(BootError(format!(
             "{} ({}) needs the model's MTP layer, and it has none",
@@ -971,7 +954,8 @@ impl QwenPrepared {
     }
 }
 
-/// Qwen3.8's refusals that need no device, in order ([`qwen_config`]: the MTP layer for
+/// Qwen3.8's refusals that need no device, in order ([`qwen_config`]: a checkpoint the
+/// executor has no kernels for (Qwen3.5's), the MTP layer for
 /// the draft width, the pools from the budget and the host tier's), then,
 /// with `gpu_cc` required, the GPUs' confidential-computing state (`crate::gpu_cc`), then
 /// the device, whose memory the budget must be less than. Nothing is allocated on the
@@ -988,7 +972,7 @@ pub fn prepare_qwen(
     gpu_cc: GpuCc,
 ) -> Result<QwenPrepared, BootError> {
     let Served::Qwen { model: qwen, .. } = model.served() else {
-        return Err(BootError("the loaded model is not Qwen3.8".into()));
+        return Err(BootError("the loaded model is not a Qwen model".into()));
     };
     let config = qwen_config(
         qwen.config(),
@@ -1292,7 +1276,7 @@ mod tests {
         }
     }
 
-    /// The gateway's build holds a pinned deployment's budget to
+    /// The sizing aid holds a deployment's budget to
     /// `cuda_kv_min_bytes`; it is exactly the least this derivation accepts, across
     /// block sizes, seats, step sizes, the cache switch and the draft width.
     #[test]
@@ -1325,7 +1309,7 @@ mod tests {
         }
     }
 
-    /// The gateway's build holds a pinned deployment's non-zero host tier to
+    /// The sizing aid holds a deployment's non-zero host tier to
     /// `cuda_kv_host_min_bytes`; it is exactly the least the host derivation accepts
     /// for the device pools the same configuration derives, across block sizes, seats,
     /// step sizes, the draft width and device budgets.
@@ -1501,7 +1485,7 @@ mod tests {
         ],
     ];
 
-    /// The gateway's build holds a pinned DeepSeek-V4.1 deployment's per-device budgets
+    /// The sizing aid holds a DeepSeek-V4.1 deployment's per-device budgets
     /// to `cuda_kv_min_bytes` and its host tier to the devices' `cuda_kv_host_min_bytes`
     /// summed. Over the released configuration (the shared `DEEPSEEK_V41_FLASH` shapes)
     /// and the dev model's (`DEV_GROUPS`, window 48), across block sizes, context lengths,
@@ -1709,7 +1693,7 @@ mod tests {
         }
     }
 
-    /// The gateway's build bounds each device's step scratch by
+    /// The sizing aid bounds each device's step scratch by
     /// `engine_deployment::step_scratch_bytes` of the released shapes
     /// (`DEEPSEEK_V41_FLASH`'s `step_scratch`). Across contexts, step sizes (below and
     /// above a draft pass's rows), seats and draft widths, laid out by the executor
@@ -1769,7 +1753,7 @@ mod tests {
         }
     }
 
-    /// A gateway never pins a DeepSeek-V4.1 deployment the node cannot lay out. At its
+    /// The sizing aid admits no DeepSeek-V4.1 sizing the node cannot lay out. At its
     /// whole 2^20-position window, with each device's budget the most the shared check
     /// accepts (`check_device_resources`: the budget, `device_weights_bytes` and
     /// `cuda_device_reserve_bytes` exactly a B300's memory; one byte more is refused),

@@ -132,8 +132,8 @@ pub struct AcceptedDeployment {
     /// holds pins to).
     pub config: String,
     /// SHA-256 of the deployment's committed `tinfoil-config.yml` (lowercase
-    /// hex): what placement data names a deployment by, and, on TDX, the
-    /// launch's MRCONFIGID.
+    /// hex): what placement data names a deployment by, and the hash its
+    /// launch carries (MRCONFIGID on TDX, HOST_DATA on SEV-SNP).
     pub config_sha256: String,
     /// The attestation pin, in `tinfoil-verifier`'s shape.
     pub pin: AllowedMeasurement,

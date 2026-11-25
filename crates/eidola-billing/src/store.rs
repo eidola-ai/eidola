@@ -1186,7 +1186,7 @@ impl Store {
         let mut c = self.client().await?;
         let tx = c.transaction().await.map_err(db)?;
         lock_account(&tx, account).await?;
-        let count=tx.execute("UPDATE account SET billing_state='closing',billing_closed_at=clock_timestamp() WHERE id=$1 AND billing_state='open'", &[&account]).await.map_err(db)?;
+        let count=tx.execute("UPDATE account SET billing_state='closing',billing_close_requested_at=clock_timestamp() WHERE id=$1 AND billing_state='open'", &[&account]).await.map_err(db)?;
         if count > 0 {
             tx.execute(
                 "INSERT INTO billing_operation(account_id,kind,reason) VALUES($1,'closure',$2)",
@@ -1207,7 +1207,7 @@ impl Store {
         Ok(c.query(
             "SELECT p.*,SUM(cl.delta)::BIGINT AS remaining FROM billing_purchase p \
             JOIN account a ON a.id=p.account_id JOIN credit_ledger cl ON cl.purchase_id=p.id \
-            WHERE p.account_id=$1 AND (p.expires_at>COALESCE(a.billing_closed_at,clock_timestamp()) OR p.purchased_at>=a.billing_closed_at) \
+            WHERE p.account_id=$1 AND (p.expires_at>COALESCE(a.billing_close_requested_at,clock_timestamp()) OR p.purchased_at>=a.billing_close_requested_at) \
             GROUP BY p.id HAVING SUM(cl.delta)>0 ORDER BY p.expires_at,p.id",
             &[&account],
         )
@@ -1234,7 +1234,7 @@ impl Store {
         let unsettled:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM billing_refund_operation r JOIN billing_operation o ON o.id=r.id \
             WHERE o.account_id=$1 AND r.state NOT IN ('succeeded','released','superseded')) OR EXISTS(SELECT 1 FROM billing_purchase p \
             JOIN account a ON a.id=p.account_id JOIN credit_ledger cl ON cl.purchase_id=p.id WHERE p.account_id=$1 \
-            AND (p.expires_at>COALESCE(a.billing_closed_at,clock_timestamp()) OR p.purchased_at>=a.billing_closed_at) GROUP BY p.id HAVING SUM(cl.delta)>0)", &[&account]).await.map_err(db)?.get(0);
+            AND (p.expires_at>COALESCE(a.billing_close_requested_at,clock_timestamp()) OR p.purchased_at>=a.billing_close_requested_at) GROUP BY p.id HAVING SUM(cl.delta)>0)", &[&account]).await.map_err(db)?.get(0);
         if unsettled {
             return Err(BillingError::Conflict(
                 "account still has unsettled refunds".into(),
@@ -1652,7 +1652,7 @@ async fn quote(c: &impl GenericClient, r: &RefundRequest) -> Result<RefundOperat
             "purchase not found for account".into(),
         ));
     }
-    let row=c.query_one("SELECT (p.expires_at>COALESCE(a.billing_closed_at,clock_timestamp()) OR COALESCE(p.purchased_at>=a.billing_closed_at,FALSE)) AS eligible, \
+    let row=c.query_one("SELECT (p.expires_at>COALESCE(a.billing_close_requested_at,clock_timestamp()) OR COALESCE(p.purchased_at>=a.billing_close_requested_at,FALSE)) AS eligible, \
         COALESCE((SELECT SUM(delta) FROM credit_ledger WHERE purchase_id=p.id),0)::BIGINT AS remaining, \
         clock_timestamp() AS requested_at FROM billing_purchase p JOIN account a ON a.id=p.account_id WHERE p.id=$1", &[&p.id]).await.map_err(db)?;
     if r.credits > 0

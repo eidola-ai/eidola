@@ -5,12 +5,20 @@
 //! the gateway's build, before it accepts a pin for the deployment, and
 //! `measure-enclave`, before it emits one. Every rule this module states
 //! (the key allow-list, the one digest-pinned container, the measured env,
-//! the shim, the weights pack, the VM shape, the platform image, GPU
-//! attestation and the node's own GPU confidential-computing check) is applied here
-//! and nowhere else, so the two cannot drift. What is left to each caller is
-//! what only it has: the gateway compares the pin it is given with the
-//! returned [`Deployment`], and the measurer computes the launch identity
-//! from the platform release.
+//! the shim, the weights pack, the platform image, GPU attestation, the
+//! node's own GPU confidential-computing check, and which TEE the pin is for)
+//! is applied here and nowhere else, so the two cannot drift. What is left to
+//! each caller is what only it has: the gateway compares the pin it is given
+//! with the returned [`Deployment`], and the measurer computes the launch
+//! identity from the platform release.
+//!
+//! Nothing here holds the deployment's sizing (the VM's `cpus` and `memory`,
+//! the GPU it runs on, KV budgets against either) to anything: the platform
+//! does not attest the machine's size, so a pin rule about it would assure
+//! nothing, and a node sized wrongly refuses to boot or serves less, which is
+//! a matter of liveness. The sizing aids beside this module
+//! ([`super::check_resources`], [`super::check_device_resources`]) say whether
+//! a sizing fits, for whoever writes one.
 //!
 //! Behind this crate's `deployment` feature, which adds `serde_yaml` only to
 //! the consumers that enable it.
@@ -18,10 +26,9 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Architecture, CacheConfig, ExecutorSettings, GpuCc, MeasuredConfig, ModelPack, SupportedGpu,
-    WeightsStorage, artifact_data_bytes, check_container_gpu_access, check_cvm_image,
-    check_device_resources, check_env_names, check_gpu_attestation, check_kernels_dir,
-    check_resources, check_secrets, check_shim_paths, check_vm_resources, check_weights_pack,
+    Architecture, CacheConfig, ExecutorSettings, GpuCc, MeasuredConfig, ModelPack, Tee,
+    WeightsStorage, check_container_gpu_access, check_cvm_image, check_env_names,
+    check_gpu_attestation, check_kernels_dir, check_secrets, check_shim_paths, check_weights_pack,
     deployment_env, env, is_safe_component, parse_cvm_version, parse_measured,
 };
 use crate::env::Env;
@@ -51,11 +58,43 @@ pub struct Deployment {
     pub weights_revision: String,
     /// The GPU evidence items a pin must require, if any.
     pub expected_gpus: Option<u64>,
-    /// The GPU its devices run on, which its device memory is held to.
-    pub gpu: SupportedGpu,
-    /// Where the Intel TDX machine policy comes from, when the deployment is
-    /// TDX.
-    pub tdx: Option<TdxMachines>,
+    /// The TEE the deployment is pinned on, and what that pin needs beyond
+    /// the release and the config.
+    pub platform: DeploymentPlatform,
+}
+
+/// The TEE a deployment is pinned on, as its sidecar states it. Both are
+/// pinned in the IGVM launch model, from the image its `cvm-version` names
+/// and the config's hash (HOST_DATA on SEV-SNP, MRCONFIGID on TDX); they
+/// differ in what pins the machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeploymentPlatform {
+    /// AMD SEV-SNP: the launch digest, HOST_DATA and the image's guest
+    /// policy, as the gateway itself is pinned for clients; the processor's
+    /// generation, chain and TCB floor are the attesting client's
+    /// (`tinfoil_verifier`'s SEV-SNP path), and no chip is named.
+    SevSnp,
+    /// Intel TDX: MRTD and MRCONFIGID, under the machine policy and PPID
+    /// allowlist derived from the platform endorsements these name.
+    Tdx(TdxMachines),
+}
+
+impl DeploymentPlatform {
+    /// Which TEE this is.
+    pub fn tee(&self) -> Tee {
+        match self {
+            DeploymentPlatform::SevSnp => Tee::SevSnp,
+            DeploymentPlatform::Tdx(_) => Tee::Tdx,
+        }
+    }
+
+    /// The TDX machines, for a TDX deployment.
+    pub fn tdx(&self) -> Option<&TdxMachines> {
+        match self {
+            DeploymentPlatform::Tdx(machines) => Some(machines),
+            DeploymentPlatform::SevSnp => None,
+        }
+    }
 }
 
 /// The machines a TDX deployment runs on: one policy of a platform
@@ -121,19 +160,42 @@ pub fn release_manifest_file(cvm_version: &str) -> Result<String, String> {
     ))
 }
 
-/// What a platform release manifest states about its TDX image.
+/// What a platform release manifest states about the images it publishes:
+/// each release image comes as one IGVM file per TEE, each with its own
+/// launch measurement.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReleaseTdxLaunch {
+pub struct ReleaseLaunch {
     /// The release the manifest describes, as it states it (`v0.15.3-rc.1+gpu`).
     pub version: String,
-    /// SHA-256 of the TDX IGVM image (`igvm.tdx`, lowercase hex).
-    pub igvm_sha256: String,
-    /// The image's MRTD (`igvm.tdx_launch.mrtd`, lowercase hex).
-    pub mrtd: String,
+    /// The SEV-SNP image: `igvm.snp`, and its launch digest
+    /// (`igvm.snp_launch.measurement`).
+    pub sev_snp: ReleaseImage,
+    /// The TDX image: `igvm.tdx`, and its MRTD (`igvm.tdx_launch.mrtd`).
+    pub tdx: ReleaseImage,
 }
 
-/// The members of a release manifest read here; the rest (the SEV-SNP
-/// image, the kernel command line, disk hashes) is not.
+/// One TEE's IGVM image of a release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseImage {
+    /// SHA-256 of the IGVM image (lowercase hex).
+    pub igvm_sha256: String,
+    /// The launch measurement the release states for it (lowercase hex, 48
+    /// bytes): the SEV-SNP launch digest, or the TDX MRTD.
+    pub measurement: String,
+}
+
+impl ReleaseLaunch {
+    /// The image of `tee`.
+    pub fn image(&self, tee: Tee) -> &ReleaseImage {
+        match tee {
+            Tee::SevSnp => &self.sev_snp,
+            Tee::Tdx => &self.tdx,
+        }
+    }
+}
+
+/// The members of a release manifest read here; the rest (the kernel
+/// command line, disk hashes) is not.
 #[derive(serde::Deserialize)]
 struct ReleaseManifestFile {
     version: String,
@@ -143,8 +205,16 @@ struct ReleaseManifestFile {
 #[derive(serde::Deserialize)]
 struct ReleaseIgvm {
     format_version: u32,
+    snp: String,
     tdx: String,
+    snp_launch: ReleaseSnpLaunchFile,
     tdx_launch: ReleaseTdxLaunchFile,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseSnpLaunchFile {
+    measurement: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -157,10 +227,11 @@ struct ReleaseTdxLaunchFile {
     rtmr3: String,
 }
 
-/// Read a release manifest's TDX launch statement, in the launch model the
-/// measurement implements: `igvm.format_version` 1, and RTMR0–RTMR3 zero
-/// (no measured boot after launch).
-pub fn read_release_manifest(manifest: &[u8]) -> Result<ReleaseTdxLaunch, String> {
+/// Read a release manifest's launch statements, in the launch model the
+/// measurement implements: `igvm.format_version` 1, both images' hashes and
+/// measurements lowercase hex at their widths, and RTMR0–RTMR3 zero (no
+/// measured boot after launch).
+pub fn read_release_manifest(manifest: &[u8]) -> Result<ReleaseLaunch, String> {
     let file: ReleaseManifestFile =
         serde_json::from_slice(manifest).map_err(|e| format!("parsing release manifest: {e}"))?;
     if file.igvm.format_version != 1 {
@@ -183,28 +254,40 @@ pub fn read_release_manifest(manifest: &[u8]) -> Result<ReleaseTdxLaunch, String
             ));
         }
     }
-    if !is_lower_hex(&file.igvm.tdx, 32) {
-        return Err("release manifest igvm.tdx must be 64 lowercase hex digits".to_string());
+    for (name, value, bytes) in [
+        ("igvm.snp", &file.igvm.snp, 32),
+        ("igvm.tdx", &file.igvm.tdx, 32),
+        (
+            "igvm.snp_launch.measurement",
+            &file.igvm.snp_launch.measurement,
+            48,
+        ),
+        ("igvm.tdx_launch.mrtd", &launch.mrtd, 48),
+    ] {
+        if !is_lower_hex(value, bytes) {
+            return Err(format!(
+                "release manifest {name} must be {} lowercase hex digits",
+                bytes * 2
+            ));
+        }
     }
-    if !is_lower_hex(&launch.mrtd, 48) {
-        return Err(
-            "release manifest igvm.tdx_launch.mrtd must be 96 lowercase hex digits".to_string(),
-        );
-    }
-    Ok(ReleaseTdxLaunch {
+    Ok(ReleaseLaunch {
         version: file.version,
-        igvm_sha256: file.igvm.tdx,
-        mrtd: launch.mrtd.clone(),
+        sev_snp: ReleaseImage {
+            igvm_sha256: file.igvm.snp,
+            measurement: file.igvm.snp_launch.measurement,
+        },
+        tdx: ReleaseImage {
+            igvm_sha256: file.igvm.tdx,
+            measurement: launch.mrtd.clone(),
+        },
     })
 }
 
 /// Check the vendored release manifest a config's `cvm-version` pins inline
 /// (`manifest`, read from [`release_manifest_file`]): it hashes to that pin,
 /// describes that release, and is read by [`read_release_manifest`].
-pub fn check_release_manifest(
-    cvm_version: &str,
-    manifest: &[u8],
-) -> Result<ReleaseTdxLaunch, String> {
+pub fn check_release_manifest(cvm_version: &str, manifest: &[u8]) -> Result<ReleaseLaunch, String> {
     use sha2::Digest as _;
     let release = parse_cvm_version(cvm_version).map_err(|e| e.to_string())?;
     let pinned = release.manifest_sha256.ok_or_else(|| {
@@ -265,31 +348,29 @@ pub fn check_deployment(
         }
     }
     check_env_names(&prefix, c.env.keys().map(String::as_str)).map_err(|e| format!("{at}: {e}"))?;
-    // A pinned deployment runs the CUDA executor: the CPU executor is the
-    // numerics reference and the development path, and nothing confidential
-    // ships on it.
-    let ExecutorSettings::Cuda {
+    // Either executor may be pinned. The CUDA executor's kernels come from
+    // the measured image, and the node's own check of its GPUs'
+    // confidential-computing mode is on in every pinned deployment; skipping
+    // it is for development boots only. The CPU executor attaches no GPU
+    // (below), and the node scrubs the host memory it computes in as it
+    // frees it (`eidola-server-engine`'s zeroing allocator).
+    if let ExecutorSettings::Cuda {
         kernels_dir,
         gpu_cc,
         ..
     } = &measured.executor
-    else {
-        return Err(format!(
-            "{at}: a pinned deployment runs the cuda executor; cpu is the reference and \
-             development path"
-        ));
-    };
-    check_kernels_dir(kernels_dir).map_err(|e| format!("{at}: {e}"))?;
-    // The node's own check of its GPUs' confidential-computing mode is on in
-    // every pinned deployment; skipping it is for development boots only.
-    if *gpu_cc != GpuCc::Required {
-        return Err(format!(
-            "{at}: {} is {:?}, but a pinned deployment must be \"required\"",
-            n(env::GPU_CC),
-            gpu_cc.as_str()
-        ));
+    {
+        check_kernels_dir(kernels_dir).map_err(|e| format!("{at}: {e}"))?;
+        if *gpu_cc != GpuCc::Required {
+            return Err(format!(
+                "{at}: {} is {:?}, but a pinned deployment must be \"required\"",
+                n(env::GPU_CC),
+                gpu_cc.as_str()
+            ));
+        }
     }
-    // The platform image the executor needs: the release's GPU image.
+    // The platform image the executor needs: the release's GPU image for
+    // `cuda`, its plain image for `cpu`.
     let release = parse_cvm_version(&c.cvm_version).map_err(|e| format!("{at}: {e}"))?;
     check_cvm_image(measured.executor.kind(), &release).map_err(|e| format!("{at}: {e}"))?;
     if measured.model_id != measured.weights_sha256 {
@@ -328,10 +409,9 @@ pub fn check_deployment(
     check_shim_paths(&c.shim_paths.iter().map(String::as_str).collect::<Vec<_>>())
         .map_err(|e| format!("{at}: {e}"))?;
 
-    // The one secret, and the VM shape.
+    // The secrets: the gateway's token and where telemetry goes.
     check_secrets(&prefix, c.secrets.iter().map(String::as_str))
         .map_err(|e| format!("{at}: {e}"))?;
-    check_vm_resources(c.cpus, c.memory).map_err(|e| format!("{at}: {e}"))?;
 
     // The sidecar, and the weights it records.
     let side = Sidecar::parse(sidecar, sidecar_path)?;
@@ -363,64 +443,6 @@ pub fn check_deployment(
     )
     .map_err(|e| format!("{at}: {e}"))?;
 
-    // What the node allocates fits the VM and the GPUs it attaches.
-    // `check_weights_pack` held the config to one pack with a whole artifact
-    // reference, so its data size bounds the weights.
-    let weights_bytes = c
-        .packs
-        .first()
-        .and_then(|p| p.mpk.as_deref())
-        .and_then(artifact_data_bytes)
-        .ok_or_else(|| format!("{at}: the weights pack has no artifact reference"))?;
-    // The CUDA executor drafts with the architecture's MTP layers, one per
-    // depth: no wider than the checkpoint ships.
-    let mtp_layers = side.architecture.mtp_layers();
-    if measured.sizing.draft_tokens > mtp_layers {
-        return Err(format!(
-            "{at}: {} is {}, more than {}'s {mtp_layers} MTP layers",
-            n(env::DRAFT_TOKENS),
-            measured.sizing.draft_tokens,
-            side.architecture,
-        ));
-    }
-    // One KV budget per device the architecture runs on: a one-device
-    // model's by the single-device rule, a split model's device by device.
-    match side.architecture.devices() {
-        [shape] => {
-            let budgets = measured.executor.kv_device_budgets().len();
-            if budgets != 1 {
-                return Err(format!(
-                    "{at}: {} names {budgets} budgets, but {} runs on one device",
-                    n(env::KV_DEVICE_BYTES),
-                    side.architecture
-                ));
-            }
-            check_resources(
-                shape,
-                &measured.sizing,
-                &measured.cache,
-                &measured.executor,
-                measured.kv_host_bytes,
-                weights_bytes,
-                c.memory,
-                c.gpus.unwrap_or(0),
-                &side.gpu,
-            )
-        }
-        devices => check_device_resources(
-            devices,
-            &measured.sizing,
-            &measured.cache,
-            &measured.executor,
-            measured.kv_host_bytes,
-            weights_bytes,
-            c.memory,
-            c.gpus.unwrap_or(0),
-            &side.gpu,
-        ),
-    }
-    .map_err(|e| format!("{at}: {e}"))?;
-
     Ok(Deployment {
         cvm_version: c.cvm_version,
         env: prefix,
@@ -429,8 +451,7 @@ pub fn check_deployment(
         weights_repo: side.repo,
         weights_revision: side.revision,
         expected_gpus: side.expected_gpus,
-        gpu: side.gpu,
-        tdx: side.tdx,
+        platform: side.platform,
     })
 }
 
@@ -553,7 +574,10 @@ struct TinfoilConfig {
     /// The platform release, with its manifest pinned inline.
     #[serde(rename = "cvm-version")]
     cvm_version: String,
-    /// VM resources (`int` in types.go).
+    /// VM resources (`int` in types.go). The platform launches the shape and
+    /// the guest's boot holds the machine to it, but no report attests it,
+    /// so nothing here holds it to a sizing; it is read for Tinfoil's own
+    /// rule, that both are positive.
     cpus: u64,
     memory: u64,
     /// GPUs attached to the VM (`int`; validation.go: 0 to 8).
@@ -670,8 +694,6 @@ struct EngineConfig {
     container_gpus: Option<String>,
     packs: Vec<Pack>,
     granted: Vec<String>,
-    cpus: u64,
-    memory: u64,
 }
 
 /// An environment name as Tinfoil's validator reads one
@@ -797,6 +819,10 @@ impl EngineConfig {
                  as VERSION@sha256:<64 lowercase hex>"
             ));
         }
+        // Tinfoil's checks of the VM shape: positive values.
+        if config.cpus == 0 || config.memory == 0 {
+            return Err(format!("{path}: cpus and memory must be positive"));
+        }
         // validation.go `Validate`: `gpus must be between 0 and 8`.
         if config.gpus.is_some_and(|n| n > 8) {
             return Err(format!("{path}: gpus must be between 0 and 8"));
@@ -914,8 +940,6 @@ impl EngineConfig {
             container_gpus,
             packs,
             granted: engine.models,
-            cpus: config.cpus,
-            memory: config.memory,
         })
     }
 }
@@ -927,8 +951,7 @@ struct Sidecar {
     repo: String,
     revision: String,
     expected_gpus: Option<u64>,
-    gpu: SupportedGpu,
-    tdx: Option<TdxMachines>,
+    platform: DeploymentPlatform,
 }
 
 // The typed shape of `deployment.json`. Every level refuses unknown members,
@@ -945,11 +968,19 @@ struct SidecarFile {
     weights: SidecarWeights,
     #[serde(default, deserialize_with = "present")]
     expected_gpus: Option<u32>,
-    /// A [`SupportedGpu`] name, as its driver reports it.
-    gpu: String,
+    /// The TEE: exactly one of `sev_snp` and `tdx`.
+    #[serde(default, deserialize_with = "present")]
+    sev_snp: Option<SidecarSevSnp>,
     #[serde(default, deserialize_with = "present")]
     tdx: Option<SidecarTdx>,
 }
+
+/// An SEV-SNP deployment: an empty object. Its pin is the launch identity
+/// alone (the launch digest, HOST_DATA, the guest policy), as the gateway's
+/// own is; nothing here selects chips or floors.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SidecarSevSnp {}
 
 /// An optional member that, when present, holds a value: absent is `None`,
 /// and `null` is refused rather than read as absent.
@@ -1022,13 +1053,6 @@ impl Sidecar {
                  on it"
             ));
         }
-        let gpu = SupportedGpu::from_name(&file.gpu).ok_or_else(|| {
-            format!(
-                "{path}: gpu {:?} is not a supported GPU ({})",
-                file.gpu,
-                SupportedGpu::ALL.map(|g| g.name).join(", ")
-            )
-        })?;
         if !is_repo(&file.weights.repo) {
             return Err(format!(
                 "{path}: weights.repo must be <owner>/<name> of [A-Za-z0-9._-]"
@@ -1070,13 +1094,21 @@ impl Sidecar {
                 })
             })
             .transpose()?;
+        let platform = match (file.sev_snp, tdx) {
+            (Some(SidecarSevSnp {}), None) => DeploymentPlatform::SevSnp,
+            (None, Some(machines)) => DeploymentPlatform::Tdx(machines),
+            _ => {
+                return Err(format!(
+                    "{path}: a deployment names exactly one TEE, `sev_snp` or `tdx`"
+                ));
+            }
+        };
         Ok(Self {
             architecture,
             repo: file.weights.repo,
             revision: file.weights.revision,
             expected_gpus: file.expected_gpus.map(u64::from),
-            gpu,
-            tdx,
+            platform,
         })
     }
 }
@@ -1164,6 +1196,7 @@ shim:
                 "format_version": 1,
                 "snp": "11".repeat(32),
                 "tdx": "22".repeat(32),
+                "snp_launch": { "measurement": "44".repeat(48) },
                 "tdx_launch": {
                     "mrtd": mrtd,
                     "rtmr0": rtmr0,
@@ -1194,12 +1227,20 @@ shim:
         let launch = check_release_manifest(&cvm(&good, "0.0.0-test+gpu"), &good).unwrap();
         assert_eq!(
             launch,
-            ReleaseTdxLaunch {
+            ReleaseLaunch {
                 version: "v0.0.0-test+gpu".into(),
-                igvm_sha256: "22".repeat(32),
-                mrtd: "33".repeat(48),
+                sev_snp: ReleaseImage {
+                    igvm_sha256: "11".repeat(32),
+                    measurement: "44".repeat(48),
+                },
+                tdx: ReleaseImage {
+                    igvm_sha256: "22".repeat(32),
+                    measurement: "33".repeat(48),
+                },
             }
         );
+        assert_eq!(launch.image(Tee::SevSnp).measurement, "44".repeat(48));
+        assert_eq!(launch.image(Tee::Tdx).measurement, "33".repeat(48));
 
         let err = |cvm_version: &str, m: &[u8]| check_release_manifest(cvm_version, m).unwrap_err();
         assert!(err("0.0.0-test+gpu", &good).contains("does not pin"));
@@ -1220,6 +1261,19 @@ shim:
         extra["igvm"]["tdx_launch"]["rtmr4"] = zero.clone().into();
         let extra = serde_json::to_vec(&extra).unwrap();
         assert!(err(&cvm(&extra, "0.0.0-test+gpu"), &extra).contains("unknown field"));
+        // The SEV-SNP statement is read as strictly as the TDX one.
+        let mut snp: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        snp["igvm"]["snp_launch"]["measurement"] = "44".repeat(32).into();
+        let snp = serde_json::to_vec(&snp).unwrap();
+        assert!(err(&cvm(&snp, "0.0.0-test+gpu"), &snp).contains("snp_launch.measurement"));
+        let mut snp: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        snp["igvm"]["snp_launch"]["policy"] = "0x30133".into();
+        let snp = serde_json::to_vec(&snp).unwrap();
+        assert!(err(&cvm(&snp, "0.0.0-test+gpu"), &snp).contains("unknown field"));
+        let mut snp: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        snp["igvm"]["snp"] = "AB".repeat(32).into();
+        let snp = serde_json::to_vec(&snp).unwrap();
+        assert!(err(&cvm(&snp, "0.0.0-test+gpu"), &snp).contains("igvm.snp must be"));
     }
 
     const MIMO_CONFIG: &[u8] =
@@ -1227,25 +1281,85 @@ shim:
     const MIMO_SIDECAR: &[u8] =
         include_bytes!("../../../../deploy/engine/mimo-v2.6-flash/b300x1/deployment.json");
 
-    /// The sidecar names the GPU the deployment runs on, one the fit check
-    /// knows: the committed deployment's is the B300, and an unknown name, or
-    /// none, is refused.
+    /// The sidecar names the TEE the deployment is pinned on, exactly one:
+    /// `sev_snp`, an empty object, or `tdx` with its machines.
     #[test]
-    fn the_sidecar_names_a_supported_gpu() {
+    fn the_sidecar_names_exactly_one_tee() {
         let d = check_deployment("config", MIMO_CONFIG, "sidecar", MIMO_SIDECAR).unwrap();
-        assert_eq!(d.gpu, SupportedGpu::B300);
+        assert_eq!(d.platform.tee(), Tee::Tdx);
         let text = std::str::from_utf8(MIMO_SIDECAR).unwrap();
-        let other = text.replace("NVIDIA B300 SXM6 AC", "NVIDIA H100 80GB HBM3");
-        let err = check_deployment("config", MIMO_CONFIG, "sidecar", other.as_bytes()).unwrap_err();
-        assert!(err.contains("not a supported GPU"), "{err}");
-        let none = text.replace("  \"gpu\": \"NVIDIA B300 SXM6 AC\",\n", "");
-        assert_ne!(none, text);
-        let err = check_deployment("config", MIMO_CONFIG, "sidecar", none.as_bytes()).unwrap_err();
-        assert!(err.contains("gpu"), "{err}");
-        assert_eq!(
-            SupportedGpu::from_name("NVIDIA B200"),
-            Some(SupportedGpu::B200)
+        let tdx_at = text.find("  \"tdx\": {").unwrap();
+        let snp = format!("{}  \"sev_snp\": {{}}\n}}\n", &text[..tdx_at]);
+        let d = check_deployment("config", MIMO_CONFIG, "sidecar", snp.as_bytes()).unwrap();
+        assert_eq!(d.platform, DeploymentPlatform::SevSnp);
+        assert_eq!(d.platform.tdx(), None);
+        let check = |sidecar: &str| {
+            check_deployment("config", MIMO_CONFIG, "sidecar", sidecar.as_bytes()).unwrap_err()
+        };
+        let neither = format!("{}}}\n", text[..tdx_at].trim_end().trim_end_matches(','));
+        assert!(check(&neither).contains("exactly one TEE"), "{neither}");
+        let both = text.replacen("  \"tdx\": {", "  \"sev_snp\": {},\n  \"tdx\": {", 1);
+        assert!(check(&both).contains("exactly one TEE"));
+        let filled = snp.replace("{}", "{\"chips\": []}");
+        assert!(
+            check(&filled).contains("unknown field"),
+            "{}",
+            check(&filled)
         );
+        let null = snp.replace("{}", "null");
+        assert!(check(&null).contains("invalid type"), "{}", check(&null));
+        // A GPU name is not a member any more: nothing reads it.
+        let gpu = text.replacen("  \"tdx\"", "  \"gpu\": \"NVIDIA B200\",\n  \"tdx\"", 1);
+        assert!(check(&gpu).contains("unknown field"), "{}", check(&gpu));
+    }
+
+    /// What the platform does not attest is not pinned: the VM's shape, and
+    /// whether the KV budgets, the host tier and the drafts fit the machine
+    /// or the model, are liveness, so a deployment sized past any machine
+    /// still checks (and its node refuses to boot or serves less). The sizing
+    /// aids say so instead; the platform's own rule, positive values, stays.
+    #[test]
+    fn sizing_is_not_pinned() {
+        let text = std::str::from_utf8(MIMO_CONFIG).unwrap();
+        let unsized_config = text
+            .replace("cpus: 24\n", "cpus: 1\n")
+            .replace("memory: 196608\n", "memory: 1\n")
+            .replace("\"85899345920\"", "\"1,1\"")
+            .replace("\"68719476736\"", "\"1\"");
+        assert_ne!(unsized_config, text);
+        let d =
+            check_deployment("config", unsized_config.as_bytes(), "sidecar", MIMO_SIDECAR).unwrap();
+        assert_eq!(d.measured.executor.kv_device_budgets(), [1, 1]);
+        let fits = |kv: u64, memory_mib: u64| {
+            super::super::check_resources(
+                Architecture::MimoV26Flash.shape(),
+                &d.measured.sizing,
+                &d.measured.cache,
+                &ExecutorSettings::Cuda {
+                    kernels_dir: "/opt/eidola/kernels".into(),
+                    kv_device_bytes: kv,
+                    further_kv_device_bytes: Vec::new(),
+                    graphs: super::super::CudaGraphs::On,
+                    gpu_cc: GpuCc::Required,
+                },
+                64 << 30,
+                177_765_052_416,
+                memory_mib,
+                1,
+                &super::super::SupportedGpu::B300,
+            )
+        };
+        assert!(fits(1, 196_608).unwrap_err().contains("smallest"));
+        assert!(fits(85_899_345_920, 1).unwrap_err().contains("memory"));
+        fits(85_899_345_920, 196_608).unwrap();
+        for zero in [
+            text.replace("cpus: 24\n", "cpus: 0\n"),
+            text.replace("memory: 196608\n", "memory: 0\n"),
+        ] {
+            let err =
+                check_deployment("config", zero.as_bytes(), "sidecar", MIMO_SIDECAR).unwrap_err();
+            assert!(err.contains("must be positive"), "{err}");
+        }
     }
 
     /// The committed MiMo-V2.6-Flash deployment reads as it always has: one
@@ -1305,7 +1419,7 @@ shim:
             "2479e2d0029eca9a34cc7e7f55a121925f81908e"
         );
         assert_eq!(d.expected_gpus, Some(1));
-        let tdx = d.tdx.unwrap();
+        let tdx = d.platform.tdx().unwrap();
         assert_eq!(
             (tdx.release.as_str(), tdx.policy.as_str()),
             ("platform-v0.1.11", "tdx-b300-prod")
@@ -1394,24 +1508,32 @@ shim:
         (config, sidecar)
     }
 
-    /// [`deepseek_stepped`] at the MiMo deployment's 8,192-token steps.
-    fn deepseek_deployment(kv: &str, gpus: u64, max_model_len: u32) -> (String, String) {
-        deepseek_stepped(kv, gpus, max_model_len, 8192)
-    }
-
+    /// A DeepSeek-V4.1 deployment checks with a budget per device, and its
+    /// sizing is the sizing aid's to judge, device by device.
     #[test]
-    fn a_deepseek_deployment_names_a_budget_per_device_and_fits_each() {
-        let check = |kv: &str, gpus: u64| {
-            let (config, sidecar) = deepseek_deployment(kv, gpus, 1 << 17);
-            check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
+    fn a_deepseek_deployment_names_a_budget_per_device_and_its_sizing_is_judged_by_the_aid() {
+        let fits = |kv: &str, gpus: u64, max_model_len: u32, step: u32| {
+            let (config, sidecar) = deepseek_stepped(kv, gpus, max_model_len, step);
+            let d = check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
+                .expect("sizing is not pinned");
+            super::super::check_device_resources(
+                d.architecture.devices(),
+                &d.measured.sizing,
+                &d.measured.cache,
+                &d.measured.executor,
+                d.measured.kv_host_bytes,
+                510_300_000_000,
+                196_608,
+                gpus,
+                &super::super::SupportedGpu::B300,
+            )
+            .map(|()| d)
         };
+        let check = |kv: &str, gpus: u64| fits(kv, gpus, 1 << 17, 8192);
         let d = check("16000000000,8000000000", 2).unwrap();
         // The whole 2^20 window with three drafts at 8,192-token steps: the
         // step's index scratch alone leaves device 1 no room, at any budget.
-        let whole = |kv: &str, step: u32| {
-            let (config, sidecar) = deepseek_stepped(kv, 2, 1 << 20, step);
-            check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
-        };
+        let whole = |kv: &str, step: u32| fits(kv, 2, 1 << 20, step);
         let err = whole("16000000000,1000000000", 8192).unwrap_err();
         assert!(
             err.contains("device 1:") && err.contains("device memory"),
@@ -1447,11 +1569,78 @@ shim:
         // Device 1 holds more weights than device 0, so less KV.
         let err = check("16000000000,16000000000", 2).unwrap_err();
         assert!(err.contains("device 1:"), "{err}");
-        // A MiMo deployment naming two budgets is refused too.
-        let two = std::str::from_utf8(MIMO_CONFIG)
+    }
+
+    /// The committed MiMo deployment, moved onto the `cpu` executor and
+    /// SEV-SNP: the release's plain CPU image, no GPU attached or asked
+    /// evidence for, and the CPU executor's settings in the env.
+    fn cpu_deployment() -> (String, String) {
+        let config = std::str::from_utf8(MIMO_CONFIG)
             .unwrap()
-            .replace("\"85899345920\"", "\"85899345920,85899345920\"");
-        let err = check_deployment("config", two.as_bytes(), "sidecar", MIMO_SIDECAR).unwrap_err();
-        assert!(err.contains("runs on one device"), "{err}");
+            .replace("0.15.4-rc.2+gpu@", "0.15.4-rc.2@")
+            .replace("gpus: 1\n", "")
+            .replace("    runtime: nvidia\n", "")
+            .replace("    gpus: all\n", "")
+            .replace("ENGINE_EXECUTOR: \"cuda\"", "ENGINE_EXECUTOR: \"cpu\"")
+            .replace(
+                "      - ENGINE_KV_DEVICE_BYTES: \"85899345920\"\n",
+                "      - ENGINE_KV_BLOCKS: \"65536\"\n",
+            )
+            .replace("      - ENGINE_KERNELS_DIR: \"/opt/eidola/kernels\"\n", "")
+            .replace("      - ENGINE_CUDA_GRAPHS: \"on\"\n", "")
+            .replace("      - ENGINE_GPU_CC: \"required\"\n", "");
+        let text = std::str::from_utf8(MIMO_SIDECAR).unwrap();
+        let tdx_at = text.find("  \"tdx\": {").unwrap();
+        let sidecar = format!("{}  \"sev_snp\": {{}}\n}}\n", &text[..tdx_at])
+            .replace("  \"expected_gpus\": 1,\n", "");
+        (config, sidecar)
+    }
+
+    /// A pinned deployment may run the `cpu` executor, on the release's CPU
+    /// image with no GPU, from verified read-only weights like any other; a
+    /// GPU, GPU evidence, the GPU image or GPU access in the container is
+    /// refused with it, and its env takes none of the CUDA executor's
+    /// settings.
+    #[test]
+    fn a_cpu_deployment_is_pinned_without_gpus() {
+        let (config, sidecar) = cpu_deployment();
+        let d =
+            check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes()).unwrap();
+        assert_eq!(
+            d.measured.executor,
+            ExecutorSettings::Cpu { kv_blocks: 65536 }
+        );
+        assert_eq!(d.expected_gpus, None);
+        assert_eq!(d.platform, DeploymentPlatform::SevSnp);
+        assert_eq!(d.measured.weights_storage, WeightsStorage::VerifiedReadonly);
+        // On TDX too.
+        let tdx = std::str::from_utf8(MIMO_SIDECAR)
+            .unwrap()
+            .replace("  \"expected_gpus\": 1,\n", "");
+        let d = check_deployment("config", config.as_bytes(), "sidecar", tdx.as_bytes()).unwrap();
+        assert_eq!(d.platform.tee(), Tee::Tdx);
+
+        let refused = |config: &str, sidecar: &str| {
+            check_deployment("config", config.as_bytes(), "sidecar", sidecar.as_bytes())
+                .unwrap_err()
+        };
+        let gpu_image = config.replace("0.15.4-rc.2@", "0.15.4-rc.2+gpu@");
+        assert!(refused(&gpu_image, &sidecar).contains("plain CPU image"));
+        let gpus = config.replace("memory: 196608\n", "memory: 196608\ngpus: 1\n");
+        assert!(refused(&gpus, &sidecar).contains("attaches no GPUs"));
+        let evidence = sidecar.replacen("{\n", "{\n  \"expected_gpus\": 1,\n", 1);
+        assert!(refused(&config, &evidence).contains("attaches no GPUs"));
+        let runtime = config.replace(
+            "    models: [\"weights\"]\n",
+            "    runtime: nvidia\n    models: [\"weights\"]\n",
+        );
+        assert!(refused(&runtime, &sidecar).contains("takes no `runtime` or `gpus`"));
+        let writable = config.replace("\"verified-readonly\"", "\"dev-writable\"");
+        assert!(refused(&writable, &sidecar).contains("verified-readonly"));
+        let cc = config.replace(
+            "      - ENGINE_MAX_MODEL_LEN",
+            "      - ENGINE_GPU_CC: \"required\"\n      - ENGINE_MAX_MODEL_LEN",
+        );
+        assert!(refused(&cc, &sidecar).contains("only to the cuda executor"));
     }
 }

@@ -83,6 +83,7 @@ CREATE TABLE pre_credential (
             AND spend_proof_data IS NULL
             AND spend_group IS NULL
             AND credits IS NOT NULL
+            AND idempotency_key IS NOT NULL
             AND length(idempotency_key) = 32
             AND issuance_request IS NOT NULL
             AND account_id IS NOT NULL)
@@ -318,7 +319,9 @@ CREATE TABLE space (
     -- opens it. Created inside the promotion transaction; NULL for
     -- every ordinary space. (Forward reference to `participant`,
     -- which is defined below — FK targets resolve at DML time.)
-    notebook_participant_id TEXT REFERENCES participant(id),
+    notebook_owner_participant_id TEXT,
+    notebook_owner_scope TEXT NOT NULL DEFAULT 'global' CHECK (notebook_owner_scope = 'global'),
+    notebook_owner_kind TEXT NOT NULL DEFAULT 'agent' CHECK (notebook_owner_kind = 'agent'),
     created_at        INTEGER NOT NULL,
     archived_at       INTEGER,
     -- The pristineness stamp: NULL means nothing has ever changed this space's
@@ -346,13 +349,15 @@ CREATE TABLE space (
     -- navigational fact the column records. MATCH SIMPLE: an ordinary
     -- space (both NULL) and an anchorless spawn (action NULL) skip it.
     FOREIGN KEY (parent_action_id, parent_space_id)
-        REFERENCES action (id, space_id)
+        REFERENCES action (id, space_id),
+    FOREIGN KEY (notebook_owner_participant_id, notebook_owner_scope, notebook_owner_kind)
+        REFERENCES participant (id, scope, kind)
 );
 
 -- One notebook per agent.
-CREATE UNIQUE INDEX idx_space_notebook_participant
-    ON space (notebook_participant_id)
-    WHERE notebook_participant_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_space_notebook_owner
+    ON space (notebook_owner_participant_id)
+    WHERE notebook_owner_participant_id IS NOT NULL;
 
 -- ============================================================
 -- Space capabilities: the attenuation snapshot.
@@ -471,6 +476,8 @@ CREATE TABLE participant (
 -- The composite-FK target for the pinned `(participant_id, participant_scope)`
 -- echoes on the reference tables and `action`.
 CREATE UNIQUE INDEX idx_participant_id_scope ON participant (id, scope);
+-- A notebook can belong only to a global agent, including after owner updates.
+CREATE UNIQUE INDEX idx_participant_id_scope_kind ON participant (id, scope, kind);
 CREATE INDEX idx_participant_owner_space ON participant (owner_space_id)
     WHERE owner_space_id IS NOT NULL;
 CREATE INDEX idx_participant_owner_template ON participant (owner_template_id)
@@ -557,9 +564,9 @@ CREATE TABLE space_template_participant (
 -- supersedes_item_id: denormalized item of the superseded
 -- generation — by invariant this row's own item (CHECKed), NULL
 -- exactly when supersedes_action_id is NULL. It exists so the
--- compound FK (supersedes_action_id, supersedes_item_id) →
--- action(id, item_id) can enforce declaratively that a
--- generation chain never hops items. Causality is preserved
+-- compound FK (supersedes_action_id, space_id, supersedes_item_id) →
+-- action(id, space_id, item_id) can enforce declaratively that a
+-- generation chain never hops items or spaces. Causality is preserved
 -- through action ids (antecedent edges record which concrete
 -- generation was replied to / quoted); the *intended* logical
 -- flow is described by item ids (rendering and context assembly
@@ -672,15 +679,15 @@ CREATE TABLE action (
 
     created_at      INTEGER NOT NULL,
 
-    -- supersedes is item-scoped: both halves present together, the item
-    -- is this row's own, and the referenced (action, item) pair must
-    -- really exist — so a generation chain cannot hop items.
+    -- supersedes is space/item-scoped: both halves present together, the item
+    -- is this row's own, and the referenced (action, space, item) tuple must
+    -- really exist — so a generation chain cannot hop items or spaces.
     CHECK (truncated = 0 OR action_type = 'inference'),
     CHECK (resumable = 0 OR truncated = 1),
     CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
     CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
-    FOREIGN KEY (supersedes_action_id, supersedes_item_id)
-        REFERENCES action (id, item_id),
+    FOREIGN KEY (supersedes_action_id, space_id, supersedes_item_id)
+        REFERENCES action (id, space_id, item_id),
     -- ON UPDATE CASCADE carries task 36's in-place promotion: an agent
     -- is promoted to a global identity by flipping scope 'space' →
     -- 'global' on the SAME participant row, and the pinned echo on
@@ -716,8 +723,8 @@ CREATE UNIQUE INDEX idx_one_root_per_item
     ON action (space_id, item_id)
     WHERE supersedes_action_id IS NULL;
 
--- Parent key for the compound supersedes FK.
-CREATE UNIQUE INDEX idx_action_id_item ON action (id, item_id);
+-- Parent key for space-scoped supersedes and memory root FKs.
+CREATE UNIQUE INDEX idx_action_id_space_item ON action (id, space_id, item_id);
 
 -- Parent key for space (parent_action_id, parent_space_id) → action.
 CREATE UNIQUE INDEX idx_action_id_space ON action (id, space_id);
@@ -878,8 +885,8 @@ CREATE INDEX idx_content_block_type
 -- ============================================================
 CREATE TABLE memory_block (
     item_id              TEXT PRIMARY KEY,
-    -- Generation 0 of that item. The pair FK proves the root
-    -- really is an action of this item.
+    -- Generation 0 of that item. The composite FK proves the root
+    -- really is an action of this item in its resident space.
     root_action_id       TEXT NOT NULL,
 
     owner_participant_id TEXT NOT NULL,
@@ -893,7 +900,7 @@ CREATE TABLE memory_block (
     updated_at           INTEGER NOT NULL,
 
     UNIQUE (owner_participant_id, name),
-    FOREIGN KEY (root_action_id, item_id) REFERENCES action (id, item_id),
+    FOREIGN KEY (root_action_id, space_id, item_id) REFERENCES action (id, space_id, item_id),
     -- Same cascade as `action`, and for the same reason: promoting an
     -- agent that already holds memory must not fail the FK or strand a
     -- stale echo. Memory is agent-owned, so promotion is a no-op for
@@ -1266,7 +1273,7 @@ SELECT
     a.id          AS current_action_id
 FROM action a
 WHERE NOT EXISTS (
-    SELECT 1 FROM action s WHERE s.supersedes_action_id = a.id
+    SELECT 1 FROM action s WHERE s.space_id = a.space_id AND s.supersedes_action_id = a.id
 );
 
 -- ============================================================
@@ -1274,7 +1281,7 @@ WHERE NOT EXISTS (
 -- state. (Origin-dereferencing is gone — content and cost now
 -- always live on the action itself.) is_current = 1 iff this
 -- action is its item's tip generation. generation is *derived*
--- (count of earlier generations in the same item), not stored;
+-- (depth in the same space's supersedes chain), not stored;
 -- the supersedes chain is the source of truth.
 -- ============================================================
 CREATE VIEW action_resolved AS
@@ -1293,13 +1300,19 @@ SELECT
     a.credits_consumed,
     a.truncated,
     a.created_at,
-    (SELECT COUNT(*) FROM action b
-     WHERE b.item_id = a.item_id
-       AND (b.created_at < a.created_at
-            OR (b.created_at = a.created_at AND b.id < a.id))
-    ) AS generation,
+    -- Walk only this action's predecessors, so reading one space need not
+    -- enumerate the generation chains of every other space in the profile.
+    (WITH RECURSIVE predecessors (action_id, supersedes_action_id, depth) AS (
+        SELECT a.id, a.supersedes_action_id, 0
+        UNION ALL
+        SELECT p.id, p.supersedes_action_id, chain.depth + 1
+        FROM action p
+        JOIN predecessors chain ON p.id = chain.supersedes_action_id
+        WHERE p.space_id = a.space_id AND p.item_id = a.item_id
+    )
+    SELECT MAX(depth) FROM predecessors) AS generation,
     CASE WHEN NOT EXISTS (
-        SELECT 1 FROM action s WHERE s.supersedes_action_id = a.id
+        SELECT 1 FROM action s WHERE s.space_id = a.space_id AND s.supersedes_action_id = a.id
     ) THEN 1 ELSE 0 END AS is_current
 FROM action a;
 

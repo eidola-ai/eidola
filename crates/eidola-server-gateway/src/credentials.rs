@@ -1489,8 +1489,8 @@ pub struct IssueCredentialsResponse {
     pub issuer_key_id: String,
     /// Number of credits issued.
     pub credits: i64,
-    /// The ledger entry ID for this issuance.
-    pub ledger_entry_id: String,
+    /// Stable identity of this issuance and all ledger allocations funding it.
+    pub issuance_id: String,
 }
 
 /// Length in bytes of an issuance idempotency key.
@@ -1568,7 +1568,7 @@ fn answer_stored(
         issuance_response: URL_SAFE_NO_PAD.encode(&stored.issuance_response),
         issuer_key_id: stored.issuer_key_id,
         credits: stored.credits,
-        ledger_entry_id: stored.ledger_entry_id.to_string(),
+        issuance_id: stored.issuance_id.to_string(),
     }))
 }
 
@@ -1805,7 +1805,7 @@ async fn issue(
     // The decision that debits, under the account lock: an attempt under the
     // same key that committed while this one was signing is found here, and
     // its response returned instead of a second debit.
-    let ledger_entry_id = match db::record_credential_issuance(
+    let issuance_id = match db::record_credential_issuance(
         &state.db_pool,
         account_id,
         &idempotency_key,
@@ -1816,7 +1816,7 @@ async fn issue(
     )
     .await?
     {
-        db::IssuanceRecord::Issued { ledger_entry_id } => ledger_entry_id,
+        db::IssuanceRecord::Issued { issuance_id } => issuance_id,
         db::IssuanceRecord::Stored(stored) => return replay(stored, &digest, outcome),
         db::IssuanceRecord::Retired => {
             *outcome = "key_retired";
@@ -1850,7 +1850,7 @@ async fn issue(
         issuance_response: URL_SAFE_NO_PAD.encode(&response_cbor),
         issuer_key_id: key_id,
         credits: request.credits,
-        ledger_entry_id: ledger_entry_id.to_string(),
+        issuance_id: issuance_id.to_string(),
     }))
 }
 
@@ -4730,7 +4730,7 @@ pub(crate) mod tests {
             .unwrap()
             .0;
         assert_eq!(again.issuance_response, first.issuance_response);
-        assert_eq!(again.ledger_entry_id, first.ledger_entry_id);
+        assert_eq!(again.issuance_id, first.issuance_id);
         assert_eq!(again.issuer_key_id, key_id);
         assert_eq!(again.credits, 1_000);
         assert_eq!(
@@ -4799,7 +4799,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .0;
-        assert_ne!(fresh.ledger_entry_id, first.ledger_entry_id);
+        assert_ne!(fresh.issuance_id, first.issuance_id);
         assert_eq!(
             db::get_available_balance(&pool, account).await.unwrap(),
             3_000
@@ -4859,7 +4859,7 @@ pub(crate) mod tests {
         let issued: Vec<_> = outcomes
             .iter()
             .filter_map(|o| match o {
-                db::IssuanceRecord::Issued { ledger_entry_id } => Some(*ledger_entry_id),
+                db::IssuanceRecord::Issued { issuance_id } => Some(*issuance_id),
                 _ => None,
             })
             .collect();
@@ -4876,7 +4876,7 @@ pub(crate) mod tests {
             1,
             "the other finds what it stored: {outcomes:?}"
         );
-        assert_eq!(stored[0].ledger_entry_id, issued[0]);
+        assert_eq!(stored[0].issuance_id, issued[0]);
         assert_eq!(
             db::get_available_balance(&pool, account).await.unwrap(),
             4_000

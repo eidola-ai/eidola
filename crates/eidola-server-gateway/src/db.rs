@@ -359,7 +359,7 @@ pub async fn record_required_document(
 
     let rows = client
         .execute(
-            "INSERT INTO required_document (document, version, sha256, url) \
+            "INSERT INTO required_document_version (document, version, sha256, url) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (document, version) DO NOTHING",
             &[&doc.document, &doc.version, &doc.sha256, &doc.url],
@@ -367,7 +367,7 @@ pub async fn record_required_document(
         .await
         .map_err(|e| {
             ServerError::Internal(format!(
-                "record required_document failed: {}",
+                "record required_document_version failed: {}",
                 db_error_summary(&e)
             ))
         })?;
@@ -378,13 +378,13 @@ pub async fn record_required_document(
 
     let row = client
         .query_one(
-            "SELECT sha256 FROM required_document WHERE document = $1 AND version = $2",
+            "SELECT sha256 FROM required_document_version WHERE document = $1 AND version = $2",
             &[&doc.document, &doc.version],
         )
         .await
         .map_err(|e| {
             ServerError::Internal(format!(
-                "query required_document failed: {}",
+                "query required_document_version failed: {}",
                 db_error_summary(&e)
             ))
         })?;
@@ -468,13 +468,13 @@ pub async fn get_required_documents(pool: &Pool) -> Result<Vec<RequiredDocumentR
     let rows = client
         .query(
             "SELECT DISTINCT ON (document) document, version, sha256, url \
-             FROM required_document ORDER BY document, version DESC",
+             FROM required_document_version ORDER BY document, version DESC",
             &[],
         )
         .await
         .map_err(|e| {
             ServerError::Internal(format!(
-                "query required_document failed: {}",
+                "query required_document_version failed: {}",
                 db_error_summary(&e)
             ))
         })?;
@@ -704,7 +704,7 @@ fn map_issuer_key_row(r: &tokio_postgres::Row) -> IssuerKeyRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssuanceRecord {
     /// Debited now and stored under the idempotency key.
-    Issued { ledger_entry_id: Uuid },
+    Issued { issuance_id: Uuid },
     /// An earlier attempt under this idempotency key was debited; this is
     /// what it stored. Nothing was debited now.
     Stored(StoredIssuance),
@@ -740,7 +740,7 @@ pub struct StoredIssuance {
     pub issuer_key_id: String,
     pub credits: i64,
     pub issuance_response: Vec<u8>,
-    pub ledger_entry_id: Uuid,
+    pub issuance_id: Uuid,
 }
 
 fn map_stored_issuance(r: &tokio_postgres::Row) -> StoredIssuance {
@@ -749,7 +749,7 @@ fn map_stored_issuance(r: &tokio_postgres::Row) -> StoredIssuance {
         issuer_key_id: r.get("issuer_key_id"),
         credits: r.get("credits"),
         issuance_response: r.get("issuance_response"),
-        ledger_entry_id: r.get("ledger_entry_id"),
+        issuance_id: r.get("issuance_id"),
     }
 }
 
@@ -769,18 +769,18 @@ pub async fn find_credential_issuance(
                 .await
                 .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
             let row = client
-        .query_opt(
-            "SELECT request_digest, issuer_key_id, credits, issuance_response, ledger_entry_id \
+                .query_opt(
+                    "SELECT request_digest, issuer_key_id, credits, issuance_response, issuance_id \
              FROM credential_issuance WHERE account_id = $1 AND idempotency_key = $2",
-            &[&account_id, &idempotency_key],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "credential issuance lookup failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
+                    &[&account_id, &idempotency_key],
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "credential issuance lookup failed: {}",
+                        db_error_summary(&e)
+                    ))
+                })?;
             Ok(row.as_ref().map(map_stored_issuance))
         }
         .await,
@@ -818,7 +818,7 @@ pub async fn record_credential_issuance(
             let row = client
                 .query_one(
                     "SELECT outcome, request_digest, issuer_key_id, credits, issuance_response, \
-             ledger_entry_id FROM record_credential_issuance($1, $2, $3, $4, $5, $6)",
+             issuance_id FROM record_credential_issuance($1, $2, $3, $4, $5, $6)",
                     &[
                         &account_id,
                         &idempotency_key,
@@ -839,7 +839,7 @@ pub async fn record_credential_issuance(
             let outcome: String = row.get("outcome");
             Ok(match outcome.as_str() {
                 "issued" => IssuanceRecord::Issued {
-                    ledger_entry_id: row.get("ledger_entry_id"),
+                    issuance_id: row.get("issuance_id"),
                 },
                 "stored" => IssuanceRecord::Stored(map_stored_issuance(&row)),
                 "retired" => IssuanceRecord::Retired,
@@ -876,7 +876,7 @@ pub async fn resolve_issuance_off_current_key(
             let row = client
                 .query_one(
                     "SELECT outcome, request_digest, issuer_key_id, credits, issuance_response, \
-             ledger_entry_id FROM resolve_issuance_off_current_key($1, $2, $3)",
+             issuance_id FROM resolve_issuance_off_current_key($1, $2, $3)",
                     &[&account_id, &idempotency_key, &issuer_key_id],
                 )
                 .await

@@ -1,12 +1,14 @@
-//! The Qwen3.8 reference forward on real weights (ignored: needs the fetched
-//! checkpoint and goldens, see `golden/qwen/README.md`).
+//! The Qwen reference forward on real weights (ignored: needs a fetched
+//! checkpoint, Qwen3.8-27B-FP8 or Qwen3.5-2B or -0.8B, and its goldens, see
+//! `golden/qwen/README.md`).
 //!
 //!     EIDOLA_QWEN_DIR=<dir> [EIDOLA_QWEN_LAYERS=4] cargo test --release \
 //!         -p eidola-engine-model --test qwen_real -- --ignored --nocapture
 //!
 //! The directory holds the checkpoint's files (all of them, or the truncation
 //! `fetch_checkpoint.py --truncation prefix` fetches) and `golden/`, written by
-//! `real_golden.py` with the same layer count. Every file is checked against
+//! `real_golden.py` with the same layer count (`EIDOLA_QWEN_LAYERS`, default
+//! 4; 24 is the whole of a Qwen3.5 checkpoint). Every file is checked against
 //! the recorded upstream hashes before anything loads. Against
 //! `golden/reference-pinned.safetensors` every comparison is exact; every
 //! other `golden/reference-*.safetensors` is reported, not asserted.

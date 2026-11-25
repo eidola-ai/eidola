@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tinfoil_verifier::SevSnpPin;
+use tinfoil_verifier::{AllowedMeasurement, PlatformMeasurement, SevSnpPin};
 
 use crate::error::AppError;
 
@@ -560,14 +560,100 @@ pub(crate) fn sweep_stale_temporaries(path: &Path) {
 // ---------------------------------------------------------------------------
 
 /// The trust-spec form a trusted server measurement is written in:
-/// `<measurement>:<host_data>:<guest_policy>`.
+/// `<measurement>:<host_data>:<guest_policy>` for an SEV-SNP launch identity,
+/// and `tdx:<mrtd>:<config hash>` for this build's own pin when it is TDX.
 pub const TRUST_SPEC_FORM: &str = "<measurement>:<host_data>:<guest_policy>";
 
-/// Parse a `<measurement>:<host_data>:<guest_policy>` trust spec (the SEV-SNP
-/// launch digest, 96 hex; HOST_DATA, 64 hex; the guest policy, such as
-/// `0x30133`) into a [`SevSnpPin`], refused unless the attesting client's own
-/// pin compiler accepts it.
-pub fn parse_trust_measurement(spec: &str) -> Result<SevSnpPin, AppError> {
+/// The prefix of a TDX trust spec.
+const TDX_SPEC_PREFIX: &str = "tdx:";
+
+/// One trusted server measurement, as the eidola row stores it: an SEV-SNP
+/// launch identity in [`SevSnpPin`]'s shape (the form every trust spec
+/// writes, and the form the build pin takes when it is SEV-SNP), or the
+/// build's own pin whole, which is how a TDX one is kept: its machine policy
+/// comes with the release, and no trust spec carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TrustedMeasurement {
+    SevSnp(SevSnpPin),
+    Pin(AllowedMeasurement),
+}
+
+impl TrustedMeasurement {
+    /// The stored form of `pin`: SEV-SNP in [`SevSnpPin`]'s shape, anything
+    /// else whole.
+    pub fn from_pin(pin: AllowedMeasurement) -> Self {
+        match pin {
+            AllowedMeasurement {
+                platform: PlatformMeasurement::SevSnp(snp),
+                expected_gpus: None,
+            } => Self::SevSnp(snp),
+            other => Self::Pin(other),
+        }
+    }
+
+    /// The pin the attesting client is given.
+    pub fn allowed(&self) -> AllowedMeasurement {
+        match self {
+            Self::SevSnp(snp) => AllowedMeasurement::sev_snp(snp.clone()),
+            Self::Pin(pin) => pin.clone(),
+        }
+    }
+
+    /// Whether it is a TDX launch identity.
+    pub fn is_tdx(&self) -> bool {
+        matches!(
+            self,
+            Self::Pin(AllowedMeasurement {
+                platform: PlatformMeasurement::Tdx(_),
+                ..
+            })
+        )
+    }
+
+    /// Its launch measurement (the SEV-SNP launch digest or the TDX MRTD) and
+    /// config hash (HOST_DATA, or the config hash MRCONFIGID carries),
+    /// lowercase: which image, and which deployment of it.
+    pub fn identity(&self) -> (String, String) {
+        let (measurement, config) = match &self.allowed().platform {
+            PlatformMeasurement::SevSnp(snp) => (snp.measurement.clone(), snp.host_data.clone()),
+            PlatformMeasurement::Tdx(tdx) => (
+                tdx.mrtd.clone(),
+                tdx.mrconfigid
+                    .get(..64)
+                    .unwrap_or(&tdx.mrconfigid)
+                    .to_string(),
+            ),
+        };
+        (
+            measurement.to_ascii_lowercase(),
+            config.to_ascii_lowercase(),
+        )
+    }
+}
+
+/// Parse a trust spec into the measurement it trusts, refused unless the
+/// attesting client's own pin compiler accepts it:
+///
+/// - `<measurement>:<host_data>:<guest_policy>`: an SEV-SNP launch identity
+///   (the launch digest, 96 hex; HOST_DATA, 64 hex; the guest policy, such as
+///   `0x30133`);
+/// - `tdx:<mrtd>:<config hash>`: this build's own pin, when it is TDX, and
+///   nothing else (a TDX pin's machine policy is the release's).
+pub fn parse_trust_measurement(spec: &str) -> Result<TrustedMeasurement, AppError> {
+    if let Some(tdx) = spec.strip_prefix(TDX_SPEC_PREFIX) {
+        let key = parse_untrust_key(tdx)?;
+        let pin = TrustedMeasurement::from_pin(crate::trust_root::server_pin());
+        let (measurement, config) = pin.identity();
+        if !pin.is_tdx() || key != format!("{measurement}:{config}") {
+            return Err(AppError::Config {
+                message: "a TDX launch identity is trusted only as this build's own pin, whose \
+                          machine policy comes with the release"
+                    .into(),
+            });
+        }
+        return Ok(pin);
+    }
     let parts: Vec<&str> = spec.split(':').collect();
     let [measurement, host_data, guest_policy] = parts.as_slice() else {
         return Err(AppError::Config {
@@ -586,22 +672,20 @@ pub fn parse_trust_measurement(spec: &str) -> Result<SevSnpPin, AppError> {
         .map_err(|e| AppError::Config {
             message: format!("trust_measurement: {e}"),
         })?;
-    Ok(pin)
+    Ok(TrustedMeasurement::SevSnp(pin))
 }
 
 /// The key a trusted measurement is untrusted by: its launch identity,
-/// `<measurement>:<host_data>`, lowercase.
-pub fn measurement_key(pin: &SevSnpPin) -> String {
-    format!(
-        "{}:{}",
-        pin.measurement.to_ascii_lowercase(),
-        pin.host_data.to_ascii_lowercase()
-    )
+/// `<measurement>:<config hash>`, lowercase.
+pub fn measurement_key(pin: &TrustedMeasurement) -> String {
+    let (measurement, config) = pin.identity();
+    format!("{measurement}:{config}")
 }
 
 /// Extract the key from an `--untrust_measurement` argument: either
-/// `<measurement>:<host_data>` or the full trust spec.
+/// `<measurement>:<host_data>` or the full trust spec, of either TEE.
 pub fn parse_untrust_key(spec: &str) -> Result<String, AppError> {
+    let spec = spec.strip_prefix(TDX_SPEC_PREFIX).unwrap_or(spec);
     let mut parts = spec.split(':');
     let (Some(measurement), Some(host_data)) = (parts.next(), parts.next()) else {
         return Err(AppError::Config {
@@ -686,10 +770,13 @@ mod tests {
         let measurement = "A".repeat(96);
         let host_data = "b".repeat(64);
         let spec = format!("{measurement}:{host_data}:0x30133");
-        let m = parse_trust_measurement(&spec).unwrap();
+        let TrustedMeasurement::SevSnp(m) = parse_trust_measurement(&spec).unwrap() else {
+            panic!("an SEV-SNP spec is an SEV-SNP pin");
+        };
         assert_eq!(m.measurement, "a".repeat(96));
         assert_eq!(m.host_data, host_data);
         assert_eq!(m.guest_policy, "0x30133");
+        let m = TrustedMeasurement::SevSnp(m);
         assert_eq!(
             measurement_key(&m),
             format!("{}:{host_data}", "a".repeat(96))
@@ -714,6 +801,52 @@ mod tests {
         ] {
             assert!(parse_trust_measurement(&spec).is_err(), "{spec}");
         }
+    }
+
+    /// A TDX spec trusts only this build's own pin, and only when the build
+    /// pins TDX: it names a launch identity, and the machine policy a TDX pin
+    /// needs comes with the release.
+    #[test]
+    fn a_tdx_spec_names_the_build_pin_only() {
+        let pin = TrustedMeasurement::from_pin(crate::trust_root::server_pin());
+        let (m, h) = pin.identity();
+        let spec = format!("tdx:{m}:{h}");
+        if pin.is_tdx() {
+            assert_eq!(parse_trust_measurement(&spec).unwrap(), pin);
+        } else {
+            assert!(parse_trust_measurement(&spec).is_err());
+        }
+        let other = format!("tdx:{}:{}", "c".repeat(96), "d".repeat(64));
+        assert!(parse_trust_measurement(&other).is_err());
+        assert!(parse_trust_measurement("tdx:").is_err());
+        assert_eq!(
+            parse_untrust_key(&other).unwrap(),
+            format!("{}:{}", "c".repeat(96), "d".repeat(64))
+        );
+    }
+
+    /// The stored list reads both forms: an SEV-SNP pin in its own shape, as
+    /// every override has been written, and a whole pin.
+    #[test]
+    fn a_stored_measurement_is_either_form() {
+        let snp = SevSnpPin {
+            measurement: "a".repeat(96),
+            host_data: "b".repeat(64),
+            guest_policy: "0x30133".into(),
+        };
+        let stored = serde_json::to_string(&[TrustedMeasurement::SevSnp(snp.clone())]).unwrap();
+        assert_eq!(
+            stored,
+            serde_json::to_string(std::slice::from_ref(&snp)).unwrap()
+        );
+        let read: Vec<TrustedMeasurement> = serde_json::from_str(&stored).unwrap();
+        assert_eq!(read, [TrustedMeasurement::SevSnp(snp.clone())]);
+        let whole = serde_json::to_string(&[AllowedMeasurement::sev_snp(snp.clone())]).unwrap();
+        let read: Vec<TrustedMeasurement> = serde_json::from_str(&whole).unwrap();
+        assert_eq!(read[0].allowed(), AllowedMeasurement::sev_snp(snp));
+        assert!(
+            serde_json::from_str::<Vec<TrustedMeasurement>>("[{\"measurement\": \"a\"}]").is_err()
+        );
     }
 
     #[test]

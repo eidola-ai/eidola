@@ -149,6 +149,197 @@ async fn issue(f: &Fixture, amount: i64, id: u8) -> String {
 
 #[tokio::test]
 #[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn an_issuance_records_every_allocation_and_retries_and_prunes_as_one() {
+    let f = fixture().await;
+    let a = purchase(&f, "a", 1000, 100);
+    let mut b = purchase(&f, "b", 1000, 200);
+    b.expires_at = a.expires_at;
+    f.store.record_purchase(&a).await.unwrap();
+    f.store.record_purchase(&b).await.unwrap();
+    assert_eq!(issue(&f, 1500, 7).await, "issued");
+    let c = f.pool.get().await.unwrap();
+    let read = "SELECT ci.issuance_id, ci.credits, cl.purchase_id, cl.credential_credits \
+                FROM credential_issuance ci \
+                JOIN credential_issuance_allocation ca ON ca.issuance_id=ci.issuance_id \
+                JOIN credit_ledger cl ON cl.id=ca.ledger_entry_id \
+                WHERE ci.account_id=$1 ORDER BY cl.purchase_id";
+    let rows = c.query(read, &[&f.account]).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    let issuance_id: Uuid = rows[0].get(0);
+    for (row, purchase, credits) in [(&rows[0], &a, 1000_i64), (&rows[1], &b, 500)] {
+        assert_eq!(row.get::<_, Uuid>(0), issuance_id);
+        assert_eq!(row.get::<_, i64>(1), 1500);
+        assert_eq!(row.get::<_, String>(2), purchase.id);
+        assert_eq!(row.get::<_, i64>(3), credits);
+    }
+    assert_eq!(issue(&f, 1500, 7).await, "stored");
+    let retried = c.query(read, &[&f.account]).await.unwrap();
+    assert_eq!(retried.len(), 2);
+    assert_eq!(retried[0].get::<_, Uuid>(0), issuance_id);
+    assert_eq!(balance(&f).await, 500);
+
+    // Neither a purchase credit nor a different account's debit may fund it.
+    let purchase_credit: Uuid = c
+        .query_one(
+            "SELECT id FROM credit_ledger WHERE purchase_id=$1 AND delta>0",
+            &[&a.id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let err = c
+        .execute(
+            "INSERT INTO credential_issuance_allocation VALUES($1,$2,$3,$4)",
+            &[&issuance_id, &f.account, &f.key, &purchase_credit],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION)
+    );
+    let other = Uuid::new_v4();
+    c.execute(
+        "INSERT INTO account(id,secret_hash) VALUES($1,'test')",
+        &[&other],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "INSERT INTO credit_ledger(account_id,delta,reason) VALUES($1,100,'manual_adjustment')",
+        &[&other],
+    )
+    .await
+    .unwrap();
+    let other_debits: Vec<Uuid> = c
+        .query_one(
+            "SELECT debit_account($1,100,'credential_issuance',NULL,$2,TRUE)",
+            &[&other, &f.key],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    for allocation_account in [f.account, other] {
+        let err = c
+            .execute(
+                "INSERT INTO credential_issuance_allocation VALUES($1,$2,$3,$4)",
+                &[&issuance_id, &allocation_account, &f.key, &other_debits[0]],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION)
+        );
+    }
+    // A failed response insert rolls back the debit as well as its allocation.
+    assert!(
+        c.query_one(
+            "SELECT * FROM record_credential_issuance($1,$2,$3,$4,100,$5)",
+            &[
+                &f.account,
+                &vec![8_u8; 32],
+                &vec![0_u8; 31],
+                &f.key,
+                &vec![1_u8]
+            ]
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(balance(&f).await, 500);
+    assert_eq!(c.query(read, &[&f.account]).await.unwrap().len(), 2);
+
+    c.execute(
+        "UPDATE issuer_key SET issue_until=now()-interval '3 hours', \
+               accept_until=now()-interval '2 hours' WHERE id=$1",
+        &[&f.key],
+    )
+    .await
+    .unwrap();
+    let pruned: i64 = c
+        .query_one("SELECT prune_expired_issuances(interval '1 hour')", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(pruned, 1);
+    assert_eq!(
+        c.query_one("SELECT count(*) FROM credential_issuance_allocation", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(c.query_one("SELECT count(*) FROM credit_ledger WHERE account_id=$1 AND reason='credential_issuance'", &[&f.account]).await.unwrap().get::<_, i64>(0), 2);
+    assert_eq!(issue(&f, 1500, 7).await, "retired");
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn a_purchase_operation_must_belong_to_its_account() {
+    let f = fixture().await;
+    let p = purchase(&f, "purchase", 1000, 100);
+    f.store.record_purchase(&p).await.unwrap();
+    let c = f.pool.get().await.unwrap();
+    let other = Uuid::new_v4();
+    c.execute(
+        "INSERT INTO account(id,secret_hash) VALUES($1,'test')",
+        &[&other],
+    )
+    .await
+    .unwrap();
+    let op: Uuid = c.query_one(
+        "INSERT INTO billing_operation(account_id,kind,reason) VALUES($1,'purchase','test') RETURNING id", &[&other]
+    ).await.unwrap().get(0);
+    let err = c
+        .execute(
+            "UPDATE billing_purchase SET operation_id=$1 WHERE id=$2",
+            &[&op, &p.id],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION)
+    );
+    assert_eq!(balance(&f).await, 1000);
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn closure_request_timestamp_is_required_and_survives_completion() {
+    let f = fixture().await;
+    let c = f.pool.get().await.unwrap();
+    for invalid in [
+        "UPDATE account SET billing_state='closing' WHERE id=$1",
+        "UPDATE account SET billing_state='closed' WHERE id=$1",
+        "UPDATE account SET billing_close_requested_at=now() WHERE id=$1",
+    ] {
+        let err = c.execute(invalid, &[&f.account]).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION)
+        );
+    }
+    assert!(f.store.begin_close(f.account).await.unwrap());
+    let requested: SystemTime = c.query_one(
+        "SELECT billing_close_requested_at FROM account WHERE id=$1 AND billing_state='closing'", &[&f.account]
+    ).await.unwrap().get(0);
+    assert!(!f.store.begin_close(f.account).await.unwrap());
+    assert!(f.store.finalize_close(f.account).await.unwrap());
+    let finished: SystemTime = c
+        .query_one(
+            "SELECT billing_close_requested_at FROM account WHERE id=$1 AND billing_state='closed'",
+            &[&f.account],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(requested, finished);
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
 async fn purchase_identity_not_event_delivery_controls_grants() {
     let f = fixture().await;
     let p = purchase(&f, "purchase", 1000, 100);

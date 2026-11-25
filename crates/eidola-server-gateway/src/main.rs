@@ -81,7 +81,7 @@ impl Config {
             .map_err(|_| format!("{master_key_var} must be exactly 32 bytes (64 hex chars)"))?;
 
         // Terms-acceptance gate. Two independent sources feed the shared
-        // `required_document` table (both through the same monotonic
+        // `required_document_version` table (both through the same monotonic
         // upsert — version may only increase):
         //
         //  - TERMS_FEED_BASE_URL: the published website to poll for each
@@ -324,7 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })?;
 
     // Terms-acceptance gate: seed any static env pins into the shared
-    // required_document table (monotonic — a stale pin can't regress a
+    // required_document_version table (monotonic — a stale pin can't regress a
     // newer polled version), then start the terms-feed poller if a feed
     // URL is configured. Seed failures are fatal (an explicitly pinned
     // gate that silently doesn't apply would be worse than not starting);

@@ -159,14 +159,28 @@ pub struct EidolaTrust {
     pub hardware_intermediate_ca_pem: Option<String>,
 }
 
-/// One trusted server launch identity (SEV-SNP, IGVM launch model).
+/// The TEE a trusted server launch identity is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeasurementPlatform {
+    /// AMD SEV-SNP.
+    SevSnp,
+    /// Intel TDX.
+    Tdx,
+}
+
+/// One trusted server launch identity (IGVM launch model), on either TEE.
 #[derive(Clone, Debug)]
 pub struct MeasurementInfo {
-    /// The launch digest of the release image (96 hex).
+    /// The TEE it is for.
+    pub platform: MeasurementPlatform,
+    /// The launch measurement of the release image (96 hex): the SEV-SNP
+    /// launch digest, or the TDX MRTD.
     pub measurement: String,
-    /// HOST_DATA: the SHA-256 of the server's config (64 hex).
+    /// The SHA-256 of the server's config (64 hex): SEV-SNP HOST_DATA, or the
+    /// config hash TDX MRCONFIGID carries.
     pub host_data: String,
-    /// The guest policy a launch must carry (`0x30133`).
+    /// The guest policy an SEV-SNP launch must carry (`0x30133`); empty for
+    /// TDX, whose machine policy comes with the release's pin.
     pub guest_policy: String,
 }
 
@@ -176,13 +190,43 @@ impl MeasurementInfo {
         format!("{}:{}", self.measurement, self.host_data)
     }
 
-    /// Its trust spec, `<measurement>:<host_data>:<guest_policy>`, the form
-    /// `trust_measurement` reads back.
+    /// Its trust spec, the form `trust_measurement` reads back:
+    /// `<measurement>:<host_data>:<guest_policy>` on SEV-SNP,
+    /// `tdx:<mrtd>:<config hash>` on TDX.
     pub fn spec(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.measurement, self.host_data, self.guest_policy
-        )
+        match self.platform {
+            MeasurementPlatform::SevSnp => format!(
+                "{}:{}:{}",
+                self.measurement, self.host_data, self.guest_policy
+            ),
+            MeasurementPlatform::Tdx => format!("tdx:{}:{}", self.measurement, self.host_data),
+        }
+    }
+
+    fn of(m: &config::TrustedMeasurement) -> Self {
+        let (measurement, host_data) = m.identity();
+        match m {
+            config::TrustedMeasurement::SevSnp(snp) => Self {
+                platform: MeasurementPlatform::SevSnp,
+                measurement,
+                host_data,
+                guest_policy: snp.guest_policy.clone(),
+            },
+            config::TrustedMeasurement::Pin(pin) => match &pin.platform {
+                tinfoil_verifier::PlatformMeasurement::SevSnp(snp) => Self {
+                    platform: MeasurementPlatform::SevSnp,
+                    measurement,
+                    host_data,
+                    guest_policy: snp.guest_policy.clone(),
+                },
+                tinfoil_verifier::PlatformMeasurement::Tdx(_) => Self {
+                    platform: MeasurementPlatform::Tdx,
+                    measurement,
+                    host_data,
+                    guest_policy: String::new(),
+                },
+            },
+        }
     }
 }
 
@@ -422,7 +466,7 @@ pub struct SpaceSettings {
     /// surface needs before it can render the roster honestly: that agent's
     /// membership is structural, so no Remove may be offered beside it — an
     /// affordance that could only ever be refused.
-    pub notebook_participant_id: Option<String>,
+    pub notebook_owner_participant_id: Option<String>,
     /// The agent that **owns this sub-space**, if it is one — the other
     /// structural membership, carried for the same reason and read the same
     /// way. It records who is answerable for the delegation, whose live-room
@@ -437,7 +481,7 @@ impl Default for SpaceSettings {
         Self {
             cascade_limit: DEFAULT_CASCADE_LIMIT,
             router_model: None,
-            notebook_participant_id: None,
+            notebook_owner_participant_id: None,
             subspace_owner_participant_id: None,
         }
     }
@@ -3012,18 +3056,16 @@ impl Inner {
     /// override-vs-pin honesty flags the UIs render.
     async fn eidola_trust(&self) -> Result<EidolaTrust, AppError> {
         let resolved = self.eidola_resolved().await?;
-        let to_info = |m: &tinfoil_verifier::SevSnpPin| MeasurementInfo {
-            measurement: m.measurement.to_ascii_lowercase(),
-            host_data: m.host_data.to_ascii_lowercase(),
-            guest_policy: m.guest_policy.clone(),
-        };
+        let to_info = MeasurementInfo::of;
         Ok(EidolaTrust {
             base_url: resolved.base_url.clone(),
             base_url_pin: trust_root::SERVER_URL.to_string(),
             base_url_is_override: resolved.base_url_is_override,
             trusted_measurements: resolved.measurements.iter().map(to_info).collect(),
             trusted_measurements_are_override: resolved.measurements_are_override,
-            pinned_measurement: to_info(&trust_root::server_measurement()),
+            pinned_measurement: to_info(&config::TrustedMeasurement::from_pin(
+                trust_root::server_pin(),
+            )),
             has_hardware_root_ca: resolved.hardware_root_ca.is_some(),
             hardware_root_ca_pem: resolved.hardware_root_ca.clone(),
             has_hardware_intermediate_ca: resolved.hardware_intermediate_ca.is_some(),
@@ -3036,7 +3078,7 @@ impl Inner {
     /// is NULL — the read-modify-write base for trust/untrust.
     async fn eidola_measurement_overrides(
         &self,
-    ) -> Result<Vec<tinfoil_verifier::SevSnpPin>, AppError> {
+    ) -> Result<Vec<config::TrustedMeasurement>, AppError> {
         let conn = self.db_conn().await?;
         let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
         match row.and_then(|r| r.trusted_measurements) {
@@ -3053,10 +3095,7 @@ impl Inner {
     /// launch identity, digest and HOST_DATA). Returns whether it was newly
     /// added; an entry for the same identity under another guest policy is
     /// not added beside it.
-    async fn trust_measurement(
-        &self,
-        entry: tinfoil_verifier::SevSnpPin,
-    ) -> Result<bool, AppError> {
+    async fn trust_measurement(&self, entry: config::TrustedMeasurement) -> Result<bool, AppError> {
         let mut list = self.eidola_measurement_overrides().await?;
         let key = config::measurement_key(&entry);
         if list.iter().any(|m| config::measurement_key(m) == key) {
@@ -3158,13 +3197,13 @@ impl Inner {
             "hardware_intermediate_ca",
         )?;
 
-        // The server is pinned on SEV-SNP only (launch digest, HOST_DATA and
-        // guest policy): the client path accepts no TDX evidence.
+        // The server is pinned on the TEE its release names (or on the
+        // overrides' own): evidence from any other is refused before it is
+        // authenticated.
         let allowed: Vec<tinfoil_verifier::AllowedMeasurement> = eidola
             .measurements
             .iter()
-            .cloned()
-            .map(tinfoil_verifier::AllowedMeasurement::sev_snp)
+            .map(config::TrustedMeasurement::allowed)
             .collect();
         transport::attesting_client(
             &self.transport,
@@ -3251,7 +3290,7 @@ impl Inner {
 struct EidolaResolved {
     base_url: String,
     base_url_is_override: bool,
-    measurements: Vec<tinfoil_verifier::SevSnpPin>,
+    measurements: Vec<config::TrustedMeasurement>,
     measurements_are_override: bool,
     hardware_root_ca: Option<String>,
     hardware_intermediate_ca: Option<String>,
@@ -3277,7 +3316,7 @@ impl EidolaResolved {
         let base_url_is_override = base_url_override.is_some();
         let base_url = base_url_override.unwrap_or_else(|| trust_root::SERVER_URL.to_string());
 
-        let measurements_override: Vec<tinfoil_verifier::SevSnpPin> =
+        let measurements_override: Vec<config::TrustedMeasurement> =
             match row.and_then(|r| r.trusted_measurements.as_deref()) {
                 Some(json) if !json.trim().is_empty() => {
                     serde_json::from_str(json).map_err(|e| AppError::Database {
@@ -3290,7 +3329,9 @@ impl EidolaResolved {
         let measurements = if measurements_are_override {
             measurements_override
         } else {
-            vec![trust_root::server_measurement()]
+            vec![config::TrustedMeasurement::from_pin(
+                trust_root::server_pin(),
+            )]
         };
 
         Ok(EidolaResolved {
@@ -6685,7 +6726,7 @@ impl Inner {
         Ok(SpaceSettings {
             cascade_limit,
             router_model: db::space_router_model(&conn, space_id).await?,
-            notebook_participant_id: db::notebook_participant_of(&conn, space_id).await?,
+            notebook_owner_participant_id: db::notebook_owner_of(&conn, space_id).await?,
             subspace_owner_participant_id: db::subspace_owner_of(&conn, space_id).await?,
         })
     }
@@ -12292,7 +12333,16 @@ impl AppCore {
         host_data: String,
         guest_policy: String,
     ) -> Result<bool, AppError> {
-        let spec = format!("{measurement}:{host_data}:{guest_policy}");
+        self.trust_measurement_spec(format!("{measurement}:{host_data}:{guest_policy}"))
+            .await
+    }
+
+    /// Add the measurement a trust spec names (`config::parse_trust_measurement`:
+    /// an SEV-SNP launch identity, or this build's own pin when it is TDX) to
+    /// the eidola backend row's override list. Returns whether it was newly
+    /// added (idempotent by launch identity). Emits [`Change::Backends`] when
+    /// it writes.
+    pub async fn trust_measurement_spec(&self, spec: String) -> Result<bool, AppError> {
         let entry = config::parse_trust_measurement(&spec)?;
         let inner = self.inner.clone();
         self.runtime
@@ -14883,7 +14933,7 @@ struct IssueCredentialsResponse {
     issuer_key_id: String,
     credits: i64,
     #[allow(dead_code)]
-    ledger_entry_id: String,
+    issuance_id: String,
 }
 
 #[derive(Deserialize)]

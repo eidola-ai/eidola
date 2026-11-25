@@ -35,6 +35,18 @@ const RELEASE_MANIFEST: &str =
 const RELEASE_SHA256: &str = "1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f";
 /// The MRTD it states, the fixture pin's.
 const RELEASE_MRTD: &str = "bf582997bf2145f275db3bc2542d703fdd889c85927b3ee199138298f863631711f41b37d8d347d5aee18036ff02c16c";
+/// The SEV-SNP launch digest it states for the same image.
+const RELEASE_SNP_MEASUREMENT: &str = "605c0b29196443fe02c3fc9b6c0bf4efda8948dc93d32a1bbcb25da1f969eda6ddbdd08d9e5358c9a9bf57f2b0c0ab98";
+/// The same release's CPU image manifest, vendored: a copy of the real
+/// `v0.15.3-rc.1` manifest, for a `cpu` deployment.
+const CPU_RELEASE_MANIFEST: &str =
+    "releases/trust/cvm-releases/v0.15.3-rc.1/tinfoil-inference-v0.15.3-rc.1-manifest.json";
+/// That manifest's SHA-256.
+const CPU_RELEASE_SHA256: &str = "ddd2e76a629df1bd4ec507441a387ac5db010ebc1bda3e372756e095df8692eb";
+/// The launch measurements it states for the CPU image: the MRTD, and the
+/// SEV-SNP launch digest.
+const CPU_RELEASE_MRTD: &str = "cc56391d1066167b";
+const CPU_RELEASE_SNP_MEASUREMENT: &str = "d712705df47368b82a283ba74501c5cf807f5a099c67906a5e1d861037514b9efe382024d4eb6245bb8c9877c7fe6858";
 
 /// The weights pack's data size in the fixture's `mpk` (`_17419419648_`).
 const FIXTURE_PACK_BYTES: u64 = 17_419_419_648;
@@ -132,8 +144,13 @@ impl Tree {
             .map(|b| format!("{b:02x}"))
             .collect();
         self.deployment()["config_sha256"] = hash.clone().into();
-        self.deployment()["pin"]["platform"]["tdx"]["mrconfigid"] =
-            format!("{hash}{}", "00".repeat(16)).into();
+        let platform = &mut self.deployment()["pin"]["platform"];
+        if let Some(tdx) = platform.get_mut("tdx") {
+            tdx["mrconfigid"] = format!("{hash}{}", "00".repeat(16)).into();
+        }
+        if let Some(snp) = platform.get_mut("sev_snp") {
+            snp["host_data"] = hash.into();
+        }
         self.files.insert(CONFIG.to_string(), text.into_bytes());
     }
 
@@ -1011,6 +1028,23 @@ fn the_sidecar_is_read_strictly_at_every_level() {
     }
 }
 
+/// The fixture deployment, moved onto SEV-SNP: the sidecar names `sev_snp`,
+/// and the pin is the launch digest the release states for the image, the
+/// config's hash as HOST_DATA, and the image's guest policy.
+fn on_sev_snp(tree: &mut Tree) {
+    let config_sha256 = tree.deployment()["config_sha256"].clone();
+    tree.deployment()["pin"]["platform"] = serde_json::json!({"sev_snp": {
+        "measurement": RELEASE_SNP_MEASUREMENT,
+        "host_data": config_sha256,
+        "guest_policy": "0x30133",
+    }});
+    let mut sidecar = tree.sidecar();
+    let side = sidecar.as_object_mut().unwrap();
+    side.remove("tdx");
+    side.insert("sev_snp".into(), serde_json::json!({}));
+    tree.set_sidecar(sidecar);
+}
+
 #[test]
 fn a_pin_names_exactly_one_platform() {
     let mut tree = Tree::fixture();
@@ -1019,36 +1053,55 @@ fn a_pin_names_exactly_one_platform() {
     // The typed parse (the runtime's) refuses a second platform member.
     refused(&tree, "engine-enclaves.json: ");
 
-    // SEV-SNP stays expressible, and then the sidecar states no TDX policy.
-    // Its HOST_DATA is the config's hash, as MRCONFIGID is on TDX.
+    // An SEV-SNP deployment is pinned like a TDX one: by the launch digest the
+    // release states for its image, with the config's hash as HOST_DATA, as
+    // MRCONFIGID is on TDX.
     let mut tree = Tree::fixture();
-    let config_sha256 = tree.deployment()["config_sha256"].clone();
-    let snp = |host_data: serde_json::Value| {
-        serde_json::json!({"sev_snp": {
-            "measurement": "a".repeat(96),
-            "host_data": host_data,
-            "guest_policy": "0x30133",
-        }})
-    };
-    tree.deployment()["pin"]["platform"] = snp(config_sha256.clone());
-    refused(&tree, "a SEV-SNP pin, but");
-    let mut sidecar = tree.sidecar();
-    sidecar.as_object_mut().unwrap().remove("tdx");
-    tree.set_sidecar(sidecar);
-    tree.check().expect("a SEV-SNP deployment is expressible");
+    on_sev_snp(&mut tree);
+    tree.check().expect("an SEV-SNP deployment is pinned");
+    // It names no platform endorsements; the newest vendored release stays as
+    // the drift baseline.
+    tree.check_vendored().unwrap();
 
+    // The pin and the sidecar name the same TEE.
+    let mut tdx_sidecar = Tree::fixture();
+    let sidecar = tdx_sidecar.sidecar();
+    on_sev_snp(&mut tdx_sidecar);
+    tdx_sidecar.set_sidecar(sidecar);
+    refused(&tdx_sidecar, "an SEV-SNP pin, but");
+    let mut snp_sidecar = Tree::fixture();
+    let mut snp = snp_sidecar.clone();
+    on_sev_snp(&mut snp);
+    snp_sidecar.set_sidecar(snp.sidecar());
+    refused(&snp_sidecar, "a TDX pin, but");
+
+    // The digest is the release's statement for the image the config
+    // launches: another image's (the TDX MRTD, the CPU image's), or one
+    // edited, is refused.
+    for other in [
+        RELEASE_MRTD.to_string(),
+        CPU_RELEASE_SNP_MEASUREMENT.to_string(),
+        format!("{}00", &RELEASE_SNP_MEASUREMENT[..94]),
+    ] {
+        let mut wrong = tree.clone();
+        wrong.deployment()["pin"]["platform"]["sev_snp"]["measurement"] = other.into();
+        refused(&wrong, "pin.platform.sev_snp.measurement is");
+    }
     let mut other = tree.clone();
-    other.deployment()["pin"]["platform"] = snp("b".repeat(64).into());
+    other.deployment()["pin"]["platform"]["sev_snp"]["host_data"] = "b".repeat(64).into();
     refused(&other, "sev_snp.host_data is not the hash of");
     let mut legacy = tree.clone();
     legacy.deployment()["pin"]["platform"] =
-        serde_json::json!({"sev_snp": {"measurement": "a".repeat(96)}});
+        serde_json::json!({"sev_snp": {"measurement": RELEASE_SNP_MEASUREMENT}});
     // A digest alone, the pre-IGVM pin shape, is no pin: the typed parse
     // refuses it.
     refused(&legacy, "missing field `host_data`");
     let mut debug = tree.clone();
     debug.deployment()["pin"]["platform"]["sev_snp"]["guest_policy"] = "0xb0133".into();
     refused(&debug, "the attesting client refuses this pin");
+    let mut migrate = tree.clone();
+    migrate.deployment()["pin"]["platform"]["sev_snp"]["guest_policy"] = "0x70133".into();
+    refused(&migrate, "the attesting client refuses this pin");
 }
 
 #[test]
@@ -1362,10 +1415,16 @@ fn a_cuda_deployment_attests_its_gpus() {
         tree.check()
             .expect("a CUDA deployment of any count it attests");
     }
+}
 
-    // A pinned deployment runs the CUDA executor: a CPU deployment is refused
-    // even when it is consistent in every other way (no GPUs, no evidence).
-    let mut tree = Tree::fixture();
+/// The fixture deployment moved onto the `cpu` executor: the release's CPU
+/// image, no GPU attached, none of the CUDA executor's settings, no GPU
+/// evidence asked for, and the pin's launch measurement the CPU image's.
+fn on_cpu(tree: &mut Tree) {
+    tree.files.insert(
+        CPU_RELEASE_MANIFEST.to_string(),
+        std::fs::read(fixture_root().join(CPU_RELEASE_MANIFEST)).unwrap(),
+    );
     tree.edit_config("gpus: 8\n", "");
     tree.edit_config("    runtime: nvidia\n", "");
     tree.edit_config("    gpus: all\n", "");
@@ -1377,14 +1436,86 @@ fn a_cuda_deployment_attests_its_gpus() {
     tree.edit_config("      - ENGINE_KERNELS_DIR: \"/opt/eidola/kernels\"\n", "");
     tree.edit_config("      - ENGINE_CUDA_GRAPHS: \"on\"\n", "");
     tree.edit_config("      - ENGINE_GPU_CC: \"required\"\n", "");
-    set_expected_gpus(&mut tree, None);
-    refused(&tree, "a pinned deployment runs the cuda executor");
+    tree.edit_config(
+        &format!("0.15.3-rc.1+gpu@sha256:{RELEASE_SHA256}"),
+        &format!("0.15.3-rc.1@sha256:{CPU_RELEASE_SHA256}"),
+    );
+    let cvm_version = format!("0.15.3-rc.1@sha256:{CPU_RELEASE_SHA256}");
+    tree.deployment()["cvm_version"] = cvm_version.into();
+    set_expected_gpus(tree, None);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&tree.files[CPU_RELEASE_MANIFEST]).unwrap();
+    let mrtd = manifest["igvm"]["tdx_launch"]["mrtd"].as_str().unwrap();
+    assert!(mrtd.starts_with(CPU_RELEASE_MRTD));
+    if let Some(tdx) = tree.deployment()["pin"]["platform"].get_mut("tdx") {
+        tdx["mrtd"] = mrtd.into();
+    }
+    if let Some(snp) = tree.deployment()["pin"]["platform"].get_mut("sev_snp") {
+        snp["measurement"] = CPU_RELEASE_SNP_MEASUREMENT.into();
+    }
 }
 
-/// Every allocation-driving size is capped, and what the node allocates fits
-/// the VM's memory and the attached GPUs.
+/// A pinned deployment may run the `cpu` executor, on either TEE: on the
+/// release's CPU image, with no GPU attached and no GPU evidence required,
+/// its pin the CPU image's launch measurement. A GPU, GPU evidence or the GPU
+/// image beside it is refused, as is a cuda deployment on the CPU image.
 #[test]
-fn allocations_are_capped_and_fit_the_deployment() {
+fn a_cpu_deployment_is_pinned_on_the_cpu_image() {
+    let mut tdx = Tree::fixture();
+    on_cpu(&mut tdx);
+    tdx.check().expect("a cpu deployment on TDX is pinned");
+    let mut snp = Tree::fixture();
+    on_sev_snp(&mut snp);
+    on_cpu(&mut snp);
+    snp.check().expect("a cpu deployment on SEV-SNP is pinned");
+
+    for tree in [&tdx, &snp] {
+        // GPU evidence asked of a node with no GPU.
+        let mut evidence = tree.clone();
+        set_expected_gpus(&mut evidence, Some(1));
+        refused(&evidence, "the cpu executor attaches no GPUs");
+        // A GPU attached.
+        let mut gpu = tree.clone();
+        gpu.edit_config("memory: 65536\n", "memory: 65536\ngpus: 1\n");
+        refused(&gpu, "the cpu executor attaches no GPUs");
+        // The GPU image's measurement under the CPU image's release.
+        let mut image = tree.clone();
+        let platform = &mut image.deployment()["pin"]["platform"];
+        if let Some(t) = platform.get_mut("tdx") {
+            t["mrtd"] = RELEASE_MRTD.into();
+        }
+        if let Some(s) = platform.get_mut("sev_snp") {
+            s["measurement"] = RELEASE_SNP_MEASUREMENT.into();
+        }
+        refused(&image, "states");
+    }
+    // The cpu executor on the GPU image.
+    let mut gpu_image = tdx.clone();
+    gpu_image.edit_config(
+        &format!("0.15.3-rc.1@sha256:{CPU_RELEASE_SHA256}"),
+        &format!("0.15.3-rc.1+gpu@sha256:{RELEASE_SHA256}"),
+    );
+    refused(
+        &gpu_image,
+        "the cpu executor runs on the release's plain CPU image",
+    );
+    // And the cuda executor on the CPU image.
+    let mut cuda = Tree::fixture();
+    cuda.edit_config(
+        &format!("0.15.3-rc.1+gpu@sha256:{RELEASE_SHA256}"),
+        &format!("0.15.3-rc.1@sha256:{CPU_RELEASE_SHA256}"),
+    );
+    refused(&cuda, "is not a GPU image");
+}
+
+/// Every allocation-driving size is capped by the node's own boot grammar,
+/// and nothing about whether a sizing fits the machine is pinned: the
+/// platform attests neither the VM's memory nor its GPU, so a deployment
+/// sized past them checks (its node refuses to boot or serves less). The
+/// sizing aids (`engine_deployment::check_resources`) still say whether it
+/// fits.
+#[test]
+fn allocations_are_capped_and_sizing_is_not_pinned() {
     for (name, from, to) in [
         ("ENGINE_MAX_SEQS", "\"64\"", "\"4294967295\""),
         ("ENGINE_MAX_SEQS", "\"64\"", "\"1025\""),
@@ -1404,40 +1535,6 @@ fn allocations_are_capped_and_fit_the_deployment() {
         tree.edit_config(&format!("{name}: {from}"), &format!("{name}: {to}"));
         refused(&tree, &format!("{name} must be at most"));
     }
-
-    // Host, near the limit: each request slot can hold 645,922,816 bytes at
-    // worst (a 32 MiB body of up to 2^18 JSON values with both parses in the
-    // read pool, and its tree, prompt and tokens in the admission pool); 99
-    // fit 64 GiB beside the headroom and tables, 100 do not (with no host
-    // tier).
-    let no_tier = |tree: &mut Tree| {
-        tree.edit_config("KV_HOST_BYTES: \"34359738368\"", "KV_HOST_BYTES: \"0\"");
-    };
-    let mut tree = Tree::fixture();
-    no_tier(&mut tree);
-    tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"99\"");
-    tree.check().expect("99 request slots fit 64 GiB");
-    let mut tree = Tree::fixture();
-    no_tier(&mut tree);
-    tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"100\"");
-    refused(&tree, "more than the VM's");
-    // The prefix cache's host tier is page-locked VM memory beside all that:
-    // with the fixture's 8 slots, a tier of exactly the rest of 64 GiB fits,
-    // a byte more does not; and it is capped at the largest VM.
-    let measured = fixture_measured(&Tree::fixture());
-    let rest = (65_536u64 << 20) - engine_deployment::host_memory_bytes(&measured.sizing);
-    let mut tree = Tree::fixture();
-    tree.edit_config(
-        "KV_HOST_BYTES: \"34359738368\"",
-        &format!("KV_HOST_BYTES: \"{rest}\""),
-    );
-    tree.check().expect("the host tier fills the VM exactly");
-    let mut tree = Tree::fixture();
-    tree.edit_config(
-        "KV_HOST_BYTES: \"34359738368\"",
-        &format!("KV_HOST_BYTES: \"{}\"", rest + 1),
-    );
-    refused(&tree, "host tier (KV_HOST_BYTES)");
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_HOST_BYTES: \"34359738368\"",
@@ -1447,83 +1544,42 @@ fn allocations_are_capped_and_fit_the_deployment() {
         ),
     );
     refused(&tree, "ENGINE_KV_HOST_BYTES must be at most");
-    // Device: the KV budget holds one longest sequence, every seat's sliding
-    // windows and, drafting three tokens, the drafter pool of as many blocks
-    // with their boundary taps, each pool with its pad block, at their
-    // smallest (`engine_deployment::cuda_kv_min_bytes`, from the fixture's own
-    // measured sizing).
-    let measured = fixture_measured(&Tree::fixture());
-    assert_eq!(measured.sizing.draft_tokens, 3);
-    let kv_min = engine_deployment::cuda_kv_min_bytes(FLASH, &measured.sizing, &measured.cache);
-    let mut tree = Tree::fixture();
-    tree.edit_config(
-        "KV_DEVICE_BYTES: \"68719476736\"",
-        &format!("KV_DEVICE_BYTES: \"{kv_min}\""),
-    );
-    tree.check().expect("the smallest KV budget fits");
-    let mut tree = Tree::fixture();
-    tree.edit_config(
-        "KV_DEVICE_BYTES: \"68719476736\"",
-        &format!("KV_DEVICE_BYTES: \"{}\"", kv_min - 1),
-    );
-    refused(
-        &tree,
-        &format!("less than the {kv_min} bytes the KV pools need"),
-    );
-    // The undrafted minimum leaves no room for the drafter pool.
-    let undrafted = engine_deployment::Sizing {
-        draft_tokens: 0,
-        ..measured.sizing
-    };
-    let undrafted_min = engine_deployment::cuda_kv_min_bytes(FLASH, &undrafted, &measured.cache);
-    assert!(undrafted_min < kv_min);
-    let mut tree = Tree::fixture();
-    tree.edit_config(
-        "KV_DEVICE_BYTES: \"68719476736\"",
-        &format!("KV_DEVICE_BYTES: \"{undrafted_min}\""),
-    );
-    refused(
-        &tree,
-        &format!("less than the {kv_min} bytes the KV pools need"),
-    );
 
-    // The device holds the KV budget, the weights (the pack's data size) and
-    // the executor's reserve (`engine_deployment::cuda_device_reserve_bytes`
-    // for this sizing, the drafter's seat rows, step tables, third group of
-    // block tables and wider partial rows included) within the B300's
-    // `SUPPORTED_GPU_MEMORY_BYTES`.
+    // Past the VM and the device, in every direction the sizing aid refuses.
+    let measured = fixture_measured(&Tree::fixture());
+    let kv_min = engine_deployment::cuda_kv_min_bytes(FLASH, &measured.sizing, &measured.cache);
     let reserve = engine_deployment::cuda_device_reserve_bytes(FLASH, &measured.sizing);
     let room = engine_deployment::SUPPORTED_GPU_MEMORY_BYTES - FIXTURE_PACK_BYTES - reserve;
-    let mut tree = Tree::fixture();
-    tree.edit_config(
-        "KV_DEVICE_BYTES: \"68719476736\"",
-        &format!("KV_DEVICE_BYTES: \"{room}\""),
-    );
-    tree.check().expect("the budget fills the device exactly");
-    let mut tree = Tree::fixture();
-    tree.edit_config(
-        "KV_DEVICE_BYTES: \"68719476736\"",
-        &format!("KV_DEVICE_BYTES: \"{}\"", room + 1),
-    );
-    refused(&tree, "more than the NVIDIA B300 SXM6 AC's 287428640768");
-    // A Flash-sized pack leaves room for 64 GiB, and not for twice that.
-    let flash_pack = "_177700003840_";
-    let mut tree = Tree::fixture();
-    tree.edit_config("_17419419648_", flash_pack);
-    tree.check().expect("64 GiB of KV beside Flash's weights");
-    let mut tree = Tree::fixture();
-    tree.edit_config("_17419419648_", flash_pack);
-    tree.edit_config(
-        "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"137438953472\"",
-    );
-    refused(
-        &tree,
-        "of device memory, more than the NVIDIA B300 SXM6 AC's",
-    );
-
-    // An undrafted cuda deployment fits too: no drafter pool, and the smaller
-    // reserve.
+    let rest = (65_536u64 << 20) - engine_deployment::host_memory_bytes(&measured.sizing);
+    for (from, to) in [
+        ("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"4096\"".to_string()),
+        (
+            "KV_HOST_BYTES: \"34359738368\"",
+            format!("KV_HOST_BYTES: \"{}\"", rest + 1),
+        ),
+        (
+            "KV_DEVICE_BYTES: \"68719476736\"",
+            format!("KV_DEVICE_BYTES: \"{}\"", kv_min - 1),
+        ),
+        (
+            "KV_DEVICE_BYTES: \"68719476736\"",
+            format!("KV_DEVICE_BYTES: \"{}\"", room + 1),
+        ),
+        (
+            "KV_DEVICE_BYTES: \"68719476736\"",
+            "KV_DEVICE_BYTES: \"68719476736,68719476736\"".to_string(),
+        ),
+        ("memory: 65536\n", "memory: 1\n".to_string()),
+        ("cpus: 16\n", "cpus: 1000\n".to_string()),
+    ] {
+        let mut tree = Tree::fixture();
+        tree.edit_config(from, &to);
+        tree.check()
+            .unwrap_or_else(|e| panic!("{to} is sizing, not pinned: {e}"));
+    }
+    // The node's own refusals that need its weights are its own, too: a draft
+    // wider than the architecture's MTP layers boots nowhere and is not the
+    // pin's to refuse.
     let mut tree = Tree::fixture();
     tree.edit_config("DRAFT_TOKENS: \"3\"", "DRAFT_TOKENS: \"0\"");
     tree.check().expect("a cuda deployment may draft nothing");
@@ -1850,25 +1906,13 @@ fn the_env_is_exactly_the_measured_variables() {
 }
 
 /// The VM's cpus and memory are a launchable shape.
+/// The VM's shape is Tinfoil's to validate: positive values, nothing more.
 #[test]
-fn the_vm_is_a_launchable_shape() {
-    for (from, to, needle) in [
-        (
-            "memory: 65536",
-            "memory: 1",
-            "memory must be a whole number of GiB",
-        ),
-        (
-            "memory: 65536",
-            "memory: 65000",
-            "memory must be a whole number of GiB",
-        ),
-        ("cpus: 16", "cpus: 0", "cpus must be from"),
-        ("cpus: 16", "cpus: 1000", "cpus must be from"),
-    ] {
+fn the_vm_shape_is_positive() {
+    for (from, to) in [("memory: 65536", "memory: 0"), ("cpus: 16", "cpus: 0")] {
         let mut tree = Tree::fixture();
         tree.edit_config(from, to);
-        refused(&tree, needle);
+        refused(&tree, "cpus and memory must be positive");
     }
 }
 

@@ -1,4 +1,4 @@
-//! [`QwenCpuExecutor`]: the serving core's executor for Qwen3.8 over the model crate's
+//! [`QwenCpuExecutor`]: the serving core's executor for Qwen3.8 and Qwen3.5 over the model crate's
 //! reference numerics: the attention layers' KV and the drafter's paged per group, the
 //! DeltaNet layers' recurrent state kept as buffers at block boundaries and a per-slot
 //! tail of inputs, and MTP drafting. Doctrine: this crate's `AGENTS.md`.

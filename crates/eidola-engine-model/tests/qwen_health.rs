@@ -1,6 +1,7 @@
-//! Health of the Qwen3.8 reference forward on the whole released checkpoint
-//! (ignored: needs the checkpoint, about 31 GB, and the token sequences
-//! `golden/qwen/health_check.py` writes, see `golden/qwen/README.md`).
+//! Health of the Qwen reference forward on a whole released checkpoint
+//! (ignored: needs the checkpoint, Qwen3.8-27B-FP8's 31 GB or a Qwen3.5
+//! one, and the token sequences `golden/qwen/health_check.py` writes, see
+//! `golden/qwen/README.md`).
 //!
 //!     EIDOLA_QWEN_DIR=<dir> cargo test --release -p eidola-engine-model \
 //!         --test qwen_health -- --ignored --nocapture
@@ -10,8 +11,8 @@
 //! to facts outside the tooling: next-token accuracy over the checkpoint's own
 //! `LICENSE` of at least 0.95, and "Paris" as the greedy reply to "What is the
 //! capital of France? Answer with one word." (thinking off). With
-//! `EIDOLA_QWEN_LAYERS` below 64 it runs a truncation and asserts nothing
-//! about health.
+//! `EIDOLA_QWEN_LAYERS` below the checkpoint's layer count it runs a
+//! truncation and asserts nothing about health.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,14 +37,14 @@ fn ids(set: &WeightSet, name: &str) -> Vec<u32> {
 #[ignore = "needs the whole checkpoint"]
 fn the_released_model_is_healthy() {
     let dir = PathBuf::from(std::env::var("EIDOLA_QWEN_DIR").expect("set EIDOLA_QWEN_DIR"));
-    let layers: usize = std::env::var("EIDOLA_QWEN_LAYERS")
-        .map(|v| v.parse().expect("EIDOLA_QWEN_LAYERS is a number"))
-        .unwrap_or(64);
     let began = Instant::now();
     let store = WeightSet::open_dir(&dir).unwrap();
     qwen_upstream::verify(&store, &dir);
     let health = WeightSet::open_files(&[dir.join("golden/health.safetensors")]).unwrap();
     let store = Arc::new(store);
+    let layers: usize = std::env::var("EIDOLA_QWEN_LAYERS")
+        .map(|v| v.parse().expect("EIDOLA_QWEN_LAYERS is a number"))
+        .unwrap_or(config_of(&store).unwrap().checkpoint_layers);
     let keep: Vec<usize> = (0..layers).collect();
     let config = config_of(&store).unwrap().truncated(&keep).unwrap();
     let model = QwenModel::new(QwenWeights::load(store, config).unwrap());

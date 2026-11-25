@@ -1,28 +1,53 @@
-//! The released Qwen3.8-27B-FP8 checkpoint's recorded bytes, for the
-//! real-weights tests: `golden/qwen/upstream-sha256.json` holds the SHA-256 of
-//! every published file used here at the pinned revision. A test loads
-//! nothing it has not checked against that list: a download of the right size
-//! and the wrong bytes gives a model that agrees with a reference run on the
-//! same bytes and is not the model.
+//! The released Qwen checkpoints' recorded bytes, for the real-weights tests:
+//! `golden/qwen/upstream-sha256.json` (Qwen3.8-27B-FP8) and
+//! `golden/qwen/upstream-qwen3.5-*-sha256.json` (Qwen3.5-2B and -0.8B) hold
+//! the SHA-256 of every published file used here at the pinned revisions. A
+//! test loads nothing it has not checked against its checkpoint's list: a
+//! download of the right size and the wrong bytes gives a model that agrees
+//! with a reference run on the same bytes and is not the model.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use eidola_engine_model::WeightSet;
 use eidola_engine_model::safetensors::SEMANTIC_FILES;
+use sha2::{Digest, Sha256};
 
-const RECORDED: &str = include_str!("../../golden/qwen/upstream-sha256.json");
+/// Every recorded list, by the repository it names.
+const RECORDED: [(&str, &str); 3] = [
+    (
+        "Qwen/Qwen3.8-27B-FP8",
+        include_str!("../../golden/qwen/upstream-sha256.json"),
+    ),
+    (
+        "Qwen/Qwen3.5-2B",
+        include_str!("../../golden/qwen/upstream-qwen3.5-2b-sha256.json"),
+    ),
+    (
+        "Qwen/Qwen3.5-0.8B",
+        include_str!("../../golden/qwen/upstream-qwen3.5-0.8b-sha256.json"),
+    ),
+];
 
-/// Next-token accuracy a healthy model reaches over the first 1,024 tokens of
-/// the checkpoint's own `LICENSE` (the Apache-2.0 text), scored after the
-/// first token. The released model served by vLLM measured 0.998.
-#[allow(dead_code)]
-pub const LICENSE_FLOOR: f64 = 0.95;
+/// The recorded list whose `config.json` is the directory's (which names the
+/// checkpoint), and that repository's name.
+pub fn recorded_for(dir: &Path) -> (&'static str, serde_json::Value) {
+    let config = std::fs::read(dir.join("config.json")).expect("the directory has a config.json");
+    let digest = hex::encode(Sha256::digest(&config));
+    for (repo, text) in RECORDED {
+        let recorded: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(recorded["repository"], repo);
+        if recorded["files"]["config.json"]["sha256"] == digest.as_str() {
+            return (repo, recorded);
+        }
+    }
+    panic!("config.json ({digest}) is not a recorded checkpoint's");
+}
 
 /// Refuse the directory's files unless each is the recorded upstream one.
-pub fn verify(store: &WeightSet, dir: &Path) {
-    let recorded: serde_json::Value = serde_json::from_str(RECORDED).unwrap();
-    assert_eq!(recorded["repository"], "Qwen/Qwen3.8-27B-FP8");
+/// Returns the checkpoint's repository.
+pub fn verify(store: &WeightSet, dir: &Path) -> &'static str {
+    let (repo, recorded) = recorded_for(dir);
     let mut manifest = BTreeMap::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let name = entry.unwrap().file_name().to_string_lossy().into_owned();
@@ -31,17 +56,24 @@ pub fn verify(store: &WeightSet, dir: &Path) {
         }
         let digest = recorded["files"][&name]["sha256"]
             .as_str()
-            .unwrap_or_else(|| panic!("{name} is not a recorded file of the checkpoint"));
+            .unwrap_or_else(|| panic!("{name} is not a recorded file of {repo}"));
         manifest.insert(name, digest.to_owned());
     }
     store
         .verify_sha256(&manifest)
         .expect("every checkpoint file is the recorded upstream one");
     println!(
-        "{} checkpoint files match their recorded hashes",
+        "{} files of {repo} match their recorded hashes",
         manifest.len()
     );
+    repo
 }
+
+/// Next-token accuracy a healthy model reaches over the first 1,024 tokens of
+/// the checkpoint's own `LICENSE` (the Apache-2.0 text), scored after the
+/// first token. The released model served by vLLM measured 0.998.
+#[allow(dead_code)]
+pub const LICENSE_FLOOR: f64 = 0.95;
 
 /// Each row's most likely token (the lowest index among equals).
 #[allow(dead_code)]

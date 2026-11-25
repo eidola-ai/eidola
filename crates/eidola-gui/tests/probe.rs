@@ -1132,6 +1132,7 @@ fn probe_eidola_trust() -> eidola_app_core::EidolaTrust {
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
         pinned_measurement: eidola_app_core::MeasurementInfo {
+            platform: eidola_app_core::MeasurementPlatform::SevSnp,
             measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
             host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
             guest_policy: "0x30133".into(),
@@ -3625,6 +3626,7 @@ fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContex
     trust.base_url = "https://staging.eidola.example/v1".into();
     trust.base_url_is_override = true;
     trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
+        platform: eidola_app_core::MeasurementPlatform::SevSnp,
         measurement: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f89d2bb3ef58af1e7c0c12f3b4a5d6e7f8".into(),
         host_data: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         guest_policy: "0x30133".into(),
@@ -4071,7 +4073,7 @@ fn space_inspector_a_notebooks_owner_is_not_removable(cx: &mut TestAppContext) {
         s.space_settings = Some((
             "demo".into(),
             eidola_app_core::SpaceSettings {
-                notebook_participant_id: Some("agent-1".into()),
+                notebook_owner_participant_id: Some("agent-1".into()),
                 ..Default::default()
             },
         ));
@@ -8170,7 +8172,7 @@ fn a_room_the_reader_only_watches_offers_no_regenerate(cx: &mut TestAppContext) 
         s.space_settings = Some((
             "s".to_string(),
             eidola_app_core::SpaceSettings {
-                notebook_participant_id: None,
+                notebook_owner_participant_id: None,
                 ..Default::default()
             },
         ));
@@ -8265,7 +8267,7 @@ fn a_room_the_reader_belongs_to_keeps_its_verbs(cx: &mut TestAppContext) {
         s.space_settings = Some((
             "s".to_string(),
             eidola_app_core::SpaceSettings {
-                notebook_participant_id: None,
+                notebook_owner_participant_id: None,
                 ..Default::default()
             },
         ));
@@ -8396,7 +8398,7 @@ fn the_acting_gate_converges_and_its_interim_withholds(cx: &mut TestAppContext) 
             s.seed_for_test(
                 "s",
                 eidola_app_core::SpaceSettings {
-                    notebook_participant_id: Some("agent-a".into()),
+                    notebook_owner_participant_id: Some("agent-a".into()),
                     ..Default::default()
                 },
             );
@@ -8632,7 +8634,7 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
             s.seed_for_test(
                 "s",
                 eidola_app_core::SpaceSettings {
-                    notebook_participant_id: Some("agent-a".into()),
+                    notebook_owner_participant_id: Some("agent-a".into()),
                     ..Default::default()
                 },
             );

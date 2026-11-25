@@ -2476,7 +2476,7 @@ async fn handle_issuance(
                     .clone()
                     .unwrap_or_else(|| issuing.key_id_hex.clone()),
                 "credits": credits,
-                "ledger_entry_id": uuid_like(),
+                "issuance_id": uuid_like(),
             })
             .to_string();
             let signed = SignedIssuance {

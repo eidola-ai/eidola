@@ -1,10 +1,11 @@
-//! Qwen3.8 configuration → a validated, typed model description.
+//! Qwen3.8 and Qwen3.5 configuration → a validated, typed model description.
 //!
 //! The checkpoint's `config.json` nests the text model under `text_config`
-//! beside the vision tower and the quantisation block. Every key at every
-//! level is read and an unknown key is refused. The per-layer table comes from
-//! `layer_types`, never from a hard-coded ratio; `full_attention_interval`
-//! must agree with it.
+//! beside the vision tower and, for FP8 weights, the quantisation block; a
+//! checkpoint without one stores its weights in BF16 ([`WeightFormat`]). Every
+//! key at every level is read and an unknown key is refused. The per-layer
+//! table comes from `layer_types`, never from a hard-coded ratio;
+//! `full_attention_interval` must agree with it.
 
 use serde::Deserialize;
 
@@ -29,7 +30,7 @@ struct HfConfig {
     vision_start_token_id: Option<u32>,
     #[allow(dead_code)]
     vision_end_token_id: Option<u32>,
-    quantization_config: HfQuant,
+    quantization_config: Option<HfQuant>,
     text_config: HfText,
     vision_config: Option<HfVision>,
 }
@@ -102,7 +103,9 @@ struct HfText {
     attention_bias: bool,
     attention_dropout: f64,
     attn_output_gate: bool,
-    partial_rotary_factor: f64,
+    /// Qwen3.8's configs repeat `rope_parameters.partial_rotary_factor` here;
+    /// Qwen3.5's do not.
+    partial_rotary_factor: Option<f64>,
     rope_parameters: HfRope,
     // Gated DeltaNet.
     linear_conv_kernel_dim: usize,
@@ -110,8 +113,14 @@ struct HfText {
     linear_value_head_dim: usize,
     linear_num_key_heads: usize,
     linear_num_value_heads: usize,
-    output_gate_type: String,
+    /// Qwen3.8's configs name the DeltaNet's output gate (`swish`); Qwen3.5's
+    /// do not. Transformers reads neither: the DeltaNet's gate is a SiLU and
+    /// the attention's a sigmoid whatever this says.
+    output_gate_type: Option<String>,
     mamba_ssm_dtype: String,
+    /// Layers with a dense MLP in a mixture-of-experts model; Qwen3.5's dense
+    /// configs list none.
+    mlp_only_layers: Option<Vec<usize>>,
     // Drafter.
     mtp_num_hidden_layers: usize,
     mtp_use_dedicated_embeddings: bool,
@@ -124,6 +133,18 @@ struct HfText {
     eos_token_id: Option<u32>,
     #[allow(dead_code)]
     pad_token_id: Option<u32>,
+}
+
+/// How the checkpoint stores its large projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightFormat {
+    /// FP8 E4M3 with a BF16 scale per 128×128 block and activations quantised
+    /// per token and 128 columns at run time (Qwen3.8-27B-FP8: a
+    /// `quantization_config` of `fp8`, `e4m3`, `dynamic`, `[128, 128]`).
+    Fp8Block128,
+    /// BF16, every projection a plain BF16 product (Qwen3.5-2B and -0.8B: no
+    /// `quantization_config`).
+    Bf16,
 }
 
 /// What a layer's token mixer is.
@@ -195,9 +216,15 @@ impl DeltaNetSpec {
     }
 }
 
-/// A validated Qwen3.8 text model.
+/// A validated Qwen3.8 or Qwen3.5 text model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QwenConfig {
+    /// How the large projections are stored.
+    pub weights: WeightFormat,
+    /// The head is the embedding (`tie_word_embeddings`): the checkpoint has
+    /// no `lm_head.weight`, and the logits are the normed state against the
+    /// embedding's rows.
+    pub tie_word_embeddings: bool,
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -258,17 +285,22 @@ impl QwenConfig {
             c.architectures == ["Qwen3_5ForConditionalGeneration"],
             || unsupported(format!("architectures {:?}", c.architectures)),
         )?;
-        let q = &c.quantization_config;
-        require(q.quant_method == "fp8", || {
-            unsupported(format!("quant_method {:?}", q.quant_method))
-        })?;
-        require(q.fmt == "e4m3", || unsupported(format!("fmt {:?}", q.fmt)))?;
-        require(q.activation_scheme == "dynamic", || {
-            unsupported(format!("activation_scheme {:?}", q.activation_scheme))
-        })?;
-        require(q.weight_block_size == [QUANT_BLOCK, QUANT_BLOCK], || {
-            unsupported(format!("weight_block_size {:?}", q.weight_block_size))
-        })?;
+        let weights = match &c.quantization_config {
+            None => WeightFormat::Bf16,
+            Some(q) => {
+                require(q.quant_method == "fp8", || {
+                    unsupported(format!("quant_method {:?}", q.quant_method))
+                })?;
+                require(q.fmt == "e4m3", || unsupported(format!("fmt {:?}", q.fmt)))?;
+                require(q.activation_scheme == "dynamic", || {
+                    unsupported(format!("activation_scheme {:?}", q.activation_scheme))
+                })?;
+                require(q.weight_block_size == [QUANT_BLOCK, QUANT_BLOCK], || {
+                    unsupported(format!("weight_block_size {:?}", q.weight_block_size))
+                })?;
+                WeightFormat::Fp8Block128
+            }
+        };
 
         let t = &c.text_config;
         require(t.model_type == "qwen3_5_text", || {
@@ -277,8 +309,11 @@ impl QwenConfig {
         require(t.dtype == "bfloat16", || {
             unsupported(format!("dtype {:?}", t.dtype))
         })?;
-        require(!c.tie_word_embeddings && !t.tie_word_embeddings, || {
-            unsupported("tied word embeddings")
+        require(c.tie_word_embeddings == t.tie_word_embeddings, || {
+            invalid(format!(
+                "tie_word_embeddings {} at the top level, {} in text_config",
+                c.tie_word_embeddings, t.tie_word_embeddings
+            ))
         })?;
         require(t.hidden_act == "silu", || {
             unsupported(format!("hidden_act {:?}", t.hidden_act))
@@ -291,9 +326,14 @@ impl QwenConfig {
             unsupported("attention without its output gate")
         })?;
         // `swish` names the DeltaNet's output gate, a SiLU of `z`. The full
-        // attention's gate is a sigmoid whatever this says.
-        require(t.output_gate_type == "swish", || {
-            unsupported(format!("output_gate_type {:?}", t.output_gate_type))
+        // attention's gate is a sigmoid whatever this says, and an absent one
+        // is the same model.
+        require(
+            t.output_gate_type.as_deref().is_none_or(|g| g == "swish"),
+            || unsupported(format!("output_gate_type {:?}", t.output_gate_type)),
+        )?;
+        require(t.mlp_only_layers.as_ref().is_none_or(Vec::is_empty), || {
+            unsupported(format!("mlp_only_layers {:?}", t.mlp_only_layers))
         })?;
         require(t.mamba_ssm_dtype == "float32", || {
             unsupported(format!("mamba_ssm_dtype {:?}", t.mamba_ssm_dtype))
@@ -309,12 +349,16 @@ impl QwenConfig {
         require(r.mrope_interleaved, || {
             unsupported("non-interleaved M-RoPE")
         })?;
-        require(r.partial_rotary_factor == t.partial_rotary_factor, || {
-            invalid(format!(
-                "partial_rotary_factor {} at the top level, {} in rope_parameters",
-                t.partial_rotary_factor, r.partial_rotary_factor
-            ))
-        })?;
+        require(
+            t.partial_rotary_factor
+                .is_none_or(|p| p == r.partial_rotary_factor),
+            || {
+                invalid(format!(
+                    "partial_rotary_factor {:?} at the top level, {} in rope_parameters",
+                    t.partial_rotary_factor, r.partial_rotary_factor
+                ))
+            },
+        )?;
         positive_f32(r.rope_theta, "rope_theta")?;
         positive_f32(r.partial_rotary_factor, "partial_rotary_factor")?;
         require(r.partial_rotary_factor <= 1.0, || {
@@ -366,11 +410,17 @@ impl QwenConfig {
             });
         }
 
-        require(t.hidden_size.is_multiple_of(QUANT_BLOCK), || {
+        // An FP8 projection's every dimension is whole 128-wide blocks.
+        let fp8 = weights == WeightFormat::Fp8Block128;
+        require(!fp8 || t.hidden_size.is_multiple_of(QUANT_BLOCK), || {
             unsupported(format!("hidden_size {} is not whole blocks", t.hidden_size))
         })?;
-        require(t.intermediate_size.is_multiple_of(QUANT_BLOCK), || {
-            unsupported(format!("intermediate_size {}", t.intermediate_size))
+        require(
+            !fp8 || t.intermediate_size.is_multiple_of(QUANT_BLOCK),
+            || unsupported(format!("intermediate_size {}", t.intermediate_size)),
+        )?;
+        require(t.hidden_size > 0 && t.intermediate_size > 0, || {
+            invalid("hidden_size or intermediate_size 0")
         })?;
         require(t.vocab_size > 0, || invalid("vocab_size 0"))?;
 
@@ -431,7 +481,7 @@ impl QwenConfig {
             ("attention KV width", t.num_key_value_heads * t.head_dim),
             ("attention output width", t.num_attention_heads * t.head_dim),
         ] {
-            require(n.is_multiple_of(QUANT_BLOCK), || {
+            require(!fp8 || n.is_multiple_of(QUANT_BLOCK), || {
                 unsupported(format!("{what} {n} is not whole blocks"))
             })?;
         }
@@ -445,6 +495,8 @@ impl QwenConfig {
         let _ = c.language_model_only;
 
         Ok(QwenConfig {
+            weights,
+            tie_word_embeddings: t.tie_word_embeddings,
             vocab_size: t.vocab_size,
             hidden_size: t.hidden_size,
             intermediate_size: t.intermediate_size,

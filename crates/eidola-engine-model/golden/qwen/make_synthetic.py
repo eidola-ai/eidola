@@ -12,6 +12,11 @@ The bytes are a function of the code alone.
 sizes (`synthetic.head_dim_256`) into `tests/fixtures/qwen_tiny256` by default:
 the fixture the CUDA executor's fast profile runs, whose attention kernels are
 compiled for 256-wide heads.
+
+`--qwen35` writes a Qwen3.5 checkpoint's shape (`synthetic.qwen35`: BF16
+projections, Qwen3.5's config keys and groupings) into
+`tests/fixtures/qwen_tiny_bf16`, and with `--tied` its head tied to the
+embedding into `tests/fixtures/qwen_tiny_bf16_tied`.
 """
 
 from __future__ import annotations
@@ -31,6 +36,8 @@ from qwen_golden import pinned_ops, reference, st, synthetic  # noqa: E402
 HERE = Path(__file__).resolve().parent
 DEFAULT_OUT = HERE.parent.parent / "tests" / "fixtures" / "qwen_tiny"
 D256_OUT = HERE.parent.parent / "tests" / "fixtures" / "qwen_tiny256"
+BF16_OUT = HERE.parent.parent / "tests" / "fixtures" / "qwen_tiny_bf16"
+TIED_OUT = HERE.parent.parent / "tests" / "fixtures" / "qwen_tiny_bf16_tied"
 
 
 def bf16(t: torch.Tensor) -> tuple:
@@ -42,10 +49,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path)
     ap.add_argument("--head-dim", type=int, choices=[128, 256], default=128)
+    ap.add_argument("--qwen35", action="store_true", help="a Qwen3.5 checkpoint's shape: BF16 projections")
+    ap.add_argument("--tied", action="store_true", help="with --qwen35: the head tied to the embedding")
     a = ap.parse_args()
+    assert not (a.tied and not a.qwen35), "--tied is a Qwen3.5 shape"
+    assert not (a.qwen35 and a.head_dim == 256), "the Qwen3.5 fixture keeps the 128-wide heads"
     if a.head_dim == 256:
         synthetic.head_dim_256()
-    a.out = a.out or (D256_OUT if a.head_dim == 256 else DEFAULT_OUT)
+    if a.qwen35:
+        synthetic.qwen35(a.tied)
+    default = TIED_OUT if a.tied else BF16_OUT if a.qwen35 else D256_OUT if a.head_dim == 256 else DEFAULT_OUT
+    a.out = a.out or default
     torch.set_num_threads(1)
     pinned_ops.install()
     a.out.mkdir(parents=True, exist_ok=True)

@@ -2,7 +2,7 @@
 
 The CPU reference executors of the engine, one module per architecture: `src/mimo/`, `src/deepseek/` and `src/qwen/`. The shared modules are `page.rs`, the page-owned buffers (`PageBuf`) every pool is built from and the row tags (`Tag`) they carry, and `pool.rs`, the per-layer K|V block pool MiMo-V2.6 and Qwen3.8 page their KV in. `CpuExecutor` (`src/mimo/`) implements the serving core's `Executor` (`eidola-engine`) for MiMo-V2.6 with the model crate's f32 reference numerics (`eidola-engine-model`), over paged KV, with MTP drafting and sampling inside the step. `DsCpuExecutor` (`src/deepseek/`) does the same for DeepSeek-V4.1, with KV in the model's packed formats and the model split across two logical devices; it has its own section, [DeepSeek-V4.1](#deepseek-v41). `QwenCpuExecutor` (`src/qwen/`) does it for Qwen3.8, with the DeltaNet layers' recurrent state kept as the serving core's state buffers; its section is [Qwen3.8](#qwen38). Everything before those sections is about MiMo's. AGPL-3.0-only. Workspace conventions live in the root `AGENTS.md`.
 
-It is not a serving backend. It exists for two reasons:
+It is not built to serve fast (a gateway may pin a deployment on it, a GPU-free one, but that is not why it exists). It exists for two reasons:
 
 - **It is the oracle for every other executor.** A GPU executor is diffed against it row for row: same step inputs, same tokens, logits equal within that executor's documented tolerance.
 - **It proves the contract can be met exactly.** Paged, chunked, prefix-cached, preempted and speculative execution through the real scheduler reproduces the dense reference forward bit for bit.
@@ -255,7 +255,7 @@ Each class was checked to fail under a deliberate bug: a chain layer starting on
 
 ## Qwen3.8
 
-`QwenCpuExecutor` runs Qwen3.8 (`eidola-engine/AGENTS.md` → Recurrent state; `eidola-engine-model/AGENTS.md` → Qwen3.8) and reproduces the model crate's dense forward bit for bit through the real engine. It computes nothing itself: every number comes from a public model-crate kernel. Those are the DeltaNet's per-token `deltanet::token_core`, its projections `linear::lin8_rows` and `linear::linear_bf16_dense`, `forward::rms_norm_zc_rows`, `forward::residual_add`, `QwenModel::mlp`, `QwenModel::layer_forward` for each attention layer (over the KV gathered from the pages), `final_norm`, `head` and `mtp_forward`. A DeltaNet layer is assembled from those pieces exactly as `QwenModel` assembles it, so that its per-position recurrence inputs can be kept and its state taken at a boundary inside a row.
+`QwenCpuExecutor` runs Qwen3.8 and Qwen3.5 (`eidola-engine/AGENTS.md` → Recurrent state; `eidola-engine-model/AGENTS.md` → Qwen3.8, → Qwen3.5) and reproduces the model crate's dense forward bit for bit through the real engine. It computes nothing itself: every number comes from a public model-crate kernel. Those are the DeltaNet's per-token `deltanet::token_core`, its projections `linear::linear_rows` (FP8 or BF16, as the checkpoint stores them) and `linear::linear_bf16_dense`, `forward::rms_norm_zc_rows`, `forward::residual_add`, `QwenModel::mlp`, `QwenModel::layer_forward` for each attention layer (over the KV gathered from the pages), `final_norm`, `head` and `mtp_forward`. A DeltaNet layer is assembled from those pieces exactly as `QwenModel` assembles it, so that its per-position recurrence inputs can be kept and its state taken at a boundary inside a row.
 
 | Module | Contents |
 |---|---|
@@ -284,9 +284,9 @@ Each class was checked to fail under a deliberate bug: a chain layer starting on
 
 ### What is verified
 
-On the model crate's committed fixture (three DeltaNet layers and one attention layer at hidden size 128, one MTP layer, vocabulary 512 of which 508 are sampleable), in 4-position blocks.
+On the model crate's committed fixtures (three DeltaNet layers and one attention layer at hidden size 128, one MTP layer, vocabulary 512 of which 508 are sampleable), in 4-position blocks: every test of `tests/qwen_engine.rs` and `tests/qwen_memory.rs` runs on `qwen_tiny` (Qwen3.8's FP8 storage) and on `qwen_tiny_bf16_tied` (Qwen3.5's BF16 storage, its head tied to the embedding), each in a module of the fixture's name (`qwen_common::on_each_fixture!`).
 
-**What is checked.** With `record`, every row's tokens, target logits at every computed position, the drafter's canonical rows, the chain's rows, drafts and output are kept. So is every state stored, with the tokens before its boundary read back through the block tables. `tests/qwen_common` checks each record bit for bit against `QwenDenseOracle` on its tokens: the target, the drafter's rows, the draft chain recomputed from the dense run, every draw and `chain_accept`. It also checks each stored state against the dense forward's states at that boundary, and every finished output against dense generation. After every step it runs the memory scan: the KV manager's invariants; every free block and state buffer zero; every free slot empty; every idle block and snapshot ciphertext and every mapped one plaintext; the host tier holding only ciphertext.
+**What is checked.** With `record`, every row's tokens, target logits at every computed position, the drafter's canonical rows, the chain's rows, drafts and output are kept. So is every state stored, with the tokens before its boundary read back through the block tables. `tests/qwen_common` checks each record bit for bit against `QwenDenseOracle` on its tokens: the target, the drafter's rows, the draft chain recomputed from the dense run, every draw and `chain_accept`. It also checks each stored state against the dense forward's states at that boundary, and every finished output against dense generation. After every step it runs the memory scan: the KV manager's invariants; every free block and state buffer zero; every free slot empty; every idle block and snapshot ciphertext and every mapped one plaintext, a queued zero counted as running before a queued crypt (a buffer taken back from an idle snapshot and given at once to a continuation point is zeroed, written and encrypted in that order; the BF16 fixture's randomized workload reaches that path); the host tier holding only ciphertext.
 
 **`tests/qwen_engine.rs`**. Through the engine, every row and stored state against the oracle:
 
@@ -325,7 +325,9 @@ Each was checked to fail under a deliberate bug:
 - a host-tier transfer dropping the tag;
 - a zero leaving the tag.
 
-Measured on an Apple M4 Max in the dev profile (the crate builds at `opt-level = 3`): `qwen_engine` 10 s, `qwen_memory` 9 s.
+Measured on an Apple M4 Max in the dev profile (the crate builds at `opt-level = 3`): `qwen_engine` 15 s and `qwen_memory` 15 s over both fixtures.
+
+**`tests/qwen_real.rs`** (ignored; `EIDOLA_QWEN_DIR`, the model crate's `golden/qwen/README.md` → Qwen3.5). A released Qwen3.5 checkpoint, every file against its recorded upstream hash, through the engine: two slices of the goldens' passage beside each other in prefill chunks of 13 (cutting blocks), the first again from its regeneration point and extended from its continuation point, greedy, without and with two drafts a step; every row, drafter and chain row, draw and stored state checked against the dense forward bit for bit, and each output against dense greedy generation. Measured on an M4 Max, release build: exact on both checkpoints (62 rows, 8 stored states; with drafts 34 rows and 50 chain rows on the 2B, 30 of its 50 drafts accepted, and 39 rows and 60 chain rows on the 0.8B), the greedy outputs the same drafted and not; 45 s for the 2B, 29 s for the 0.8B, most of it the dense checks.
 
 ### What a device executor must reproduce
 

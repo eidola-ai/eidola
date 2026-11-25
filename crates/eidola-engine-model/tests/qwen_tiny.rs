@@ -1,26 +1,33 @@
-//! The Qwen3.8 reference forward against the committed synthetic fixture,
-//! whose goldens are Transformers' `qwen3_5` model code run with its
+//! The Qwen3.8 and Qwen3.5 reference forward against the committed synthetic
+//! fixtures, whose goldens are Transformers' `qwen3_5` model code run with its
 //! unspecified operations pinned (see `golden/qwen/README.md`). Under those
 //! rules the reference is a function of the tokens alone, and every
 //! comparison here is exact.
+//!
+//! Every test runs on each fixture, in a module of its name: `qwen_tiny`
+//! (Qwen3.8's FP8 storage), `qwen_tiny_bf16` (Qwen3.5's BF16 storage, its own
+//! head) and `qwen_tiny_bf16_tied` (BF16, the head tied to the embedding).
 
 use std::path::PathBuf;
 
 use eidola_engine_model::WeightSet;
 use eidola_engine_model::qwen::{
-    KvCache, LayerState, LogitRows, QwenForwardOptions, QwenModel, SequenceState, load_reference,
+    KvCache, LayerState, LogitRows, QwenForwardOptions, QwenModel, SequenceState, WeightFormat,
+    load_reference,
 };
 use eidola_engine_model::tensor::Matrix;
 
-fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen_tiny")
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
 struct Golden(WeightSet);
 
 impl Golden {
-    fn open() -> Self {
-        Golden(WeightSet::open_files(&[fixture().join("golden.safetensors")]).unwrap())
+    fn open(name: &str) -> Self {
+        Golden(WeightSet::open_files(&[fixture(name).join("golden.safetensors")]).unwrap())
     }
     fn f32(&self, name: &str) -> Vec<f32> {
         self.0.get(name).unwrap().to_f32(name).unwrap()
@@ -31,8 +38,8 @@ impl Golden {
     }
 }
 
-fn model() -> QwenModel {
-    load_reference(&fixture(), Ok).unwrap()
+fn model(name: &str) -> QwenModel {
+    load_reference(&fixture(name), Ok).unwrap()
 }
 
 /// Bit equality, reporting the first differing element.
@@ -80,10 +87,9 @@ fn deltanet_states(state: &SequenceState) -> Vec<(usize, &[f32], &[f32])> {
         .collect()
 }
 
-#[test]
-fn one_call_matches_the_reference_exactly() {
-    let g = Golden::open();
-    let m = model();
+fn one_call_matches_the_reference_exactly(f: &str) {
+    let g = Golden::open(f);
+    let m = model(f);
     let tokens = g.tokens();
     let mut state = m.new_state();
     let out = m.forward(&mut state, &tokens, &all(true)).unwrap();
@@ -122,10 +128,9 @@ fn one_call_matches_the_reference_exactly() {
     }
 }
 
-#[test]
-fn one_token_per_call_matches_the_reference_exactly() {
-    let g = Golden::open();
-    let m = model();
+fn one_token_per_call_matches_the_reference_exactly(f: &str) {
+    let g = Golden::open(f);
+    let m = model(f);
     let tokens = g.tokens();
     let first = 24;
     let mut state = m.new_state();
@@ -156,10 +161,9 @@ fn one_token_per_call_matches_the_reference_exactly() {
     );
 }
 
-#[test]
-fn mtp_matches_the_reference_exactly() {
-    let g = Golden::open();
-    let m = model();
+fn mtp_matches_the_reference_exactly(f: &str) {
+    let g = Golden::open(f);
+    let m = model(f);
     let tokens = g.tokens();
     let h = m.config().hidden_size;
     let normed = g.f32("prefill.normed");
@@ -203,10 +207,9 @@ fn mtp_matches_the_reference_exactly() {
     );
 }
 
-#[test]
-fn prefix_rows_are_bit_identical() {
-    let g = Golden::open();
-    let m = model();
+fn prefix_rows_are_bit_identical(f: &str) {
+    let g = Golden::open(f);
+    let m = model(f);
     let tokens = g.tokens();
     let v = m.config().vocab_size;
     let full = m
@@ -230,10 +233,9 @@ fn prefix_rows_are_bit_identical() {
 /// Running 0..n, saving the state, then running n..m from the saved copy
 /// equals running 0..m, in logits and in every layer's state, at any n:
 /// chunk ends, mid-chunk points and single tokens alike.
-#[test]
-fn a_saved_state_resumes_exactly() {
-    let g = Golden::open();
-    let m = model();
+fn a_saved_state_resumes_exactly(f: &str) {
+    let g = Golden::open(f);
+    let m = model(f);
     let tokens = &g.tokens()[..56];
     let v = m.config().vocab_size;
     let mut whole_state = m.new_state();
@@ -278,9 +280,8 @@ fn a_saved_state_resumes_exactly() {
     }
 }
 
-#[test]
-fn vision_placeholders_and_out_of_range_tokens_are_refused() {
-    let m = model();
+fn vision_placeholders_and_out_of_range_tokens_are_refused(f: &str) {
+    let m = model(f);
     let v = m.config().vocab_size as u32;
     for bad in [v - 2, v - 1, v] {
         assert!(
@@ -288,5 +289,72 @@ fn vision_placeholders_and_out_of_range_tokens_are_refused() {
                 .is_err(),
             "token {bad}"
         );
+    }
+}
+
+/// Which format each fixture stores, and that a tied head is the embedding's
+/// own rows.
+fn fixture_is_its_format(f: &str) {
+    let m = model(f);
+    let c = m.config();
+    let (format, tied) = match f {
+        "qwen_tiny" => (WeightFormat::Fp8Block128, false),
+        "qwen_tiny_bf16" => (WeightFormat::Bf16, false),
+        "qwen_tiny_bf16_tied" => (WeightFormat::Bf16, true),
+        other => panic!("fixture {other}"),
+    };
+    assert_eq!((c.weights, c.tie_word_embeddings), (format, tied));
+    let w = &m.weights;
+    let same_rows = (0..c.vocab_size).all(|r| w.head.row(r) == w.embed.row(r));
+    assert_eq!(same_rows, tied, "{f}: the head is the embedding");
+}
+
+macro_rules! on_each_fixture {
+    ($($fixture:ident),* ; $tests:tt) => {
+        $(on_each_fixture!(@one $fixture $tests);)*
+    };
+    (@one $fixture:ident [$($test:ident),*]) => {
+        mod $fixture {
+            $(
+                #[test]
+                fn $test() {
+                    super::$test(stringify!($fixture))
+                }
+            )*
+        }
+    };
+}
+
+on_each_fixture!(qwen_tiny, qwen_tiny_bf16, qwen_tiny_bf16_tied; [
+    one_call_matches_the_reference_exactly,
+    one_token_per_call_matches_the_reference_exactly,
+    mtp_matches_the_reference_exactly,
+    prefix_rows_are_bit_identical,
+    a_saved_state_resumes_exactly,
+    vision_placeholders_and_out_of_range_tokens_are_refused,
+    fixture_is_its_format
+]);
+
+/// A tied config over a checkpoint that carries a head of its own is refused,
+/// and so is an untied config over a checkpoint without one: the head the
+/// forward reads is never a guess.
+#[test]
+fn a_head_that_disagrees_with_the_config_is_refused() {
+    let dir = std::env::temp_dir().join(format!("qwen-tied-mix-{}", std::process::id()));
+    for (config, weights) in [
+        ("qwen_tiny_bf16_tied", "qwen_tiny_bf16"),
+        ("qwen_tiny_bf16", "qwen_tiny_bf16_tied"),
+    ] {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(fixture(config).join("config.json"), dir.join("config.json")).unwrap();
+        std::fs::copy(
+            fixture(weights).join("model.safetensors"),
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+        let err = load_reference(&dir, Ok).err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let err = err.unwrap_or_else(|| panic!("{config} over {weights} loaded"));
+        assert!(err.to_string().contains("lm_head"), "{err}");
     }
 }
