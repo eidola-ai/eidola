@@ -88,6 +88,9 @@ impl ConversationView {
             _subscriptions: subscriptions,
         };
         this.rebuild(cx);
+        // A post refused while no view showed the conversation is given back
+        // here, as it would have been to the view that sent it.
+        this.restore_rejected(cx);
         // A new conversation opens ready to write.
         if this.rows.is_empty() {
             this.composer.update(cx, |c, cx| c.focus(window, cx));
@@ -116,15 +119,9 @@ impl ConversationView {
                 self.composer.update(cx, |c, cx| c.set_holding(false, cx));
                 self.list.set_follow_mode(FollowMode::Tail);
             }
-            ConversationEvent::SubmitFailed { text, reply_to } => {
-                let target = reply_to.as_ref().map(|id| ReplyTarget {
-                    action_id: id.clone(),
-                    author: self.author_of(id, cx),
-                });
-                self.composer.update(cx, |c, cx| {
-                    c.set_holding(false, cx);
-                    c.restore(text, target, cx);
-                });
+            ConversationEvent::SubmitFailed => {
+                self.composer.update(cx, |c, cx| c.set_holding(false, cx));
+                self.restore_rejected(cx);
             }
             ConversationEvent::Landed { seq, action_id } => {
                 if self.reasoning_open.remove(&RowKey::Turn(*seq)) {
@@ -171,6 +168,20 @@ impl ConversationView {
             }
         }
         cx.notify();
+    }
+
+    /// Take a refused post's words back into the composer (which keeps them
+    /// only if the reader has not started writing something else).
+    fn restore_rejected(&mut self, cx: &mut Context<Self>) {
+        let Some(rejected) = self.conversation.update(cx, |c, cx| c.take_rejected(cx)) else {
+            return;
+        };
+        let target = rejected.reply_to.as_ref().map(|id| ReplyTarget {
+            action_id: id.clone(),
+            author: self.author_of(id, cx),
+        });
+        self.composer
+            .update(cx, |c, cx| c.restore(&rejected.text, target, cx));
     }
 
     /// The action id at the end of the visible branch.
