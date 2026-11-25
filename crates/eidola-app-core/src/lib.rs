@@ -3440,6 +3440,16 @@ impl Inner {
         if saved.is_ok() {
             self.bus.emit(Change::Config);
         }
+        // Kept means durable. On a profile its host owns, the save above only
+        // queued the config for the host; a host that then fails the write has
+        // kept nothing, and the next launch would have no account. So the
+        // creation waits for the host (within the durability barrier's bound)
+        // and a failure is an unsaved account, like a config that could not
+        // be written at all. On the filesystem the save is already durable.
+        let saved = match saved {
+            Ok(()) => self.files.durable().await,
+            Err(e) => Err(e),
+        };
         // Not kept: write the credential to a file of its own beside the
         // profile, now, before any more network. The returned error carries it
         // too, but a caller can drop that (a window closed mid-create, a
@@ -3456,7 +3466,11 @@ impl Inner {
                 account_secret: Some(created.secret.clone()),
                 ..Config::default()
             };
-            self.files.save_config(&recovery, &path).ok().map(|()| path)
+            // Named only once it is durable, as the profile would have been.
+            match self.files.save_config(&recovery, &path) {
+                Ok(()) if self.files.durable().await.is_ok() => Some(path),
+                _ => None,
+            }
         } else {
             None
         };
