@@ -19,12 +19,13 @@ name: Mobile release bundle
 # a native one, runs weekly instead (mobile-bundle-cross-arch.yml), because
 # under emulation it takes about two and a half hours.
 #
-# Path-filtered to the bundle's inputs, which are wide: any crate can be in
-# the app's graph, and app-core compiles in the trust root and the model
-# catalog.
+# Like the desktop's reproducibility checks, it runs for main only: on the
+# promotion PR from next and on pushes to main. Path-filtered to the bundle's
+# inputs, which are wide: any crate can be in the app's graph, and app-core
+# compiles in the trust root and the model catalog.
 on:
   push:
-    branches: [next]
+    branches: [main]
     paths:
       - "crates/**"
       - "Cargo.toml"
@@ -43,7 +44,7 @@ on:
       - "mobile/tools/bundle_digest.py"
       - ".github/workflows/mobile-bundle-release.yml"
   pull_request:
-    branches: [next, main]
+    branches: [main]
     paths:
       - "crates/**"
       - "Cargo.toml"
