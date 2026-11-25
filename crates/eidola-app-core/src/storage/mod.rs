@@ -204,6 +204,23 @@ impl ProfileFiles {
         }
     }
 
+    /// Wait until every write made before the call is durable, within the
+    /// durability barrier's bound: at once on the filesystem, whose writes
+    /// are durable when they return; on a host, its flush
+    /// ([`ProfileImage::flush`]), failed when the stream has stopped or the
+    /// host does not answer in time.
+    pub(crate) async fn durable(&self) -> Result<(), AppError> {
+        match self {
+            #[cfg(not(target_family = "wasm"))]
+            Self::Disk => Ok(()),
+            Self::Host(image) => {
+                crate::durability::Durability::host(image.clone())
+                    .barrier()
+                    .await
+            }
+        }
+    }
+
     /// Remove what a crashed [`Config::save_to`] left behind. A host
     /// profile's are removed when it is loaded.
     pub(crate) fn sweep_config_temporaries(&self, path: &Path) {

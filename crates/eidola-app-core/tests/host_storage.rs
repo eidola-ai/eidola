@@ -480,6 +480,118 @@ fn a_request_waits_on_its_own_profile_and_no_other() {
         .expect("a request waited on another profile's stream");
 }
 
+/// [`MemHost`] that refuses every call on the config (`config.toml` and the
+/// temporary it is replaced through), as a full or failing disk would.
+struct ConfigRefusingHost(Arc<MemHost>);
+
+impl ConfigRefusingHost {
+    fn refuse(name: &str) -> HostFuture<'static, io::Result<()>> {
+        let refused = io::Error::other(format!("no space left for {name}"));
+        Box::pin(async move { Err(refused) })
+    }
+}
+
+impl HostStorage for ConfigRefusingHost {
+    fn read(&self, name: &str) -> HostFuture<'_, io::Result<Option<Vec<u8>>>> {
+        self.0.read(name)
+    }
+    fn write_at(&self, name: &str, offset: u64, bytes: Vec<u8>) -> HostFuture<'_, io::Result<()>> {
+        if name.starts_with("config.toml") {
+            return Self::refuse(name);
+        }
+        self.0.write_at(name, offset, bytes)
+    }
+    fn truncate(&self, name: &str, len: u64) -> HostFuture<'_, io::Result<()>> {
+        if name.starts_with("config.toml") {
+            return Self::refuse(name);
+        }
+        self.0.truncate(name, len)
+    }
+    fn sync(&self, name: &str) -> HostFuture<'_, io::Result<()>> {
+        self.0.sync(name)
+    }
+    fn rename(&self, from: &str, to: &str) -> HostFuture<'_, io::Result<()>> {
+        if to.starts_with("config.toml") {
+            return Self::refuse(to);
+        }
+        self.0.rename(from, to)
+    }
+    fn remove(&self, name: &str) -> HostFuture<'_, io::Result<()>> {
+        self.0.remove(name)
+    }
+    fn list(&self) -> HostFuture<'_, io::Result<Vec<String>>> {
+        self.0.list()
+    }
+}
+
+/// **An account is created only once its secret is on the host.** On a
+/// profile its host owns, saving the config queues it; a host that then
+/// fails the write has kept nothing. The server holds only the secret's
+/// hash, so the creation must hand the credential back as unsaved — what a
+/// config that could not be written on the desktop does — and never report
+/// an account that the next launch will not have.
+#[test]
+fn an_account_the_host_failed_to_keep_is_handed_back_as_unsaved() {
+    std::thread::spawn(|| {
+        let mem = MemHost::with_files(BTreeMap::new());
+        let host: Arc<dyn HostStorage> = Arc::new(ConfigRefusingHost(mem.clone()));
+        let dir = tempfile::tempdir().unwrap();
+        let profile = current_thread()
+            .block_on(HostProfile::load(dir.path().to_path_buf(), host))
+            .unwrap();
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let core = AppCore::on_host_with_test_http_client(profile, reqwest::Client::new()).unwrap();
+        let rt = core.runtime();
+        let server = rt.block_on(async {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/v1/account"))
+                .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(
+                    serde_json::json!({
+                        "account_id": "00000000-0000-0000-0000-00000000000d",
+                        "secret": "only-copy-of-the-new-secret",
+                        "created_at": "2025-01-01T00:00:00Z",
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v1/terms"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "documents": [] })),
+                )
+                .mount(&server)
+                .await;
+            server
+        });
+        rt.block_on(core.set_base_url(server.uri())).unwrap();
+
+        match rt.block_on(core.account_create(Vec::new())) {
+            Err(eidola_app_core::error::AppError::AccountNotSaved { account, reason }) => {
+                assert_eq!(account.account_id, "00000000-0000-0000-0000-00000000000d");
+                assert_eq!(account.secret.expose(), "only-copy-of-the-new-secret");
+                assert_eq!(
+                    account.recovery_file, None,
+                    "a recovery file the host cannot keep was named"
+                );
+                assert!(
+                    reason.contains("could not be saved"),
+                    "the reason does not say the device kept nothing: {reason}"
+                );
+            }
+            other => panic!("an account the host never kept was reported created: {other:?}"),
+        }
+        drop(core);
+        assert!(
+            !mem.files().contains_key("config.toml"),
+            "the host kept the config after all"
+        );
+    })
+    .join()
+    .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Crash consistency
 // ---------------------------------------------------------------------------

@@ -292,6 +292,14 @@ impl Conversation {
         self.post_runner.is_some() || !self.turn_runners.is_empty() || !self.plan_tasks.is_empty()
     }
 
+    /// Whether the entity must outlive every view of it: work in flight
+    /// (`is_busy`), or a failed turn whose notice and Retry wait for the
+    /// reader until retried or dismissed. `SpacesStore::left` holds it
+    /// while this is true.
+    pub fn needs_keeping(&self) -> bool {
+        self.is_busy() || self.can_retry()
+    }
+
     /// A save is in flight: the composer holds its next one.
     pub fn is_saving(&self) -> bool {
         self.post_runner.is_some()

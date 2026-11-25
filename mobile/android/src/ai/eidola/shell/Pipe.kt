@@ -3,7 +3,6 @@ package ai.eidola.shell
 
 import java.io.IOException
 import java.net.InetAddress
-import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
@@ -15,7 +14,8 @@ import org.json.JSONObject
 
 class Pipe {
     private class Sock {
-        val socket = Socket()
+        /** The connected socket; while connecting, the one being dialled, which a close aborts. */
+        @Volatile var socket = Socket()
         @Volatile var connected = false
         @Volatile var closed = false
         @Volatile var shut = false
@@ -66,11 +66,13 @@ class Pipe {
                     try {
                         // Blocks for as long as the resolver takes; the deadline and a close answer
                         // without waiting for it, and a socket it returns too late is closed below.
-                        val address = InetAddress.getByName(host)
-                        val left = (giveUp - System.nanoTime()) / 1_000_000
-                        if (left <= 0 || s.connecting.get() == null) throw IOException("abandoned")
-                        s.socket.tcpNoDelay = true
-                        s.socket.connect(InetSocketAddress(address, port.toInt()), left.toInt())
+                        val addresses = InetAddress.getAllByName(host).toList()
+                        if (s.connecting.get() == null) throw IOException("abandoned")
+                        // Every address, in the resolver's order, within what is left of the deadline.
+                        s.socket = connectFirst(addresses, port.toInt(), giveUp) { attempt ->
+                            s.socket = attempt
+                            s.connecting.get() != null
+                        }
                         s.connected = true
                         timer.cancel(false)
                         if (!answer(s, JSONObject(), null)) closeQuietly(s)

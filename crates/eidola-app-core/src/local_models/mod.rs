@@ -639,11 +639,27 @@ mod tests {
     }
 
     #[test]
-    fn default_model_is_the_curated_e4b_in_the_local_store() {
-        let entry = catalog_entry_for_model_ref(crate::config::DEFAULT_MODEL)
-            .expect("the default model must be a curated local catalog entry");
+    fn the_local_default_is_the_curated_e4b_in_the_local_store() {
+        let entry = catalog_entry_for_model_ref(crate::config::LOCAL_DEFAULT_MODEL)
+            .expect("the local default model must be a curated local catalog entry");
         assert_eq!(entry.id, "gemma-4-e4b");
-        assert_eq!(entry.model_ref(), crate::config::DEFAULT_MODEL);
+        assert_eq!(entry.model_ref(), crate::config::LOCAL_DEFAULT_MODEL);
+    }
+
+    /// Each build defaults to a model it can run: the desktop to the curated
+    /// local model, a build without local engines to a hosted one.
+    #[test]
+    fn the_default_model_is_one_this_build_can_run() {
+        #[cfg(feature = "desktop")]
+        assert_eq!(
+            crate::config::DEFAULT_MODEL,
+            crate::config::LOCAL_DEFAULT_MODEL
+        );
+        #[cfg(not(feature = "desktop"))]
+        assert_eq!(
+            crate::config::DEFAULT_MODEL,
+            crate::config::HOSTED_DEFAULT_MODEL
+        );
     }
 
     #[test]

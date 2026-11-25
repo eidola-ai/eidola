@@ -28,6 +28,12 @@ struct Model {
 
 impl Model {
     fn start(delay: Duration) -> Self {
+        Self::answering(delay, 200)
+    }
+
+    /// A model whose streamed answers end, after `delay`, with `status`
+    /// (`200`: the answer; anything else: a refusal the turn fails on).
+    fn answering(delay: Duration, status: u16) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -58,11 +64,15 @@ impl Model {
             Mock::given(method("POST"))
                 .and(path("/v1/chat/completions"))
                 .and(body_partial_json(serde_json::json!({"stream": true})))
-                .respond_with(
+                .respond_with(if status == 200 {
                     ResponseTemplate::new(200)
                         .set_body_raw(body, "text/event-stream")
-                        .set_delay(delay),
-                )
+                        .set_delay(delay)
+                } else {
+                    ResponseTemplate::new(status)
+                        .set_body_json(serde_json::json!({"error": {"message": "overloaded"}}))
+                        .set_delay(delay)
+                })
                 .mount(&server)
                 .await;
             Mock::given(method("POST"))
@@ -256,6 +266,65 @@ fn coming_back_joins_the_answer_still_streaming(cx: &mut TestAppContext) {
     wait_until(cx, "the answer lands", |cx| {
         posts(&again, cx) == 2 && again.read_with(cx, |c, _| c.turns().is_empty())
     });
+    wait_until(cx, "the hold is released", |cx| {
+        stores.spaces.read_with(cx, |s, _| !s.is_held(&id))
+    });
+}
+
+/// Back while an answer streams, and the turn then fails: the failure and its
+/// Retry wait for the reader, who finds them on coming back, and the
+/// conversation is let go only once the recovery ends (here, dismissed).
+#[gpui::test]
+fn a_turn_that_fails_after_the_reader_left_keeps_its_retry(cx: &mut TestAppContext) {
+    let model = Model::answering(Duration::from_millis(500), 503);
+    let (stores, _dir) = stores(cx, &model);
+    let conversation = created(&stores, cx);
+    let id = conversation.read_with(cx, |c, _| c.id().to_string());
+    let entity = conversation.entity_id();
+
+    conversation.update(cx, |c, cx| assert!(c.submit("Hello".into(), None, cx)));
+    wait_until(cx, "the answer is streaming", |cx| {
+        conversation.read_with(cx, |c, _| !c.turns().is_empty())
+    });
+    stores.spaces.update(cx, |s, cx| s.left(&conversation, cx));
+    drop(conversation);
+
+    // The turn fails with no view to show it (watched through a weak handle,
+    // which keeps nothing alive); the store keeps the conversation for the
+    // reader.
+    assert!(
+        stores.spaces.read_with(cx, |s, _| s.is_held(&id)),
+        "a streaming conversation was not held"
+    );
+    let watched = stores
+        .spaces
+        .update(cx, |s, cx| s.open(&id, cx))
+        .downgrade();
+    wait_until(
+        cx,
+        "the turn has failed or the conversation is gone",
+        |cx| {
+            watched
+                .upgrade()
+                .is_none_or(|c| c.read_with(cx, |c, _| !c.is_busy() && c.error().is_some()))
+        },
+    );
+    cx.run_until_parked();
+    assert!(
+        watched.upgrade().is_some() && stores.spaces.read_with(cx, |s, _| s.is_held(&id)),
+        "a failed turn's conversation was let go before the reader saw it"
+    );
+
+    let again = stores.spaces.update(cx, |s, cx| s.open(&id, cx));
+    assert_eq!(again.entity_id(), entity, "a second entity for one space");
+    assert!(
+        again.read_with(cx, |c, _| c.error().is_some() && c.can_retry()),
+        "the failure notice or its Retry was lost"
+    );
+
+    // Dismissed, the recovery ends and nothing holds it any more.
+    again.update(cx, |c, cx| c.dismiss_error(cx));
+    stores.spaces.update(cx, |s, cx| s.left(&again, cx));
     wait_until(cx, "the hold is released", |cx| {
         stores.spaces.read_with(cx, |s, _| !s.is_held(&id))
     });

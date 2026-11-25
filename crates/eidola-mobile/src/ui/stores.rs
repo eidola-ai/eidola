@@ -68,8 +68,9 @@ pub struct SpacesStore {
     disposals: HashMap<String, Task<()>>,
     /// One entity per open space, shared by every view of it.
     registry: HashMap<String, WeakEntity<Conversation>>,
-    /// Conversations no view shows that still have work in flight, kept alive
-    /// until it settles (the observation releases them).
+    /// Conversations no view shows that still have work in flight or a failed
+    /// turn to offer again, kept alive until that ends (the observation
+    /// releases them).
     held: HashMap<String, (Entity<Conversation>, Subscription)>,
 }
 
@@ -186,7 +187,9 @@ impl SpacesStore {
     /// settles, so the save's plan is followed, the answer lands with its
     /// recovery state, and a reader who comes back joins the same entity and
     /// its running stream (`open`). Dropping it would cancel exactly the
-    /// continuations that do those things.
+    /// continuations that do those things. A turn that failed is held on
+    /// until it is retried or dismissed, so its notice and Retry are there
+    /// when the reader comes back (`Conversation::needs_keeping`).
     ///
     /// A space nobody wrote in goes with its screen — otherwise every "new
     /// conversation" tapped and abandoned stays in the Library — but a write
@@ -194,14 +197,14 @@ impl SpacesStore {
     /// disposed of, and app-core decides inside the delete whether anything
     /// there is worth keeping.
     pub fn left(&mut self, conversation: &Entity<Conversation>, cx: &mut Context<Self>) {
-        let (id, busy, deciding) = {
+        let (id, keep, deciding) = {
             let c = conversation.read(cx);
-            (c.id().to_string(), c.is_busy(), c.is_deciding())
+            (c.id().to_string(), c.needs_keeping(), c.is_deciding())
         };
-        if busy {
+        if keep {
             let key = id.clone();
             let settled = cx.observe(conversation, move |this, conversation, cx| {
-                if !conversation.read(cx).is_busy() {
+                if !conversation.read(cx).needs_keeping() {
                     this.held.remove(&key);
                 }
             });
@@ -250,7 +253,7 @@ impl SpacesStore {
     }
 
     /// Whether a conversation no view shows is being kept alive for its work
-    /// in flight.
+    /// in flight or its failed turn.
     pub fn is_held(&self, id: &str) -> bool {
         self.held.contains_key(id)
     }
