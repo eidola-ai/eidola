@@ -24,7 +24,7 @@ name: Mobile release bundle
 # catalog.
 on:
   push:
-    branches: [mobile]
+    branches: [next]
     paths:
       - "crates/**"
       - "Cargo.toml"
@@ -43,7 +43,7 @@ on:
       - "mobile/tools/bundle_digest.py"
       - ".github/workflows/mobile-bundle-release.yml"
   pull_request:
-    branches: [mobile]
+    branches: [next, main]
     paths:
       - "crates/**"
       - "Cargo.toml"

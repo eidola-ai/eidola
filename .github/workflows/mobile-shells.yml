@@ -11,7 +11,7 @@ name: Mobile shells
 # change.
 on:
   push:
-    branches: [mobile]
+    branches: [next]
     paths:
       - "mobile/**"
       - "crates/eidola-mobile/**"
@@ -23,7 +23,7 @@ on:
       - ".cargo/config.toml"
       - ".github/workflows/mobile-shells.yml"
   pull_request:
-    branches: [mobile]
+    branches: [next, main]
     paths:
       - "mobile/**"
       - "crates/eidola-mobile/**"
