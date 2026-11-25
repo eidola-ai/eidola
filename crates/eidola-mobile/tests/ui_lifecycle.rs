@@ -13,6 +13,7 @@ use std::time::Duration;
 use eidola_app_core::AppCore;
 use eidola_mobile::dev::{DevConfig, seed};
 use eidola_mobile::ui::conversation::{Conversation, Rejected};
+use eidola_mobile::ui::conversation_view::ConversationView;
 use eidola_mobile::ui::stores::Stores;
 use gpui::{Entity, TestAppContext};
 use wiremock::matchers::{body_partial_json, method, path};
@@ -459,4 +460,43 @@ fn a_refused_link_is_rolled_back_with_no_screen_holding_it(cx: &mut TestAppConte
         !config.has_account && !config.has_account_secret,
         "a refused link left its credentials in the profile"
     );
+}
+
+#[gpui::test]
+fn a_post_refused_while_the_reader_writes_waits_for_the_field(cx: &mut TestAppContext) {
+    let model = Model::start(Duration::ZERO);
+    let (stores, _dir) = stores(cx, &model);
+    let conversation = created(&stores, cx);
+    cx.update(eidola_mobile::ui::init);
+    let window = cx.add_window(|window, cx| {
+        ConversationView::new(stores.clone(), conversation.clone(), window, cx)
+    });
+    let view = window.root(cx).unwrap();
+    let composer = view.read_with(cx, |v, _| v.composer().clone());
+
+    // A reply to a post that does not exist is refused; by the time the
+    // refusal lands, the reader has started writing the next message.
+    conversation.update(cx, |c, cx| {
+        assert!(c.submit("My words".into(), Some("no-such-post".into()), cx))
+    });
+    composer.update(cx, |c, cx| c.restore("Next words", None, cx));
+    wait_until(cx, "the save is refused", |cx| {
+        conversation.read_with(cx, |c, _| !c.is_saving())
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        composer.read_with(cx, |c, cx| c.text(cx)),
+        "Next words",
+        "the refused words replaced what the reader was writing"
+    );
+    assert!(
+        conversation.read_with(cx, |c, _| c.rejected().is_some()),
+        "the refused words were dropped while the field was in use"
+    );
+
+    // The field empties (the reader's message was sent): the words come back.
+    composer.update(cx, |c, cx| c.sent(cx));
+    cx.run_until_parked();
+    assert_eq!(composer.read_with(cx, |c, cx| c.text(cx)), "My words");
+    assert!(conversation.read_with(cx, |c, _| c.rejected().is_none()));
 }

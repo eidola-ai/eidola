@@ -163,6 +163,7 @@ impl ConversationView {
                     self.list.set_follow_mode(FollowMode::Tail);
                 }
             }
+            ComposerEvent::Emptied => self.restore_rejected(cx),
             ComposerEvent::Focused => {
                 self.list.set_follow_mode(FollowMode::Tail);
             }
@@ -170,9 +171,18 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// Take a refused post's words back into the composer (which keeps them
-    /// only if the reader has not started writing something else).
+    pub fn composer(&self) -> &Entity<Composer> {
+        &self.composer
+    }
+
+    /// Take a refused post's words back into the composer, if it is empty.
+    /// While the reader is writing something else they stay on the
+    /// conversation, and come back when the field next empties
+    /// (`ComposerEvent::Emptied`) or another view opens it.
     fn restore_rejected(&mut self, cx: &mut Context<Self>) {
+        if self.conversation.read(cx).rejected().is_none() || !self.composer.read(cx).is_empty(cx) {
+            return;
+        }
         let Some(rejected) = self.conversation.update(cx, |c, cx| c.take_rejected(cx)) else {
             return;
         };

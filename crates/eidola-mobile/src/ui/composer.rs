@@ -46,6 +46,9 @@ pub enum ComposerEvent {
     },
     /// The field gained focus (the conversation scrolls to its end).
     Focused,
+    /// The field became empty (sent, or cleared): free for a refused post's
+    /// words.
+    Emptied,
 }
 
 pub struct Composer {
@@ -67,9 +70,11 @@ impl Focusable for Composer {
 impl Composer {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| MarkdownEditorState::new(window, cx));
-        let subscription = cx.subscribe(&editor, |_, _, event: &MarkdownEditorEvent, cx| {
-            if matches!(event, MarkdownEditorEvent::Focus) {
-                cx.emit(ComposerEvent::Focused);
+        let subscription = cx.subscribe(&editor, |this, _, event: &MarkdownEditorEvent, cx| {
+            match event {
+                MarkdownEditorEvent::Focus => cx.emit(ComposerEvent::Focused),
+                MarkdownEditorEvent::Change if this.is_empty(cx) => cx.emit(ComposerEvent::Emptied),
+                _ => {}
             }
             cx.notify();
         });
@@ -103,14 +108,24 @@ impl Composer {
         cx.notify();
     }
 
-    /// The save was refused: the words come back, unless the reader has
-    /// already started writing something else.
+    /// What the field holds.
+    pub fn text(&self, cx: &gpui::App) -> String {
+        self.editor.read(cx).value().to_string()
+    }
+
+    /// Nothing written in the field, and no composition open.
+    pub fn is_empty(&self, cx: &gpui::App) -> bool {
+        let editor = self.editor.read(cx);
+        editor.value().trim().is_empty() && !editor.is_composing()
+    }
+
+    /// A refused save's words come back into the field. The caller gives
+    /// them only to an empty field ([`Self::is_empty`]), so nothing the
+    /// reader has started writing is replaced.
     pub fn restore(&mut self, text: &str, reply_to: Option<ReplyTarget>, cx: &mut Context<Self>) {
-        if self.editor.read(cx).value().trim().is_empty() {
-            self.editor
-                .update(cx, |e, cx| e.set_value(text.to_string(), cx));
-            self.reply_to = reply_to;
-        }
+        self.editor
+            .update(cx, |e, cx| e.set_value(text.to_string(), cx));
+        self.reply_to = reply_to;
         cx.notify();
     }
 
