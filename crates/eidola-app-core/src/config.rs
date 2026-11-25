@@ -16,11 +16,26 @@ pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidola:inference:production:2
 /// Embedded fallback for the inference model. The `default_model` config key
 /// is gone (Participants v1); this is the model the seeded "Default" space
 /// template's agent participant carries, and the last-resort fallback when a
-/// space or template has no resolvable agent model. It is the curated Gemma 4
-/// E4B in the managed local store (`gemma-4-e4b` in
-/// `local_models::LOCAL_MODEL_CATALOG`), spelled as the `<file-stem>@local`
-/// reference that model is selected by once downloaded.
-pub const DEFAULT_MODEL: &str = "gemma-4-E4B_q4_0-it@local";
+/// space or template has no resolvable agent model.
+///
+/// It is a model this build can run. With the `desktop` feature it is
+/// [`LOCAL_DEFAULT_MODEL`]; a build without it (the mobile app) has no local
+/// engines, so it is [`HOSTED_DEFAULT_MODEL`].
+#[cfg(feature = "desktop")]
+pub const DEFAULT_MODEL: &str = LOCAL_DEFAULT_MODEL;
+#[cfg(not(feature = "desktop"))]
+pub const DEFAULT_MODEL: &str = HOSTED_DEFAULT_MODEL;
+
+/// The desktop's default model: the curated Gemma 4 E4B in the managed local
+/// store (`gemma-4-e4b` in `local_models::LOCAL_MODEL_CATALOG`), spelled as
+/// the `<file-stem>@local` reference that model is selected by once
+/// downloaded.
+pub const LOCAL_DEFAULT_MODEL: &str = "gemma-4-E4B_q4_0-it@local";
+
+/// The default model of a build without local models: a tag of the Eidola
+/// model catalog (`models/`), bare so it routes to the `eidola` backend and
+/// follows the tag as it moves. A test holds it to a current catalog row.
+pub const HOSTED_DEFAULT_MODEL: &str = "mimo-v2.6-flash";
 
 /// Well-known id of the seeded "Default" space template — the compiled-in
 /// value [`Config::default_template`] resolves to when the user has set no
