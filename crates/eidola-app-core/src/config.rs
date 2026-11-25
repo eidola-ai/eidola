@@ -35,7 +35,7 @@ pub const LOCAL_DEFAULT_MODEL: &str = "gemma-4-E4B_q4_0-it@local";
 /// The default model of a build without local models: a tag of the Eidola
 /// model catalog (`models/`), bare so it routes to the `eidola` backend and
 /// follows the tag as it moves. A test holds it to a current catalog row.
-pub const HOSTED_DEFAULT_MODEL: &str = "mimo-v2.6-flash";
+pub const HOSTED_DEFAULT_MODEL: &str = "qwen3.5-2b";
 
 /// Well-known id of the seeded "Default" space template — the compiled-in
 /// value [`Config::default_template`] resolves to when the user has set no
