@@ -9,7 +9,9 @@
 #                               measurement) and DIR/pids; logs to DIR
 #   account_stack.sh down DIR   stops what `up` started (and the database container)
 # The shim's certificate also names 10.0.2.2, the address the Android emulator reaches this machine
-# at. Needs docker (the database) and the database image `just services` builds.
+# at. With ACCOUNT_STACK_HOST set to this machine's LAN address, the shim listens on the LAN and its
+# certificate names that address too, for a physical device. Needs docker (the database) and the
+# database image `just services` builds.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -35,8 +37,11 @@ wait_port() { for _ in $(seq 120); do nc -z 127.0.0.1 "$1" 2>/dev/null && return
 
 # The database: TLS only, its root trusted by the gateway.
 (cd "$ROOT" && ./scripts/dev-postgres-tls.sh >/dev/null && docker compose up -d postgres >/dev/null)
+# Ready means the server the image ends on, the one with TLS on: on a new volume the image first
+# runs a server without it to apply its init scripts, then stops it, so a plain readiness check can
+# pass just before the database goes down to restart.
 for i in $(seq 60); do
-  (cd "$ROOT" && docker compose exec -T postgres pg_isready -U eidola >/dev/null 2>&1) && break
+  [[ "$(cd "$ROOT" && docker compose exec -T postgres psql -U eidola -d eidola -tAc 'SHOW ssl' 2>/dev/null)" == on ]] && break
   [[ $i == 60 ]] && { echo "postgres did not start" >&2; exit 1; }
   sleep 1
 done
@@ -70,8 +75,11 @@ python3 "$HERE/billing_edge_stub.py" --port "$EDGE_PORT" --upstream "http://127.
 echo $! >>"$DIR/pids"
 wait_port "$EDGE_PORT"
 mkdir -p "$DIR/certs"
-CERT_DIR="$DIR/certs" LISTEN_ADDR="127.0.0.1:$SHIM_PORT" UPSTREAM_URL="http://127.0.0.1:$EDGE_PORT" \
-  DEV_MEASUREMENT="$MEASUREMENT" EXTRA_TLS_NAMES=10.0.2.2 "$BIN/tinfoil-shim-mock" >"$DIR/shim.log" 2>&1 &
+LAN="${ACCOUNT_STACK_HOST:-}"
+BIND=127.0.0.1
+[[ -n "$LAN" ]] && BIND=0.0.0.0
+CERT_DIR="$DIR/certs" LISTEN_ADDR="$BIND:$SHIM_PORT" UPSTREAM_URL="http://127.0.0.1:$EDGE_PORT" \
+  DEV_MEASUREMENT="$MEASUREMENT" EXTRA_TLS_NAMES="10.0.2.2${LAN:+,$LAN}" "$BIN/tinfoil-shim-mock" >"$DIR/shim.log" 2>&1 &
 echo $! >>"$DIR/pids"
 wait_port "$SHIM_PORT"
 

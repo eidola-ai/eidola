@@ -4,7 +4,9 @@ fixed answer, so the app's conversation flow runs end to end in the Simulator an
 the emulator — through the shell's pipe, app-core's turn and its stream — with no
 account and no engine. Never part of a release.
 
-  openai_stub.py [--port 8790] [--delay 0.03]
+  openai_stub.py [--port 8790] [--delay 0.03] [--bind 127.0.0.1]
+
+(`--bind 0.0.0.0` for a physical device, which reaches it over the LAN.)
 
 GET /v1/models lists one model, `stub`. POST /v1/chat/completions answers the last
 user message: streamed (server-sent events), its reasoning first
@@ -158,10 +160,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--delay", type=float, default=0.03)
+    parser.add_argument("--bind", default="127.0.0.1")
     args = parser.parse_args()
     Handler.delay = args.delay
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"stub: listening on 127.0.0.1:{args.port}", flush=True)
+    server = ThreadingHTTPServer((args.bind, args.port), Handler)
+    print(f"stub: listening on {args.bind}:{args.port}", flush=True)
     server.serve_forever()
 
 

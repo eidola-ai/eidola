@@ -43,7 +43,7 @@ The sheet is the shell's statement of what it serves, so it is exactly as trustw
 The Android shell's unsigned APK is a function of its source, the bundle it embeds and build tools pinned by hash: the same source gives the same APK on macOS and Linux, which CI checks. A signed APK differs only by its signature, and removing the signature restores the unsigned bytes exactly, so a signed APK, or one taken off a phone, can be held to a build from source:
 
 ```sh
-adb shell pm path ai.eidola.mobile             # where the installed APK is
+adb shell pm path ai.eidola.app.android        # where the installed APK is
 adb pull <path> eidola.apk
 python3 mobile/android/tools/strip_apk_signature.py eidola.apk unsigned.apk
 sha256sum unsigned.apk                         # compare with a build from the same source

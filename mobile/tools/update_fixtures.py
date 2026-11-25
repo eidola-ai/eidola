@@ -2,7 +2,13 @@
 """Serve the update a development bundle's update check finds (its `update_fixtures`
 URL, `build-bundle.sh --dev-update`), for the phone interface's UI tests.
 
-    update_fixtures.py BUNDLE_DIR WORK_DIR --port 8791 --base http://HOST:8791
+    update_fixtures.py BUNDLE_DIR WORK_DIR --port 8791 --base http://HOST:8791 [--bind 127.0.0.1]
+        [--broken-version 0.0.10]
+
+(`--bind 0.0.0.0` for a physical device, which reaches it over the LAN at HOST. The shell
+remembers the last version that failed its trial and the app refuses to install it again, so a
+device that keeps its install from one run to the next needs a `--broken-version` of its own each
+run.)
 
 Two releases, built here into WORK_DIR and served from it over plain HTTP:
 
@@ -58,6 +64,8 @@ def main():
     ap.add_argument("work")
     ap.add_argument("--port", type=int, default=8791)
     ap.add_argument("--base", required=True)
+    ap.add_argument("--bind", default="127.0.0.1")
+    ap.add_argument("--broken-version", default="0.0.10")
     args = ap.parse_args()
     work = os.path.abspath(args.work)
     shutil.rmtree(work, ignore_errors=True)
@@ -68,7 +76,7 @@ def main():
     with open(f"{work}/broken/index.html", "w") as f:
         f.write("<!doctype html><title>a bundle that never confirms</title>\n")
     releases = []
-    for version, src in [("0.0.9", "update"), ("0.0.10", "broken")]:
+    for version, src in [("0.0.9", "update"), (args.broken_version, "broken")]:
         os.makedirs(f"{work}/www/download/v{version}", exist_ok=True)
         row = container(f"{work}/{src}", f"{work}/www/download/v{version}/eidola-mobile-bundle.tar")
         releases.append((f"/download/v{version}/eidola-mobile-bundle.tar", staged(args.base, version, row), row))
@@ -100,7 +108,7 @@ def main():
                         print(f"fixtures: container of release {i} fetched; next offer {state['next']}", flush=True)
             super().do_GET()
 
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

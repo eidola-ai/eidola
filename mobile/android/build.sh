@@ -3,8 +3,8 @@
 #   build.sh [--bundle DIR] [--debug] [--aab] [--out DIR]
 # --bundle  the bundle to embed (default: the app, built by ../build-bundle.sh; the tests embed
 #           ../contract-test)
-# --debug   a debuggable APK as ai.eidola.mobile.dev (console in logcat, inspectable WebView);
-#           the default, release, is ai.eidola.mobile
+# --debug   a debuggable APK as ai.eidola.app.android.dev (console in logcat, inspectable WebView);
+#           the default, release, is ai.eidola.app.android
 # --aab     also the App Bundle Play takes, OUT/eidola-shell-unsigned.aab: the same compiled shell and
 #           bundle, laid out as a bundletool module (a release build only; Play signs what it
 #           delivers, and the upload key signs this file at release time, outside the build)
@@ -43,9 +43,9 @@ W="$OUT/stage"
 rm -rf "$W" && mkdir -p "$W/dex"
 
 # 1. The binary manifest and resources. A debug build is debuggable and installs beside a release one, as
-#    ai.eidola.mobile.dev; the release package is the manifest's own, ai.eidola.mobile.
+#    ai.eidola.app.android.dev; the release package is the manifest's own, ai.eidola.app.android.
 DEBUG_MODE=()
-[[ $VARIANT == debug ]] && DEBUG_MODE=(--debug-mode --rename-manifest-package ai.eidola.mobile.dev)
+[[ $VARIANT == debug ]] && DEBUG_MODE=(--debug-mode --rename-manifest-package ai.eidola.app.android.dev)
 #    The only resources are the launcher icon's, generated from brand/ (just update-brand).
 mkdir -p "$W/res"
 for f in $(cd "$HERE/res" && find . -type f | LC_ALL=C sort); do

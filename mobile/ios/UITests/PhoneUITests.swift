@@ -35,10 +35,32 @@ final class PhoneUITests: XCTestCase {
             .matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).allElementsBoundByIndex
     }
 
+    /// A device asks for local network access at a new install's first connect to this Mac (the
+    /// Simulator never does), and that connect fails while the prompt is up: allow it whenever it
+    /// is up, then retry what failed (the onboarding's terms read offers a retry).
+    private func allowLocalNetwork() {
+        #if !targetEnvironment(simulator)
+            let allow = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.buttons["Allow"]
+            guard allow.exists else { return }
+            allow.tap()
+            let retry = app.webViews.firstMatch.descendants(matching: .any)
+                .matching(NSPredicate(format: "label ENDSWITH '/retry'")).firstMatch
+            if retry.waitForExistence(timeout: 5) {
+                retry.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            }
+        #endif
+    }
+
     @discardableResult
     private func waitFor(_ name: String, timeout: TimeInterval = 30) -> XCUIElement {
         let element = probe(name)
-        if !element.waitForExistence(timeout: timeout) {
+        let deadline = Date().addingTimeInterval(timeout)
+        var found = element.waitForExistence(timeout: min(timeout, 2))
+        while !found && Date() < deadline {
+            allowLocalNetwork()
+            found = element.waitForExistence(timeout: 2)
+        }
+        if !found {
             shot("failure-\(name.replacingOccurrences(of: "/", with: "-"))")
             XCTFail("no \(name)")
         }
