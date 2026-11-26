@@ -24,7 +24,7 @@ path = "src/lib.rs"
 [dependencies]
 rumdl = "=0.3.4"
 just = "=1.59.0"
-cargo-deny = "=0.20.2"
+cargo-deny = "=0.22.0"
 
 [workspace]
 
