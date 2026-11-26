@@ -2,7 +2,7 @@
 
 This guide is for a release officer setting up a fresh YubiKey 5 (e.g. a 5C) as a human release-attestation signing key — a key whose sha256 SPKI fingerprint is pinned in `releases/trust/trust-constants.json` (`trusted_attestant_fingerprints`) and which signs each release attestation via `just release-attest`.
 
-For the conceptual model of what the attestant key is and how it fits the trust root, see [`../trust-root.md`](../trust-root.md). For the rotation procedure once a key is already in service, see [`../../releases/README.md`](../../releases/README.md#rotating-an-attestant-key). This document covers the one-time hardware provisioning that those assume has already happened.
+For the conceptual model of what the attestant key is and how it fits the trust root, see [`../releases.md`](../releases.md#the-compiled-in-trust-root). For the rotation procedure once a key is already in service, see [`../../releases/README.md`](../../releases/README.md#rotating-an-attestant-key). This document covers the one-time hardware provisioning that those assume has already happened.
 
 This is the human-presence key and must require touch. The distinct [Apple CI signing YubiKey](release-apple-signing-yubikey.md) must not require touch, because it signs unattended workflows.
 

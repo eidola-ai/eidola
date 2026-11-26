@@ -1,92 +1,59 @@
 # Model identity
 
-A model Eidola sells is identified by its **weights hash**: a SHA-256 over every file the inference engine reads from its weights directory. The hash is the model's key everywhere: in the catalog, in the engine deployments the gateway pins, in the engine's own refusal of a request naming other weights, and in what the gateway publishes. Names are a convenience on top of it. This page specifies the hash well enough to reimplement it without Eidola's code, says what it does and does not pin, and shows how to check it against files you download yourself.
+## Why model names aren't enough
 
-## Naming a model
+If you have used hosted AI for any length of time, you have probably felt a quiet doubt: you pick a model by name, come to rely on how it writes or reasons, and one day it feels different. A provider can quietly swap in a smaller quantization, update a checkpoint, alter a prompt template, or route overflow traffic to another model — and a name alone gives you no way to tell.
 
-A request's `model` field takes one of three forms:
+Even with hardware-attested enclaves running open-source code, a model name still leaves a gap: *which weights is that attested engine actually loading?*
 
-- **`tag`**, such as `mimo-v2.6-flash`: whatever weights the tag resolves to in this release. A tag matches `[A-Za-z0-9._-]+`, is at most 64 characters, and names exactly one hash at a time. Tags move only with a release, so following a tag means accepting the release's choice.
-- **`tag@sha256:<64 lowercase hex digits>`**: a pin. As in a container image reference, **the digest is authoritative**: the gateway serves exactly those weights, and reads the tag only as the client's label for them, whether it names that hash now, named it once, or never did. A pin keeps its weights across a release that moves its tag, for as long as the gateway serves them.
-- **`sha256:<64 lowercase hex digits>`**: those weights, with no label.
+In a plain chat app with no external capabilities, that gap is a real but bounded risk; once a model can wield tools and act on your behalf, the stakes change completely. Even tiny changes to a model's weights can substantially alter its behavior — and a service free to swap in different weights than the ones you evaluated leaves you exposed to broad or even targeted manipulation.
 
-Only full digests are accepted. The gateway resolves the reference to a hash as the request arrives; everything after that point works with the hash alone. A response's `model` names what was resolved: the reference as the client sent it, normalised (`tag@sha256:<hex>` for a tag, with the hash it resolved to, or for a pin; `sha256:<hex>` for a hash named alone). A reference that is malformed, names no model the gateway serves, or names a retired model is refused, and the request is refunded all but the request fee. Telling a user that a tag they pinned now names other weights is the client's job, from the catalog compiled into it.
+Eidola closes that gap by identifying every model by its **weights hash** — a single cryptographic fingerprint (SHA-256) computed over the exact open-weight files the inference engine loads. Human-readable names are just convenience labels on top of that hash. Because Eidola sells private compute over open-weight models rather than proprietary AI, that fingerprint points directly to public files anyone can download, inspect, and evaluate on their own hardware or another service.
 
-Every model's catalog entry is a file in the source tree, `models/<family>/<label>.toml`, compiled into the gateway, so the catalog a gateway publishes is part of what its enclave measurement covers. A model is **current** or **deprecated** (still served, with a retirement date announced) while it is listed, and **retired** when a release stops serving it; a retired model is refused by name, tag or hash.
+## Tags and pinned weights
 
-## In the Eidola app
+Every model in Eidola's catalog is compiled into both the gateway (making the catalog part of its measured enclave identity) and your app. When you choose a hosted model, you can reference it in two ways:
 
-The app compiles in the same catalog files the gateway does, so it knows what each name resolves to in the release it trusts, without asking anyone.
+- **Follow a tag** (for example, `qwen3.8-27b`). A tag points to one specific weights hash in your current Eidola release. Tags never move silently on the server behind your back — they change only with a new, attested release. When a tag you follow moves to newer weights, the app notifies you so you know what changed.
+- **Pin exact weights** (`tag@sha256:<hash>`, or the bare `sha256:<hash>`). As with a container image digest, the hash is authoritative and the tag is just your label. A pinned conversation stays on those exact weights even if a future release moves the tag, while offering a one-click option to switch when newer weights are available.
 
-- **Choosing a model** stores the choice as you made it: a tag, which follows the tag, or a pin, which keeps the weights it names.
-- **Each answer is sent under the exact weights its turn resolved to.** A turn that follows a tag names the tag's current hash on every request it makes, tool calls included, so one answer never mixes two sets of weights. The app records which weights each answer came from.
-- **The model's identity is shown wherever you choose it:** its weights hash, the repository and revision the weights come from, and a link to this page, so you can check them yourself.
-- **You can follow a tag or pin weights.** The model picker offers each model both ways: following its tag, or pinned to the weights it names now, shown with the start of their hash.
-- **It tells you when something changed.** If a tag you follow now names newer weights than your last answer came from, it says the model was updated, and you can dismiss that until the tag moves again. If you pinned weights whose tag has moved on, it offers the newer ones, and one click switches that conversation to them. If your weights are deprecated, it shows the announced retirement date, and it tells you again once they are retired.
-- **The command line shows the same:** `eidola model show <tag>` prints the hash, the source, every file the hash covers and how to check them, with the same notices.
+Across the entire serving path, identity is enforced structurally:
 
-## What `/v1/models` publishes
+- **One answer, one set of weights.** Even when you follow a tag, your app resolves it to its current weights hash before sending the turn — and sends that exact hash on every follow-up tool call or continuation — so a single answer never mixes two models. The app records which weights hash produced each answer.
+- **Engines refuse mismatches.** Every inference node hashes its read-only weights directory on startup, and the gateway sends the requested weights hash on every call. If a node does not hold those exact weights, it refuses the request before doing any compute.
+- **No silent substitutions.** Every model has an explicit lifecycle: **current**, **deprecated** (still served, with an announced retirement date shown in the app), or **retired**. Once weights are retired, requests naming them are refused rather than quietly routed to something else.
 
-For each model the gateway sells, `/v1/models` publishes:
+## What the hash does and doesn't cover
 
-- `sha256`, the weights hash, and `tags`, every tag that resolves to it;
-- `weights`: the source repository and revision (on Hugging Face) and the per-file manifest, each file's `path`, `size` and `sha256`;
-- `architecture`, the model family the engine runs it as;
-- `lifecycle`: `status` (`current` or `deprecated`) and, for a deprecated model, `retire_after`;
-- `deployments`: for every engine deployment the gateway accepts for these weights, the SHA-256 of its committed configuration and the attestation measurement the gateway holds every connection to it to.
+**What it pins:** the exact bytes of the model's weight shards, along with its configuration, tokenizer, and any chat template and default sampling settings. Every quantization Eidola serves is stored as standard-format `safetensors` files with its own weights hash and catalog entry, never as a hidden transform applied when weights are loaded. The files you can download and hash are the exact files the engine computes with.
 
-Its `id` is the model's first tag, or `sha256:<hex>` when it has none.
+**What it does not pin:** identical token-by-token output across different software or hardware. The weights hash pins *the model files*; the inference engine's code and compiled kernels are pinned separately by each [engine deployment's measurement](architecture.md#pinning-and-attestation). Loading the same verified weights in another engine will produce outputs that agree in substance, though differences in floating-point execution and sampling mean they won't match to the exact token.
 
-## The weights hash
+## How the hash is computed
 
-The hash covers files at the top level of the engine's weights directory only. A published checkpoint may hold subdirectories (MiMo-V2.6-Flash's carries a drafter and an audio tokenizer in two); the engine reads nothing in them, and they are not hashed. The hash **covers** these files:
+The weights hash is deliberately simple to compute without Eidola's code:
 
-- every file whose name ends in `.safetensors` (the shards);
-- `config.json`, `tokenizer.json`, `chat_template.jinja`, `generation_config.json` and `model.safetensors.index.json`, each when present.
+1. Collect the covered files at the top level of the model's weights directory: every `.safetensors` shard, plus `config.json`, `tokenizer.json`, and — when present — `chat_template.jinja`, `generation_config.json`, and `model.safetensors.index.json`. Subdirectories are not read by the engine and are excluded.
+2. Compute the lowercase hex SHA-256 of each covered file and build a manifest with one line per file in standard `sha256sum` format: `<sha256>  <filename>\n` (two spaces between hash and name), sorted by filename in ASCII byte order. (Filenames are restricted to ASCII letters, digits, `.`, `_`, and `-`, never starting with `.` or `-`, so standard shell tools reproduce the manifest identically.)
+3. Take the lowercase hex SHA-256 of that manifest's bytes. That digest is the **weights hash**.
 
-`config.json` and `tokenizer.json` are always required. A model whose engine reads the other two requires them as well: MiMo-V2.6's and Qwen3.8's read their template and their sampling defaults; DeepSeek-V4.1's encodes its prompt with code compiled into the engine and reads `generation_config.json` only when there is one. A covered file the engine does not read is hashed all the same.
+The gateway publishes each served model's weights hash, upstream repository and revision, per-file hashes and sizes, lifecycle status, and pinned engine measurements on `/v1/models`. Inside Eidola, the model picker shows the hash and source repository directly — and on the command line, `eidola model show <tag>` prints the full manifest and any update or retirement notices.
 
-Every covered name must match `[A-Za-z0-9_][A-Za-z0-9._-]*`: ASCII letters, digits, `.`, `_` and `-`, not starting with `.` or `-`. The engine refuses a directory holding a covered file named otherwise. Files that are not covered are not read.
+## Checking weights yourself
 
-The **manifest** is one line per covered file, `<sha256>␠␠<name>\n`: the file's SHA-256 in lowercase hex, two spaces, its name, a newline. That is exactly the output of `sha256sum`. Lines are sorted by name in byte order, which for these names is ASCII order. The **weights hash** is the SHA-256 of the manifest's bytes, in lowercase hex.
+To check a model independently, you don't need to trust Eidola's app or website — you can fetch the files directly from their upstream Hugging Face repository at the published revision and recompute the hash yourself.
 
-In a shell, inside the directory:
+The repository includes [`scripts/weights-hash.py`](../scripts/weights-hash.py), which uses only the Python 3.11+ standard library:
 
 ```sh
-LC_ALL=C ls *.safetensors config.json model.safetensors.index.json \
-    tokenizer.json chat_template.jinja generation_config.json 2>/dev/null \
-  | LC_ALL=C sort | xargs sha256sum | sha256sum      # macOS: shasum -a 256
-```
+# Download every file in a catalog entry from its upstream repo and verify each hash
+python3 scripts/weights-hash.py download models/qwen/qwen3.8-27b.toml ./weights
 
-The name rule is what makes this reproduce the manifest byte for byte: `sha256sum` escapes a name holding a backslash or newline, `xargs` splits on whitespace and quotes, a leading `-` reads as an option, and the shell's `*` skips a leading `.`.
+# Verify a weights directory you already have against a catalog file or /v1/models entry
+python3 scripts/weights-hash.py verify models/qwen/qwen3.8-27b.toml ./weights
 
-The published per-file manifest lets you check one file at a time, and its sizes let you check a download before hashing it. The sizes are not part of the hash.
-
-## What the hash pins, and what it does not
-
-The hash pins **the bytes of the weights**, and with them the tokenizer, the chat template where the engine reads one, and the default sampling settings. A prompt format compiled into the engine (DeepSeek-V4.1's) is pinned with the engine build, below. A node refuses a request naming any other hash before the request is admitted, and the gateway names the hash on every request it sends.
-
-It does **not** pin exact behaviour. The engine's code and version, its numerics (the kernels, the order floating-point work is done in, the batch a request shares) and the sampling seed are outside it. The engine build is pinned separately, by the deployment's launch identity ([The engine](engine.md#what-pins-the-engine)); two engines serving the same hash run the same model, not necessarily to the same bit.
-
-**Every quantization Eidola serves is its own set of standard-format files**: safetensors shards with their own hash and their own catalog entry, never a transform applied when the weights are loaded. So the files you can download and hash are the files the engine computes with.
-
-## Checking it yourself
-
-[`scripts/weights-hash.py`](../scripts/weights-hash.py) does all of this with the Python standard library (3.11 or later):
-
-```sh
-# Download every file a catalog entry lists, from its repository at its
-# revision, checking each file's size and SHA-256, then the aggregate.
-# MiMo-V2.6-Flash's entry lists 134 files, 173 GB.
-python3 scripts/weights-hash.py download models/mimo/mimo-v2.6-flash.toml ./weights
-
-# Check a directory you already have against an entry.
-python3 scripts/weights-hash.py verify models/mimo/mimo-v2.6-flash.toml ./weights
-
-# Print the weights hash of a directory, as the engine computes it.
+# Compute the weights hash of any local checkpoint directory
 python3 scripts/weights-hash.py hash ./weights
 ```
 
-The entry can also be one model's object from `/v1/models`, saved as a `.json` file, so you can check what a running server publishes rather than what the source tree says.
-
-The directory that verifies is an ordinary Hugging Face checkpoint. Load the same files in another engine to compare: `vllm serve ./weights`, or convert them with llama.cpp's `convert_hf_to_gguf.py ./weights` (the conversion is then your transform, outside the hash). Outputs will agree in substance, not to the token: the hash pins the weights, not the engine (see above).
+You can also pass a single model's JSON object saved from `/v1/models` in place of the catalog file to verify what a live gateway advertises. The resulting directory is an ordinary Hugging Face checkpoint — you can load those exact same files in another engine on your own hardware or rented compute and compare for yourself.

@@ -14,8 +14,8 @@ For an explanation of how Eidola works, what it commits to, and what it doesn't 
 
 - [Privacy guarantees](docs/privacy-guarantees.md) — the specific properties human attestants commit to with every release.
 - [Threat model](docs/threat-model.md) — who Eidola defends against, who it doesn't.
-- [The client](docs/client.md), [gateway](docs/gateway.md), and [inference engine](docs/engine.md) — design pieces.
-- [Releases](docs/releases.md) and [trust root spec](docs/trust-root.md) — how new code becomes trustable.
+- [Architecture](docs/architecture.md) — how the client, gateway, and inference engine fit together.
+- [Verifiable releases](docs/releases.md) and [apps & platform verification](docs/apps.md) — how new code becomes trustable and how downloads verify on each platform.
 - [Known gaps](docs/gaps.md) — what we don't yet defend against.
 
 ## Contributing
@@ -179,7 +179,7 @@ just update-openapi    # OpenAPI spec
 just update-manifest   # artifact-manifest.json (OCI images, desktop binaries, enclave measurements)
 ```
 
-This uses the pinned amd64 BuildKit builder configuration for the OCI images, the local Nix build for the host platform's native desktop payloads (the macOS universal CLI and GUI `.app` on macOS; the Linux GUI on Linux) plus their flake-built `.tar.gz` archives, and the `measure-enclave` binary to compute SEV-SNP and TDX measurements from `deploy/gateway/tinfoil-config.yml`. The Linux GUI `narHash` / `archiveSha256` are always regenerated: natively on Linux, and on macOS by reproducing CI's native `x86_64-linux` build inside a pinned `linux/amd64` Nix container (`docker` required — the same assumption the StageX pipeline already makes). Only the macOS hashes are host-exclusive (they can't be cross-built from Linux), so on a Linux host they're carried over from the committed manifest; CI verifies the full set on both platforms. How to check a published download: [`docs/verification.md`](docs/verification.md).
+This uses the pinned amd64 BuildKit builder configuration for the OCI images, the local Nix build for the host platform's native desktop payloads (the macOS universal CLI and GUI `.app` on macOS; the Linux GUI on Linux) plus their flake-built `.tar.gz` archives, and the `measure-enclave` binary to compute SEV-SNP and TDX measurements from `deploy/gateway/tinfoil-config.yml`. The Linux GUI `narHash` / `archiveSha256` are always regenerated: natively on Linux, and on macOS by reproducing CI's native `x86_64-linux` build inside a pinned `linux/amd64` Nix container (`docker` required — the same assumption the StageX pipeline already makes). Only the macOS hashes are host-exclusive (they can't be cross-built from Linux), so on a Linux host they're carried over from the committed manifest; CI verifies the full set on both platforms. How to check a published download: [`docs/apps.md`](docs/apps.md).
 
 To compute enclave measurements independently (without rebuilding images):
 

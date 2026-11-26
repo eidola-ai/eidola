@@ -1,210 +1,154 @@
 # Known gaps
 
-Every piece of the Eidola trust chain that is deferred is catalogued here. Each entry names an attack that other parts of the chain constrain but do not close.
+No privacy system is finished on day one. This page catalogues every known gap or deferred defense in Eidola's trust chain — why it matters in practice, what constrains it today, and where we want to take it.
 
-The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs) and `rekor.rs`, and the install-side gap is described where the verifier hands off to [`crates/eidola-app-core/src/updater/install/`](../crates/eidola-app-core/src/updater/install/mod.rs).
+## Hardware and hosting
 
-## Cryptographic verifier
+### Physical access to server hardware
 
-### SCT verification in the Fulcio leaf certificate
+**Why it matters.** Recent research (including attacks such as [tee.fail](https://tee.fail/)) demonstrated that an attacker with physical access to a confidential-computing server can interpose on the memory bus and extract secrets from an enclave. In response, both AMD and Intel explicitly defined physical hardware attacks as outside the threat model of their current confidential-computing implementations. That means hardware attestation alone proves *what code is running on genuine silicon*, not *whether someone with a screwdriver can touch the machine*.
 
-**What it would catch.** A malicious or compromised Fulcio issuing certificates for OIDC identities it shouldn't — the Signed Certificate Timestamp proves the cert was logged in a public CT log.
+**Where things stand today.** Our answer here is weak today. For inference engines running on Intel TDX, the gateway restricts connections to an allowlist of specific machines endorsed by our hosting provider (Tinfoil), rather than accepting any Intel chip anywhere. For the gateway itself (AMD SEV-SNP), the client checks that the processor is genuine AMD silicon meeting firmware floors, but cannot yet distinguish a server in Tinfoil's data center from an identical AMD machine an attacker physically controls. Even on endorsed machines, physical security still rests on trusting the data center operator.
 
-**What constrains it today.** The OIDC-identity match and the Fulcio chain walk are the primary binding. The SCT check is defense-in-depth on top of those, not a single point of failure.
-
-### Rekor checkpoint signature verification
-
-**What it would catch.** The Rekor instance silently forking a side-tree just for our entries — the inclusion proof we compute is mathematically valid but roots to a tree the public never sees.
-
-**What constrains it today.** The Signed Entry Timestamp already requires the Rekor public key to vouch for our specific entry. The checkpoint adds independence from private forks by verifying against the publicly-witnessed log head.
-
-### Artifact-hash check at install time
-
-**What it would catch.** A tampered binary download — the *manifest* is signed and content-verified, but the actual binary bytes that would run are not yet hashed against the manifest's declared digests.
-
-**What constrains it today.** The check itself now exists: `updater::install::stage` hashes each downloaded container against the value the verified manifest records and refuses on any difference, leaving no staged tree. What is still missing is the wiring that builds an install plan from a verified release — which waits on the attestation carrying the detached material's hash and the signing identity to expect.
-
-### Multi-hop continuity
-
-**Current behavior.** A client several releases behind is offered the *next* release along the latest's history, not the latest: each release is verified by the clients of the release before it, against their pins, so a client steps through the releases it missed one at a time (`updater::discover_next_release`). The history is found by reading each release's unsigned `previous_release` back from the latest, by tag, and only the release found is gated and verified.
-
-**What it costs.** One update per release missed, each its own download, verification and relaunch. Jumping straight to the latest would need the client to trust each intermediate release's pins without having installed it, which is the chain a pin rotation breaks. A release removed from the listing breaks the walk for every client behind it, who then install the latest manually; so does falling more than `MAX_RELEASE_HOPS` releases behind.
-
-## Operational
-
-### Install / atomic-replace
-
-**Current behavior.** `eidola update` runs the full verification pipeline and prints the verified attestation prose. Downloading and verifying an update is implemented — `updater::install::stage` fetches the payload, hashes it against the manifest, reconstructs the signed macOS app from the detached material, and checks that the result claims the identity the attestation names — but it stops at a *staged* bundle. Nothing replaces the running application.
-
-**Future.** Promotion: swapping a staged bundle for the installed one, and relaunching. That is a product decision rather than a missing mechanism, because the answer differs by install location — `updater::install::promotion_readiness` reports whether this process could do it without privileges it should not be acquiring on its own. The CLI stays out of scope (no TCC need, and a bare Mach-O cannot be stapled).
-
-### Single-attestant policy
-
-**Current behavior.** `MIN_HUMAN_ATTESTATIONS` (embedded in the client, sourced from `releases/trust/trust-constants.json`) is `1` in current releases — only one engineer needs to attest for a release to verify.
-
-**Future.** Once a co-attestant key is provisioned and added to `trusted_attestant_fingerprints`, bumping `min_human_attestations` to `2` (in a release signed under the *current* threshold) makes every subsequent release require independent corroboration. The verifier already supports arbitrary M-of-N; the second key just hasn't been generated yet.
-
-### First-install downgrade
-
-**Current behavior.** A fresh client (no prior installed `git_commit`) bypasses continuity, so an adversary serving an internally-consistent *older* `release.json` could route them onto a real-but-stale release.
-
-**Today every client is a fresh client.** No build knows the commit it was released from, and none can learn it at build time: the release commit records the binaries' `narHash` in `artifact-manifest.json`, so a binary embedding that commit could never reach a fixed point (the same reason the manifest is excluded from the build's source). The installed commit has to come from the updater recording what it installed (`updater::installed`, keyed by the SHA-256 of the install's main executable, so a manual install over the top reads as a fresh install again). The record is read on every check, and nothing writes it until promotion lands (Install / atomic-replace, below). Until then the continuity stage is skipped on every check, and the client is offered the oldest release newer than its compile-time version along the latest's history.
-
-**Mitigations today.** None that the client can enforce. A first install is exactly the case where the client has nothing to compare against, so the surface "did you download a current release or a stale-but-internally-consistent one?" lives outside the client's reach today.
-
-**Future.** A *freshness anchor* is something a fresh install *can* validate at the moment of download, without needing prior state. The general shape: every release embeds (or references) a recent timestamped artifact from a public, append-only system that an attacker cannot retroactively forge.
-
-### Anonymity-set size
-
-**Current behavior.** An anonymous credit token is unlinkable to its issuance only *within its anonymity set*: the accounts that received tokens under the same `(issuer_key, domain_separator)` during that key's issuance window ([privacy-guarantees.md](privacy-guarantees.md) §2.3). The partition parameters — weekly issuance epochs, a single non-rotating domain separator, an acceptance window one full epoch beyond issuance — are compile-time constants, but the *population* inside a partition is a deployment fact the code cannot control. Early in the deployment, or during a quiet week, a window may contain few active accounts; in the degenerate one-account case the cryptography still holds, but the operator could attribute spends by elimination.
-
-**What constrains it today.** Temporal decoupling (§2.4) keeps issuance and redemption timestamps from being forced near-equal, the gateway persists no per-redemption timestamps, and nothing in the protocol subdivides the partition further. None of that enlarges a small population.
-
-**Two-input requests narrow it.** A request may present two tokens ([anonymous-credits.md § Spending several tokens in one request](anonymous-credits.md#spending-several-tokens-in-one-request)), and tokens presented together are known to come from one client. Two under one key place the request among the accounts issued at least two tokens under that key; one under each of two keys, among the accounts issued under both. The client issues two tokens under each key it provisions under, so the first set is every account that provisioned under the key rather than the heavy users; an account that only ever converted just in time is not in it, and the second set is the accounts that provisioned in both epochs.
-
-**Future.** The set grows with the user base. If population per window stays small, the epoch length can be raised (a release-visible constant change) to trade key-rotation hygiene for coarser partitions.
-
-### Spend timing at the database
-
-**Current behavior.** A spend writes its nullifier row twice: the nullifier with a provisional sealed refund when the request is accepted, and the final sealed refund when the request ends ([gateway.md § Unlinkability](gateway.md#unlinkability)). A request with two inputs writes both rows in one transaction, and both final refunds as it ends, so the database also sees which two nullifiers belong to one request: its input count and key set, never an amount. The row carries no timestamp, but Postgres runs outside the enclave, so whoever can watch it live — or read its write-ahead log, a replica, or a backup, whose commit records are timed — can see when each write happened, and so how long each request took. Duration follows the length of the answer, so this is a coarse, per-request content-size signal in the operator's hands, and the same database holds per-account issuance timestamps in the credit ledger.
-
-Requests that follow one another closely are a second signal. The client asks for a bounded amount of output at a time and continues a longer answer with a follow-up request as soon as the first ends, so a long answer is a run of spends, each beginning as the one before it finishes. A tool-calling turn is such a run too, and so is a request refused for its declared cached prefix followed by the same request sent again without one. When few requests are in flight, whoever watches the writes can tell that the spends of a run came from one client, although nothing in the rows says so. If the client pays each with the change of the one before, the run is also consecutive spends of one token.
-
-**What constrains it today.** The refund amount itself is stored sealed under a key that needs the client's own secret, at a fixed length; nothing written names an account; and the timing is the signal a network observer of the gateway already has from each response's total duration ([Passive traffic analysis](#passive-traffic-analysis)). The database is treated as adversarial, so this is a real gap rather than a theoretical one.
-
-**Future.** Decouple the second write from completion: hold completed refunds in enclave memory and write them in batches on a fixed interval, so a write says only which interval a request finished in. Batching nullifier inserts from different requests on a fixed interval would likewise blur which rows belong to one request, and which requests follow one another. Recording the nullifier only at completion would hide the start too, but gives up refusing a double spend before it is served once more than one gateway instance shares the database, and is not planned.
-
-### Credit left in a credential when its key lapses
-
-**Current behavior.** Each anonymous credential is issued under one issuer key, and the change from every spend is issued under that same key, so a credential's whole remaining value lives and dies with the key. The gateway accepts a key's credentials until its `accept_until` — one full epoch after the key stops issuing ([gateway.md § Anonymity set](gateway.md#anonymity-set)) — and the client spends a credential until shortly before that deadline (`CREDENTIAL_SPEND_MARGIN`, a few minutes, so a spend begun at the edge still lands inside the window; a spend already in flight stays recoverable until the deadline itself). Whatever is still in the credential after that is lost: it was debited from the account when the credential was issued, and nothing exchanges it for a credential under a newer key.
-
-**What constrains it today.** Every credential gets at least one full epoch of spendable life, however late in its key's issuing window it was minted, and automatic provisioning allocates a modest amount at a time ([`DEFAULT_ALLOCATION_CREDITS`](../crates/eidola-app-core/src/lib.rs)), so the exposure is bounded by one allocation's unspent change per key. A token too small for the next request is drained into it with another token, under a newer key where the older key holds no other, so a residual lapses only if no request reaches it before its key stops accepting. Issuance ahead of need adds at most two allocations to what is held at a time, keeps no buffer for a wallet that has not spent within a week, and prefers a key's early life, when its credentials have the longest to be spent ([anonymous-credits.md § Issuance timing](anonymous-credits.md#issuance-timing)). Issuance is refused outright under a key whose spend deadline has already passed, so the account is never debited into a credential that could not be spent.
-
-**Future.** A rollover: exchanging what remains in an expiring credential for a fresh one under the current key, without that exchange linking the two. That needs its own unlinkability analysis and is not designed yet.
-
-### Multi-jurisdiction attestant distribution
-
-**Current behavior.** Attestants share a small operational surface and may share a jurisdiction.
-
-**Future.** Distributing pinned attestants across hardware vendors, custody arrangements, and jurisdictions raises the cost of coordinated legal compulsion — the central concern of the no-coercion attestation claims in [privacy-guarantees.md §6.4](privacy-guarantees.md#6-release-integrity) and the bounded claim in [§8.7](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise). This is a matter of organizational rollout, not engineering, but it is named here because it is part of what the guarantee depends on.
-
-## Anonymous credits
-
-The decisions behind anonymous payment, and the reasons for them, are in [anonymous-credits.md](anonymous-credits.md). These are the residuals it names, beside two listed above: [Spend timing at the database](#spend-timing-at-the-database) and [Credit left in a credential when its key lapses](#credit-left-in-a-credential-when-its-key-lapses).
-
-### Issuance-to-first-spend timing
-
-**Current behavior.** The app keeps a small buffer of credit tokens issued ahead of need, at random intervals unrelated to any request, so a token's first spend normally comes long after its issuance ([anonymous-credits.md § Issuance timing](anonymous-credits.md#issuance-timing)). When nothing held covers a request, the client still converts credits and spends the new token immediately: on a fresh install, on the first request after a week without spending (no buffer is kept for an idle wallet), from a CLI used while the app is not running, when the balance is below one standard allocation, or for a request larger than what is held. The token converted is then the one standard size, or the remaining balance when that is less, never one sized to the request; a request that one such token beside the largest held one would not pay is refused before anything is converted ([anonymous-credits.md § Issuance sizing](anonymous-credits.md#issuance-sizing)). The database records each issuance with its account and time and sees each spend's nullifier as it is written, so whoever can watch it, or the gateway's traffic, can pair such an issuance with the spend that follows it a moment later, linking that token's first spend to its account. A prompt-cache key on that request then links the rest of its conversation lineage ([privacy-guarantees.md §2.7](privacy-guarantees.md#2-unlinkability)).
-
-A background issuance is timed too: it follows, by one random interval of 10 to 50 minutes, the spend that took the buffer below its threshold. That says some spend in the preceding hour drained a token, which every spend in that window shares; it does not pair the issuance with a spend.
-
-**What constrains it today.** Allocations are large enough (about $1.00) that a token pays for many requests, so even the fallback is rare for an active user; tokens can be converted ahead of time by hand (`eidola account allocate`).
-
-**Future.** A buffer for the CLI-only case, which needs a long-lived process the CLI does not have.
-
-### A crash mid-spend costs the request's hold
-
-**Current behavior.** A spend records its nullifier, with a provisional refund of nothing stored on the same row in the same statement, before the request is served, and replaces that with the final refund when the request ends ([anonymous-credits.md § Provisional refunds, the live set, and ending a request early](anonymous-credits.md#provisional-refunds-the-live-set-and-ending-a-request-early)). If the gateway stops in between (a crash, a restart), the provisional refund is the spend's last: as soon as the gateway is back, recovery finds no request serving the spend, calls the provisional refund final, and the client gets back the token's balance less the hold. The hold itself, which the request may or may not have used, is lost. The same is true, for the request's partial return only, when a client recovers a spend that is still running on a *different* live gateway instance: that instance's live set is not the one recovery asks.
-
-**What constrains it today.** The window is the duration of one request on one instance, and the client's wait is the gateway's restart time. Production runs one gateway instance, so the cross-instance case is at most a deploy overlap. The client keeps the spend's state and keeps retrying recovery until the key stops accepting.
-
-**Future.** Charging a crashed request what it actually used would need its usage to outlive the process, which the gateway deliberately keeps nowhere outside enclave memory. Running several instances side by side would need recovery to ask the instance that holds the spend, without the database learning which requests are in flight.
-
-### A drained balance is visible to the measured code
-
-**Current behavior.** A request paid from two tokens drains the first: its share is that token's whole remaining balance, exactly ([anonymous-credits.md § Draining a token](anonymous-credits.md#draining-a-token)). The spend proof hides a token's balance; a drain gives that up for the drained token, to the gateway's measured code, for the length of the request. A drained token whose share is not fully charged returns as a successor holding exactly the change, a value the gateway computed, so a later drain of that successor shows a share equal to a refund the gateway issued.
-
-**What constrains it today.** The measured server code keeps no share, charge or refund amount anywhere outside enclave memory: refunds are stored sealed under a key only the client holds, at a fixed length, and none of these values is logged or exported. With nothing retained, no one can match a drained balance to an earlier charge or refund. The guarantee for drained tokens therefore rests on the measured code, not on the cryptography.
-
-**Future.** Rounding a drain down to a public step would reveal the balance only to that precision and leave a remainder the gateway does not know, at the cost of stranding less than the step. How coarse a step would matter depends on the population, so it is deferred.
-
-### A client's first sight of an epoch's key
-
-**Current behavior.** Issuer keys sit on a public calendar (one per seven-day epoch, with windows anyone can compute), each key's windows are bound into the encryption of its private key so that the database cannot edit them, and each client records the key it first sees for every epoch and refuses any other for that epoch ([anonymous-credits.md § Key rotation and partitioning](anonymous-credits.md#key-rotation-and-partitioning)). What remains is the first sight: a client with no record for an epoch (a new install, or one that fetched no key listing since the previous epoch began) accepts the key it is shown. A gateway, or a database that made a gateway mint a second key by hiding rows from it, could show that client a key nobody else has, and the client would have nothing to compare it with. A gateway brought up on an empty database is the honest form of the same thing: it mints new keys, which new clients take and existing clients refuse for up to two epochs.
-
-**What constrains it today.** Every listing carries the next epoch's key, so a client that issues at least once an epoch records each key an epoch before it issues; singling it out means starting that early and keeping every listing it fetches consistent. A gateway refuses to mint a second key for an epoch it already holds one for, and refuses to issue at all while it holds two, so a hidden row splits the set only at an instance's start, and only for clients without a record. The client checks that every key it uses is named by the hash of its public key, and that every token and refund it receives is under that key with the request context every client under the key shares.
-
-**Future.** Publish the sequence of keys somewhere clients can compare against without trusting the gateway that serves it (a transparency log, or keys derived from the enclave's measured state), so that a client's first sight is checked too.
-
-## Hardware
+**Direction.** We are actively working on adding stronger transparency and independent auditability around the physical machines hosting enclaves, and are in close communication with Tinfoil.
 
 ### Trust in confidential-compute vendors
 
-**Current behavior.** Eidola trusts AMD, Intel, and NVIDIA to issue genuine attestation chains. A vendor issuing fraudulent attestations for an enclave that does not in fact provide confidential compute would defeat that layer of the chain.
+**Why it matters.** Every hardware attestation ultimately chains back to signing keys controlled by AMD, Intel, and NVIDIA. If a hardware vendor issued fraudulent attestation chains — vouching for a non-confidential machine as an enclave — that layer of protection would collapse.
 
-**Mitigations today.** Limited. The use of WebPKI for our TLS certificate provides a defense in depth, ensuring that an outside party issuing a fraudulent attestation must also produce or obtain a fraudulent WebPKI certificate. However, this provides little resistance in the case of a malicious insider. Generally, we accept hardware vendor trust as residual.
+**Where things stand today.** WebPKI provides a modest extra layer against an external attacker (who would also need a valid TLS certificate for our domain), but does little against a compromised vendor or insider. We accept hardware-vendor trust as residual today.
 
-**Future.** Open hardware roots like OpenTitan reduce the scope of vendors the trust chain depends on. This is an industry-wide direction, not an Eidola-specific roadmap item, but it is the long-term mitigation for this residual trust.
+**Direction.** Open-source hardware roots of trust (such as OpenTitan) are the long-term way to reduce vendor opacity — an industry-wide shift we track rather than something Eidola can solve alone.
 
-### TLS-key exfiltration and channel binding
+### GPU attestation and host endorsements
 
-**Current behavior.** Everything the per-handshake verifier proves rides on the enclave-held TLS key: the hardware report commits to the exact endorsed crypto-material section containing the peer certificate's SPKI hash, together with the nonce and device-evidence hash, and the inline attestation shares the request's connection ([privacy-guarantees.md](privacy-guarantees.md) §4.3). It does not commit TLS exporter or other session-specific key material. An adversary who exfiltrated that private key from the enclave could terminate TLS outside it and relay fresh attestations from a real one — an active MITM that fails no client-side check.
+**Why it matters.** GPU-hosted models run on confidential VMs paired with confidential-computing GPUs. Ideally, the gateway would independently verify every GPU's cryptographic attestation chain on every connection, and host-machine policies would not depend on a single provider's endorsements.
 
-**What constrains it today.** The key is generated and held only in enclave memory by the attestation shim, which is part of the measured boot image (§4.1, §5.1) — there is no export interface, so exfiltration requires a defect in that hash-pinned image, not any code path in this repository. The image being measurement-bound means the code that would have to leak it is fixed and inspectable.
+**Where things stand today.** Three nuances remain at the engine layer:
 
-**Future.** Stronger channel binding upstream — e.g. attestation freshness bound into the TLS key-exchange transcript rather than to a long-lived per-boot key — would shrink the value of a leaked key to a single session. This is shim-side (Tinfoil) work we track rather than control.
+- **GPUs are appraised at boot inside the measured VM, not re-appraised per handshake.** When a GPU engine boots, its measured boot image runs NVIDIA's local attestation verifier against every attached GPU and refuses to open them unless all pass; our engine then checks before use that confidential-computing mode is active and developer tools are disabled. On each request connection, the gateway verifies the VM's hardware attestation and checks the nonce-labelled GPU evidence count, rather than independently validating NVIDIA's certificate chain and reference measurements itself.
+- **Host policies come from Tinfoil's signed endorsements.** For TDX engine deployments, the allowlist of permitted machines and firmware floors is derived from Tinfoil's Sigstore-signed platform endorsements committed into the gateway build (verified offline at build time). Eidola verifies that Tinfoil signed those endorsements, not independently that every machine in the list is sound, and adopting a newer endorsement release requires a reviewed gateway update. Some host hardware flags — including simultaneous multithreading (SMT), which allows cross-thread side channels — are accepted on multi-socket hosts today.
+- **Offline revocation windows.** Because attestation checks run offline using vendor-signed certificates and revocation lists carried with each report, an attacker can replay older vendor-signed revocation data until its signed validity window expires, delaying recognition of a brand-new revocation by that window.
 
-### TDX acceptance
+**Direction.** Our goal is for the gateway verifier to appraise NVIDIA GPU evidence independently on every handshake, and to extend endorsed-machine pinning to SEV-SNP gateway deployments as Tinfoil's platform releases mature.
 
-**Current behavior.** The client → gateway path accepts the gateway on the one TEE its release pins, and refuses a presentation on the other before authenticating it. The gateway is deployed on SEV-SNP, so that pin is an SEV-SNP entry — the launch digest of the platform release image, HOST_DATA (the config's SHA-256) and the guest policy. A client also reads a trust root that pins the gateway on TDX instead (MRTD, MRCONFIGID and a machine policy, as an engine's is), so a later release may move the gateway; none does yet. Acceptance is driven by the caller's pins, never by the document: every pinned entry names its platform, evidence is checked only against entries of its own platform, and evidence from a platform with no entry is refused. A document author therefore cannot select the other branch to sidestep the pinned one.
+### TLS channel binding
 
-The verifier accepts TDX for a caller that pins an explicit TDX entry. Today the one such caller is the gateway's connection to its own engine deployments, which pins each deployment on the TEE it names, SEV-SNP or TDX, and the committed deployments are TDX ([engine.md](engine.md#what-pins-the-engine)); an SEV-SNP engine pin is held to exactly what the gateway's own is. Such a pin follows the platform provider's IGVM launch model, in which the guest is a single firmware-less image with no measured boot after launch. The provider ships that model only in pre-releases so far; the gateway's own enclave is on it too, on the SEV-SNP side. Each release publishes a CPU image and a GPU image (`X+gpu`), each in an SEV-SNP and a TDX form with its own measurement, and an engine deployment names the one its executor needs: the GPU image to compute on GPUs, the CPU image to compute on the CPU alone (`engine_deployment::check_cvm_image`). A TDX pin is:
+**Why it matters.** On every new connection, the hardware attestation binds the enclave's TLS *public key* (together with a fresh random nonce), not the individual TLS *session*. If a bug in the measured boot image ever leaked the enclave's TLS private key, an active network attacker could terminate your TLS connection outside the enclave and relay fresh, nonce-bound attestations fetched from the real enclave — passing every client check.
 
-- **Launch identity.** MRTD, which the TDX module measures over every page of the image and which is fixed per image release, and MRCONFIGID, the SHA-256 of the deployment's config followed by sixteen zero bytes, which the guest refuses to boot without. RTMR0–RTMR3 must all be zero. `measure-enclave` recomputes MRTD from the release's published image, checked against the release manifest, and MRCONFIGID from the config bytes. The release manifest is committed, pinned by the config, and every gateway build requires the pin's MRTD to be the one it states.
-- **Machine policy and machines**, for the report fields an image cannot fix. The TDX module (MR_SEAM), exact TD attributes (debug off, `SEPT_VE_DISABLE` on — a debug relaunch of the pinned image has the same MRTD) and XFAM, a TEE TCB SVN floor, the QE vendor, a floor on the Intel collateral's evaluation-data number, and an allowlist of individual machines by PPID: the Platform Provisioning ID in the host's Intel-signed PCK certificate, which names one registered platform. All of these are derived from the provider's signed platform endorsements (below). Intel's platform, QE and TDX-module TCB statuses must all be `UpToDate`.
-- **Quote verification.** The PCK chain verifies to the pinned Intel SGX root with both Intel CRLs consulted. TCB Info and QE Identity carry valid Intel signatures and are inside their validity windows. The quote and QE report signatures verify. All of it runs offline, against the Intel PCS responses the document carries.
+**Where things stand today.** The TLS private key is generated inside enclave memory by the measured boot image's attestation shim and has no export interface, so exfiltrating it requires exploiting a vulnerability in that pinned, inspectable image rather than any operator action.
 
-`REPORT_DATA` binding and the envelope checks are the same as on the SEV-SNP path. An entry may also declare how many GPUs its enclave runs with. The document must then carry exactly that many NVIDIA GPU evidence items, each labelled with this handshake's nonce.
+**Direction.** Stronger channel binding — committing a per-session TLS exporter value directly into the hardware attestation report — would limit any hypothetical key leak to a single session. This requires upstream changes in Tinfoil's attestation shim.
 
-**What constrains it today.** Only a caller that pins a TDX entry can accept TDX: the gateway's engine connections, whose committed deployments are pinned and not running. For an engine pin:
-
-- **GPU evidence is counted, not appraised.** The CPU measurement vouches for boot code that refuses to start unless the GPUs attest. The GPU image's measured boot checks the GPUs' PCI device IDs, runs NVIDIA's `nvattest` with its local verifier on each GPU (measurements against NVIDIA's reference values, and the certificate chains and revocation status of the report and reference values), requires exactly `gpus` reports, and only then sets the ready state that lets CUDA work reach the GPUs; any failure ends the boot. The engine, before it opens a GPU, then requires NVML to report confidential computing on, DevTools mode off, the production environment and that ready state, which NVIDIA's verifier does not check as such (`ENGINE_GPU_CC=required`, which the gateway's build requires of every pin). On each handshake the gateway counts the items and checks each one's `nonce` member, which the measured attestation shim writes beside NVIDIA's report; the quote's `REPORT_DATA` covers the whole device section. NVIDIA's certificate chain, the SPDM report signature, the nonce inside that report and the reference measurements are not verified by the gateway, nor by the provider's own client. So the GPUs are appraised inside the guest at boot, not per handshake, and that boot depends on reaching NVIDIA's reference-value and revocation services.
-- **Machine policy is the provider's signed statement, as of a committed release.** The provider publishes Sigstore-signed platform endorsements (`platform-vX.Y.Z` releases of its image repository) that map each of its machines, TDX ones by PPID, to a named policy (TDX module, TD attributes, XFAM, TEE TCB SVN floor, QE vendor, collateral floor). An engine deployment names one policy of one release. That release's file and its attestation bundle are committed, with the file's hash, and `measure-enclave` and every gateway build verify them offline against the committed Sigstore trusted root: signed by the provider's release workflow at exactly that tag in its repository, on a GitHub-hosted runner, logged in Rekor, about a file with that hash. The pin's policy, and its PPID allowlist of every machine the release maps to that policy, are derived from the file, and a build whose pin differs is refused. No network is read to do it. What this leaves:
-  - The values are the provider's. The pin accepts exactly the machines and floors the provider endorses; Eidola checks that the provider signed them, not that they are the right ones.
-  - They are as of the committed release. A release the provider publishes later (a raised floor, a machine retired) applies only once it is committed, and the provider's own client also asks for a recent signed freshness statement about the release it applies, which a compiled-in pin cannot do: its release is fixed when the gateway is built. A scheduled check reports a newer release, but adopting it is a reviewed change and a new gateway build.
-  - The Sigstore verification omits the Fulcio leaf's SCT and the Rekor checkpoint signature, as the client's update verification does ([SCT verification](#sct-verification-in-the-fulcio-leaf-certificate), [Rekor checkpoint signature verification](#rekor-checkpoint-signature-verification)).
-  - The PCK certificate's platform flags — dynamic platform, cached keys and SMT enabled — are hand-supplied, because the endorsements do not carry them. Each must be stated in the pin, and a host whose flag differs is refused. A sample multi-package TDX host asserts all three, and accepting SMT in particular admits cross-thread side channels ([threat-model.md](threat-model.md)).
-
-  There is no platform-family (FMSPC) allowlist: the family is a fixed property of each listed machine, so it would refuse nothing the PPID allowlist admits.
-- **Collateral can be replayed within its window.** As with the AMD CRL, a relay can serve older Intel-signed collateral (CRLs, TCB Info, QE Identity) until its signed validity ends. That delays recognition of a newer revocation or TCB recovery; the evaluation-data floor bounds how old it may be.
-
-**Future.** Measure and pin the first engine deployment, on a stable release of the IGVM line once there is one. Appraise GPU evidence against NVIDIA's roots and reference values. On SEV-SNP pins (the gateway's, and an SEV-SNP engine's), appraise the machine as the TDX path does: the provider's signed platform endorsements also carry SEV-SNP policies (PLATFORM_INFO, launch-TCB and firmware floors) and an allowlist of chips, which the client does not read yet, so any genuine chip at the TCB floor is accepted. The images carry no ID block, so there is none to pin.
-
-## Network / metadata
-
-Eidola does not defend against an adversary observing network metadata (connection patterns, packet sizes, timing). Content is protected by TLS terminated inside the attested enclave; metadata is visible to network observers. There are really two distinct gaps here that share infrastructure but answer different questions for the user:
+## Network and metadata
 
 ### Passive traffic analysis
 
-**What it would catch.** Connection patterns, packet sizes, timing — even with TLS confidentiality, these can reveal a great deal (which model you used, the rough shape of conversations, when you are active).
+**Why it matters.** Even with strong encryption, network observers (ISPs, Wi-Fi operators, transit providers, or the hosting network) can infer a lot from packet sizes and timing — when you are active, roughly how long conversations run, and how much text you send.
 
-**Mitigations today.** User-side: route Eidola through Tor. Eidola's protocol is plain HTTPS, so this works without modification. Server-side, for the response only: the gateway writes a streamed answer to its client as fixed-size frames at a fixed interval and pads every other response (an error, a refusal) to a size bucket, and an engine shapes its answer to the gateway the same way, so an observer of either connection sees how long a response ran rather than the size and timing of its tokens ([gateway.md § Response shape](gateway.md#response-shape)). Connection patterns, request sizes and the total duration of each response remain visible, and an engine's host can still observe the engine's own activity.
+**Where things stand today.** Eidola's [response shaping](architecture.md#response-shaping) hides individual token sizes and inter-token rhythm on both network hops by sending fixed-size frames on a fixed clock tick and padding non-streaming responses to size buckets. However, connection patterns, total response duration, and **outgoing request sizes** remain visible. Request sizes are especially revealing: each turn sends the conversation so far, and automatic continuations send only the text just generated — exposing exact byte growth between turns. Users who need metadata protection today can route Eidola through Tor.
 
-Request sizes say more than they seem to. A request carries the conversation so far, so the size of each request less the one before it is the size of what was added: the previous answer and the new message together, for a new turn. When the client continues a long answer by itself, the follow-up request adds only the text generated so far, so its size gives that text's exact length in bytes, where the response's own shape gave only its duration. Padding request bodies to size buckets would close this and is not done today.
+**Direction.** Padding outgoing request bodies to fixed size buckets (tracked in issue [#620](https://github.com/eidola-ai/eidola/issues/620)) is the most straightforward step toward closing the request-size leak. Over the longer term, we are considering transport options such as a Tor hidden service or independent oblivious HTTP (oHTTP) relays to obscure broader traffic patterns.
 
-**Future.** We consider this in-scope as an Eidola problem to address, but do not yet have a committed plan. Explored directions include offering a Tor hidden service endpoint and partnering with independent organizations to provide oblivious HTTP (oHTTP) or MASQUE/CONNECT-style transports that decouple network identity from request content.
+### Network identity
 
-### Network identity as a linking factor
+**Why it matters.** Your IP address is itself an identifier. Even if Eidola's servers never log IP addresses, a network observer watching traffic into our infrastructure could see the same IP address authenticate to the linked account surface (or visit Stripe checkout) and shortly afterward make anonymous inference requests — undermining application-layer unlinkability at the network layer.
 
-**What it would catch.** Even a single connection to Eidola from a unique IP is itself an identity signal: an observer (or Eidola's own network logs, were they to exist) can correlate "a connection from IP X" with the account billed at approximately the same time, undermining the unlinkability invariants in [privacy-guarantees.md §2](privacy-guarantees.md#2-unlinkability) at the transport layer rather than at the application layer.
+**Where things stand today.** Eidola never persists or logs client IP addresses in application code, but cannot hide your IP from the internet path between you and our servers. Users who want network-identity separation today should connect through Tor or a reputable, high-traffic VPN.
 
-**Mitigations today.** User-side: use Tor, or a reputable VPN provider like Mullvad. Both break the direct IP↔account correlation by inserting a third party that doesn't share data with Eidola.
+**Direction.** We are interested in partnering with independent organizations to operate network-terminating relays — such as oHTTP or MASQUE — so that no single party, Eidola included, sees both your network identity and your requests.
 
-**Future.** Same direction as above (oHTTP, MASQUE, partner relays). The Eidola-side mitigation here is partnering with an independent organization whose role is to terminate the network connection so that no single party — Eidola included — sees both the network identity and the account it corresponds to.
+## Anonymous credits
 
-## Build chain opacity
+### Anonymity-set size
 
-### Non-source-bootstrapped components in the trust chain
+**Why it matters.** An anonymous credit token is unlinkable only *within the crowd of accounts* that converted tokens under the same weekly issuer key ([Key epochs and the public calendar](anonymous-credits.md#key-epochs-and-the-public-calendar)). Early in Eidola's life — or during a quiet week — that crowd may be small. In the extreme case where only one account converted tokens in a given week, an operator could attribute spends by elimination even though the cryptography held. Presenting two tokens in one request narrows the set to accounts that received at least two tokens under those keys (which background buffering mitigates by minting two tokens per key for every active user).
 
-**What it would catch.** Build-pipeline subversion in a stage we don't fully source-bootstrap.
+**Where things stand today.** Weekly epochs, a fixed non-rotating protocol context, and a full-week grace period keep partitions as coarse as billing hygiene allows, and two-per-key buffering keeps multi-token spends ordinary. None of those increases a small user population on its own.
 
-**Current behavior.** Several components of the Eidola build chain are pinned by hash and used reproducibly, but are themselves not fully source-bootstrapped:
+**Direction.** The anonymity set grows naturally with adoption; if early traffic is sparse, epoch lengths can be widened in a visible release.
 
-- **macOS Nix builds.** Hermetic and reproducible (`narHash` / `archiveSha256` pinning of the unsigned payload), but rely on the Apple SDK / Xcode toolchain as opaque inputs. Cross-compiling macOS binaries from Linux is not viable today, so macOS releases must be built on macOS. The Apple envelope (Developer ID, notarization) is non-reproducible by construction and is bound only in the human attestation; see [verification.md](verification.md) and [apple-distribution.md](apple-distribution.md).
-- **Linux GUI Nix build.** Hermetic and reproducible (`narHash` / `archiveSha256`) from the open nixpkgs toolchain, but not source-bootstrapped in the StageX sense. The Nix installable is a glibc dynamic binary with nixpkgs Mesa referenced via `VK_ADD_DRIVER_FILES` (those driver bytes are not in the archive). A desktop GUI that talks to host Vulkan must be glibc; the musl-by-design StageX pipeline cannot produce it. Separately, that artifact is **Nix-shaped**: its archive is a store-path serialization whose binary resolves its libraries out of `/nix/store`, so it is not a download a non-Nix user can extract and run — the Debian package is the installable for everyone else, and it carries no GPU bytes at all ([verification.md](verification.md#the-two-linux-installables)).
-- **Inference engine image.** Built reproducibly and source-bootstrapped with StageX, like the other server images, but with three differences. The engine loads NVIDIA's driver libraries at runtime, so it is a glibc dynamic binary, cross-compiled by StageX's Rust against StageX's glibc, which StageX publishes from its less-exercised user tier. Its standard library for that target is built from the compiler's own source with an unstable build option, rather than shipped by StageX. And its GPU kernels are compiled ahead of time with NVIDIA's closed CUDA toolkit, in a separate image built reproducibly with Nix and pinned by digest: the compiled kernels are reproducible and every image build checks them against the committed `kernels.manifest.json`, but the compiler itself is opaque. The NVIDIA driver is not in the image; the platform's GPU boot image supplies it, inside that image's measurement.
-- **`cvmimage`.** Pinned by hash, but not source-bootstrapped. The gateway's enclave boots a `cvmimage` SEV-SNP IGVM image with no firmware, bound into its pin (the launch digest). An engine deployment boots a `cvmimage` IGVM image with no firmware, bound into its pin (MRTD); its GPU variant carries the NVIDIA driver, CUDA userspace and GPU firmware inside that measurement. The provider builds `cvmimage` hermetically with Nix from pinned nixpkgs and documents the build as byte-for-byte reproducible, with an audit procedure, but Ubuntu packages, Docker's container runtime (`dockerd`, `containerd`, `runc`), and NVIDIA's driver, CUDA and firmware enter it as hash-pinned binary archives, and the build takes its compilers and tools from the NixOS binary cache. Eidola rebuilds each release it pins and compares it byte for byte with the published one ([procedure and last result](contributing/rebuilding-platform-images.md)), which confirms the image follows from the source and those inputs, not what the inputs contain. So they cannot be changed silently, but the original build chain is more trusted than we ideally want.
+### Database spend timing
 
-**What constrains it today.** Each of these has digest pinning and provenance verification at the import boundary (the `cvmimage` release manifest pinned by sha256 in the committed config — with Sigstore provenance verified on top — and `narHash` / `archiveSha256` for Nix outputs), so silent substitution is detectable. The gap is that the upstream *builders* of those artifacts are trusted to a degree we don't fully audit.
+**Why it matters.** Even though anonymous spend rows in Postgres carry no account ID, no amount, and no timestamp column, Postgres runs outside the enclave. Anyone watching live database writes — or reading replication logs and backups — can see *when* a spend row is inserted (request start) and updated (request end), revealing how long each paid request took. Back-to-back requests — such as automatic continuations of a long answer, multi-step tool calls, or an uncached retry after a prefix-cache miss — also appear as tight clusters of database writes that can look linked during quiet periods.
 
-**Future.** Rebuilding a pinned `cvmimage` release and recording the result is within reach now. Source-bootstrapped macOS toolchains and CVM image builds depend on ecosystem progress.
+**Where things stand today.** Refunds are stored encrypted under a client-supplied key at a fixed length, nothing written names an account or cost, and duration is the same coarse signal a network observer already sees from response length. Still, because we treat the database as adversarial, this is a real gap.
+
+**Direction.** We currently accept this as a tolerable residual risk.
+
+### Just-in-time issuance timing
+
+**Why it matters.** If your app converts account credit into a token and spends that token one second later, anyone watching the gateway or database can pair the linked conversion with the unlinked spend that immediately follows — linking that token's first request (and any subsequent turns sharing its prefix-cache key) back to your account.
+
+**Where things stand today.** While the desktop app is running, [background buffering](anonymous-credits.md#fixed-denominations-and-buffering-ahead) converts $1.00 tokens ahead of need at random 10–50 minute intervals unrelated to your chat activity. However, your app still falls back to just-in-time conversion when nothing held can pay for a request — on a fresh install, after a week of inactivity, from a standalone CLI run without the desktop app open, or when your remaining account balance is under $1.00. Standard $1.00 allocations keep this fallback infrequent, and CLI users can pre-allocate tokens manually with `eidola account allocate`.
+
+**Direction.** A lightweight background buffering option could close this gap for CLI-only users who do not keep the desktop app running, and it is an approach we are considering.
+
+### First sight of a weekly key
+
+**Why it matters.** Your app prevents a malicious gateway or database from singling you out with a private issuer key by pinning the first key it sees for each weekly epoch — including next week's key, published a full week early ([Key epochs and the public calendar](anonymous-credits.md#key-epochs-and-the-public-calendar)). However, a brand-new install (or a device that hasn't checked in for over a week) has no prior record for the current epoch and must accept the first valid key it is shown.
+
+**Where things stand today.** Active apps record every key a week before it starts issuing, forcing an attacker to target a user well in advance and stay consistent across every check. Still, first sight remains unverified against what other users saw.
+
+**Direction.** Making every epoch's issuer key verifiable on first contact — either by publishing each key to an independent public transparency log or by deriving keys deterministically from measured enclave state — would let even a brand-new install confirm it received the same key as everyone else.
+
+### Drained balances visible to measured code
+
+**Why it matters.** Ordinary anonymous spends hide your token's total balance behind a zero-knowledge proof. When your app pays a request using two tokens — draining a small leftover token and filling the rest from a second token ([Draining small leftovers](anonymous-credits.md#draining-small-leftovers)) — the drained token's exact remaining balance is briefly visible to the gateway's measured code for the duration of that request.
+
+**Where things stand today.** Because the gateway never logs, exports, or stores spend amounts or refund amounts outside enclave memory, nothing persists that could link a drained balance back to earlier spends. Privacy for drained tokens therefore relies on the gateway's measured enclave code rather than the cryptography alone.
+
+**Direction.** Rounding drained shares down to a coarse public step would hide exact remainders at the cost of stranding tiny amounts; we have deferred that trade-off until real usage shows whether it is warranted.
+
+### Expiring tokens and mid-spend crashes
+
+**Why it matters.** Two small edge cases can cost a user a limited amount of prepaid credit:
+
+- **Credit left in a token when its weekly key expires.** Because refund change stays under the spent token's original weekly key so expired credits cannot live forever, any leftover change still unspent when a key's two-week lifetime ends is lost ([When a key expires](anonymous-credits.md#when-a-key-expires)).
+- **A gateway crash mid-request.** If the gateway crashes between recording a spend's nullifier and writing its final refund, crash recovery returns the rest of your token immediately via the provisional refund, but the single request's upfront hold is lost ([Sealed refunds and crash recovery](anonymous-credits.md#sealed-refunds-and-crash-recovery)).
+
+**Where things stand today.** Small $1.00 allocations, oldest-first spending, two-token draining, and pausing background buffering for idle wallets keep expiring leftovers small. Gateway crashes are rare, and the provisional refund ensures a crash can never wipe out a token's whole balance — only the hold of the one interrupted request.
+
+**Direction.** A cleaner long-term answer would be an unlinkable rollover scheme that migrates expiring change into a new epoch without linking old and new tokens, which we are interested in exploring as the protocol matures.
+
+## Releases and build chain
+
+### Single attestant and jurisdiction diversity
+
+**Why it matters.** Eidola's release-attestation defense against legal compulsion and hardware-key compromise gets dramatically stronger when multiple independent people — holding separate hardware keys in different legal jurisdictions — must all sign off on every release ([Human attestations](releases.md#human-attestations)).
+
+**Where things stand today.** Although the client verifier already supports an arbitrary M-of-N attestant threshold pinned in the prior release, **only one human attestant is required today**. A single person is a single point of legal compulsion or operational risk.
+
+**Direction.** As the trusted circle around Eidola grows, we intend to onboard additional independent attestants holding hardware-backed keys across multiple jurisdictions, then raise the pinned threshold through a normal attested release.
+
+### First-install downgrade
+
+**Why it matters.** Once Eidola has installed an update, it enforces continuity — refusing any future update that doesn't explicitly descend from the exact commit you are running, which blocks stale-release substitution and rollback attacks ([How your app verifies an update](releases.md#how-your-app-verifies-an-update)). A brand-new installation, however, has no prior recorded commit to check against (and no build can embed its own release commit hash without creating a circular dependency). An attacker controlling your download mirror could therefore serve a genuinely signed, internally consistent *older* release to a fresh install.
+
+**Where things stand today.** Stepping through updates on an existing install checks version ordering and continuity once recorded; on desktop, full in-place atomic replacement of a running app is also still being wired on top of the verified staging pipeline. First-install freshness remains outside what the client can prove by itself.
+
+**Direction.** To let even a first-time installer check that a download is genuinely current, we are considering embedding a public *freshness anchor* — such as a recent timestamped artifact from a public append-only system — into each release, alongside completing safe in-place update promotion on desktop.
+
+### Non-source-bootstrapped build inputs
+
+**Why it matters.** Reproducible builds prove that a binary came from specific committed inputs, not that every compiler or prebuilt binary inside those inputs was free of hidden tampering. Fully source-bootstrapped builds — where even the compiler itself is compiled from auditable source — are the gold standard.
+
+**Where things stand today.** Eidola's gateway, static Linux CLI, and mobile WebAssembly bundle are built with a source-bootstrapped toolchain (StageX). Four parts of the stack still rely on hash-pinned, reproducible — but not fully source-bootstrapped — inputs:
+
+- **macOS desktop app:** built hermetically with Nix, relying on Apple's closed SDK/Xcode toolchain (and wrapped with Apple's non-reproducible Developer ID signature, bound via human attestation).
+- **Linux desktop app:** built reproducibly with Nix (using the open nixpkgs binary toolchain rather than StageX, because desktop GPU/Wayland integration requires glibc).
+- **Inference engine GPU kernels:** the engine binary itself is StageX-built, while its ahead-of-time GPU kernels are compiled with NVIDIA's closed CUDA toolkit and checked against a committed hash manifest on every build.
+- **Confidential-VM boot images (`cvmimage`):** built reproducibly with Nix by Tinfoil from pinned inputs that include binary Ubuntu packages, Docker runtime binaries, and NVIDIA's driver and firmware. We independently rebuild every pinned `cvmimage` release byte for byte from Tinfoil's public build definition ([rebuild log](contributing/rebuilding-platform-images.md)), confirming it matches its inputs — not what every binary input contains.
+
+**Direction.** Every non-bootstrapped input is pinned by exact hash at the import boundary so silent substitution is impossible. Moving further toward full source-bootstrapping on macOS, GPUs, and confidential-VM images depends on broader ecosystem progress.
+
+### Transparency-log hardening
+
+**Why it matters.** Sigstore's public transparency log (Rekor) and certificate authority (Fulcio) are independent layers backing CI provenance and human release attestations ([Transparency logs and CI provenance](releases.md#transparency-logs-and-ci-provenance)). Two deeper verification checks are not yet implemented in the client verifier:
+
+- **Fulcio Signed Certificate Timestamps (SCTs):** confirming that a CI signing certificate was logged in a public Certificate Transparency log (defense in depth on top of OIDC identity and chain verification).
+- **Rekor witnessed checkpoint signatures:** confirming that a verified Rekor inclusion proof roots to the globally witnessed public log head rather than a hypothetical private fork served only to Eidola.
+
+**Where things stand today.** Both CI signatures and human attestations are verified offline against pinned Rekor public keys and Signed Entry Timestamps, and human hardware-key signatures remain mandatory regardless of Fulcio.
+
+**Direction.** Fulcio SCT verification and witnessed Rekor checkpoint validation are both straightforward layers of defense in depth that we would like to add to the client verifier.

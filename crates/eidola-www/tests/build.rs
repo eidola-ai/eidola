@@ -112,55 +112,58 @@ fn builds_the_real_site() {
     }
 
     // Docs: index + a nested page, with .md links rewritten to routes and
-    // out-of-docs links rewritten to GitHub.
+    // out-of-docs (including docs/contributing/) links rewritten to GitHub.
     let docs_index = read(&out, "docs/index.html");
     assert!(docs_index.contains("href=\"/docs/paradigm/\""));
     assert!(docs_index.contains("https://github.com/eidola-ai/eidola/blob/main/README.md"));
-    assert!(out.join("docs/contributing/index.html").exists());
     assert!(
-        out.join("docs/contributing/release-attestant-yubikey/index.html")
-            .exists()
+        docs_index
+            .contains("https://github.com/eidola-ai/eidola/blob/main/docs/contributing/README.md")
     );
+    assert!(!out.join("docs/contributing/index.html").exists());
+    assert!(out.join("docs/guide/getting-started/index.html").exists());
 
     // Docs sidebar: on every docs page (both renderings), current page
     // marked, driven by www/docs-nav.toml — and never on non-doc pages.
-    let client = read(&out, "docs/client/index.html");
-    assert!(client.contains("class=\"docs-sidebar\""));
-    assert!(client.contains("class=\"docs-nav-inline\""));
-    assert!(client.contains("<a href=\"/docs/client/\" aria-current=\"page\">The client</a>"));
-    assert!(client.contains("<p class=\"docs-nav-title\">Start here</p>"));
+    let architecture = read(&out, "docs/architecture/index.html");
+    assert!(architecture.contains("class=\"docs-sidebar\""));
+    assert!(architecture.contains("class=\"docs-nav-inline\""));
+    assert!(
+        architecture
+            .contains("<a href=\"/docs/architecture/\" aria-current=\"page\">Architecture</a>")
+    );
+    assert!(architecture.contains("<p class=\"docs-nav-title\">Start here</p>"));
+    assert!(architecture.contains("<p class=\"docs-nav-title\">User guide</p>"));
     assert!(docs_index.contains("<a href=\"/docs/\" aria-current=\"page\">Overview</a>"));
     assert!(!home.contains("docs-sidebar"));
 
     // In-page ToC: on structured docs (entries link the generated
     // heading ids), never on plain pages like privacy.
-    let trust_root = read(&out, "docs/trust-root/index.html");
-    assert!(trust_root.contains("class=\"toc\""));
-    assert!(trust_root.contains("<a href=\"#whats-pinned\">"));
-    assert!(trust_root.contains("class=\"toc-h1\""));
-    assert!(trust_root.contains("/assets/toc.js"));
+    let releases = read(&out, "docs/releases/index.html");
+    assert!(releases.contains("class=\"toc\""));
+    assert!(releases.contains("<a href=\"#the-compiled-in-trust-root\">"));
+    assert!(releases.contains("class=\"toc-h1\""));
+    assert!(releases.contains("/assets/toc.js"));
     assert!(!read(&out, "privacy/index.html").contains("class=\"toc\""));
     assert!(read(&out, "assets/toc.js").contains("aria-current"));
 
     // A mermaid block is drawn as an inline SVG: its lines link to the
     // page's own sections and its nodes through the page's link rewriting,
     // and the source block itself is gone.
-    let architecture = read(&out, "docs/architecture/index.html");
     assert!(architecture.contains("<figure class=\"diagram\"><svg"));
     assert!(architecture.contains("<a href=\"#chat\">"));
-    assert!(architecture.contains("<h3 id=\"chat\">"));
-    assert!(architecture.contains("<a href=\"/docs/gateway/\"><title>Gateway</title>"));
+    assert!(architecture.contains("<h4 id=\"chat\">"));
+    assert!(architecture.contains("<a href=\"#the-gateway\"><title>Gateway</title>"));
     assert!(!architecture.contains("language-mermaid"));
 
     // Every docs page carries an edit link to its own source; nothing
     // else does.
-    assert!(client.contains("https://github.com/eidola-ai/eidola/edit/main/docs/client.md"));
     assert!(
-        read(
-            &out,
-            "docs/contributing/release-attestant-yubikey/index.html"
-        )
-        .contains("edit/main/docs/contributing/release-attestant-yubikey.md")
+        architecture.contains("https://github.com/eidola-ai/eidola/edit/main/docs/architecture.md")
+    );
+    assert!(
+        read(&out, "docs/guide/getting-started/index.html")
+            .contains("edit/main/docs/guide/getting-started.md")
     );
     assert!(!home.contains("page-edit"));
     assert!(!read(&out, "privacy/index.html").contains("page-edit"));
@@ -187,7 +190,13 @@ fn builds_the_real_site() {
 
     // Sitemap covers the key routes, and omits the unpublished blog.
     let sitemap = read(&out, "sitemap.xml");
-    for route in ["/", "/docs/client/", "/privacy/", "/terms/"] {
+    for route in [
+        "/",
+        "/docs/architecture/",
+        "/docs/guide/getting-started/",
+        "/privacy/",
+        "/terms/",
+    ] {
         assert!(
             sitemap.contains(&format!("<loc>https://www.eidola.ai{route}</loc>")),
             "sitemap missing {route}"

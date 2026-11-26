@@ -1,87 +1,73 @@
-# Releases
+# Verifiable releases
 
-A **release** is the unit of trust: every artifact, the paired gateway, the inference engine deployments that gateway accepts, the build inputs, the measurements, and the signatures attesting to them. This page explains how a new release becomes trustable.
+Even a perfectly audited app today can be undone tomorrow by a silent update. If a company's build server is breached, if a malicious or coerced engineer slips a backdoor into the next version, or if the company's commitments change under new leadership or priorities — an ordinary auto-updater will quietly deliver compromised software to every user overnight.
 
-How those artifacts are hashed, what a user `shasum`s, and the payload / archive / envelope / installable split live in [verification.md](verification.md). The compile-time pin set is [trust-root.md](trust-root.md).
+In Eidola, a **release** is the complete unit of trust: every client app, the paired gateway, the inference engines that gateway accepts, the reproducible build hashes, and the cryptographic signatures vouching for them. Nothing updates silently, and no single compromised machine or account can authorize a release on its own.
 
-## What a release contains
+Each layer below solves a problem that the layer before it leaves open.
 
-A single release ships:
+## Reproducible builds and the artifact manifest
 
-- A **client artifact** for each supported platform (macOS and Linux GUI, CLI) whose **payload** embeds the trust root at compile time.
-- A **server image** (OCI **archive**) built reproducibly from the same source commit, whose confidential-compute measurement matches the value embedded in the client. The inference engine deployments the gateway accepts are pinned inside that image ([engine.md](engine.md#what-pins-the-engine)), so the client's one pin covers them too.
-- A signed **artifact manifest** (`artifact-manifest.json`) recording each artifact’s archive identity (`digest` or `archiveSha256`), Nix `narHash` where applicable, and the enclave measurement.
-- One or more **human attestations**, each signed under a pinned engineer's hardware-bound key, with their Sigstore Rekor inclusion proof. The attestation also binds Apple **envelope** / **installable** hashes, which must not appear in the CI-signed manifest.
+**The problem.** Public source code only proves what a developer published in a repository — it does not prove that the binary you downloaded was actually compiled from that code. A compromised build server could slip surveillance code into a release binary while leaving the public repository untouched.
 
-The client carries enough information to verify all of this locally before installing an update.
+**How Eidola solves it.** Every release is built reproducibly from one public git commit so anyone can rebuild the release artifacts and arrive at the exact same cryptographic hashes. Those hashes are recorded in a single file — `artifact-manifest.json` — committed alongside the source and re-derived in CI on every release.
 
-## Two cryptographic systems, one transparency log
+Crucially, **everything in the manifest is a deterministic function of the repository's committed inputs**: it records hashes for the server and engine container images, the desktop packages, the static CLI binaries, the Android APK, the mobile app bundle, and the paired gateway's enclave measurement. Platform signatures that depend on private keys (such as Apple's macOS notarization or Android APK signing) are structurally barred from ever entering the manifest, so anyone can reproduce it without holding a single secret key.
 
-Eidola uses two signing systems in coordination. Both ride the same Sigstore Rekor transparency log via the same entry shape (`hashedrekord` v0.0.1).
+**What this still leaves open.** Reproducibility proves *what binaries a given commit produces*, not *which commit you should trust* — and it does not stop an attacker from secretly building a backdoored branch for a single targeted user.
 
-| Surface | Signature | Identity binding |
-|---|---|---|
-| CI signs the manifest | Sigstore bundle | Fulcio keyless cert tied to the GitHub OIDC workflow identity |
-| Engineer signs a release attestation | `cosign sign-blob` against a hardware-held key (YubiKey-PIV, KMS, etc.) | sha256(PKIX SubjectPublicKeyInfo) matches a fingerprint pinned in the client |
+## Transparency logs and CI provenance
 
-The CI side gives us "this archive came from the release workflow on this tag." The engineer side gives us "a named human, signing under their legal identity, attests to the properties this release claims." Neither alone is sufficient; both are required.
+**The problem.** Even with reproducible builds, a compromised operator could privately compile a modified release from a hidden branch and serve it only to one victim, while everyone else receives the clean release. How do you tie a signed release back to the public repository and leave a permanent public record of everything that was ever signed?
 
-## What the engineer attests to
+**How Eidola solves it.** Eidola uses **Sigstore** and its public, append-only transparency log (**Rekor**), operated independently by the Linux Foundation and mirrored and checkpointed by outside witnesses (independence we would not get by hosting a log ourselves):
 
-Every release attestation is a structured JSON document where the engineer makes specific claims under their legal identity. The full template is at `releases/schema/attestation-templates.json`. The copy that binds is the one embedded in the *previous* release's clients — they re-render every claim and reject any mismatch — so `release-tool attest` renders from the templates as committed at the previous release tag, and a template change takes effect for the release after the one that ships it. The claims include:
+- **CI provenance as defense in depth.** When a release tag is cut, our automated GitHub release workflow signs `artifact-manifest.json` using Sigstore's keyless OIDC identity and logs it to Rekor — adding a signal that the manifest came from the official workflow running on that tag. Because some release steps use self-hosted runners, CI provenance is a relatively weak signal on its own, much like WebPKI beneath hardware attestation — useful as an extra layer, never sufficient by itself.
+- **An independent public record.** Both CI's manifest signature and every human attestation (below) are recorded in Rekor, producing tamper-evident proof that a given release was signed.
 
-- `no_compelled_subversion` — the engineer is **not currently subject to any legal order, technical capability notice, or other legal compulsion** that has caused (or that requires them to cause) the release to weaken a privacy or security guarantee, introduce or preserve a backdoor or covert surveillance mechanism, or misrepresent any of these properties.
-- `no_gag_preventing_attestation` — the engineer is **not subject to a gag order or nondisclosure obligation** that prevents them from truthfully making any claim in this attestation.
-- `no_coercion` — the engineer has **not been threatened or coerced** by any party to alter the release, falsify any claim, or conceal any material fact about the privacy or security properties of the release.
-- `signing_freely` — the engineer is signing **of their own volition**, with a key whose private component exists only on hardware under their exclusive physical control.
-- `manifest_reproduced` — the engineer **personally reproduced** `artifact-manifest.json` from the source commit on hardware under their exclusive physical control, and confirmed bit-for-bit equality with CI's output.
-- `apple_signature_reconstructs` — applying the published detached signature bundle to the reproducible unsigned macOS build recorded in `artifact-manifest.json` **yields exactly the shipped signed artifact**. This is the claim that lets the Apple signature be published as data: the manifest stays a function of source, and the hashes that depend on a key (the detached material's, the shipped container's) are carried here instead, together with the Team ID and signing identifier the reconstruction must report. `release-tool attest` performs that reconstruction itself and refuses to offer the claim unless it holds — an engineer is never asked to affirm something the tool did not check.
-- `diff_reviewed` — the engineer **personally inspected the source-level diff** between the prior release commit and this release commit.
-- `privacy_guarantees_not_weakened` — the version of [`privacy-guarantees.md`](privacy-guarantees.md) at release time **does not weaken, narrow, or remove** any privacy or security guarantee that was stated in the prior release's version.
-- `code_delivers_guarantees` — based on the diff review, the engineer is **not aware of any change** in this release that causes the code to fail to deliver the privacy and security guarantees stated in `privacy-guarantees.md`.
-- `no_known_backdoor` — based on the diff review, the engineer is **not aware of any backdoor**, covert surveillance mechanism, or undisclosed data path in this release that transmits user data in a manner not described in `privacy-guarantees.md` or the user-facing documentation it references.
+**What this still leaves open.** First, anyone who compromises GitHub, the workflow, or a build runner can forge a CI signature — which is why your app never accepts a release signed only by CI. Second, the public Rekor log has a practical limit today: because it does not make it trivial to query *"show every release Eidola has ever signed,"* it does not yet provide a live canary that automatically alerts the world if a hidden release appears. Instead, it serves primarily as **post-hoc evidence**: if a targeted, compromised release ever surfaces, its logged signature is permanent, undeniable proof.
 
-These claims are recorded verbatim in the attestation document, hashed into the Sigstore Rekor transparency log, and verified by the client during self-update. The verifier re-renders each claim from a pinned template and rejects any attestation whose claim text does not match character-for-character.
+## Human attestations
 
-## How the client verifies a release
+**The problem.** Automated build pipelines can be breached, and build software has neither judgment nor legal accountability. Even a genuinely reproducible build from a public commit could still contain a subtle backdoor pushed by a compromised maintainer, a coerced engineer, or a company whose priorities shifted.
 
-Before the client tells anyone that an update exists, and again before it installs one, it:
+**How Eidola solves it.** To become trustable, every release must also carry signed **human attestations** from named officers, created using hardware-held keys (such as a YubiKey requiring a PIN and physical touch for every signature) and logged to Rekor. Where CI proves *which workflow ran*, a human attestation puts a real person's name, review, and legal accountability behind the release.
 
-1. **Finds the next release.** It downloads the release index of the release marked latest and, when the installed release is more than one behind, reads back through each index's `previous_release` to the release that follows the installed one. That release, not the latest, is the one checked and offered (see [Release continuity](#release-continuity)). It then downloads the manifest and the attestation bundles that release names. None of these locations is trusted, and the marker is only a pointer: whoever can edit the release listing can change which release is checked, and nothing more.
-2. **Verifies CI's manifest signature** against the pinned Fulcio identity pattern and the embedded Sigstore trusted root, and requires that signature to be bound to this release's own tag.
-3. **Verifies each human attestation**: cosign signature against the pinned attestant fingerprint, Sigstore bundle integrity, Rekor inclusion proof.
-4. **Counts independent attestations** and fails if fewer than `MIN_HUMAN_ATTESTATIONS` (pinned in the *current* client) have verified.
-5. **Re-renders each claim** from the pinned template and checks character equality with the attestation's recorded claim text.
-6. **Checks continuity**: the new release's `previous_release.git_commit` must equal the currently-installed `git_commit`, when the client knows it.
-7. **Surfaces the verified prose** to the user before approving the install.
+### What an attestant affirms
 
-If any step fails, the update is rejected. There is no override prompt. A release that CI signed and that no trusted attestant has attested is never announced as an update. The client reports it as unverifiable, because a release pipeline that has been compromised can produce exactly that.
+Each human attestation is a structured document containing specific, positive claims rendered from [pinned templates](https://github.com/eidola-ai/eidola/blob/main/releases/schema/attestation-templates.json). When your app verifies an update, it re-renders every claim from its own compiled-in templates and rejects any attestation that differs by a single character. The claims cover three areas:
 
-## Why each piece is necessary
+- **Build and code integrity.** The attestant personally reproduced `artifact-manifest.json` from the release commit on hardware under their exclusive physical control, confirmed that platform-signed installables (like the notarized macOS app) reconstruct cleanly from the reproducible unsigned build plus detached signatures, and personally inspected the full source diff since the previous release.
+- **Privacy commitments.** Based on that diff review, the release delivers the commitments in [Privacy guarantees](privacy-guarantees.md), does not weaken, narrow, or remove any guarantee that was in effect in the previous release, and contains no known backdoor, covert surveillance mechanism, or undisclosed data path.
+- **Freedom from compulsion.** The attestant is signing freely and of their own volition with a hardware key under their exclusive physical control — not under coercion, a gag order, or legal compulsion to weaken the release or misrepresent its properties.
 
-- **CI alone is not enough.** A compromise of GitHub, the OIDC flow, or the workflow definition gives an attacker the CI signature. CI cannot produce a signature from an engineer's hardware-held key, so the human attestation defends against pipeline compromise.
-- **A single human alone is not enough.** A single attestant is one legal target. The minimum-attestant policy (`MIN_HUMAN_ATTESTATIONS`) is pinned in the *prior* client, so a coerced engineer cannot lower the threshold by shipping a release that requires fewer signatures. **Today** `MIN_HUMAN_ATTESTATIONS` is `1`: the verifier supports M-of-N, but one attestant key is provisioned. Raising the threshold is a trust-constants change that goes through a release like any other. See [gaps.md](gaps.md#single-attestant-policy).
-- **Sigstore Rekor is not enough.** Sigstore proves that *a signature exists in a public log*. It does not prove that the signer was acting freely, that the source matches the release, or that the release does not weaken guarantees. The structured claims are what add that semantic content.
+If a release ever needed to weaken a guarantee, an honest attestant could not sign truthfully; verification would break loudly and surface the discrepancy rather than slipping through silently.
 
-## Schema versions: every change is breaking
+**What a human attestation does not promise.** A signed attestation is not a guarantee that a release is free of security bugs, that every consequence of a change was anticipated, or that the signer audited every upstream dependency and compiler down to machine code — no human reviewer can do that. Mistakes, oversights, and vulnerabilities will happen, which is precisely why Eidola's source code and reproducible builds are public. Human attestation serves a narrower, still vital purpose: holding named people accountable for their own intent, review, and claims, and making silent release-pipeline compromise vastly harder.
 
-Every release document carries an integer `schema_version`. The client refuses to parse any document outside its supported set. There is no "compatible minor" tolerance. This is deliberate: silent acceptance of new fields would let a future release add a claim that older clients ignored, weakening the contract for those clients without their knowledge.
+**What this still leaves open.** Who decides *which* humans are authorized, *how many* must sign, and *what exact claims* they must affirm? If the incoming update could supply those rules, a single attacker could ship an update that lowered the bar to one forged key and rewrote the claims.
 
-Schema rotations themselves go through a release: a new client release adds the new schema version to its supported set, while still signing releases under the old schema. Only after rolled-out clients accept both versions does the engineer start signing under the new schema.
+## The compiled-in trust root
 
-## Release continuity
+**The problem.** Any verification rule fetched over the network — or carried inside an incoming update — can be rewritten by the very attacker trying to trick your app.
 
-The client's update path requires that each release's claimed `previous_release.git_commit` equals the currently-installed commit. This rules out two adversary moves:
+**How Eidola solves it.** Every Eidola client — desktop, CLI, and the mobile app's WebAssembly bundle — compiles a fixed **trust root** into itself at build time. While advanced users can explicitly override which server endpoint, enclave measurement, or hardware certificates the client connects to (for development or self-hosting), nothing — neither a server response nor any runtime setting — can alter the rules that govern release verification. That compiled-in trust root pins:
 
-1. **Stale-release substitution.** An attacker serving a real but older release cannot route an updating client onto it; the continuity check fails.
-2. **Rollback to a known-bad past release.** Even if a past release was later discovered to have a vulnerability and was superseded, the continuity check prevents an attacker from walking an updating client *backwards* into it. The only release the verifier will accept is the one whose `previous_release.git_commit` matches the installed commit.
+- **The paired gateway identity.** Exactly one enclave measurement for the gateway build that belongs to this release (which in turn pins the inference engines it accepts; see [Architecture](architecture.md#fail-safe-verification)).
+- **Authorized human attestants and threshold.** The public-key fingerprints of every person authorized to attest releases, plus the minimum number of independent human attestations required. Because that minimum is pinned in the *currently installed* app — never read from the incoming release — a single coerced signer cannot lower the bar by shipping a release that asks for fewer signatures. *(Today the threshold is 1 while the verifier already supports M-of-N across multiple attestants; see [Known gaps](gaps.md#single-attestant-and-jurisdiction-diversity).)*
+- **The authorized CI workflow identity** and **Sigstore transparency-log roots**, so neither a forged CI job nor a spoofed transparency log can pass verification.
+- **Exact claim templates and strict schema versions.** Every release document carries an integer schema version with no "backwards-compatible minor bump" tolerance. If a future release introduces fields or a schema version your installed app does not know how to enforce, the app refuses to accept it silently — showing you plainly that the release's claims differ from what it expects.
 
-**One release at a time.** A client several releases behind is offered the release after the one it runs, not the latest, and reaches the latest by installing each in turn. A release is verified by the clients of the release before it, against the pins they embed, so this is the only order in which every release is checked by a client holding the pins it was signed under, including across a change of those pins. The client finds that release by reading each release's `previous_release` back from the latest; those documents are unsigned and only locate the release, which is then held to every check above.
+## How your app verifies an update
 
-**Where the installed commit comes from.** No build can contain the commit it was released from, because that commit records the build's own hashes. The client records the commit when it installs a release, keyed by the hash of the installed executable, so installing a download by hand over the top makes the client a fresh install again. A client with no recorded commit is offered the oldest release newer than its own version, without the continuity check. That first-install case is the residual gap; see [gaps.md](gaps.md#first-install-downgrade).
+**The problem.** Even with signed manifests, human attestations, and a compiled-in trust root, an attacker controlling your network or the release mirror could still try to serve a genuine *older* release with a known vulnerability (a downgrade or rollback attack), or skip past an intermediate release that rotated keys or claim templates.
 
-## For the technical specification
+**How Eidola solves it.** Whenever Eidola checks for updates — and again before installing one — the entire verification runs locally on your device in five steps:
 
-For exact pinning, signing-system formats, schema document shapes, and the build-input vs. build-output story (why `artifact-manifest.json` and `server-enclave.json` are separate files), see [trust-root.md](trust-root.md). For archive hashes and how to check a download, see [verification.md](verification.md).
+1. **Step one release at a time.** Rather than jumping straight to the latest version, updates step through releases in sequence so every transition (including key or schema rotations) is verified by a client holding the exact pins it was signed under. The discovery listing (`release.json`) is unsigned and serves purely as a map of URLs — it carries no hashes and no trust policy.
+2. **Verify CI's manifest signature.** Your app downloads `artifact-manifest.json` and checks CI's Sigstore bundle against the compiled-in workflow identity, release tag, and Rekor inclusion proof.
+3. **Verify the human attestations.** It checks each attestant's hardware-key signature against the compiled-in fingerprints, verifies each entry's inclusion in Rekor, confirms the required minimum number of independent signers, and re-renders every claim word for word against its pinned templates.
+4. **Check continuity.** Once an installed commit is recorded, your app verifies that the incoming release explicitly names that exact commit as its predecessor — blocking both stale-release substitution and rollback to an older, vulnerable version. *(A fresh install has no prior recorded commit to anchor against; see [Known gaps](gaps.md#first-install-downgrade).)*
+5. **Present the verified claims to you.** Only after every check passes does your app show you the verified attestation summary and offer the update. If any step fails — including a release signed by CI with no human attestation — the app refuses it as unverifiable, with no override prompt.
 
-For the operational side — how to actually cut a release, rotate an attestant key, or update the Sigstore trusted root — see [`releases/README.md`](../releases/README.md).
+How those verified release hashes map onto the actual file or app running on your specific operating system — macOS, Linux, Android, or iOS — is covered in [Apps & platform verification](apps.md).

@@ -1,118 +1,104 @@
 # Threat model
 
-This document names who Eidola defends against, who it does not, and what is left as residual trust.
-
-For each adversary, the question is the same: *given the [privacy guarantees](privacy-guarantees.md), what can this adversary do, and what stops them?*
+No privacy claim is meaningful without stating *who* you are defending against — and *who* you are not. This page maps each adversary against Eidola's [privacy guarantees](privacy-guarantees.md), explaining what stops them, what remains exposed, and where residual trust sits.
 
 ## Adversaries we defend against
 
-### A1. A curious or malicious Eidola operator
+### A curious or malicious Eidola operator
 
-**Capability:** Operates Eidola's infrastructure and can observe its logs, its database, and its network.
+**Capability.** Operates Eidola's infrastructure and can read its logs, its database, its telemetry, and its network traffic.
 
-**What stops them:** The boundary between the *linked* account surface and the *unlinked* inference surface is structural in the gateway: the two take different kinds of credential and no endpoint accepts both, and the inference surface uses anonymous credentials (Privacy Pass ACT). The operator can see *that* a credential was redeemed, never *whose* it was. Inference content never reaches a log, and exists in cleartext only inside the gateway's and the engine's enclaves. On the network between those enclaves an answer is framed and padded as it is on the client's connection, so the operator does not see the size or timing of its tokens there either ([privacy-guarantees.md §3.8](privacy-guarantees.md#3-content)). The gateway's and engines' telemetry carries no per-request records: the operator sees counters and histograms aggregated across requests. The operator cannot single out a request for closer inspection either: a per-request trace is produced only when the requester asks for one by sending a `traceparent`.
+**What stops them.** The gateway enforces a structural split between the linked account surface and the unlinked inference surface, using [anonymous credit tokens](anonymous-credits.md) so the operator can see *that* a token was spent, never *which account* funded it. Prompts and answers exist in plaintext only inside hardware-attested enclaves ([Architecture](architecture.md#the-gateway)), responses are shaped on both network hops to hide token sizes and rhythm, and telemetry is aggregated inside the enclaves with no per-request records. Deploying a modified gateway or engine to bypass these rules fails immediately: every client pins one exact gateway measurement, and the gateway pins its engines — so weakening server behavior requires shipping a new, attested client release ([Verifiable releases](releases.md)).
 
-**Residual exposure:** The database runs outside the enclave, so the operator sees when each spend is written and so roughly how long each paid request ran ([gaps.md](gaps.md#spend-timing-at-the-database)). The operator could also attempt to deploy a gateway or an engine that violates these properties. The client refuses to talk to any gateway whose attestation does not match the launch identity pinned in the client build, and the gateway refuses any engine that does not match the pins in its own, so deploying either requires the operator to also ship a violating *client release*. That path is blocked by the release-integrity invariants in [privacy-guarantees.md §6](privacy-guarantees.md#6-release-integrity) — in particular, the embedded trust root (§6.5), the human attestation requirement (§6.2), the attestant's no-known-backdoor claim (§6.3), and the no-compulsion claims (§6.4).
+**Residual exposure.** Because the database runs outside the enclave, a live observer of database writes can see when each spend starts and ends — revealing rough request durations and bursts of follow-up turns, never content or amounts ([Database spend timing](gaps.md#database-spend-timing)).
 
-### A2. A passive network observer
+### A passive network observer
 
-**Capability:** Sees all packets between the user's device and Eidola's servers, including TLS metadata (SNI, IP, timing).
+**Capability.** Watches all encrypted packets between your device and Eidola's servers (your ISP, Wi-Fi operator, or transit carriers).
 
-**What stops them:** TLS confidentiality and integrity. (The deeper attestation binding that protects against an *active* attacker with a valid WebPKI cert is described in [A3](#a3-an-active-network-attacker-mitm) — a passive observer has nothing to gain there, since they can't impersonate the gateway in the first place.)
+**What stops them.** TLS terminated directly inside the gateway enclave protects message confidentiality and integrity. Response shaping — fixed-size frames on a fixed clock tick for streamed answers, and size-bucketed non-streaming responses — hides individual token sizes and timing ([Response shaping](architecture.md#response-shaping)).
 
-**Residual exposure:** Network metadata remains visible: that a connection occurred, when, from where, the size of each request, and how long each response ran. The gateway pads its responses and writes a streamed answer in fixed-size frames at a fixed interval, so the size and timing of individual tokens are hidden ([privacy-guarantees.md §3.8](privacy-guarantees.md#3-content)); nothing else about the traffic is. Users who need more should layer Eidola behind Tor or a similar anonymity network. See [gaps.md](gaps.md#network--metadata).
+**Residual exposure.** Network metadata remains visible: your IP address, when connections happen, the size of each outgoing request (requests are not padded yet), and how long each response runs. Users who need network-layer anonymity should connect through Tor or a trusted VPN with a large userbase ([Network and metadata](gaps.md#network-and-metadata)).
 
-### A3. An active network attacker (MITM)
+### An active network attacker (MITM)
 
-**Capability:** Can intercept, modify, and re-route traffic between the user's device and Eidola.
+**Capability.** Intercepts, modifies, or redirects traffic between your device and Eidola — even using a fraudulently issued WebPKI TLS certificate for our domain.
 
-**What stops them:** Binding between the TLS key and a *fresh* enclave attestation. The client issues an inline `GET /.well-known/tinfoil-attestation?nonce=<hex>` (a fresh random nonce per handshake) over the same TCP+TLS connection as the real request. It hashes the exact endorsed crypto-material and device-evidence section bytes and verifies `REPORT_DATA = sha256(report-data-v1 URI ‖ nonce ‖ crypto_material_hash ‖ device_evidence_hash)`, with the crypto section's `tls` item equal to `sha256(SPKI(peer_cert))`. An attacker presenting a valid certificate for the same hostname without the matching attestation fails the check; an attacker presenting a stale or replayed attestation document fails either the SPKI binding or nonce check.
+**What stops them.** On every new TLS connection, your app sends a fresh random nonce and verifies a hardware attestation report over that same connection binding both the nonce and the server's TLS public key to the exact enclave measurement compiled into the app ([Fail-safe verification](architecture.md#fail-safe-verification)). A forged certificate without a matching hardware attestation — or a replayed attestation from an earlier connection — is rejected before any prompt or credential is sent.
 
-**Residual exposure:** The per-handshake nonce proves *freshness*: the report was generated for this handshake by a genuine confidential-compute machine that holds the certificate's key, which defeats replay of a captured document. It does not defeat an attacker who has **exfiltrated** the enclave's TLS private key. The report binds the enclave's TLS *key* (the certificate's SPKI), not the TLS *session*, so such an attacker can terminate the client's connection with the stolen key and relay a fresh, nonce-bound report fetched from the enclave's public attestation endpoint, which serves any nonce. Every client check passes. The defense is that the key stays sealed inside the enclave. Removing the exposure would require channel binding: committing a TLS-session value (such as an RFC 5705 exporter) into `REPORT_DATA` ([gaps.md](gaps.md#tls-key-exfiltration-and-channel-binding)).
+**Residual exposure.** Because the attestation binds the enclave's long-lived TLS key rather than each individual TLS session, an attacker who somehow exfiltrated the private key from inside the enclave could terminate TLS outside it and relay fresh attestations ([TLS channel binding](gaps.md#tls-channel-binding)).
 
-### A3.5. A rogue deployer
+### A rogue deployer or server impersonator
 
-**Capability:** Anyone with deploy access to the legitimate Eidola infrastructure (the hosting platform's operators, an Eidola employee with deploy credentials, or an attacker who has compromised one) could attempt to alter what runs: substitute a binary, change injected secrets, point the gateway at a different inference engine, or roll back to an older, vulnerable build.
+**Capability.** Either an insider with deployment access to Eidola's hosting platform attempting to swap binaries, alter configuration, point the gateway at an unverified model server, or roll back to an older build — or an external attacker hijacking DNS/BGP to impersonate Eidola from outside our infrastructure.
 
-**What stops them:** What the gateway runs is determined by its **attested configuration** (`tinfoil-config.yml`), whose SHA-256 every attestation report carries as HOST_DATA. The enclave checks that hash against its configuration before it boots, and the client pins it beside the launch digest. The configuration covers the gateway image digest, the argument list, the environment, and the names of the secrets injected beside it. Any change produces a different launch identity, which the client refuses to connect to. The pairing of client and gateway (see [client.md](client.md#one-release-pairs-exactly-one-client-with-one-server)) also blocks rollback: each client release pins exactly one gateway launch identity, so a genuinely attested *older* gateway build does not match the pin in an updated client. The inference engines are fixed the same way, one level down: their deployments are pinned in the gateway's own build, the placement data the gateway reads from its database says only where they are, and an engine whose attestation matches no pin for the requested model is refused ([engine.md](engine.md#what-pins-the-engine)).
+**What stops them.** Every enclave's launch identity covers both its boot image and the hash of its committed deployment configuration. Any change to the running image, command arguments, or measured environment produces a different launch identity that the client refuses. Because each client release pins one exact gateway measurement — and that gateway pins its inference engines and model weights — rollback to a genuinely attested *older* build also fails. Database engine-placement records control availability only, never trust ([Pinning and attestation](architecture.md#pinning-and-attestation)).
 
-**Residual exposure:** Configuration that is not committed into the attested boot path is not bound into the measurement, so any new sensitive setting has to be added there. The injected secrets' values are not bound: someone with deploy access can change which database, payment account, telemetry collector or legal-document feed the gateway uses, or the key that encrypts issuer keys at rest, and which collector an engine sends its telemetry to. Each is outside the enclave and already treated as the operator's, and what the gateway or an engine sends to each is fixed by its measured code, so substituting one gives them nothing the operator does not already have. The boot images themselves are the hosting platform's: pinned by hash and measured, but not built by Eidola ([gaps.md](gaps.md#build-chain-opacity)).
+**Residual exposure.** Runtime secrets injected for external operator services (database, Stripe, telemetry destination) are not part of the enclave measurement; substituting them redirects traffic only to services already treated as untrusted, while measured code still fixes everything sent to them. Platform boot images are pinned by hash rather than built from source by Eidola ([Non-source-bootstrapped build inputs](gaps.md#non-source-bootstrapped-build-inputs)).
 
-### A3.6. A server impersonator
+### A compromised release pipeline
 
-**Capability:** Operates a server pretending to be Eidola from outside the legitimate infrastructure: a DNS hijack, a BGP redirection, a server the attacker controls at the real hostname, or a stack not running confidential compute at all. The active attacker of [A3](#a3-an-active-network-attacker-mitm) is one route to this.
+**Capability.** Gains write access to our GitHub repository, CI runners, or the OIDC identity that signs release manifests.
 
-**What stops them:** The same controls as [A3.5](#a35-a-rogue-deployer). The client's pinned launch identity names exactly one gateway build; only an enclave running that build can produce a matching attestation, and only confidential-compute hardware with valid vendor keys can produce an attestation at all. WebPKI is an additional layer: an impersonator without a valid TLS certificate for the real hostname never reaches the attestation step, and one with a fraudulent certificate still fails the measurement check.
+**What stops them.** Your app never accepts a release signed only by CI. Every update also requires [human attestations](releases.md#human-attestations) signed from hardware-held keys (requiring physical presence) whose fingerprints — along with the minimum signer count and exact claim templates — are compiled into the currently installed app. Controlling CI cannot forge a hardware-bound human signature.
 
-**Residual exposure:** The same as A3: an attacker who has exfiltrated the enclave's TLS private key can relay a fresh attestation.
+**Residual exposure.** Simultaneously compromising every pinned attestant's hardware key defeats this. Today the required threshold is one attestant while the verifier supports multiple independent signers ([Single attestant and jurisdiction diversity](gaps.md#single-attestant-and-jurisdiction-diversity)).
 
-### A4. An attacker who compromises the Eidola release pipeline
+### A tampered build toolchain or binary
 
-**Capability:** Has gained write access to the GitHub repo, the CI system, or the OIDC identity used to sign artifact manifests.
+**Capability.** Subverts a prebuilt compiler, container base image, or binary package — or silently swaps an upstream dependency after review — to slip malicious code into Eidola's binaries without touching public source.
 
-**What stops them:** The release pipeline's signature alone is not sufficient for the client to accept a release. The client *also* requires a [human attestation](releases.md) signed by a pinned attestant from hardware under their exclusive physical control, posted to a public transparency log (Rekor). An attacker who controls CI cannot mint that signature. An attacker who has additionally compromised an attestant's hardware-bound key has crossed a higher bar; the verifier enforces a minimum number of independent attestations, raising the cost as more attestants come online.
+**What stops them.** Every dependency is pinned by exact version and cryptographic hash, preventing silent substitution. Server, CLI, and mobile-bundle builds use a source-bootstrapped reproducible toolchain (StageX), desktop builds use hermetic, reproducible Nix inputs, and GPU kernels are compiled ahead of time and checked against a committed hash manifest — narrowing the risk from opaque, arbitrarily produced binaries to public, widely scrutinized source code. CI enforces bit-for-bit manifest reproducibility before any release reaches `main`, and release attestants independently reproduce the manifest and inspect the full diff before signing, catching tampering local to any single build machine.
 
-**Residual exposure:** A compromise of every pinned attestant simultaneously, sufficient to extract or coerce each hardware-bound signing key, defeats this. The mitigation is distribution of attestants across hardware tokens, jurisdictions, and physical custody, plus a public minimum threshold pinned in the *prior* client so the bar cannot be lowered by the compromise itself.
+**Residual exposure.** Source bootstrapping and hash pinning do not stop a vulnerability or backdoor introduced directly into public upstream source — whether a library Eidola depends on or a compiler in the bootstrap chain — if it escapes community scrutiny and our review. Several build inputs also remain opaque binaries rather than source-bootstrapped, including Apple's SDK, NVIDIA's CUDA compiler, and binary packages in the platform boot image ([Non-source-bootstrapped build inputs](gaps.md#non-source-bootstrapped-build-inputs)).
 
-### A5. A compromised dependency (supply chain)
+### A legally compelled engineer or officer
 
-**Capability:** Has subverted a third-party crate, container base image, or build tool that Eidola depends on.
+**Capability.** A court order, technical capability notice, or secret directive attempts to force an Eidola engineer or officer to introduce a backdoor or weaken privacy guarantees.
 
-**What stops them:** The structural defenses, in order of how much of the attack surface they actually close:
+**What stops them.** Every release attestation requires a positive, word-for-word statement signed under the attestant's legal identity affirming that they are *not* subject to legal compulsion or a gag order weakening the release ([What an attestant affirms](releases.md#what-an-attestant-affirms)). A compelled, gagged signer must either refuse to sign — halting releases and creating a public signal — or commit an explicit falsehood on a public transparency log. As more attestants across jurisdictions are pinned, an adversary must secretly compel multiple independent people at once.
 
-- **Pinned dependency surface.** Every dependency has a fixed version and an expected hash. Updates are explicit commits.
-- **Minimal runtime dependencies.** Distribution of compiled binaries limits exposure to outdated or vulnerable libraries on the end-user's machine.
-- **Source-bootstrapped reproducible builds for the Linux OCI images** (StageX, the inference engine's included). Every binary in the toolchain, down to the compiler's own bootstrap, is built from source whose hash is committed and verified.
-- **Hermetic builds for the desktop artifacts** (Nix: the macOS universal binaries and the Linux GUI). These are hermetic and reproducible but not source-bootstrapped in the StageX sense. On macOS, the Apple SDK and toolchain are opaque inputs, because cross-compiling to macOS from Linux is not viable today. The Linux GUI is Nix-built because a desktop GUI must be a glibc dynamic binary to load the host GPU stack, which StageX's musl toolchain cannot produce. See [gaps.md](gaps.md#build-chain-opacity).
-- **A source-bootstrapped build for the inference engine image** (StageX), with one hermetic exception. The engine must load NVIDIA's driver libraries at runtime, so it is a glibc dynamic binary, cross-compiled by StageX's toolchain against StageX's glibc. Its GPU kernels are compiled with NVIDIA's closed CUDA toolkit in a separate Nix-built image, pinned by digest; the output is reproducible and checked against committed hashes on every image build.
-- **Hash-pinned platform boot images.** The images the gateway and the engines boot are the hosting platform's, pinned by hash and bound into the measurements, so they cannot change silently. They are not source-bootstrapped ([gaps.md](gaps.md#build-chain-opacity)).
-- **A committed `artifact-manifest.json` as a merge invariant.** The pipeline that promotes the integration branch to `main` re-derives the manifest from source and refuses to advance if the result differs from the committed copy, so reproducibility is checked before every release rather than only asserted at it.
-- **Personal reproduction in the release attestation.** Every release attestation includes a claim that the attestant has personally reproduced the manifest from source on hardware under their control.
-
-**Residual exposure:** A dependency compromise that occurred, was incorporated, and was not caught by any of the above (PR review, attestant diff review, downstream public review) is the remaining gap. Operational practices supplement these (advisory monitoring, a preference for pure-Rust dependencies, a small direct dependency count), but they are ordinary good practice rather than structural defenses.
-
-### A6. A legally-compelled Eidola engineer
-
-**Capability:** A court order, technical capability notice, or other legal compulsion directs an engineer to weaken the privacy guarantees or introduce a backdoor.
-
-**What stops them:** The release-attestation no-compulsion claims ([privacy-guarantees.md §6.4](privacy-guarantees.md#6-release-integrity)) require the attestant to sign, under their legal identity, that they are *not* under such compulsion. A coerced engineer who is also gagged must either (a) decline to sign, breaking the release and sending a public signal, or (b) sign falsely and incur the legal exposure they were trying to avoid. As attestant counts grow, the required-threshold check forces the adversary to compel multiple independent engineers, multiplying the legal and operational risk on the adversary's side.
-
-**Residual exposure:** A jurisdiction able to compel every pinned attestant in coordinated secrecy defeats this silently. The mitigation is distributing attestants across jurisdictions ([gaps.md](gaps.md#multi-jurisdiction-attestant-distribution)). Today one attestant is required ([gaps.md](gaps.md#single-attestant-policy)).
+**Residual exposure.** Coordinated secret compulsion of *every* pinned attestant defeats this silently — a heightened risk while only one attestant is required ([Single attestant and jurisdiction diversity](gaps.md#single-attestant-and-jurisdiction-diversity)).
 
 ## Adversaries we do not defend against
 
-### N1. A compromised local environment
+### A compromised local device
 
-If the user's device is compromised — malicious app with sufficient privilege, OS-level surveillance, malware in the Eidola binary's host process — most user-facing privacy properties fall, regardless of what Eidola does. The client's fail-safe defaults and embedded trust root limit *what code runs*, but they cannot prevent an already-trusted process from observing the user. This is named explicitly in [privacy-guarantees.md §8.1](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise).
+If your computer or phone is compromised — malware, keyloggers, OS-level surveillance, or another privileged process — your local conversations, account secret, and wallet are exposed just like any other file on your device ([Privacy guarantees §8.1](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise)). On iOS, this trusted local boundary includes the native shell around the mobile app, which cannot be verified against public source ([Verifying on Android vs. iOS](apps.md#verifying-on-android-vs-ios)).
 
-### N2. A hardware-manufacturer forgery
+### Physical access to server hardware
 
-If AMD, Intel, or NVIDIA were to issue fraudulent attestation chains (for example, signing measurements for an enclave that does not in fact provide confidential compute), the corresponding layer of the verification chain falls. This is residual trust we currently accept; the long-term mitigation is open hardware roots like OpenTitan, tracked in [gaps.md](gaps.md).
+Current generations of confidential-computing CPUs from AMD and Intel explicitly treat physical attacks on the host machine — such as interposing on the memory bus ([tee.fail](https://tee.fail/)) — as out of scope. Hardware attestation proves what code is running on genuine silicon, not who has physical access to the server rack. This is an important real-world limitation that we discuss in [Physical access to server hardware](gaps.md#physical-access-to-server-hardware).
 
-### N3. A traffic-analysis adversary
+### Hardware-vendor forgery
 
-An adversary observing network metadata (connection patterns, sizes, timing) can infer a great deal even when content is encrypted. Eidola hides the size and timing of an answer's individual tokens from an observer of the client's connection to the gateway or of the gateway's connection to an engine ([privacy-guarantees.md §3.8](privacy-guarantees.md#3-content)) and nothing more: connection patterns, network identity, request sizes and response durations remain visible. Users who need metadata privacy should layer Eidola behind Tor or a similar anonymity network.
+If AMD, Intel, or NVIDIA issued fraudulent attestation certificates — vouching for an enclave that does not actually provide confidential execution — that layer of the verification chain would break. Open hardware roots of trust are the long-term industry direction, not something Eidola can build alone ([Trust in confidential-compute vendors](gaps.md#trust-in-confidential-compute-vendors)).
 
-### N4. A user who voluntarily leaks
+### Microarchitectural side channels
 
-A user who pastes their email into a prompt, copies inference output to a third-party service, or screenshots their chat history has exited Eidola's privacy boundary by their own action. Eidola does not redact, classify, or filter user input.
+Confidential-compute hardware isolates enclave memory from the host OS, but does not guarantee immunity from microarchitectural side channels (speculative execution, cache timing, power analysis, or fault injection). Attestation enforces minimum firmware floors to require known patches, and engine hosts may run with simultaneous multithreading (SMT) enabled, which admits cross-thread side channels. Eidola does not promise that no new hardware vulnerabilities will be discovered.
 
-### N5. Microarchitectural side channels against confidential-compute hardware
+### Traffic analysis
 
-Confidential-compute hardware proves which code is running in an enclave. It does not prove that the host platform is free of microarchitectural side channels (speculative-execution leaks, cache timing, power analysis, fault injection). Published attacks on SEV-SNP and TDX show this is an active research area. Mitigations live in firmware and microcode: every attestation is held to a TCB floor, on the gateway's SEV-SNP hosts and on the engines' TDX hosts alike. The engines' hosts may run with SMT enabled, which admits cross-thread channels ([gaps.md](gaps.md#tdx-acceptance)). Eidola does not promise that no further vulnerability will be found.
+Beyond hiding individual token sizes and timing via response shaping, Eidola does not defend against network traffic analysis. Connection timing, IP addresses, request sizes, and total response durations remain visible to network observers; users needing metadata anonymity should layer Eidola over Tor or a trusted VPN with a large userbase ([Network and metadata](gaps.md#network-and-metadata)).
 
-## Residual trust, named explicitly
+### Voluntary user disclosure
 
-Every system rests on something it cannot verify from inside itself. Ours is listed so a reader can decide whether it is acceptable for their threat model:
+If you paste identifying details into a prompt, copy model outputs into another service, or share screenshots of your chats, you have stepped outside Eidola's privacy boundary by your own action.
 
-| Trust anchor | What we rely on it for | What lowers the exposure |
-|---|---|---|
-| **Confidential compute vendors** (AMD, Intel, NVIDIA) | The attestation chains prove real enclave execution | An inference request depends on all three: AMD for the gateway's enclave, Intel and NVIDIA for the engine's. Nothing lowers this today; open hardware roots would over time. See [N2](#n2-a-hardware-manufacturer-forgery) and [N5](#n5-microarchitectural-side-channels-against-confidential-compute-hardware) |
-| **The hosting platform** (Tinfoil) | The boot images the enclaves launch, and its signed endorsements of which hosts an engine may run on and the firmware levels they must meet | The images are pinned by hash and measured, and the endorsements are verified and committed with each gateway build, so neither can change silently. See [gaps.md](gaps.md#build-chain-opacity) and [gaps.md](gaps.md#tdx-acceptance) |
-| **WebPKI** (Let's Encrypt) | The TLS cert presented by the gateway is genuinely the one issued for the hostname | The cert is bound to a fresh enclave attestation by the client (the report's `REPORT_DATA` commits to `tls_key_fp == sha256(SPKI(peer_cert))` alongside the per-handshake nonce); a forged WebPKI cert alone is not enough |
-| **Sigstore Rekor** (Linux Foundation) | The transparency log entry for a release attestation is genuine and never removed | The client never contacts Rekor. Each attestation carries its log entry, inclusion proof and signed entry timestamp, and the client verifies them offline against Rekor's public keys, pinned in `sigstore-trusted-root.json`, so whether Rekor can be reached has no bearing on whether an update verifies. Checkpoint signature verification is a [gap](gaps.md#rekor-checkpoint-signature-verification) |
-| **GitHub OIDC** (Fulcio identity binding) | The release-signing CI workflow ran under the identity it claims | Pinned identity pattern + tag, plus the human attestation requirement makes OIDC compromise alone insufficient. Manual escape via [rotation](../releases/README.md#rotating-the-ci-signing-workflow) |
-| **The user's prior client binary** | Embedded trust root has not been silently subverted before install | Public release record + signed continuity check between releases |
-| **The user's hardware and OS** | Process isolation, key storage, code execution integrity | Outside Eidola's scope; named in [N1](#n1-a-compromised-local-environment) |
+## Residual trust
 
-Each of these is a place where a capable adversary could break the chain. Where mitigations are in progress, they are in [gaps.md](gaps.md).
+Every system rests on layers it cannot verify from inside itself. Here is every anchor Eidola still relies on, so you can decide whether it fits your threat model:
+
+| Trust anchor | What we rely on it for | What limits the exposure |
+| --- | --- | --- |
+| **Confidential-compute vendors** (AMD, Intel, NVIDIA) | Genuine hardware isolation and honest attestation chains | Inference depends on the enclave CPU and GPU vendors. Long-term mitigation is open hardware roots ([Trust in confidential-compute vendors](gaps.md#trust-in-confidential-compute-vendors)). |
+| **Physical data-center security & hosting platform** (Tinfoil) | Physical protection against memory-bus attacks, platform boot images, and signed host endorsements | TDX engine hosts are pinned to signed endorsements. Physical-machine transparency is an active gap ([Physical access to server hardware](gaps.md#physical-access-to-server-hardware)). |
+| **WebPKI** (Let's Encrypt) | Standard TLS certificate issuance for our domain | Every connection also requires a fresh hardware attestation bound to the certificate's public key — a forged WebPKI certificate alone fails. |
+| **Sigstore Rekor** (Linux Foundation) | Public, append-only logging of release signatures | Clients verify Rekor inclusion proofs offline against pinned public keys; Rekor is externally mirrored. Witnessed checkpoint checks remain a gap ([Transparency-log hardening](gaps.md#transparency-log-hardening)). |
+| **GitHub OIDC** | Tying CI manifest signatures to our release workflow | Defense in depth only — human attestations from hardware-held keys are required on every release. |
+| **Your first installed app** | Starting from an honest binary with an intact compiled-in trust root | Public reproducible builds and platform verification ([Apps & platform verification](apps.md)), plus release continuity on subsequent updates. |
+| **Mobile native shell (iOS)** | Serving the verified bundle and storing local files honestly | On Android, the shell reproduces from source. On iOS, Apple encrypts App Store binaries so the shell must be trusted alongside iOS itself ([Verifying on Android vs. iOS](apps.md#verifying-on-android-vs-ios)). |
+| **Your hardware and OS** | Local process isolation, storage, and input privacy | Outside Eidola's control ([A compromised local device](#a-compromised-local-device)). |
+
+Where mitigations are still in progress or deferred, they are tracked in [Known gaps](gaps.md).

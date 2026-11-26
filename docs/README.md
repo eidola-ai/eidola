@@ -1,37 +1,35 @@
 # Documentation
 
-These docs describe how Eidola works, what it commits to, and what it does not yet defend against. They are written for a technical reader who wants to check the design.
+Eidola is a private client for running open-weight AI models — locally on your own hardware, on servers you bring yourself, or on Eidola's confidential-compute infrastructure.
+
+These docs explain how to use Eidola, how it works under the hood, what it commits to, and where its limits are.
 
 ## Start here
 
-1. **[Paradigm](paradigm.md)** — The principles the design follows.
-2. **[Privacy guarantees](privacy-guarantees.md)** — The enumerated commitments a release attestant signs against for every release.
-3. **[Threat model](threat-model.md)** — Who Eidola defends against, who it does not, and what is left as residual trust.
+- **[How to think about Eidola](paradigm.md)** — The core mental model: user sovereignty, why Eidola provides compute rather than proprietary AI, and why structure matters more than policy.
 
-## Design pieces
+## User guide
 
-4. **[Architecture](architecture.md)** — Every part and every connection between them, with what each connection reveals and what protects it.
-5. **[The client](client.md)** — Embedded trust root, per-handshake attestation, and refusal when verification fails.
-6. **[The gateway](gateway.md)** — Linked and unlinked surfaces, anonymous credentials, telemetry, and what runs in confidential compute.
-7. **[The engine](engine.md)** — Where models run, and how that layer is pinned and verified.
-8. **[Model identity](model-identity.md)** — The weights hash that names a model, and how to recompute it.
-9. **[Anonymous credits](anonymous-credits.md)** — How payment stays unlinkable from use, one decision at a time.
+- **[Getting started](guide/getting-started.md)** — Installing Eidola on desktop or mobile, creating an anonymous account (or skipping straight to local models), and sending your first prompt.
+- **[Running hosted models](guide/hosted-models.md)** — Buying credits, how the local wallet works, choosing models, and following tags versus pinning weights.
+- **[Local & external models](guide/local-models.md)** — Running models on your own device without an account, or connecting your own server.
+- **[Command line & other tools](guide/tools-and-cli.md)** — Using the bundled `eidola` CLI and connecting other apps through the local inference proxy.
 
-## Release flow
+## How it works
 
-10. **[Releases](releases.md)** — How a release becomes trustable: a CI signature plus human attestation, both on the same transparency log.
-11. **[Verification](verification.md)** — Payload, archive, envelope, installable: the hashes a user checks, and what the CI-signed manifest records.
-12. **[Trust root](trust-root.md)** — What is pinned at compile time, how schema versions work, and how the verifier walks the chain.
-13. **[Apple distribution](apple-distribution.md)** — The macOS envelope: Developer ID, notarization, and why those bytes never enter the manifest.
+- **[Architecture](architecture.md)** — The system from end to end: your device, the gateway, Eidola's inference engine, and what every connection reveals.
+- **[Anonymous credits](anonymous-credits.md)** — How payment stays cryptographically unlinkable from usage.
+- **[Model identity](model-identity.md)** — Why model names aren't enough, how weights hashes work, and how to check them yourself.
+- **[Verifiable releases](releases.md)** — How a release becomes trustworthy: reproducible builds, CI signatures, named human attestations, and the compiled-in trust root.
+- **[Apps & platform verification](apps.md)** — How each platform (Linux, macOS, Android, and iOS) delivers and verifies the app on your device.
 
-## What's missing
+## Trust & limits
 
-14. **[Known gaps](gaps.md)** — Every piece of the trust chain that is deferred, with what it would catch and what constrains it today.
-
-## Operations
-
-15. **[Infrastructure and vendors](vendors.md)** — The third parties that process data for Eidola, and what each can see. Referenced by the [privacy policy](https://www.eidola.ai/privacy/).
+- **[Privacy guarantees](privacy-guarantees.md)** — The enumerated commitments signed into every release.
+- **[Threat model](threat-model.md)** — Who Eidola defends against, who it does not, and what residual trust remains.
+- **[Known gaps](gaps.md)** — What isn't closed yet, why it matters, and what constrains it today.
+- **[Infrastructure & vendors](vendors.md)** — The third parties involved in operating Eidola, and what each can see.
 
 ## For contributors
 
-Contributor-facing READMEs live beside the code they describe. Start with the top-level [`README.md`](../README.md) for dev setup, and [`releases/README.md`](../releases/README.md) for release-pipeline operations. [`AGENTS.md`](../AGENTS.md) is written for and mostly maintained by coding agents, but contains a useful architecture overview. Task-oriented runbooks (such as provisioning the release signing YubiKey) live in [`contributing/`](contributing/README.md).
+Contributor setup, architecture notes, and operational runbooks live in the [GitHub repository](https://github.com/eidola-ai/eidola) — start with [`README.md`](../README.md), [`releases/README.md`](../releases/README.md), and [`docs/contributing/`](contributing/README.md).

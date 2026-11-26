@@ -1,8 +1,6 @@
 # Infrastructure and vendors
 
-This is the complete list of third parties that process data in the operation of Eidola's service, website, and business — what each one is for, and exactly what it can see. The [privacy policy](https://www.eidola.ai/privacy/) points here rather than naming vendors inline, so that this list can stay current (and its history auditable) in the repository.
-
-The list is short because the architecture makes it short: inference content never reaches any of these parties in a form they can read, link, or keep, and most of them never see anything about you at all.
+This is the complete list of third parties that process data in the operation of Eidola's service, website, and business — what each one is for, and exactly what it can see. Inference content never reaches any of these parties in a form they can read, link, or keep, and most of them never see anything about you at all.
 
 ## Processors — parties handling data on our behalf
 
@@ -18,17 +16,11 @@ The list is short because the architecture makes it short: inference content nev
 
 | Vendor | Role | What it sees |
 | --- | --- | --- |
-| **Tinfoil** | Confidential-compute hosting, for the gateway, the inference engines and billing | Ciphertext, attested enclaves, and network metadata (connection IPs, timing, volume). Inference content is decrypted only inside enclaves whose measurements are verified on every connection: the client verifies the gateway's, and the gateway verifies each engine's against the deployments its own build pins — see [the engine](engine.md) and the [threat model](threat-model.md). We treat Tinfoil's network layer as potentially logging transport metadata, like any network operator. Tinfoil also stores the credentials our services are deployed with, so it is in a position to read what our billing database and Stripe keys can reach. |
+| **Tinfoil** | Confidential-compute hosting, for the gateway, the inference engines and billing | Ciphertext, attested enclaves, and network metadata (connection IPs, timing, volume). Inference content is decrypted only inside enclaves whose measurements are verified on every connection: the client verifies the gateway's, and the gateway verifies each engine's against the deployments its own build pins — see [Architecture](architecture.md#the-inference-engine) and the [threat model](threat-model.md). We treat Tinfoil's network layer as potentially logging transport metadata, like any network operator. Tinfoil also stores the credentials our services are deployed with, so it is in a position to read what our billing database and Stripe keys can reach. |
 
 ## Independent platforms we participate in
 
 | Platform | Role | Notes |
 | --- | --- | --- |
-| **Apple** | Developer ID code signing and notarization for direct macOS distribution | Receives each notarized release binary and the Apple developer-team identity attached to it. Apple can revoke the certificate or notarization trust used by Gatekeeper; see [Apple distribution](apple-distribution.md). It does not process Eidola inference content or ordinary account data. |
+| **Apple** | Developer ID code signing and notarization for direct macOS distribution | Receives each notarized release binary and the Apple developer-team identity attached to it. Apple can revoke the certificate or notarization trust used by Gatekeeper; see [Apps & platform verification](apps.md#macos-and-apple-signing). It does not process Eidola inference content or ordinary account data. |
 | **Matrix.org Foundation** | Homeserver hosting our public community rooms | An independent controller under its own privacy policy. Room content is public and federates to servers nobody controls; see the privacy policy's community section. |
-
-## What is deliberately absent
-
-No advertising networks, no analytics providers, no data brokers, no "enrichment" services, no CRM holding profiles of users. Sub-processors of the vendors above (for example, a vendor's own cloud provider) are bound through our contracts with that vendor, per standard data-processing terms.
-
-Changes to this list are visible in this file's git history.

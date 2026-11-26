@@ -431,7 +431,9 @@ main.prose {
 }
 
 /* The section a line links to marks itself when it is the target. */
-.prose h3:target {
+.prose h2:target,
+.prose h3:target,
+.prose h4:target {
   color: var(--accent-foreground);
 }
 

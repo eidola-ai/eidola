@@ -1,6 +1,6 @@
 # Billing — shared account operations
 
-This crate owns the account billing behavior used by the gateway and the private `eidola-billing-cli`. Neither surface has its own refund or chargeback algorithm. Read [anonymous-credit doctrine](../../docs/anonymous-credits.md) for every change: these tables belong to the linked account surface. No ACT spend, nullifier, recovery key, inference request or client spend trail belongs here.
+This crate owns the account billing behavior used by the gateway and the private `eidola-billing-cli`. Neither surface has its own refund or chargeback algorithm. Check every change against the anonymous-credit review checklist in `crates/eidola-server-gateway/AGENTS.md` (and the public overview in [anonymous credits](../../docs/anonymous-credits.md)): these tables belong to the linked account surface. No ACT spend, nullifier, recovery key, inference request or client spend trail belongs here.
 
 ## Boundaries
 

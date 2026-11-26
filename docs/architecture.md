@@ -1,6 +1,10 @@
 # Architecture
 
-Eidola is composed of several distinct components that function as a complete system. The architecture follows [our paradigm](paradigm.md), ensuring that the pieces operating outside the control of the client are never privy to information that could be used to violate the core privacy goals of Eidola.
+Eidola is built from a small set of components arranged around explicit trust boundaries. Everything that touches your prompts and answers runs either on your own device or inside hardware-attested confidential enclaves whose exact code is verified before a request is sent. Everything else — the database, billing processes, telemetry, and third-party services — is treated as untrusted and shown as little as possible.
+
+This page walks through the system from end to end: your device, the gateway, Eidola's inference engine, and each connection between them.
+
+## System map
 
 ```mermaid
 flowchart TB
@@ -47,160 +51,228 @@ flowchart TB
   class client,gateway,engines content
   classDef content stroke-width:3px
 
-  click client "client.md"
-  click gateway "gateway.md"
-  click engines "engine.md"
-  click pg "anonymous-credits.md#what-postgres-may-hold"
-  click webhook "anonymous-credits.md#payment-reversals"
-  click worker "anonymous-credits.md#payment-reversals"
+  click client "#the-client"
+  click gateway "#the-gateway"
+  click engines "#the-inference-engine"
+  click pg "anonymous-credits.md#what-the-database-may-hold"
+  click webhook "#events"
+  click worker "#billing-work"
   click stripe "vendors.md#processors--parties-handling-data-on-our-behalf"
-  click grafana "gateway.md#telemetry-scope-and-boundary"
+  click grafana "#telemetry-and-logs"
 ```
 
-## Reading the diagram
+### Reading the diagram
 
-- **The boxes are trust boundaries.**
-  - *Eidola, attested* code is measured, and its measurement is checked by whoever connects to it, on every connection, before anything is sent.
-  - *Eidola, unattested* is the rest of Eidola's service run by Eidola or on its behalf. The app is unable to pin and verify these, so the privacy design treats them as untrusted, sending as little as possible.
-  - *Third parties* are services Eidola uses and does not run.
-- **A dotted line** carries nothing that can be tied to an account or a person, while **a solid line** carries something that can: prompts and answers, an account's own records, or a payment.
-- **A thick line** carries prompts and answers, and **a thick outline** marks a part that sees your prompts and answers.
-- **An arrow points away from the side that opens the connection.** Data flows both ways on almost every line.
+- **Boxes are trust boundaries.**
+  - *Eidola, attested* components run inside confidential-compute enclaves. Whoever connects to them verifies their hardware measurement on every new connection before sending any data.
+  - *Eidola, unattested* components are supporting services run by Eidola or on its behalf outside enclaves. The app cannot pin or verify them, so the system treats them as untrusted and never sends them prompt content or linkable spend records.
+  - *Third parties* are external services Eidola relies on (currently Stripe for payment processing).
+- **Dotted vs. solid lines.** A dotted line carries nothing that can be tied to an account or person; a solid line carries data tied to a conversation, an account, or a payment.
+- **Thick lines and outlines** mark the only paths and components that ever see your prompts and answers in the clear: your device, the gateway enclave, and the inference engine enclave.
+- **Arrows** point away from the side that opens the connection (data flows both ways on almost every link).
 
-Each line links to its section below, and each part to the page that describes it.
+Click any box to jump to its description, or any labelled arrow to jump to its privacy breakdown in [How the pieces connect](#how-the-pieces-connect).
 
-**Not shown:** connections outside Eidola's service. The app checks for updates at GitHub, and your browser downloads them there. Stripe returns your browser to this website after a payment, and the gateway reads the current terms from it. The app downloads local models from Hugging Face when you ask it to, and sends prompts to any other server you configure yourself, outside everything on this page. The hosting provider runs the machines and the network beneath the attested parts and holds the services' deployment secrets ([vendors.md](vendors.md#infrastructure-inside-the-trust-boundary)). What an observer of several of these networks at once could correlate is a question of its own ([gaps.md](gaps.md#network--metadata)).
+**Not shown:** connections outside Eidola's hosted compute path. Your device checks GitHub for releases and downloads updates there; Stripe redirects your browser back to this website after checkout, and the gateway reads the current legal terms from it; your device downloads on-device models from Hugging Face when you ask it to, and talks directly to any external model server you configure yourself. Beneath the attested enclaves, the hosting provider operates the physical machines and network and supplies deployment secrets ([Infrastructure & vendors](vendors.md#infrastructure-inside-the-trust-boundary)).
 
-## The parts
+## The client
 
-- **Eidola app** — the GUI and CLI, built on one shared core. It holds your conversations, your account secret and your anonymous credit locally, and it is the only place your account and your requests meet ([client.md](client.md#what-the-client-does-locally-by-design)).
-- **Browser** — your own browser, which the app opens for Stripe's checkout and billing pages.
-- **Gateway** — the service the app connects to. It runs the account surface and the inference surface side by side and keeps them apart, and it routes each inference request to an engine ([gateway.md](gateway.md#linked-vs-unlinked)).
-- **Engines** — Eidola's own inference engine, one model per deployment, in confidential VMs, with confidential-computing GPUs when it computes on them ([engine.md](engine.md#where-the-model-runs)).
-- **Postgres** — the one shared database, outside every enclave. It holds account and billing records, and one record per spend of anonymous credit that cannot be traced to the account that paid ([anonymous-credits.md](anonymous-credits.md#what-postgres-may-hold)).
-- **Webhook receiver** — a small process that accepts Stripe's notifications and queues them.
-- **Billing worker** — a process that works through that queue, asks Stripe for the facts behind each notification, and applies purchases, refunds and disputes to the account records ([anonymous-credits.md](anonymous-credits.md#payment-reversals)).
-- **Stripe** — the payment processor. It knows who paid, and never sees what was asked.
-- **Grafana** — where the gateway, the engines and the billing processes send their operational telemetry ([gateway.md](gateway.md#telemetry-scope-and-boundary)).
+Eidola ships as a desktop app (macOS and Linux), a command-line tool (`eidola`), and a mobile app (iOS and Android). All of them run **one shared Rust core** — the same wallet, the same local database, the same attestation verifier, and the same fail-safe rules. On mobile, that core compiles to WebAssembly and runs inside a minimal native shell that passes only encrypted network bytes ([Apps & platform verification](apps.md#mobile-apps)).
 
-## The connections
+### Fail-safe verification
 
-### Chat
+Every trust decision happens locally on your device, against a **trust root** compiled directly into the app at build time. There is no runtime API and no server call that can alter what a running client trusts.
 
-The app sends each inference request to the gateway, paid for with anonymous credit, and receives the answer.
+- **One client release pairs with one gateway build.** A client does not accept "any gateway at or above version X" — a floor like that would let an attacker downgrade you to an older, vulnerable server build. Instead, each client release pins one exact gateway launch identity, and that gateway pins the exact inference engines it will talk to. Updating the server side reaches users only through a new, attested client release.
+- **Fresh attestation on every connection.** Every time the client opens a new TLS connection to the gateway, it generates a fresh random nonce and requests a hardware attestation report over that same connection before sending any application data. Offline, using hardware vendor roots compiled into the app, it verifies that a genuine confidential-compute processor signed the report, that the report binds both the fresh nonce and the TLS certificate's public key, that the enclave's debug mode is disabled, that its firmware meets minimum security floors, and that its boot image and configuration hash match the compiled-in pin. There is no "verified once" cache.
+- **Refusal on any failure.** If attestation fails, if an update lacks the required human signatures, or if a release document uses a schema version the client doesn't understand, the client refuses to proceed. There is no fallback and no prompt to ignore a security warning.
 
-**Who can see it.** Your own network, the internet carriers in between, and the hosting provider's network on the way in. The other end is the gateway's measured code.
+### What stays on your device
 
-**What they see.** On the network, encrypted traffic: your IP address, when each request is sent and how large it is, and when each answer starts and how long it runs. Requests are not padded, so their sizes are visible ([gaps.md](gaps.md#passive-traffic-analysis)). Inside its enclave the gateway sees the prompt, the answer and the credit that pays for them. It does not see which account the credit came from.
+Eidola keeps everything personal on your machine, never in a cloud profile:
 
-**What protects it.** TLS ends inside the gateway's enclave, and the app checks the enclave's attestation on every new connection against the identity compiled into it, refusing on any mismatch ([client.md](client.md#per-handshake-attestation-no-caching)). The request carries anonymous credit and no account credentials; a request carrying account credentials is refused ([gateway.md](gateway.md#linked-vs-unlinked)). A streamed answer leaves as fixed-size frames on a fixed tick, and every other response is padded to a size bucket ([gateway.md](gateway.md#response-shape)).
+- **Conversations and account state** live in a local database in your device's application storage. Your device is the only place your account identity and your conversations ever meet.
+- **Your anonymous wallet** holds your credit tokens locally. The client generates each token's secrets, requests blind signatures from the gateway, and spends tokens on inference without revealing which account funded them ([Anonymous credits](anonymous-credits.md)).
+- **Stream assembly.** The gateway serves every chat answer as a stream. Even when you ask for one complete answer (from the CLI or a non-streaming local tool), your client reads the stream and assembles it locally — so if a connection drops halfway through, you still keep the text you paid for and settle cleanly on what was generated.
+- **Self-update verification.** Checking whether an update is legitimate runs entirely inside the client, checking signatures and transparency-log proofs locally against its compiled-in trust root ([Releases](releases.md)).
+- **Prefix-cache keys.** Reusing work an inference engine has already done on the earlier turns of a conversation makes follow-up turns much faster and cheaper. To scope that reuse strictly to one conversation, the client generates a random cache key for each conversation lineage (one participant in one space) and only sends it for models that support prefix caching. Because a shared key links the turns that carry it, the client automatically rotates it whenever the conversation goes idle past the model's declared retention window, hits its maximum age, or switches models — and never sends cache keys for requests coming through the local inference proxy. Keys live only in your local database and are never logged or exported.
 
-### Account
+> [!NOTE]
+> **Configuration overrides.** Developers and self-hosters can override where the client connects (the server URL, accepted enclave measurements, and hardware root CAs) through Settings or `eidola configure`. Overrides never disable attestation — they only change which enclave identity is expected — and release-verification rules cannot be overridden at all. Eidola's [privacy guarantees](privacy-guarantees.md) apply only to official releases running under the built-in trust root with no overrides set.
 
-The app manages its account at the gateway: creating it, accepting terms, converting purchased credit into anonymous credit, and starting a purchase, a visit to the billing portal or a repair.
+## The gateway
 
-**Who can see it.** The same network parties as for chat, and the gateway.
+The gateway is the single front door to Eidola's hosted compute. It runs inside a confidential-compute VM whose entire boot image and deployment configuration are measured at launch and verified by every connecting client. TLS terminates **inside that enclave**: the private key is generated in enclave memory and has no export interface, so neither the hosting provider nor Eidola's operators can inspect traffic in transit. The gateway is purely request-based — it keeps no conversation history, no cross-request memory, and no operator interface for inspecting, flagging, or replaying traffic.
 
-**What they see.** On the network, the same as for chat. The gateway sees the account (a random identifier, with no name or email), when it converts credit and how much, the terms it accepted, and its purchase and repair requests. It never sees a prompt here.
+### Linked vs. unlinked surfaces
 
-**What protects it.** The same attested TLS as chat. Anonymous credit is signed blind: the gateway signs it without seeing it, and cannot recognise it later when it is spent ([anonymous-credits.md](anonymous-credits.md#issuance-blind-signing)). The app converts credit ahead of need, at random times and in one public amount, so a conversion cannot be matched to a later request by time or size ([anonymous-credits.md](anonymous-credits.md#issuance-timing)).
+The gateway's core privacy boundary is a strict structural split across its HTTP endpoints:
 
-### Inference
+| Surface | Authentication | Knows your account? | Sees prompts or answers? |
+| --- | --- | --- | --- |
+| **Public** | None | No | No |
+| **Linked** (account & billing) | Account ID + secret (HTTP Basic header) | Yes | No |
+| **Unlinked** (inference) | Anonymous credit tokens (request body) | **No** | Only in enclave memory while routing |
 
-The gateway forwards each request to an engine serving the model it names, and relays the answer.
+Which surface an endpoint belongs to is fixed in code, not configuration. Account endpoints accept only account credentials and never handle inference; inference endpoints accept only anonymous credit tokens.
 
-**Who can see it.** The hosting provider, which runs the engine's machine and the network between the two enclaves, and Eidola as operator.
+With full access to the database, nobody at Eidola can connect an inference request to the account that paid for it, or link two inference requests to the same user. For the full story of how tokens are issued, rotated, buffered, spent, and recovered across crashes without leaking identity, see [Anonymous credits](anonymous-credits.md).
 
-**What they see.** On the network, encrypted traffic: when a request goes, how large it is, and when its answer starts and how long it runs. Requests that share a prefix-cache key go to the same engine, so where they go links them ([privacy-guarantees.md](privacy-guarantees.md#2-unlinkability)). The engine sees the prompt, the answer, the weights it is asked for and the cache key. It never sees a credit, an account or a trace.
+Account billing reconciliation — receiving Stripe webhooks, handling refunds, disputes, and account closures — runs in separate billing processes sharing Postgres. Those processes never touch the inference path or anonymous spend records, and cannot identify or recall tokens that have already been issued.
 
-**What protects it.** TLS ends inside the engine's confidential VM, and the gateway checks its attestation on every connection against the deployments pinned in the gateway's own measured build. The database records only where engines are, never which to trust ([engine.md](engine.md#what-pins-the-engine)). The engine answers in fixed frames on a fixed tick too, and keeps cached prompt state encrypted between requests under a key derived from the client's.
+### Response shaping
 
-### Spends
+Even over encrypted TLS, a streamed AI answer can leak information through packet sizes and timing: each token arrives as its own encrypted chunk, and published attacks can recover topics and phrases from token lengths and pacing alone.
 
-The gateway records each spend of anonymous credit, so that none is spent twice.
+To hide token-level shape on **both** network hops — between your device and the gateway, and between the gateway and the inference engine — every streamed chat answer is re-framed into fixed-size frames sent on a fixed clock tick (padding any spare space in each frame with whitespace ignored by standard stream readers). Every non-streaming response, including errors and refusals, is padded to a fixed power-of-two size bucket, and refusals never echo back what your request contained.
 
-**Who can see it.** Whoever can read the database: its host, and anyone holding its credentials.
+Response shaping hides individual token sizes and inter-token rhythm. It does **not** hide that a connection happened, when it started, how long the whole answer took, the size of your outgoing request (requests are not padded yet; see issue [#620](https://github.com/eidola-ai/eidola/issues/620)), or the engine's own hardware activity as observed by its host. See [Known gaps](gaps.md#network-and-metadata).
 
-**What they see.** One record per spend: the key the credit was issued under, a serial number revealed only by spending, and a sealed refund. No account, no amount and no time. The record is written when a request is accepted and again when it ends, so someone watching the database as it changes learns when requests start and how long they run ([gaps.md](gaps.md#spend-timing-at-the-database)).
+### Telemetry and logs
 
-**What protects it.** Nothing written on the inference path names an account, an amount, a time or any content, or shares a key with the account records ([anonymous-credits.md](anonymous-credits.md#what-postgres-may-hold)). The refund is sealed under a key derived from the client's own secret, which the operator does not hold ([anonymous-credits.md](anonymous-credits.md#sealed-refund-tokens)).
+Operating a real service requires knowing whether engines are healthy and where latency is going, but does not require creating a per-request audit trail.
 
-### Account records
+- **Aggregated in the enclave.** The gateway and engines record internal timing spans, convert them into aggregate counters and histograms *inside the enclave*, and discard the individual spans. Only coarse periodic aggregates leave for Grafana, labelled strictly from fixed lists (models are resolved to their weights hash on arrival; unrecognized inputs collapse to a shared bucket). Nothing per-request is exported by default.
+- **No per-request logs.** Because every log line carries a timestamp, logging routine per-request events (like refusals) could let an observer correlate timing across surfaces. Routine conditions are counted in aggregate metrics instead. Logs are reserved for genuine incidents — misconfiguration, engine health changes, and rare server errors — with internal error messages redacted before leaving the enclave.
+- **Opt-in tracing.** A request produces an exported trace only if the caller explicitly requests one by sending a sampled W3C `traceparent` header (used when we profile our own traffic).
 
-The gateway keeps each account and its history.
+## The inference engine
 
-**Who can see it.** The same as for spends.
+Models do not run inside the gateway. They run on **Eidola's own Rust inference engine**, deployed in separate confidential VMs where all participating hardware — the CPU and any attached GPUs — operates in confidential-compute mode and is transitively bound into the checked measurement. Each deployment serves exactly one open-weight model.
 
-**What they see.** Each account's random identifier, a hash of its secret, and its Stripe customer reference; the terms it accepted; one entry per conversion of credit, with the amount and time; queued repair requests; and the gateway's signing keys, encrypted. The gateway also reads here which engines are available.
+### Why we built our own engine
 
-**What protects it.** No name, email or other personal information is collected. Account records and spend records share nothing to join them by ([privacy-guarantees.md](privacy-guarantees.md#2-unlinkability)).
+Most hosted AI providers wrap off-the-shelf serving stacks like vLLM. We chose to write a compact, purpose-built Rust engine instead, for four reasons that matter directly to users:
 
-### Checkout
+1. **Auditability and reproducibility.** General-purpose serving engines are massive, fast-moving codebases spanning Python, C++, and runtime-compiled CUDA, built to support hundreds of models across dozens of hardware setups. Auditing every path a prompt takes — or reproducing the exact binary from source — is practically impossible at that scale. Eidola serves a small, curated set of open-weight models on a tightly bounded set of confidential hardware. That narrow scope makes a small, self-contained Rust engine tractable: its binary is built reproducibly from source, and its GPU kernels are compiled ahead of time (with no runtime JIT compilation) and checked against a committed hash manifest.
+2. **Batch isolation.** In conventional inference engines, floating-point execution order varies with batching and scheduling — meaning the exact output your prompt produces can depend subtly on what other users' prompts happen to be running in the same batch. That may not look like a blatant data leak, but it is a weak isolation boundary between users sharing a GPU, and weak boundaries get exploited. Eidola's engine enforces **batch invariance**: your logits and outputs depend strictly on your own tokens, never on who else is scheduled beside you, how requests are chunked, or which memory slots they occupy.
+3. **Client-encrypted prefix caching.** Standard serving engines keep cached conversation state sitting in plaintext in GPU or host memory, shared across requests and discounted after the fact. Owning the engine lets Eidola isolate each conversation's cache under a key the client supplies and rotates, encrypt idle KV cache entries under a key derived from the client's (which the engine does not retain), and verify a client's [declared cached prefix](anonymous-credits.md#declared-prefix-caching) *before* doing any compute.
+4. **Clean continuation.** To keep upfront anonymous-credit holds small without leaking wallet balances, the client requests bounded output lengths and automatically continues long answers across follow-up requests ([Output ceilings and automatic continuation](anonymous-credits.md#output-ceilings-and-automatic-continuation)). General-purpose engines rarely guarantee that an answer stopped at a token limit — especially mid-reasoning — can be resumed cleanly. Owning the engine lets Eidola explicitly signal when a length-limited output is cleanly continuable and resume it seamlessly from that boundary.
 
-The gateway asks Stripe for prices, creates the account's Stripe customer, starts checkouts and billing-portal sessions, and reads whether a subscription is in force.
+### Pinning and attestation
 
-**Who can see it.** Stripe, and the network in between.
+You don't take our word that a model runs in confidential compute — that property is enforced structurally by the same verification chain that pins the gateway:
 
-**What they see.** Stripe sees the account's identifier, the price chosen, and when. It sees nothing about inference.
+- **The gateway pins its engines at build time.** Every accepted engine deployment is compiled into the gateway's own measured image: its confidential-VM boot image measurement, the SHA-256 of its committed deployment configuration, its host and hardware policy (including any attached GPUs), and the exact **weights hash** of the model it serves ([Model identity](model-identity.md)). Because the client pins the gateway's measurement, one client release transitively fixes the entire inference path — gateway, engine, hardware mode, and model weights.
+- **Database placement matters for availability only.** Postgres tells the gateway *where* running engines can be reached, but never *which* ones to trust. On every new TLS connection to an engine, the gateway runs the same per-handshake hardware attestation verifier the client uses, and probes the engine's weights hash before sending any user request. An engine whose attestation or weights don't match the compiled-in pin is refused before a single prompt crosses the wire.
+- **Updates roll in order.** Nothing can add an engine pin at runtime. Adding a model or changing an engine image requires a new gateway build and a new client release that pins it.
 
-**What protects it.** What the gateway sends is fixed by its measured code, and no trace context leaves on any outbound call ([gateway.md](gateway.md#client-directed-tracing)). Stripe can connect an account to the person who paid for it; Eidola's promise is that payment cannot be connected to use ([privacy-guarantees.md](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise)).
+**What remains trusted at this layer** (as distinct from what is verified):
 
-### Telemetry
+- **Hardware vendors.** AMD, Intel, and NVIDIA are trusted to manufacture genuine confidential-compute hardware and honest attestation keys ([Threat model](threat-model.md#hardware-vendor-forgery)).
+- **GPU checks inside the measured guest.** Where a deployment uses GPUs, the measured boot image runs NVIDIA's attestation verifier on each GPU at startup and refuses to open them unless it passes, and our engine checks before using any GPU that confidential-compute mode is active and developer tools are off. On each request handshake, the gateway verifies the VM's hardware attestation and checks the nonce-labelled GPU evidence count, rather than re-appraising NVIDIA's certificate chain itself ([Known gaps](gaps.md#gpu-attestation-and-host-endorsements)).
+- **Platform boot images and host endorsements.** Both the gateway and engines boot confidential-VM images published by our hosting platform (Tinfoil), pinned by hash and reproduced by us from their public build definition, though some upstream inputs (Ubuntu packages, Docker runtime, NVIDIA driver/CUDA toolkit) are binary inputs rather than source-bootstrapped. For endorsed-host engine deployments, the allowlist of machines and firmware floors comes from Tinfoil's signed platform endorsements committed into the gateway build ([Known gaps](gaps.md#non-source-bootstrapped-build-inputs)).
 
-The gateway, the engines, the webhook receiver and the billing worker each send operational telemetry to Grafana.
+### Memory, caching, and shutdown
 
-**Who can see it.** Grafana, and the networks in between, the hosting provider's among them.
+Everything an engine computes from your prompt stays strictly in ephemeral enclave memory — never logged and never written to disk.
 
-**What they see.** From the gateway: counts, durations and token totals, aggregated in the enclave over each export interval and labelled only from fixed lists; a log line for each misconfiguration, engine health change or server error, with its content redacted; and a per-request trace only for a request that asked to be traced. From each engine, on the same interval: counts of requests, tokens and prefix-cache activity, and how much work is waiting, running and held in memory, labelled by model and a random id for the engine process. An interval in which a single request fell describes that one request. From the billing processes: counts of Stripe notifications, jobs and calls to Stripe, purchases with their amounts by kind and currency, refunds and disputes, and how much work is waiting.
+- **Unkeyed requests leave nothing behind.** When a request without a prefix-cache key finishes, the engine zeroes and releases the memory it used. (Released memory in general host allocations is reclaimed on normal reuse; KV pools and host-tier buffers are explicitly zeroed on free.)
+- **Encrypted idle prefix cache.** When a request carries a client prefix-cache key, the engine retains the computed prompt state only within the model's declared idle and maximum-age limits, and only a later request presenting the same key can reuse it. Between requests, idle cache entries are encrypted under a key derived from the client's own cache key — which the engine does not keep — so the engine itself cannot read an idle entry on its own. Under GPU memory pressure, encrypted entries can be demoted to page-locked enclave RAM and promoted back on a hit, still encrypted while idle. Lookup keys are one-way hashes that reveal neither your prompt nor your cache key.
+- **Clean failure on hangs.** If an engine encounters an unrecoverable error — or if a GPU call hangs past a generous watchdog bound — the engine stops serving, exits for the platform to restart it, and the gateway settles every in-flight request fairly on what was already generated. (Note that a forced watchdog exit cannot run the normal zero-on-free pass before the process terminates; what was in flight stays inside enclave memory until the driver reclaims it.)
 
-**What protects it.** Every label comes from a fixed list, and no identifier, account or Stripe text is ever one. Aggregation happens before anything is sent, so nothing per request leaves unless the request asked for it, and a condition that can happen once per request is counted rather than logged ([gateway.md](gateway.md#telemetry-scope-and-boundary)). An engine coarsens every figure a cached prompt's length could be read from before it exports it, and exports on its own timer at a size that does not follow the values, so the export itself does not show when the engine is busy. What the gateway and the engines send is fixed by their measured code, and the operator chooses only where it goes. The engines' network lets them open connections to any address, so that code is what limits what leaves them. The billing processes see only the account side, so their telemetry holds nothing about inference.
+## How the pieces connect
 
-### Payment
+Every labelled arrow in the [System map](#system-map) links directly to its entry below: who can observe the connection, what they can see, and what protects it.
 
-Your browser pays on Stripe's own pages.
+### Inference and accounts
 
-**Who can see it.** Stripe, and your network.
+#### Chat
 
-**What they see.** Stripe sees who you are as a payer, such as your card and email, and connects that to your account through its customer record.
+The app sends each inference request to the gateway, paid for with anonymous credit, and receives the streamed answer.
 
-**What protects it.** No payment detail passes through Eidola. The separation Eidola keeps is between paying and using: Stripe knows who paid, and the gateway cannot tell which account any request came from ([privacy-guarantees.md](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise)).
+- **Who can see it:** Your network, internet transit providers, the hosting provider's network, and — inside its enclave — the gateway's measured code.
+- **What they see:** On the wire, encrypted traffic: your IP address, when requests happen, request sizes (requests are not padded), and how long each response runs. Inside the gateway enclave: the prompt, the answer, and the anonymous spend paying for it (but never which account funded that spend).
+- **What protects it:** Per-handshake attested TLS terminated inside the gateway enclave; anonymous credit tokens with no account credentials allowed; fixed-frame, fixed-tick response shaping hiding token sizes and rhythm.
 
-### Events
+#### Account
 
-Stripe notifies the webhook receiver that something happened to a payment.
+The app creates an account, records terms acceptance, converts purchased balance into anonymous credit tokens, and opens Stripe checkout or billing-portal sessions.
 
-**Who can see it.** Stripe, the network, and whatever the operator runs in front of the receiver. The receiver runs outside the attested boundary.
+- **Who can see it:** The same network observers as Chat, and the gateway.
+- **What they see:** On the wire, encrypted traffic metadata. Inside the gateway: a random account ID (no name or email), when credits are converted and in what denomination, terms acceptance, and billing requests. Never a prompt.
+- **What protects it:** The same per-handshake attested TLS as Chat. Tokens are blind-signed so the gateway cannot recognize them when later spent, and the app converts credits ahead of need at random intervals in a single standard denomination so conversions don't line up with requests ([Anonymous credits](anonymous-credits.md)).
 
-**What they see.** Only which event happened, of what kind, and to which Stripe object. Stripe's notification carries no customer details.
+#### Inference
 
-**What protects it.** The receiver verifies each notification's signature before keeping it, and holds no key that could ask Stripe for more.
+The gateway forwards each inference request to an attested engine serving the requested model weights and relays the answer back.
 
-### Event queue
+- **Who can see it:** The hosting provider (which operates the machines and the network between enclaves), Eidola as operator (network metadata only), and — inside its confidential VM — the engine's measured code.
+- **What they see:** On the wire, encrypted traffic timing and request sizes. Because requests carrying the same prefix-cache key route to the same engine for cache locality, network observers between enclaves can correlate turns sharing a key by destination as well as timing. Inside the engine: the prompt, the answer, the requested weights hash, and the cache key — never a credit, an account, or a trace.
+- **What protects it:** Per-handshake attested TLS terminated inside the engine's confidential VM against pins compiled into the gateway; weights-hash verification on every request; fixed-frame response shaping between enclaves; encrypted idle prefix caching.
 
-The receiver queues each notification for the billing worker.
+### Database and telemetry
 
-**Who can see it.** Whoever can read the database.
+#### Spends
 
-**What they see.** One entry per notification: its identifier, its kind, the Stripe object it concerns and when it arrived. The receiver touches no account and no record of spending.
+The gateway records each anonymous credit spend in Postgres so no token can be spent twice.
 
-**What protects it.** It stores identifiers only, so the queue holds nothing Stripe did not already say.
+- **Who can see it:** Whoever can read the database — PlanetScale (our database host) and anyone with database credentials.
+- **What they see:** One row per spend: the issuer key ID, a one-time serial number (nullifier) revealed only at spend time, and an encrypted refund blob of fixed length. No account ID, no cost, no model, and no timestamp column. Because each row is written when a request starts and updated when it finishes, a live observer of database writes (or replication logs) can observe request start times and durations ([Known gaps](gaps.md#database-spend-timing)).
+- **What protects it:** Strict schema separation (nothing on the inference path names an account, amount, or content) and client-keyed refund encryption that neither the database nor Eidola can open ([Anonymous credits](anonymous-credits.md#what-the-database-may-hold)).
 
-### Billing work
+#### Account records
 
-The billing worker applies each queued notification to the account records.
+The gateway reads and writes account balances, credit conversions, terms acceptances, encrypted issuer keys, and engine availability in Postgres.
 
-**Who can see it.** Whoever can read the database.
+- **Who can see it:** The same parties as Spends.
+- **What they see:** Random account IDs, hashed secrets, Stripe customer references, terms records, conversion ledger rows (amounts and times), queued repair requests, and encrypted issuer keys — plus the list of reachable engine addresses.
+- **What protects it:** No personal contact information is collected, issuer private keys are encrypted with their validity windows authenticated inside the enclave, and account records share no join key with spend records.
 
-**What they see.** Purchases with the price paid, credit granted, and credit taken back by a refund or a dispute, against the account that bought it.
+#### Telemetry
 
-**What protects it.** The billing processes never read or write spends, their serial numbers or their refunds, so nothing they do can find or recall anonymous credit already converted ([anonymous-credits.md](anonymous-credits.md#payment-reversals)).
+The gateway, inference engines, webhook receiver, and billing worker export operational metrics and incident logs to Grafana Cloud.
 
-### Payment facts
+- **Who can see it:** Grafana Cloud, and the networks in between.
+- **What they see:** From the gateway and engines: periodic aggregate counters and histograms (latencies, token totals, stream outcomes, queue and memory levels) labelled only from fixed sets, plus redacted incident logs. (An interval containing only a single request necessarily reflects that one request.) From the billing processes: job counts, Stripe call counts, and aggregate purchase/refund/dispute amounts by currency, but never an account or Stripe identifier.
+- **What protects it:** In-enclave aggregation before export, fixed label lists, coarsened engine cache counters on a fixed export timer, and measured gateway/engine code fixing exactly what can be sent ([Telemetry and logs](#telemetry-and-logs)).
 
-The billing worker asks Stripe what a notification refers to, and acts on it: it reads checkouts, invoices, charges, refunds, disputes and subscriptions, and it issues refunds and cancels subscriptions.
+### Payments and billing
 
-**Who can see it.** Stripe, and the network in between.
+#### Checkout
 
-**What they see.** Stripe sees which of its own records the worker asks about, and when.
+The gateway fetches current plan prices from Stripe, creates a Stripe customer for an account, opens checkout and billing-portal sessions, and checks subscription status.
 
-**What protects it.** The worker treats a notification only as a reason to look, and takes every fact from Stripe directly. It holds no webhook secret and accepts no connections.
+- **Who can see it:** Stripe, and the network between the gateway and Stripe.
+- **What they see:** The account's random ID, the plan chosen, and when. Nothing about inference.
+- **What protects it:** Measured gateway code fixes what is sent, and no trace context propagates outbound. Stripe can link a payment to a person; Eidola ensures payment cannot be linked to usage.
+
+#### Payment
+
+Your browser opens Stripe's own hosted pages to pay for a subscription or credit top-up.
+
+- **Who can see it:** Stripe, and your network.
+- **What they see:** Your payment method, email, and transaction history, linked to your account's Stripe customer record.
+- **What protects it:** Payment details never pass through Eidola's servers, and spending credits crosses the anonymous-credential boundary before reaching inference.
+
+#### Events
+
+Stripe sends thin webhook notifications to Eidola's webhook receiver when payment events occur.
+
+- **Who can see it:** Stripe, the network, and infrastructure in front of the unattested webhook receiver.
+- **What they see:** Only an event ID, event type, and the ID of the related Stripe object — no customer details.
+- **What protects it:** The receiver verifies Stripe's webhook signature before accepting an event and holds no Stripe API key that could fetch customer details.
+
+#### Event queue
+
+The webhook receiver writes each verified notification ID into Postgres for the billing worker to pick up.
+
+- **Who can see it:** Whoever can read the database.
+- **What they see:** The event ID, type, Stripe object reference, and arrival time. The receiver touches no account rows and no spend records.
+- **What protects it:** Minimal data stored — only the identifiers Stripe already sent.
+
+#### Billing work
+
+The billing worker processes queued events and applies purchases, refunds, and disputes to account balances in Postgres.
+
+- **Who can see it:** Whoever can read the database.
+- **What they see:** Account credit grants, prices paid, refunds, and dispute adjustments against the account ID.
+- **What protects it:** Billing processes never read or write anonymous spend records, so nothing in billing can locate or recall anonymous tokens already issued ([Anonymous credits](anonymous-credits.md#what-the-database-may-hold)).
+
+#### Payment facts
+
+The billing worker queries Stripe directly for the authoritative state behind each queued notification (checkouts, invoices, charges, refunds, disputes, subscriptions) and executes refunds or cancellations.
+
+- **Who can see it:** Stripe, and the network in between.
+- **What they see:** Which Stripe objects the worker inspects or updates, and when.
+- **What protects it:** The worker treats webhook notifications solely as a prompt to check Stripe directly, holds no webhook secret, and accepts no inbound connections.

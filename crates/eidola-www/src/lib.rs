@@ -227,6 +227,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), Error> {
 }
 
 /// Collect `.md` files under `docs/`, returning paths relative to it.
+/// `docs/contributing/` holds internal contributor runbooks and stays on
+/// GitHub rather than being published on the website.
 fn collect_docs(dir: &Path, prefix: &str, into: &mut Vec<String>) -> Result<(), Error> {
     for path in read_dir_sorted(dir)? {
         let name = path
@@ -234,6 +236,9 @@ fn collect_docs(dir: &Path, prefix: &str, into: &mut Vec<String>) -> Result<(), 
             .expect("read_dir yields named entries")
             .to_string_lossy()
             .into_owned();
+        if prefix.is_empty() && name == "contributing" {
+            continue;
+        }
         let rel = if prefix.is_empty() {
             name.clone()
         } else {

@@ -59,6 +59,7 @@ fn rewrite_link(dest: &str, source_dir: &str) -> String {
     let repo_path = parts.join("/");
     if repo_path.ends_with(".md")
         && let Some(rel) = repo_path.strip_prefix("docs/")
+        && !rel.starts_with("contributing/")
     {
         return format!("{}{}", docs_route(rel), fragment);
     }
@@ -261,6 +262,10 @@ mod tests {
         assert_eq!(
             rewrite_link("../crates/eidola-server-gateway/schema/schema.sql", "docs"),
             "https://github.com/eidola-ai/eidola/blob/main/crates/eidola-server-gateway/schema/schema.sql"
+        );
+        assert_eq!(
+            rewrite_link("contributing/README.md", "docs"),
+            "https://github.com/eidola-ai/eidola/blob/main/docs/contributing/README.md"
         );
     }
 

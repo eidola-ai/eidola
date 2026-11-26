@@ -66,7 +66,25 @@ An OpenAI-compatible proxy that routes requests to Eidola's own inference engine
 
 ## Issuer keys, spends and nullifiers (`src/credentials.rs`)
 
-**Every change to credentials, issuance, spends, refunds, recovery, pricing or the billing schema must be checked against [docs/anonymous-credits.md](../../docs/anonymous-credits.md)**, which records each decision those paths carry, where it is enforced, and what would break it. A change to one of those decisions updates that page in the same pull request.
+**Every change to credentials, issuance, spends, refunds, recovery, pricing or the billing schema must satisfy the review checklist below** (and keep the public design explanation in [docs/anonymous-credits.md](../../docs/anonymous-credits.md) accurate when a design decision changes):
+
+- Is every spend still paid in full, up front, by an amount fixed by the request alone: by what it contains and what it declares, never by what an engine's cache held?
+- Is a request that declares a cached prefix still refused before any work unless the declaration holds, and never repriced or clamped?
+- Does every path after a nullifier is recorded still issue a refund, under the spent token's own key, and overwrite the provisional one, within the request deadline, and still charge at least the request fee?
+- Is the hold still exactly the worst case, on both sides, as the sum of a request's shares?
+- Are a request's inputs still recorded all or none, taken by the client all or none under the spend gate, charged in input order, and refunded each under its own key?
+- Does a credential still travel only in the request body, and never into a log, a Record row or an engine?
+- Is every key use still checked against its deadline, and no nullifier pruned while its key could accept a spend?
+- Is every balance check still serialized with its debit?
+- Does nothing new persist, log or export a charge, a refund amount, a timestamp per spend, or a value derived from a request's content, outside the enclave?
+- Does nothing new give two clients different keys, contexts or separators?
+- Is every issuer key still on the public calendar, one per epoch, with its windows bound into its encryption, and does the client still refuse a key that is off the calendar or is not the one it recorded for the epoch?
+- Does the client still check what the issuer chose (context, amount, key) before storing a token?
+- Is no new value made to outlive the key it was issued under?
+- Is every issuance still either ahead of need at a time no request decides, or the just-in-time fallback, and is its amount still the standard size rule? Does a request sent again after a refused declaration still convert nothing?
+- Is the ceiling the client asks for still a function of the request and public numbers alone?
+- Does every debit for an issuance still happen in the transaction that stores its response, after the stored lookup, under the account lock?
+- Does no idempotency key, request digest or stored response ever reach the inference surface or a log?
 
 Each issuer key has three instants: `issue_from` / `issue_until` (issuance) and `accept_until` (spending), all a function of its epoch on the public calendar (`eidola_common::issuer_calendar`: seven-day epochs from the Unix epoch, accepted for one more). Decrypted keys live in an in-memory `KeyCache` shared by every handler.
 
@@ -117,7 +135,7 @@ CI enforces the ordering contract: any PR changing a legal document's bytes must
 
 ## Observability
 
-OpenTelemetry ships metrics and logs directly to Grafana Cloud (or any OTLP endpoint) via HTTP/protobuf, enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` is set and not empty; otherwise stdout logging only. It ships **no traces**. Instruments and the trace pipeline live in `telemetry.rs`; `middleware.rs` opens the root request span. Full reasoning in [docs/gateway.md](../../docs/gateway.md#telemetry-scope-and-boundary), enforcing `privacy-guarantees.md` §3.2–3.3:
+OpenTelemetry ships metrics and logs directly to Grafana Cloud (or any OTLP endpoint) via HTTP/protobuf, enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` is set and not empty; otherwise stdout logging only. It ships **no traces**. Instruments and the trace pipeline live in `telemetry.rs`; `middleware.rs` opens the root request span. Full reasoning in [docs/architecture.md](../../docs/architecture.md#telemetry-and-logs), enforcing `privacy-guarantees.md` §3.2–3.3:
 
 - **Spans are recorded everywhere and exported only when a request asks to be traced.** `AggregatingSpanProcessor` sees every span and turns it into a histogram observation; a batch exporter is also registered but drops unsampled spans, and `ClientDirectedSampler` returns `RecordOnly` unless middleware installed a sampled parent. Never switch the sampler to `AlwaysOn` (everything exports) or `AlwaysOff` (yields `Drop`, which is non-recording — `on_end` stops firing and every aggregate silently reads zero). There is deliberately no route classifier: the rule is uniform so nothing can be misclassified, which is how `/v1/credentials/refund` was silently traced under the old prefix rule.
 - **Client-directed tracing lives in one place**, `requested_trace_parent` in `middleware.rs`: a hand-parsed `traceparent` whose sampled flag is honored, and nothing else. **Do not install a `TextMapPropagator`** — a global one also injects trace context into the server's outbound calls, putting the trace id on requests to the engines, Stripe, and the terms feed. Today no outbound request carries trace context. The sampler must stay unable to promote a trace on its own; it only propagates middleware's decision to child spans. **And keep the trace layer's context activation off** (`otel_trace_layer` in `telemetry.rs`): the `tracing-opentelemetry` default attaches each entered span's OTel context to the ambient task-local, and the SDK logger stamps that context's trace id onto every exported log record, sampled or not — regrouping a request's log lines under one id. `exported_logs_carry_no_trace_context` pins this.

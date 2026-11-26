@@ -3,7 +3,7 @@
 # docs/, the label is the short sidebar name (doc h1s are often too long
 # for a 200px rail). The build fails if an entry points at a missing file
 # or if a docs page is missing from this nav — when adding a doc, add it
-# here too.
+# here too. (`docs/contributing/` is excluded from the website.)
 
 [[sections]]
 title = ""
@@ -11,45 +11,32 @@ pages = [["README.md", "Overview"]]
 
 [[sections]]
 title = "Start here"
+pages = [["paradigm.md", "How to think about Eidola"]]
+
+[[sections]]
+title = "User guide"
 pages = [
-    ["paradigm.md", "Paradigm"],
-    ["privacy-guarantees.md", "Privacy guarantees"],
-    ["threat-model.md", "Threat model"],
+    ["guide/getting-started.md", "Getting started"],
+    ["guide/hosted-models.md", "Running hosted models"],
+    ["guide/local-models.md", "Local & external models"],
+    ["guide/tools-and-cli.md", "Command line & other tools"],
 ]
 
 [[sections]]
-title = "Design pieces"
+title = "How it works"
 pages = [
     ["architecture.md", "Architecture"],
-    ["client.md", "The client"],
-    ["gateway.md", "The gateway"],
-    ["engine.md", "The engine"],
-    ["model-identity.md", "Model identity"],
     ["anonymous-credits.md", "Anonymous credits"],
+    ["model-identity.md", "Model identity"],
+    ["releases.md", "Verifiable releases"],
+    ["apps.md", "Apps & platform verification"],
 ]
 
 [[sections]]
-title = "Release flow"
+title = "Trust & limits"
 pages = [
-    ["releases.md", "Releases"],
-    ["verification.md", "Verification"],
-    ["trust-root.md", "Trust root"],
-    ["apple-distribution.md", "Apple distribution"],
-]
-
-[[sections]]
-title = "What's missing"
-pages = [["gaps.md", "Known gaps"]]
-
-[[sections]]
-title = "Operations"
-pages = [["vendors.md", "Vendors"]]
-
-[[sections]]
-title = "Contributing"
-pages = [
-    ["contributing/README.md", "Runbooks"],
-    ["contributing/release-attestant-yubikey.md", "Attestant YubiKey"],
-    ["contributing/release-apple-signing-yubikey.md", "Apple CI YubiKey"],
-    ["contributing/rebuilding-platform-images.md", "Platform image rebuild"],
+    ["privacy-guarantees.md", "Privacy guarantees"],
+    ["threat-model.md", "Threat model"],
+    ["gaps.md", "Known gaps"],
+    ["vendors.md", "Infrastructure & vendors"],
 ]

@@ -1,54 +1,54 @@
 # How to think about Eidola
 
-Privacy claims about an AI product are easy to make and hard to check. Eidola is built so that its claims can be checked, and so that they do not depend on the operator's intentions.
+Today, most AI products demand enormous trust: when you send your thoughts to someone else's server, the software and models behind it can change at any moment without telling you, and your only assurance of privacy is a company's policy page.
 
-The operating paradigm is **user sovereignty**: the user runs software they control, on hardware they choose, talking to systems whose properties they can verify. Where the user relies on infrastructure we provide, they can verify what is running on it and hold Eidola to the [privacy guarantees](privacy-guarantees.md) it publishes.
+Eidola takes a different approach — one that used to be ordinary. When software came on a CD and ran on your own computer, its behavior couldn't silently change, and your files, drafts, and habits stayed yours. That wasn't because the software vendor was unusually virtuous; it was because the structure of the technology made anything else impossible.
 
-Three principles follow, and the rest of these docs assume them.
+Modern AI models are often too large for a laptop or phone, so running them means reaching a data center. **Eidola is designed to extend the sovereignty of a local tool to remote compute** — so that using a hosted machine doesn't mean surrendering control of your work, your privacy, or the software you rely on.
 
-## 1. The client is sovereign
+## Compute, not proprietary AI
 
-Eidola is an installed application: software on a device you control, running locally, with its own data. Some of what it does needs remote compute that no consumer device can supply. The trust architecture extends the installed-app model to those remote interactions without giving up the integrity and confidentiality a user has on their own machine.
+Eidola's paid service sells **private compute**, not proprietary AI.
 
-Every decision about what to run, what to trust, and whether to talk to a given server is made locally, against values compiled into the client before it shipped.
+Most AI products sell "intelligence as a service" — an arrangement where another company sits inside your conversations as a party to your work. Eidola provides "compute as a service," operating more like a utility supplying electricity or fuel: it delivers the raw power your AI workloads need, with effectively no visibility into what you do with it.
 
-A client binary trusts **exactly one gateway build**, and that build fixes the inference engines it accepts. The trust root (measurements, identity patterns, fingerprints, and policy constants) is embedded at compile time. Every release rebuilds the clients, the gateway and its engine pins together so that their values correspond, and nothing hands trust over at runtime. See [client.md](client.md).
+The models you run through Eidola are open-weight models — publicly released files that anyone can download and inspect. The engine that runs them is open source too. If you own or rent the hardware, you can run the exact same models on the exact same engine without involving Eidola at all. And inside the Eidola app, you can run smaller open models directly on your own computer, or point the app at any server you already control, with no Eidola account required.
 
-The client **fails safe**: if anything in the verification chain cannot be confirmed, the connection is refused. There is no fallback to an unverified path.
+What our paid service does is make large models practical and affordable for ordinary people who don't have a rack of GPUs or the time to operate one — without asking them to trade away privacy to get there.
 
-Your data (chat history, drafts, accounts) lives on your device. A request that needs remote computation is sent only to confidential-compute enclaves, with TLS terminated inside the enclave, so that no host, operator, or network observer, us included, can read it in transit, and nothing writes it to storage or logs.
+## Three principles
 
-## 2. Code is the trust boundary, not policy
+Everything in these docs follows from three design principles.
 
-Privacy guarantees in Eidola are properties of the *running code*, not of an operator's stated policy. The user can verify which code is running because:
+### 1. Your device is sovereign
 
-- **The source is public and the builds are reproducible.** Anyone can rebuild the released binaries from the committed source and get the same bytes. The expected hashes are committed beside the source and re-derived in CI.
-- **Servers run in confidential compute.** The gateway and the inference engines run in confidential VMs, each on AMD SEV-SNP or Intel TDX as its deployment names (today the gateway on SEV-SNP, and the engines on TDX with NVIDIA confidential-computing GPUs). The client verifies the gateway's hardware attestation on every TLS handshake, and the gateway verifies each engine's the same way. Each checks against measurements compiled into its own build. See [gateway.md](gateway.md) and [engine.md](engine.md).
-- **Releases are attested by named people.** Every release [carries a signed attestation](releases.md), in wording the previous version of the app fixes and verifies, that the release meets the versioned properties in [Privacy guarantees](privacy-guarantees.md). Each attestant's key fingerprint is pinned in the prior client, so the chain of authorized attestants is unbroken across releases.
+Eidola is an installed application on hardware you control. Your conversations, drafts, settings, and wallet live locally on your device — never in a cloud account we can browse or take away.
 
-Together these make the guarantees auditable: whether chat history is logged is a question about the running code, which can be read, and a named person has signed that the code matches the claims.
+Every trust decision happens on your device, against values compiled into the app before it shipped:
 
-## 3. Limits are stated
+- **One client pairs with one exact server build.** Your app doesn't just check a domain name or a TLS certificate; on every new connection, it verifies a hardware proof that the server is running the exact measured build paired with the release installed on your machine — and that server, in turn, verifies the exact inference engines it talks to.
+- **Updates require you.** Neither the client nor the server changes underneath you. A new server build reaches you only when you review and install a new client release that pins it.
+- **Failure is refusal.** If anything in the verification chain cannot be confirmed, the app refuses to connect. There is no degraded mode and no "proceed anyway" button.
 
-Eidola's residual trust assumptions and deferred defenses are catalogued in the [threat model](threat-model.md) and [known gaps](gaps.md). If a threat scenario is missing, open an issue or a pull request.
+### 2. Structure over promises
 
-## Who these documents are for
+Privacy claims are easy to write and hard to audit. In Eidola, the guarantees that matter are properties of the *running code* — enforced by cryptography, hardware isolation, and reproducible builds rather than by operator goodwill:
 
-A **technically curious user** who wants to evaluate Eidola against the alternatives can read [Privacy guarantees](privacy-guarantees.md) for the enumerated properties, and the component pages for how the design upholds them.
+- **Public source and reproducible builds.** Anyone can read the code, rebuild the released binaries from source, and verify that they get the same bytes.
+- **Verified confidential compute.** Both the gateway and the inference engines run inside hardware-attested confidential enclaves, with TLS terminated inside each enclave. No hosting provider, network observer, or Eidola operator can read your prompts in transit or in memory, and nothing writes them to storage or logs.
+- **Payment separated from use.** Buying credits touches a payment processor; spending them uses anonymous cryptographic tokens that cannot be linked back to your account or to each other — even with full access to our database.
+- **Accountable human attestations.** Every release requires signed attestations from named humans — using hardware-held keys and recorded on a public transparency log — affirming that they reproduced the build, reviewed the diff against our [privacy guarantees](privacy-guarantees.md), and are signing freely, without coercion.
 
-A **reader doing due diligence** (a security engineer, a privacy researcher) can check every claim against the source in this repository.
+No single person can audit every line of code, every cryptographic detail, and every build pipeline on their own — and we don't expect you to. Making the entire chain verifiable means *anyone* you choose to trust — a technical friend, an independent researcher, a security auditor — can inspect it on your behalf, rather than forcing you to take our word for it.
 
-These docs may be incomplete, and may drift from the code. The code is the source of truth. If you find a divergence, please open an issue or a pull request.
+### 3. Limits are stated plainly
 
-## Where to read next
+No system eliminates trust completely. Every architecture rests on layers it cannot verify from inside itself — from the hardware vendors who manufacture confidential-compute chips, to the network metadata visible to your ISP, to the security of your own device.
 
-- [Privacy guarantees](privacy-guarantees.md) — the specific commitments in each release.
-- [Threat model](threat-model.md) — who you're trusting and who you're not.
-- [Architecture](architecture.md) — every part and connection, and what each connection reveals.
-- [The client](client.md) — the trust root and what the client refuses.
-- [The gateway](gateway.md) — what runs in confidential compute, and what is deliberately kept apart from it.
-- [The engine](engine.md) — where models run, and how that layer is pinned.
-- [Releases](releases.md) — how a new binary becomes trustable.
-- [Verification](verification.md) — payload, archive, envelope, installable, and the hashes a user checks.
-- [Known gaps](gaps.md) — what we don't yet defend against.
-- [Trust root](trust-root.md) — the technical specification.
+Rather than glossing over those edges, we document them explicitly in our [threat model](threat-model.md) and [known gaps](gaps.md). Where a defense is incomplete or depends on ongoing ecosystem work, we say so plainly so you can decide whether Eidola fits your own threat model.
+
+## Where to go next
+
+- **Want to try Eidola?** Start with [Getting started](guide/getting-started.md).
+- **Want to see how the pieces fit together?** Read [Architecture](architecture.md) for the interactive system map and end-to-end walkthrough.
+- **Want to inspect what we commit to — and what we don't?** Read [Privacy guarantees](privacy-guarantees.md), [Threat model](threat-model.md), and [Known gaps](gaps.md).
