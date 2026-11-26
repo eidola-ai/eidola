@@ -43,7 +43,7 @@ rustls = { version = "0.23", default-features = false, features = ["std"] }
 # Hashing. Pinned to 0.10 because the rsa crate's `VerifyingKey<D>`
 # bounds require `D: rsa::sha2::Digest`, which only resolves when our
 # `Sha384` comes from the same `sha2` version rsa was compiled against.
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
 
 # Encoding
 base64 = "0.23"
