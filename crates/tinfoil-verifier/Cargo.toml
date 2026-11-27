@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # SEV-SNP attestation report parsing and certificate chain verification
-sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
+sev = { version = "9", default-features = false, features = ["snp", "crypto_nossl"] }
 
 # Intel TDX quote verification (pure Rust, RustCrypto backend): PCK chain to
 # the pinned Intel SGX root with CRL checks, TCB Info / QE Identity

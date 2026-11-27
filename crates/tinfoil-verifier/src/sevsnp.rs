@@ -250,11 +250,16 @@ impl SevSnpGeneration {
             }
         };
         // The parser read every TCB_VERSION in the layout of the generation it
-        // took from these same bytes; only Turin's layout has an FMC byte.
+        // took from these same bytes; only Turin's layout has an FMC byte, and
+        // both carry the bootloader and microcode SVNs Venice's layout drops.
         let turin_layout = generation == Self::Turin;
         if [report.reported_tcb, report.committed_tcb]
             .iter()
-            .any(|tcb| tcb.fmc.is_some() != turin_layout)
+            .any(|tcb| {
+                tcb.fmc.is_some() != turin_layout
+                    || tcb.bootloader.is_none()
+                    || tcb.microcode.is_none()
+            })
         {
             return Err(Error::Report(format!(
                 "report TCB layout does not match its {generation} CPUID"
@@ -432,7 +437,7 @@ fn check_vcek_binding(
         microcode: spl(OID_UCODE_SPL, "ucodeSPL")?,
         fmc,
     };
-    let reported = SevSnpTcbSvns::from(report.reported_tcb);
+    let reported = SevSnpTcbSvns::try_from(report.reported_tcb)?;
     if cert_tcb != reported {
         return Err(Error::CertChain(format!(
             "report reported_tcb ({reported}) is not the TCB its VCEK was endorsed for \
@@ -524,15 +529,24 @@ pub struct SevSnpTcbSvns {
     pub fmc: Option<u8>,
 }
 
-impl From<TcbVersion> for SevSnpTcbSvns {
-    fn from(t: TcbVersion) -> Self {
-        Self {
-            bootloader: t.bootloader,
+/// Refuses a TCB_VERSION without a bootloader or microcode SVN (Venice's
+/// layout), which no floor here can be held to.
+impl TryFrom<TcbVersion> for SevSnpTcbSvns {
+    type Error = Error;
+
+    fn try_from(t: TcbVersion) -> Result<Self, Error> {
+        let (Some(bootloader), Some(microcode)) = (t.bootloader, t.microcode) else {
+            return Err(Error::Report(
+                "report TCB_VERSION carries no bootloader or microcode SVN".to_string(),
+            ));
+        };
+        Ok(Self {
+            bootloader,
             tee: t.tee,
             snp: t.snp,
-            microcode: t.microcode,
+            microcode,
             fmc: t.fmc,
-        }
+        })
     }
 }
 
@@ -651,8 +665,24 @@ impl SevSnpTcbPolicy {
         report: &AttestationReport,
         generation: SevSnpGeneration,
     ) -> (SevSnpTcbObservation, Result<(), Error>) {
-        let reported = SevSnpTcbSvns::from(report.reported_tcb);
-        let committed = SevSnpTcbSvns::from(report.committed_tcb);
+        // `of_report` refuses such a report before any caller gets here; an
+        // absent SVN cannot meet a floor, so it is counted below one.
+        let (reported, committed) = match (
+            SevSnpTcbSvns::try_from(report.reported_tcb),
+            SevSnpTcbSvns::try_from(report.committed_tcb),
+        ) {
+            (Ok(reported), Ok(committed)) => (reported, committed),
+            (Err(e), _) | (_, Err(e)) => {
+                let observation = SevSnpTcbObservation {
+                    generation,
+                    reported_tcb: SevSnpTcbSvns::default(),
+                    committed_tcb: SevSnpTcbSvns::default(),
+                    chip_id: report.chip_id,
+                    bucket: BUCKET_BELOW_FLOOR,
+                };
+                return (observation, Err(e));
+            }
+        };
 
         let rollback = self.detect_rollback(&reported, &committed);
         let below_floor = self.detect_below_floor(&reported);
@@ -867,17 +897,17 @@ pub(crate) mod tests {
     fn report_with_tcb(reported: SevSnpTcbSvns, committed: SevSnpTcbSvns) -> AttestationReport {
         AttestationReport {
             reported_tcb: TcbVersion {
-                bootloader: reported.bootloader,
+                bootloader: Some(reported.bootloader),
                 tee: reported.tee,
                 snp: reported.snp,
-                microcode: reported.microcode,
+                microcode: Some(reported.microcode),
                 fmc: reported.fmc,
             },
             committed_tcb: TcbVersion {
-                bootloader: committed.bootloader,
+                bootloader: Some(committed.bootloader),
                 tee: committed.tee,
                 snp: committed.snp,
-                microcode: committed.microcode,
+                microcode: Some(committed.microcode),
                 fmc: committed.fmc,
             },
             ..Default::default()
@@ -1380,8 +1410,8 @@ pub(crate) mod tests {
             SevSnpGeneration::of_report(&turin).unwrap(),
             SevSnpGeneration::Turin
         );
-        assert_eq!(SevSnpTcbSvns::from(turin.reported_tcb), tcb);
-        assert_eq!(SevSnpTcbSvns::from(turin.committed_tcb), tcb);
+        assert_eq!(SevSnpTcbSvns::try_from(turin.reported_tcb).unwrap(), tcb);
+        assert_eq!(SevSnpTcbSvns::try_from(turin.committed_tcb).unwrap(), tcb);
 
         // Generations with no pinned chain.
         for (family, model, name) in [(0x19, 0x01, "Milan"), (0x1A, 0x50, "Venice")] {
@@ -1418,6 +1448,35 @@ pub(crate) mod tests {
         genoa.reported_tcb.fmc = Some(1);
         let err = SevSnpGeneration::of_report(&genoa).unwrap_err();
         assert!(err.to_string().contains("layout"), "{err}");
+
+        // Either TCB without a bootloader or microcode SVN, Venice's layout.
+        let genoa = parse_report(&v3_report_bytes(|_| {})).unwrap();
+        for report in [genoa, turin_report(tcb, tcb)] {
+            for drop in [
+                |t: &mut TcbVersion| t.bootloader = None,
+                |t: &mut TcbVersion| t.microcode = None,
+            ] {
+                let mut reported = report;
+                drop(&mut reported.reported_tcb);
+                let mut committed = report;
+                drop(&mut committed.committed_tcb);
+                for report in [reported, committed] {
+                    let err = SevSnpGeneration::of_report(&report).unwrap_err();
+                    assert!(err.to_string().contains("layout"), "{err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tcb_without_bootloader_or_microcode_meets_no_floor() {
+        let mut report = report_with_tcb(svns(9, 9, 9, 250), svns(9, 9, 9, 250));
+        report.reported_tcb.microcode = None;
+        let (observation, result) =
+            SevSnpTcbPolicy::genoa().evaluate(&report, SevSnpGeneration::Genoa);
+        assert!(result.is_err());
+        assert_eq!(observation.as_metric_label(), "below_floor");
+        assert!(SevSnpTcbSvns::try_from(report.reported_tcb).is_err());
     }
 
     #[test]
