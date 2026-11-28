@@ -385,6 +385,53 @@ fn an_unresolvable_utility_model_generates_nothing() {
     });
 }
 
+/// The summary calls' bodies exactly as the mock received them.
+fn summary_calls_sent(mock: &MockServer) -> Vec<Vec<u8>> {
+    mock.chat_sent_bodies()
+        .into_iter()
+        .filter(|b| {
+            let text = String::from_utf8_lossy(b);
+            text.contains(SUMMARY_PROMPT_HEAD)
+        })
+        .collect()
+}
+
+/// **A chore sent to Eidola's gateway is padded to its size bucket, as a turn
+/// is** (privacy guarantees §3.8): a summary call carries the branch it
+/// summarizes, so its size is that branch's. One sent to an engine is sent as
+/// it is.
+#[test]
+fn a_chore_is_padded_on_its_way_to_the_gateway_and_only_there() {
+    for (utility, to_gateway) in [(MODEL, true), (chat_harness::ROUTER_MODEL, false)] {
+        run(move || {
+            let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+                chat: ChatBehavior::OkStreaming,
+                summary: SummaryBehavior::Reply(SUMMARY.into()),
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let fx = branched_space(&core);
+            use_utility_model(&core, &mock, &fx.space, utility);
+            summarize(&core, &fx.space);
+
+            let sent = summary_calls_sent(&mock);
+            assert!(!sent.is_empty(), "{utility}: a summary call");
+            for body in sent {
+                let unpadded = eidola_common::stream_shape::unpadded(&body);
+                let expected = if to_gateway {
+                    eidola_common::stream_shape::request_bucket(
+                        unpadded.len(),
+                        eidola_common::engine_protocol::GATEWAY_MAX_REQUEST_BODY_BYTES,
+                    )
+                } else {
+                    unpadded.len()
+                };
+                assert_eq!(body.len(), expected, "{utility}");
+            }
+        });
+    }
+}
+
 // ===========================================================================
 // Generation and rendering
 // ===========================================================================

@@ -91,7 +91,7 @@ If AMD, Intel, or NVIDIA were to issue fraudulent attestation chains (for exampl
 
 ### N3. A traffic-analysis adversary
 
-An adversary observing network metadata (connection patterns, sizes, timing) can infer a great deal even when content is encrypted. Eidola hides the size and timing of an answer's individual tokens from an observer of the client's connection to the gateway or of the gateway's connection to an engine ([privacy-guarantees.md §3.8](privacy-guarantees.md#3-content)) and nothing more: connection patterns, network identity, request sizes and response durations remain visible. Users who need metadata privacy should layer Eidola behind Tor or a similar anonymity network.
+An adversary observing network metadata (connection patterns, sizes, timing) can infer a great deal even when content is encrypted. Eidola hides the size and timing of an answer's individual tokens from an observer of the client's connection to the gateway or of the gateway's connection to an engine ([privacy-guarantees.md §3.8](privacy-guarantees.md#3-content)) and nothing more: connection patterns, network identity and response durations remain visible, and so do request sizes, to within a size bucket on the client's connection (Eidola's own clients pad every chat request) and exactly on the engine's. Users who need metadata privacy should layer Eidola behind Tor or a similar anonymity network.
 
 ### N4. A user who voluntarily leaks
 

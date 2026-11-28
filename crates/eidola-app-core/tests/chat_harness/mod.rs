@@ -1123,8 +1123,9 @@ pub struct MockServer {
     /// upstream (e.g. regenerate's upstream-only thread).
     chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     /// The exact bytes of every `POST /v1/chat/completions` body, in arrival
-    /// order — for the assertions that are about bytes rather than JSON
-    /// values (a body that must be byte-for-byte what it was before).
+    /// order, spend and padding included — for the assertions that are about
+    /// bytes rather than JSON values (a body that must be byte-for-byte what
+    /// it was before, a body's size on the wire).
     chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     /// Whether each `POST /v1/chat/completions` carried an `Authorization`
     /// header, in arrival order — local turns must send none (no spend).
@@ -1235,8 +1236,15 @@ impl MockServer {
     pub fn chat_bodies(&self) -> Vec<serde_json::Value> {
         self.chat_bodies.lock().unwrap().clone()
     }
-    /// The recorded chat request bodies as sent (see `chat_raw_bodies`).
+    /// The recorded chat request bodies as sent, without their `credentials`
+    /// member (see `chat_raw_bodies`).
     pub fn chat_raw_bodies(&self) -> Vec<Vec<u8>> {
+        let sent = self.chat_raw_bodies.lock().unwrap();
+        sent.iter().map(|raw| without_credentials(raw)).collect()
+    }
+    /// The recorded chat request bodies exactly as sent, spend included: what
+    /// a network observer measures.
+    pub fn chat_sent_bodies(&self) -> Vec<Vec<u8>> {
         self.chat_raw_bodies.lock().unwrap().clone()
     }
     /// The `cache_key` each chat request carried, in arrival order.
@@ -2188,10 +2196,7 @@ async fn handle_conn(
                 }
                 chat_bodies.lock().unwrap().push(body);
             }
-            chat_raw_bodies
-                .lock()
-                .unwrap()
-                .push(without_credentials(&req.body));
+            chat_raw_bodies.lock().unwrap().push(req.body.clone());
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
             chat_spends

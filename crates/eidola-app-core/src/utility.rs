@@ -317,7 +317,11 @@ impl Inner {
             body["stream"] = true.into();
             request = request.header("Accept", "text/event-stream");
         }
-        let mut request = request.json(&*crate::body_with_spend(&body, spend.as_ref()));
+        let mut request = crate::with_chat_body(
+            request,
+            &crate::body_with_spend(&body, spend.as_ref()),
+            target.kind == backends::BackendKind::Eidola,
+        );
         request = crate::with_authorization(request, auth_value.as_deref());
 
         let response = match request.send().await {

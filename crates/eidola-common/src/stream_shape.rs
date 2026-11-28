@@ -22,7 +22,9 @@
 //!
 //! **Every other response** is padded with trailing spaces to a size bucket
 //! ([`body_bucket`], [`pad_body`]); [`unpadded`] is the reader's half for a
-//! body that is not JSON.
+//! body that is not JSON. A chat request is padded the same way by its sender
+//! ([`request_bucket`], [`pad_request_body`]), capped at what its reader
+//! accepts.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -347,6 +349,27 @@ pub fn pad_body(mut body: Vec<u8>) -> Vec<u8> {
     body
 }
 
+/// The size a request body of `len` bytes is padded to, for a reader that
+/// accepts at most `limit` bytes: [`body_bucket`], held to `limit`, so a body
+/// the reader accepts is never padded into one it refuses. Above the largest
+/// bucket under `limit` every body pads to `limit` itself, one size like every
+/// other bucket. A body over `limit` is left its own length; it is refused
+/// whatever its padding.
+pub const fn request_bucket(len: usize, limit: usize) -> usize {
+    if len > limit {
+        return len;
+    }
+    let bucket = body_bucket(len);
+    if bucket > limit { limit } else { bucket }
+}
+
+/// `body` with trailing spaces to [`request_bucket`] of its length.
+pub fn pad_request_body(mut body: Vec<u8>, limit: usize) -> Vec<u8> {
+    let size = request_bucket(body.len(), limit);
+    body.resize(size, b' ');
+    body
+}
+
 /// A padded body without its padding: what a reader compares a body that is
 /// not JSON against.
 pub fn unpadded(body: &[u8]) -> &[u8] {
@@ -546,6 +569,34 @@ mod tests {
         let json = pad_body(br#"{"a":"b "}"#.to_vec());
         let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(value["a"], "b ");
+    }
+
+    #[test]
+    fn request_bodies_pad_to_a_bucket_no_larger_than_their_reader_accepts() {
+        let limit = 24 * 1024 * 1024;
+        assert_eq!(request_bucket(0, limit), MIN_BODY_BUCKET);
+        // Already a bucket's size: not padded.
+        assert_eq!(request_bucket(MIN_BODY_BUCKET, limit), MIN_BODY_BUCKET);
+        assert_eq!(request_bucket(1 << 20, limit), 1 << 20);
+        assert_eq!(request_bucket((1 << 20) + 1, limit), 2 << 20);
+        // Above the largest power of two under the limit: the limit.
+        assert_eq!(request_bucket((16 << 20) + 1, limit), limit);
+        assert_eq!(request_bucket(limit, limit), limit);
+        // Over it: refused anyway, so left as it is.
+        assert_eq!(request_bucket(limit + 1, limit), limit + 1);
+
+        let body = br#"{"messages":[{"role":"user","content":"hi "}]}"#.to_vec();
+        let padded = pad_request_body(body.clone(), limit);
+        assert_eq!(padded.len(), MIN_BODY_BUCKET);
+        assert_eq!(unpadded(&padded), body.as_slice());
+        let value: serde_json::Value = serde_json::from_slice(&padded).unwrap();
+        assert_eq!(value["messages"][0]["content"], "hi ");
+        // The gateway's pre-parse scan reads the padded body as the body.
+        assert_eq!(
+            crate::engine_protocol::check_request_json(&padded),
+            crate::engine_protocol::check_request_json(&body)
+        );
+        assert!(crate::engine_protocol::check_request_json(&padded).is_ok());
     }
 
     #[test]

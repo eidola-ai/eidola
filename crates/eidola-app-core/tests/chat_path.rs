@@ -10938,7 +10938,8 @@ fn a_model_whose_engine_caches_prefixes_is_sent_a_key_on_both_transports() {
 
 /// Requests to a model that declares no prefix cache — no leaf, a leaf saying
 /// no, or a leaf this client cannot bound — are **byte for byte** the shared
-/// body without a key: exactly what the client sent before keys existed.
+/// body without a key, padded to its size bucket: exactly what the client sent
+/// before keys existed.
 #[test]
 fn a_model_without_a_declared_prefix_cache_is_sent_the_body_it_always_was() {
     let leaves = [
@@ -10967,6 +10968,9 @@ fn a_model_without_a_declared_prefix_cache_is_sent_the_body_it_always_was() {
 
             let raw = mock.chat_raw_bodies();
             assert_eq!(raw.len(), 3, "{leaf:?}");
+            for sent in mock.chat_sent_bodies() {
+                assert_padded_to_its_bucket(&sent);
+            }
             for (sent, stream) in raw.iter().zip([true, true, true]) {
                 let parsed: serde_json::Value = serde_json::from_slice(sent).unwrap();
                 assert!(parsed.get("cache_key").is_none(), "{leaf:?}: {parsed}");
@@ -10986,10 +10990,76 @@ fn a_model_without_a_declared_prefix_cache_is_sent_the_body_it_always_was() {
                     None,
                 );
                 assert_eq!(
-                    sent,
-                    &serde_json::to_vec(&expected).unwrap(),
+                    stream_shape::unpadded(sent),
+                    serde_json::to_vec(&expected).unwrap().as_slice(),
                     "{leaf:?}: the bytes on the wire are the keyless shared body"
                 );
+            }
+        });
+    }
+}
+
+use eidola_common::stream_shape;
+
+/// `sent` is a request body padded to its bucket: trailing spaces after the
+/// JSON, to exactly the size the gateway's limit allows it.
+fn assert_padded_to_its_bucket(sent: &[u8]) {
+    let body = stream_shape::unpadded(sent);
+    assert!(body.ends_with(b"}"), "the padding trails the JSON value");
+    assert_eq!(
+        sent.len(),
+        stream_shape::request_bucket(
+            body.len(),
+            eidola_common::engine_protocol::GATEWAY_MAX_REQUEST_BODY_BYTES,
+        ),
+        "a {}-byte body travels as its bucket",
+        body.len()
+    );
+}
+
+/// **A chat request's size on the wire names its bucket, not the
+/// conversation** (privacy guarantees §3.8). Every request to the gateway,
+/// keyed or not, is the body padded with trailing spaces to its size bucket, so two conversations of different lengths in one
+/// bucket are sent the same number of bytes. The body the Record keeps is the
+/// unpadded one.
+#[test]
+fn a_chat_request_travels_padded_to_its_bucket_and_the_record_keeps_it_unpadded() {
+    for leaf in [None, Some(chat_harness::supported_prompt_cache())] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::OkStreaming,
+                declared_prompt_cache: leaf.clone(),
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            // Two conversations, one a little longer than the other.
+            turn(&core, "Hi.", None, None);
+            turn(&core, "Hi, how are you today?", None, None);
+
+            let raw = mock.chat_sent_bodies();
+            assert_eq!(raw.len(), 2, "{leaf:?}");
+            for sent in &raw {
+                assert_padded_to_its_bucket(sent);
+            }
+            assert_eq!(
+                raw[0].len(),
+                raw[1].len(),
+                "{leaf:?}: both fit one bucket, and travel as one size"
+            );
+            assert_ne!(
+                stream_shape::unpadded(&raw[0]).len(),
+                stream_shape::unpadded(&raw[1]).len()
+            );
+
+            for row in completion_rows(&core) {
+                let recorded = request_detail(&core, &row.id)
+                    .request_body
+                    .expect("a recorded body");
+                assert!(
+                    !recorded.ends_with(b" "),
+                    "{leaf:?}: the Record keeps the body unpadded"
+                );
+                assert!(recorded.len() < raw[0].len(), "{leaf:?}");
             }
         });
     }
