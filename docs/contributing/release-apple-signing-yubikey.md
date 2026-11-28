@@ -1,40 +1,58 @@
 # Provisioning a YubiKey for Apple CI signing
 
-This key is **not** the human release-attestation key. The policies are intentionally inverted: the human-attestation key requires a physical touch for every signature, while this Apple code-signing key must not require touch because CI signs releases unattended. Do not substitute one key for the other or copy their policies.
+> [!CAUTION]
+> **This key is NOT the human release-attestation key.** Their policies are intentionally inverted: the [human release-attestation YubiKey](release-attestant-yubikey.md) requires physical touch for every signature, while this Apple code-signing key must **not** require touch because CI signs macOS releases unattended. Never reuse one device for both roles or copy policies between them.
 
-The Apple key exists to keep the Developer ID private key non-exportable while still requiring the protected release environment to authorize its use. The YubiKey stays connected to the self-hosted macOS runner; its PIV PIN is stored only as a secret in GitHub’s protected Apple-signing environment. Possession of the runner or token alone must not be sufficient to sign.
+This runbook defines the custody boundary, Apple certificate requirements, and operational hand-off for the hardware token that holds Eidola's Apple Developer ID Application signing key. For how Apple's non-reproducible signature is bound back to Eidola's reproducible unsigned macOS build, see [`docs/apps.md`](../apps.md#macos-and-apple-signing).
+
+## Role separation at a glance
+
+| Property | Human release-attestation key | Apple CI signing key (this doc) |
+| --- | --- | --- |
+| **Purpose** | Signs human release attestations affirming build reproduction, diff review, and freedom from coercion | Signs and notarizes macOS `.app` releases for Gatekeeper |
+| **Device custody** | Held personally by each release officer | Connected to the self-hosted macOS CI runner |
+| **Touch policy** | `ALWAYS` (physical presence required) | `NEVER` (unattended CI) |
+| **PIN custody** | Known only to the officer; prompted interactively | Stored only in GitHub's protected Apple-signing environment |
+| **Runbook** | [`release-attestant-yubikey.md`](release-attestant-yubikey.md) | This document |
+
+Possession of the CI runner or the token alone must not be sufficient to sign: the private key stays non-exportable on the YubiKey, while its PIV PIN lives only as a secret in GitHub's protected release-tag signing environment.
 
 ## Provisioning boundary
 
-Generate the private key on the YubiKey. Host tooling constructs and writes the PKCS#10 certificate signing request, and the on-token key signs it. Do not generate a private key in Keychain Access, import one into the token, export a `.p12`, or place a private key in a repository, runner configuration, or GitHub secret. Apple documents that `codesign` can use identities held by a smart card or other hardware token; the private key stays on that token. See [TN3161: Inside Code Signing: Certificates](https://developer.apple.com/documentation/technotes/tn3161-inside-code-signing-certificates).
+> [!NOTE]
+> **Status — intentionally stops before key-generation commands.** The exact PIV slot, PIN policy, and noninteractive CryptoTokenKit unlock mechanism have not yet been selected and empirically verified on the actual macOS runner. Because PIV key policies are immutable once generated, do not provision the token until those choices are approved and tested on the target runner.
 
-The exact PIV slot, PIN policy, and unattended unlock mechanism have not yet been selected. They are security-significant and immutable or operationally binding, so this runbook intentionally stops before a token-generation command. Do not provision the key until those choices have been approved and tested on the intended runner.
+Fixed requirements that apply regardless of final slot selection:
 
-The following requirements are already fixed:
-
-- The private key is generated and retained on-token. Host tooling constructs the CSR and the token key signs it.
-- The touch policy is `never`; unattended CI cannot satisfy physical presence.
-- The PIV PIN is a GitHub environment secret, available only to the protected Apple-signing workflow. Never log it, put it in a command line, or save it on the runner.
-- A human release-attestation key continues to use touch; it is a separate device and role.
-
-Yubico documents that touch policy must be chosen when a PIV key is generated or imported, and that `Never` means no touch is required. Its [PIV policy guide](https://docs.yubico.com/yesdk/users-manual/application-piv/pin-touch-policies.html) and [`ykman` PIV reference](https://docs.yubico.com/software/yubikey/tools/ykman/PIV_Commands.html) are the command reference for the approved procedure.
+- **On-token generation only.** Generate the private key on the YubiKey; host tooling constructs the PKCS#10 certificate signing request (CSR) and the on-token key signs it. Never generate a private key in Keychain Access, import one into the token, export a `.p12`, or place a private key in a repository, runner config, or GitHub secret. Apple documents smart-card / hardware-token support for `codesign` in [TN3161: Inside Code Signing: Certificates](https://developer.apple.com/documentation/technotes/tn3161-inside-code-signing-certificates).
+- **Touch policy `NEVER`.** Unattended CI cannot satisfy physical presence. Touch policy must be set at key-generation time; see Yubico's [PIV policy guide](https://docs.yubico.com/yesdk/users-manual/application-piv/pin-touch-policies.html) and [`ykman` PIV reference](https://docs.yubico.com/software/yubikey/tools/ykman/PIV_Commands.html).
+- **Environment-scoped PIN.** The PIV PIN lives only as a secret in GitHub's protected Apple-signing environment. Never log it, pass it on a command line, or persist it on the runner.
 
 ## Certificate issuance and installation
 
-The Apple Developer Program Account Holder creates the Developer ID Application certificate from the CSR. Apple lists the Account Holder as the required role for this certificate type. The resulting certificate is public material; import it into the same token slot as the matching on-token key, then confirm macOS can see a complete Developer ID identity through CryptoTokenKit. Do not use a certificate whose private key was generated elsewhere.
-
-Follow Apple’s current [Developer ID certificate procedure](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/) for the portal steps. Before enabling a release workflow, test signing a non-release fixture on the actual runner and verify that `codesign` uses the hardware-token identity rather than a file-based key. The current workflow does not yet implement this path, so no CI command is prescribed here.
+1. The Apple Developer Program **Account Holder** (the role Apple requires for Developer ID Application certificates) submits the CSR through Apple's [Developer ID certificate procedure](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/).
+2. Import the resulting public certificate into the same YubiKey slot as the matching on-token private key. Never use a certificate whose private key was generated off-token.
+3. Confirm macOS exposes a complete Developer ID identity through CryptoTokenKit.
+4. Before enabling release signing in CI, test signing a non-release fixture on the actual runner and confirm `codesign` uses the hardware-token identity rather than a file-based key. *(The CI workflow does not yet implement this path, so no workflow command is prescribed here.)*
 
 ## Environment and runner hand-off
 
-Create the protected Apple-signing environment before enabling signing. Its PIN secret belongs only there. Restrict the environment to release tags and its signing workflow; do not make the secret available to general `main` builds or nightlies. The runner may host the token, but it must not retain the PIN after a job finishes.
+- Create the protected Apple-signing GitHub environment before enabling signing, and store the PIV PIN secret only there.
+- Restrict the environment to release tags and the dedicated signing workflow — never expose it to general `main` builds, PRs, or nightlies.
+- Ensure jobs never leave the PIN cached or written on the runner after completion.
+- Keep Apple signing assets and key-dependent claims strictly outside `artifact-manifest.json` (enforced by `scripts/check-manifest-determinism.sh`; see [`.github/AGENTS.md`](../../.github/AGENTS.md)).
 
-Record outside the repository: token serial, firmware version, key role, certificate SHA-1 identity, Apple Team ID, certificate expiry, the responsible Account Holder, and the environment’s owners. Keep the PUK and management-key recovery material in the organization’s approved secret store, separate from the runner.
+Record the following custody metadata **outside the repository** (keep PUK and management-key recovery material in the organization's approved secret store, separate from the runner):
+
+- Token serial number and firmware version
+- Key role and PIV slot
+- Certificate SHA-1 identity, Apple Team ID, and expiry date
+- Responsible Apple Account Holder and GitHub environment owners
 
 ## Renewal, revocation, and timestamps
 
-Put the Developer ID certificate expiry on a calendar well before its five-year term ends. Renewal is a new on-token key, a host-generated CSR signed by that key, and certificate issuance, followed by a runner test and a controlled identity change; do not replace the existing identity blindly. Apple says a secure timestamp allows users to continue running an app signed while its Developer ID certificate was valid, but a revoked Developer ID certificate is different: Apple says affected apps can no longer be installed or launched. New releases require a current certificate.
+- **Calendar the expiry well in advance** of the five-year Developer ID certificate term. Renewal uses a fresh on-token key, host-generated CSR, new Apple certificate, runner verification, and a controlled identity switch — never overwrite an active identity blindly.
+- **Always include Apple's secure timestamp.** Apple requires a secure timestamp for notarization, and it allows users to keep running releases signed while the certificate was valid even after the certificate later expires.
+- **Revocation is different from expiry:** a revoked Developer ID certificate prevents affected apps from installing or launching, and new releases require a current certificate.
 
-The release signer must include Apple’s secure timestamp. Apple requires it for notarization, and it is what preserves the signing-time validity of releases after certificate expiry. See Apple’s [notarization requirements](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution),
-[certificate-expiry guidance](https://developer.apple.com/support/developer-id/),
-and [TN3161](https://developer.apple.com/documentation/technotes/tn3161-inside-code-signing-certificates).
+References: Apple's [notarization requirements](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution), [Developer ID certificate-expiry guidance](https://developer.apple.com/support/developer-id/), and [TN3161](https://developer.apple.com/documentation/technotes/tn3161-inside-code-signing-certificates).
