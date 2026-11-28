@@ -4127,6 +4127,41 @@ fn a_proxied_completion_carries_no_cache_key_even_when_its_caller_sends_one() {
     });
 }
 
+/// **A proxied completion travels to the gateway padded to its size bucket**
+/// (privacy guarantees §3.8), as the app's own turns do: a downstream tool's
+/// request is the same conversation-sized body, and the proxy is what sends it
+/// to Eidola.
+#[test]
+fn a_proxied_completion_travels_padded_to_its_bucket() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+        let body =
+            format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hello"}}]}}"#);
+        let (status, answer) =
+            runtime.block_on(exchange(&core, &post("/v1/chat/completions", &key, &body)));
+        assert_eq!(status, 200, "{answer}");
+
+        let sent = mock.chat_sent_bodies();
+        assert_eq!(sent.len(), 1);
+        let unpadded = eidola_common::stream_shape::unpadded(&sent[0]);
+        assert!(unpadded.ends_with(b"}"));
+        assert_eq!(
+            sent[0].len(),
+            eidola_common::stream_shape::request_bucket(
+                unpadded.len(),
+                eidola_common::engine_protocol::GATEWAY_MAX_REQUEST_BODY_BYTES,
+            )
+        );
+    });
+}
+
 /// **A proxied completion holds the request fee and never declares a cached
 /// prefix** — not one of this app's (it has no lineage, so it carries no key
 /// and has nothing to claim), and not one its caller wrote (`cached_prefix`

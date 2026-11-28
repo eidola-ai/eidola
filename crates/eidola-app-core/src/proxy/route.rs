@@ -521,6 +521,9 @@ struct ProxyRoute {
     /// The canonical `<model>@<backend>` string the caller named.
     canonical: String,
     backend_id: String,
+    /// Whether this route is Eidola's gateway, whose requests go padded to a
+    /// size bucket ([`crate::wire_body`]).
+    to_gateway: bool,
     /// `(prompt_rate, completion_rate, scale_factor)` — `Some` only for a
     /// route that bills.
     pricing: Option<ChargePricing>,
@@ -901,6 +904,7 @@ impl Inner {
                     wire_model: target.canonical.clone(),
                     canonical: target.canonical.clone(),
                     backend_id: backend.id.clone(),
+                    to_gateway: false,
                     pricing: None,
                     external_auth: None,
                     // Written once a send is attempted, never at open — see
@@ -927,6 +931,7 @@ impl Inner {
                     wire_model: target.model.clone(),
                     canonical: target.canonical.clone(),
                     backend_id: backend.id.clone(),
+                    to_gateway: false,
                     pricing: None,
                     external_auth: backend.api_key.as_ref().map(|k| format!("Bearer {k}")),
                     // Written once a send is attempted, never at open — see
@@ -1023,6 +1028,7 @@ impl Inner {
                     wire_model: target.model.clone(),
                     canonical: target.canonical.clone(),
                     backend_id: backend.id.clone(),
+                    to_gateway: true,
                     pricing: Some(ChargePricing::from_catalog(&entry.pricing)),
                     external_auth: None,
                     connection_id,
@@ -2121,7 +2127,8 @@ fn offers_running_engines_only(exposure: LocalExposure, starts_on_demand: bool) 
 ///
 /// An Eidola spend goes into the body here, in its `credentials` member
 /// ([`crate::body_with_spend`]), onto a copy: `body` is what the Record keeps,
-/// and it never holds a credential.
+/// and it never holds a credential. On the way to Eidola's gateway the copy
+/// is padded to its size bucket ([`crate::wire_body`]).
 fn build_upstream_request(
     route: &ProxyRoute,
     body: &Value,
@@ -2132,7 +2139,7 @@ fn build_upstream_request(
     let mut request = route
         .client
         .post(format!("{}/v1/chat/completions", route.base_url))
-        .body(sent.to_string())
+        .body(crate::wire_body(&sent, route.to_gateway))
         .build()
         .map_err(|e| AppError::Network {
             message: format!(
@@ -3196,6 +3203,7 @@ mod tests {
             wire_model: "m".into(),
             canonical: "m".into(),
             backend_id: "eidola".into(),
+            to_gateway: true,
             pricing: None,
             external_auth: None,
             // What the *listing's* handshake wrote.

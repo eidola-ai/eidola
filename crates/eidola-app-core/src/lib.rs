@@ -15168,7 +15168,9 @@ const CACHE_KEY_PLACEHOLDER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 /// exactly as unlinkable as no key, and the same length. Only if the OS cannot
 /// supply randomness at all does the body fail, and the request with it.
 fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (crate::transport::Body, usize) {
-    let mut bytes = serde_json::to_vec(body).expect("a JSON value serializes");
+    // Padded before the key goes in, which is the placeholder's length: the
+    // padding trails the value, so the member is found where it always was.
+    let mut bytes = wire_body(body, !prep.plain_route);
     // Object members serialize sorted, and `cache_key` sorts first among the
     // body's members, so the first unescaped occurrence is the member itself
     // (a message's text holding the same characters is escaped).
@@ -16126,7 +16128,8 @@ impl TurnPrep {
 
     /// Attach `body` to `request`: as JSON for every turn without a prefix
     /// cache, as a [`keyed_body`] otherwise, and with this round's spend in
-    /// its `credentials` member when it has one.
+    /// its `credentials` member when it has one. Either is padded to its size
+    /// bucket on its way to Eidola's gateway ([`wire_body`]).
     ///
     /// The spend goes onto a copy, on its way to the wire: `body` itself is
     /// what the Record keeps, and it never holds a credential.
@@ -16137,7 +16140,7 @@ impl TurnPrep {
     ) -> crate::transport::RequestBuilder {
         let body = body_with_spend(body, self.spend.as_ref());
         if self.cache_scope.is_none() {
-            return request.json(&*body);
+            return with_chat_body(request, &body, !self.plain_route);
         }
         let (stream, len) = keyed_body(self, &body);
         request
@@ -21117,6 +21120,41 @@ pub(crate) fn body_with_spend<'a>(
     spend: Option<&SpendPrep>,
 ) -> std::borrow::Cow<'a, serde_json::Value> {
     with_credentials(body, spend.map(SpendPrep::credentials))
+}
+
+/// `body` as the bytes a chat request carries: padded with trailing spaces to
+/// its size bucket ([`eidola_common::stream_shape::request_bucket`], capped
+/// at what the gateway reads) when it goes to Eidola's gateway, so its length
+/// names the bucket rather than the conversation (privacy guarantees §3.8).
+/// Trailing whitespace leaves the JSON value unchanged, and the gateway prices
+/// the parsed value, never the bytes. Only the wire copy is padded: the body
+/// the Record keeps is not. Engines and external backends are sent the body
+/// as it is.
+pub(crate) fn wire_body(body: &serde_json::Value, to_gateway: bool) -> Vec<u8> {
+    let bytes = serde_json::to_vec(body).expect("a JSON value serializes");
+    if to_gateway {
+        eidola_common::stream_shape::pad_request_body(
+            bytes,
+            eidola_common::engine_protocol::GATEWAY_MAX_REQUEST_BODY_BYTES,
+        )
+    } else {
+        bytes
+    }
+}
+
+/// `request` with `body` as its JSON, padded ([`wire_body`]) when it goes to
+/// Eidola's gateway.
+pub(crate) fn with_chat_body(
+    request: crate::transport::RequestBuilder,
+    body: &serde_json::Value,
+    to_gateway: bool,
+) -> crate::transport::RequestBuilder {
+    if !to_gateway {
+        return request.json(body);
+    }
+    request
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(wire_body(body, true))
 }
 
 /// `body` with `credentials` as its `credentials` member, on a copy; `body`

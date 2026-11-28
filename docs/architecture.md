@@ -91,7 +91,7 @@ The app sends each inference request to the gateway, paid for with anonymous cre
 
 **Who can see it.** Your own network, the internet carriers in between, and the hosting provider's network on the way in. The other end is the gateway's measured code.
 
-**What they see.** On the network, encrypted traffic: your IP address, when each request is sent and how large it is, and when each answer starts and how long it runs. Requests are not padded, so their sizes are visible ([gaps.md](gaps.md#passive-traffic-analysis)). Inside its enclave the gateway sees the prompt, the answer and the credit that pays for them. It does not see which account the credit came from.
+**What they see.** On the network, encrypted traffic: your IP address, when each request is sent and how large it is, and when each answer starts and how long it runs. Each chat request is padded to a size bucket, so its size shows only to within that bucket ([gaps.md](gaps.md#passive-traffic-analysis)). Inside its enclave the gateway sees the prompt, the answer and the credit that pays for them. It does not see which account the credit came from.
 
 **What protects it.** TLS ends inside the gateway's enclave, and the app checks the enclave's attestation on every new connection against the identity compiled into it, refusing on any mismatch ([client.md](client.md#per-handshake-attestation-no-caching)). The request carries anonymous credit and no account credentials; a request carrying account credentials is refused ([gateway.md](gateway.md#linked-vs-unlinked)). A streamed answer leaves as fixed-size frames on a fixed tick, and every other response is padded to a size bucket ([gateway.md](gateway.md#response-shape)).
 
